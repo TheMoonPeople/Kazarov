@@ -24,7 +24,10 @@ pc;
 
 layout(location = 0) in vec4 v_color;
 layout(location = 1) in vec2 v_uv;
-layout(location = 2) in float v_fog;
+// xw: weighted vertex F*w and weight*w; y: unlimited F*w; z: near/eye blend weight.
+layout(location = 2) in vec4 v_fog;
+// xy: near/far limits; z: -2 constant, -1 direct 2D, 0 DC1 mesh, 1 DC2 prog0; w: constant F.
+layout(location = 3) flat in vec4 v_fog_mode;
 
 layout(location = 0, index = 0) out vec4 o_color;
 layout(location = 0, index = 1) out vec4 o_factor;
@@ -127,7 +130,21 @@ void main() {
     }
 
     if ((pc.flags & kFog) != 0u) {
-        color.rgb = mix(unpackUnorm4x8(pc.fog_color).rgb, color.rgb, v_fog);
+        float fog = v_fog_mode.z < -1.5 ? v_fog_mode.w : v_fog.x;
+        if (v_fog_mode.z >= 0.0) {
+            // Each edge depends only on its own endpoints, including after homogeneous clipping.
+            // Zero markers give PS2 vertex-clamp-then-screen-interpolate.
+            // Hardware clipping cannot emit fresh PS2 vertex F; near/eye crossings blend towards it.
+            float fresh = v_fog.y * gl_FragCoord.w;
+            fresh = v_fog_mode.z > 0.5 ? max(max(min(fresh, v_fog_mode.x), v_fog_mode.y), 0.0)
+                                       : min(max(fresh, v_fog_mode.y), v_fog_mode.x);
+            if (v_fog_mode.z > 0.5) {
+                fresh = floor(fresh);
+            }
+            fog = v_fog.w > 0.0 ? mix(v_fog.x / v_fog.w, fresh, clamp(v_fog.z, 0.0, 1.0)) : fresh;
+            fog /= 255.0;
+        }
+        color.rgb = mix(unpackUnorm4x8(pc.fog_color).rgb, color.rgb, fog);
     }
 
     if (kAlphaTest && !AlphaPasses(color.a)) {
