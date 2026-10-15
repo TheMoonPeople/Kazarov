@@ -104,6 +104,10 @@ function(kz_port_host_library target)
     target_link_libraries(${target} PRIVATE SDL3::SDL3 Vulkan::Vulkan nlohmann_json::nlohmann_json)
     # The game's replacement units include "gfx/gfx.hpp", so the include root is part of this library's interface.
     target_link_libraries(${target} PUBLIC kz_port_headers)
+    if(WIN32)
+        # platform/game_icon.cpp's shortcut beside the executable (IShellLinkW).
+        target_link_libraries(${target} PUBLIC ole32 uuid)
+    endif()
     target_compile_options(${target} PRIVATE -Wall -ffunction-sections -fdata-sections)
     # arm64 clang fuses a*b+c into one rounding and x86-64 has no FMA in its baseline. The logical-to-pixel
     # mapping floors such sums, so a fused one lands a whole pixel off on arm64 alone.
