@@ -180,3 +180,49 @@ TEST(GfxMisc, TextureReusingFrameTargetKeepsTexelCoordinates) {
     EXPECT_TRUE(fixture.PixelNear(270, 210, 255, 255, 255));
     EXPECT_FALSE(gfx::GetTextureInfo(texture)->frame_target);
 }
+
+TEST(GfxMisc, TextureWithMorePixelsThanItsLogicalSizeIsAddressedInLogicalTexels) {
+    GfxFixture fixture(1280, 960);
+    gfx::SetFrameLayout({gfx::AspectMode::Fill, 1.0f});
+
+    // An 8x2 image the draws address as 4x1: each logical texel is a 2x2 block of pixels.
+    gfx::TextureDesc desc;
+    desc.width = 8;
+    desc.height = 2;
+    desc.logical_width = 4;
+    desc.logical_height = 1;
+    gfx::TextureHandle texture = gfx::CreateTexture(desc);
+    ASSERT_NE(texture, gfx::kNullTexture);
+    auto info = gfx::GetTextureInfo(texture);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->width, 4u);
+    EXPECT_EQ(info->height, 1u);
+    EXPECT_EQ(info->pixel_width, 8u);
+    EXPECT_EQ(info->pixel_height, 2u);
+
+    uint32_t colors[] = {Rgba(255, 0, 0), Rgba(0, 255, 0), Rgba(0, 0, 255), Rgba(255, 255, 255)};
+    uint32_t texels[16];
+    for (int y = 0; y < 2; y++) {
+        for (int x = 0; x < 8; x++) {
+            texels[y * 8 + x] = colors[x / 2];
+        }
+    }
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 8, 2, texels));
+    fixture.Frame({0, 0, 0, 0x80}, [&] {
+        gfx::TextureBinding binding;
+        binding.texture = texture;
+        binding.filter = gfx::Filter::Nearest;
+        auto quad = Quad(100, 100, 40, 10, {0x80, 0x80, 0x80, 0x80}, 0, 0, 4, 1);
+        gfx::Draw2D(gfx::Primitive::Quads, quad, binding, gfx::DrawState{});
+    });
+    EXPECT_TRUE(fixture.PixelNear(210, 210, 255, 0, 0));
+    EXPECT_TRUE(fixture.PixelNear(230, 210, 0, 255, 0));
+    EXPECT_TRUE(fixture.PixelNear(250, 210, 0, 0, 255));
+    EXPECT_TRUE(fixture.PixelNear(270, 210, 255, 255, 255));
+
+    // Left at 0, the logical size is the image's.
+    gfx::TextureHandle plain = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+    ASSERT_NE(plain, gfx::kNullTexture);
+    EXPECT_EQ(gfx::GetTextureInfo(plain)->width, 4u);
+    EXPECT_EQ(gfx::GetTextureInfo(plain)->pixel_width, 4u);
+}

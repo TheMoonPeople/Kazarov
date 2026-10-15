@@ -582,8 +582,8 @@ TextureHandle CreateTexture(const TextureDesc &desc) {
     texture.shares_main_depth = false;
     texture.display_sized_shared = false;
     texture.frame = false;
-    texture.logical_width = desc.width;
-    texture.logical_height = desc.height;
+    texture.logical_width = desc.logical_width != 0 ? desc.logical_width : desc.width;
+    texture.logical_height = desc.logical_height != 0 ? desc.logical_height : desc.height;
     texture.last_draw_use = 0;
     texture.contents.clear();
     texture.contents_version = 0;

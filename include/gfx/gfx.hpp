@@ -168,6 +168,11 @@ struct TextureDesc {
     uint32_t      mip_levels = 1;
     // False for 24-bit sources: the draw's TEXA state supplies alpha when the texture is sampled.
     bool has_alpha = true;
+    // The size the texture is addressed at, in texels, when its image has more pixels than that: draws give u, v in
+    // these texels and the image is sampled across them, so a redrawn texture with four times the pixels takes the
+    // same draws. 0 for the image's own width or height.
+    uint32_t logical_width = 0;
+    uint32_t logical_height = 0;
 };
 
 struct TextureInfo {
