@@ -105,7 +105,7 @@ constexpr VkPipelineStageFlags2 kVertexInput =
 constexpr VkAccessFlags2 kVertexRead = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
 
 void UploadToBuffer(Mesh &mesh, VkDeviceSize offset, const void *data, VkDeviceSize size) {
-    TransientSpan staging = AllocateTransient(size, 16);
+    TransientSpan staging = AllocateStaging(size);
     std::memcpy(staging.data, data, size);
     VkCommandBuffer cmd = CommandsForWrite(mesh.last_draw_use);
     MemoryBarrier(cmd, kVertexInput, kVertexRead, VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -675,7 +675,7 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
         return true;
     }
 
-    TransientSpan staging = AllocateTransient(static_cast<VkDeviceSize>(row) * h, 16);
+    TransientSpan staging = AllocateStaging(static_cast<VkDeviceSize>(row) * h);
     for (uint32_t i = 0; i < h; i++) {
         std::memcpy(staging.data + static_cast<size_t>(i) * row,
                     static_cast<const uint8_t *>(pixels) + static_cast<size_t>(i) * stride, row);

@@ -229,63 +229,111 @@ VkDescriptorSet AllocateBlockSet(VkDescriptorPool pool, VkDescriptorSetLayout la
     return set;
 }
 
-TransientSpan AllocateTransient(VkDeviceSize size, VkDeviceSize alignment) {
-    Frame       &frame = CurrentFrame();
-    VkDeviceSize align = std::max<VkDeviceSize>(alignment, 16);
+namespace {
 
-    for (; frame.chunk < frame.chunks.size(); frame.chunk++) {
-        TransientChunk &chunk = frame.chunks[frame.chunk];
+// Staging chunks are dedicated allocations, so the ones a big load adds go back to the driver
+// once it is over instead of staying in a block.
+constexpr VkDeviceSize kStagingChunkSize = kDedicatedThreshold;
+constexpr size_t       kKeptChunks = 8;
+constexpr size_t       kKeptStagingChunks = 2;
+
+TransientSpan AllocateFromChunks(std::vector<TransientChunk> &chunks, uint32_t &current, VkDeviceSize size,
+                                 VkDeviceSize alignment, VkDeviceSize chunk_size, VkBufferUsageFlags usage) {
+    VkDeviceSize align = std::max<VkDeviceSize>(alignment, 16);
+    for (; current < chunks.size(); current++) {
+        TransientChunk &chunk = chunks[current];
         VkDeviceSize    offset = AlignUp(chunk.used, align);
         if (offset + size <= chunk.buffer.size) {
             chunk.used = offset + size;
-            return TransientSpan{chunk.buffer.buffer, offset, chunk.buffer.memory.mapped + offset,
-                                 chunk.constants_set, chunk.prog0_set};
+            return TransientSpan{chunk.buffer.buffer, offset, chunk.buffer.memory.mapped + offset, VK_NULL_HANDLE};
         }
     }
 
     TransientChunk chunk;
-    chunk.buffer = CreateBuffer(std::max(kTransientChunkSize, AlignUp(size, 1 << 20)),
-                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                                true);
-    chunk.constants_set = AllocateBlockSet(g.constants_pool, g.constants_set_layout, chunk.buffer.buffer,
-                                           sizeof(MeshConstants));
-    if (g.config.prog0_meshes) {
-        chunk.prog0_set = AllocateBlockSet(g.prog0_descriptor_pool, g.prog0_set_layout, chunk.buffer.buffer,
-                                           sizeof(Prog0Constants));
-    }
-
+    chunk.buffer = CreateBuffer(std::max(chunk_size, AlignUp(size, 1 << 20)), usage, true);
     chunk.used = size;
-    frame.chunks.push_back(chunk);
-    frame.chunk = static_cast<uint32_t>(frame.chunks.size() - 1);
-    return TransientSpan{chunk.buffer.buffer, 0, chunk.buffer.memory.mapped, chunk.constants_set, chunk.prog0_set};
+    chunks.push_back(chunk);
+    current = static_cast<uint32_t>(chunks.size() - 1);
+    return TransientSpan{chunk.buffer.buffer, 0, chunk.buffer.memory.mapped, VK_NULL_HANDLE};
+}
+
+void DestroyChunk(TransientChunk &chunk) {
+    if (chunk.constants_set != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(g.device, g.constants_pool, 1, &chunk.constants_set);
+    }
+    if (chunk.prog0_set != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(g.device, g.prog0_descriptor_pool, 1, &chunk.prog0_set);
+    }
+    DestroyBuffer(chunk.buffer);
+}
+
+void ResetChunks(std::vector<TransientChunk> &chunks, uint32_t &current, VkDeviceSize chunk_size, size_t kept) {
+    // A chunk grown for one oversized upload is not kept around for every later frame.
+    for (size_t i = chunks.size(); i-- > 0;) {
+        if (chunks[i].buffer.size > chunk_size || i >= kept) {
+            DestroyChunk(chunks[i]);
+            chunks.erase(chunks.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+    }
+    for (TransientChunk &chunk : chunks) {
+        chunk.used = 0;
+    }
+    current = 0;
+}
+
+} // namespace
+
+TransientSpan AllocateTransient(VkDeviceSize size, VkDeviceSize alignment) {
+    Frame &frame = CurrentFrame();
+    return AllocateFromChunks(frame.chunks, frame.chunk, size, alignment, kTransientChunkSize,
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+}
+
+TransientSpan AllocateConstants(bool prog0) {
+    VkDeviceSize  size = prog0 ? sizeof(Prog0Constants) : sizeof(MeshConstants);
+    TransientSpan span = AllocateTransient(size, g.properties.limits.minUniformBufferOffsetAlignment);
+    // Only chunks that hold constants take a set; the pools hold far fewer sets than a frame can have chunks.
+    Frame          &frame = CurrentFrame();
+    TransientChunk &chunk = frame.chunks[frame.chunk];
+    if (prog0) {
+        if (chunk.prog0_set == VK_NULL_HANDLE) {
+            chunk.prog0_set =
+                AllocateBlockSet(g.prog0_descriptor_pool, g.prog0_set_layout, chunk.buffer.buffer, size);
+        }
+        span.set = chunk.prog0_set;
+    } else {
+        if (chunk.constants_set == VK_NULL_HANDLE) {
+            chunk.constants_set =
+                AllocateBlockSet(g.constants_pool, g.constants_set_layout, chunk.buffer.buffer, size);
+        }
+        span.set = chunk.constants_set;
+    }
+    return span;
+}
+
+TransientSpan AllocateStaging(VkDeviceSize size) {
+    Frame &frame = CurrentFrame();
+    return AllocateFromChunks(frame.staging_chunks, frame.staging_chunk, size, 16, kStagingChunkSize,
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
 }
 
 void ResetTransients(Frame &frame) {
-    // A chunk grown for one oversized upload is not kept around for every later frame.
-    for (size_t i = frame.chunks.size(); i-- > 0;) {
-        if (frame.chunks[i].buffer.size > kTransientChunkSize || i >= 8) {
-            vkFreeDescriptorSets(g.device, g.constants_pool, 1, &frame.chunks[i].constants_set);
-            if (frame.chunks[i].prog0_set != VK_NULL_HANDLE) {
-                vkFreeDescriptorSets(g.device, g.prog0_descriptor_pool, 1, &frame.chunks[i].prog0_set);
-            }
-            DestroyBuffer(frame.chunks[i].buffer);
-            frame.chunks.erase(frame.chunks.begin() + static_cast<std::ptrdiff_t>(i));
-        }
-    }
-    for (TransientChunk &chunk : frame.chunks) {
-        chunk.used = 0;
-    }
-    frame.chunk = 0;
+    ResetChunks(frame.chunks, frame.chunk, kTransientChunkSize, kKeptChunks);
+    ResetChunks(frame.staging_chunks, frame.staging_chunk, kStagingChunkSize, kKeptStagingChunks);
 }
 
 void DestroyTransients(Frame &frame) {
-    for (TransientChunk &chunk : frame.chunks) {
-        DestroyBuffer(chunk.buffer);
+    // Before the descriptor pools are destroyed, which RendererShutdown does after this.
+    for (std::vector<TransientChunk> *chunks : {&frame.chunks, &frame.staging_chunks}) {
+        for (TransientChunk &chunk : *chunks) {
+            DestroyChunk(chunk);
+        }
+        chunks->clear();
     }
-    frame.chunks.clear();
     frame.chunk = 0;
+    frame.staging_chunk = 0;
 }
 
 } // namespace gfx::detail

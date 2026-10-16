@@ -117,8 +117,9 @@ struct Mesh {
 struct TransientChunk {
     Buffer          buffer;
     VkDeviceSize    used = 0;
+    // The chunk's MeshConstants at set 1, allocated once the chunk first holds a MeshConstants.
     VkDescriptorSet constants_set = VK_NULL_HANDLE;
-    // The chunk's Prog0Constants at set 2; only with RendererConfig::prog0_meshes.
+    // The chunk's Prog0Constants at set 2, likewise; only with RendererConfig::prog0_meshes.
     VkDescriptorSet prog0_set = VK_NULL_HANDLE;
 };
 
@@ -126,8 +127,8 @@ struct TransientSpan {
     VkBuffer        buffer;
     VkDeviceSize    offset;
     uint8_t        *data;
-    VkDescriptorSet constants_set;
-    VkDescriptorSet prog0_set;
+    // The chunk's uniform block set; only from AllocateConstants.
+    VkDescriptorSet set;
 };
 
 struct DepthQuery {
@@ -147,6 +148,9 @@ struct Frame {
     bool                               pending = false;
     std::vector<TransientChunk>        chunks;
     uint32_t                           chunk = 0;
+    // Upload sources, apart from chunks so that a load's worth of texels never takes descriptor sets.
+    std::vector<TransientChunk>        staging_chunks;
+    uint32_t                           staging_chunk = 0;
     std::vector<std::function<void()>> deletions;
     // The only buffer the GPU writes for the host; kept apart from the transients, which it reads.
     Buffer depth_readback;
@@ -368,6 +372,10 @@ void     DestroyMainTargets();
 
 // memory.cpp
 TransientSpan AllocateTransient(VkDeviceSize size, VkDeviceSize alignment);
+// A MeshConstants block, or a Prog0Constants one when prog0, with the set that binds it.
+TransientSpan AllocateConstants(bool prog0);
+// The source of a copy into a buffer or image.
+TransientSpan AllocateStaging(VkDeviceSize size);
 void          ResetTransients(Frame &frame);
 void          DestroyTransients(Frame &frame);
 

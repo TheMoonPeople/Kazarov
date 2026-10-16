@@ -480,19 +480,18 @@ void BindVertices(VkBuffer buffer, VkDeviceSize offset) {
 
 // prog0 is the draw's Vu_prog0 block at set 2, or nullptr for a plain draw.
 void BindConstants(VkPipelineLayout layout, const MeshConstants &constants, const Prog0Constants *prog0) {
-    VkDeviceSize alignment = g.properties.limits.minUniformBufferOffsetAlignment;
-    TransientSpan span = AllocateTransient(sizeof(MeshConstants), alignment);
+    TransientSpan span = AllocateConstants(false);
     std::memcpy(span.data, &constants, sizeof(MeshConstants));
     uint32_t offset = static_cast<uint32_t>(span.offset);
     VkCommandBuffer cmd = DrawCommands();
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &span.constants_set, 1, &offset);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &span.set, 1, &offset);
     if (prog0 == nullptr) {
         return;
     }
-    TransientSpan block = AllocateTransient(sizeof(Prog0Constants), alignment);
+    TransientSpan block = AllocateConstants(true);
     std::memcpy(block.data, prog0, sizeof(Prog0Constants));
     uint32_t block_offset = static_cast<uint32_t>(block.offset);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 2, 1, &block.prog0_set, 1, &block_offset);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 2, 1, &block.set, 1, &block_offset);
 }
 
 // Pixel rectangle of a logical one on an image, for copies and blits; along the axes in extend it
