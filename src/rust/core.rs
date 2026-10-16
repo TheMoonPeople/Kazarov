@@ -2,6 +2,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[path = "archive.rs"]
 pub mod archive;
@@ -201,8 +202,51 @@ fn source_state(source: &Path) -> CoreResult<serde_json::Value> {
     Ok(serde_json::json!({"path":path,"fingerprint":fingerprint}))
 }
 
+/// Coalesces parallel progress callbacks for stderr; the bar never moves backwards.
+#[derive(Default)]
+struct ExtractCliProgress {
+    coalesced_fraction: f32,
+    coalesced_message: &'static str,
+    printed_fraction: f32,
+    printed_message: &'static str,
+}
+
+impl ExtractCliProgress {
+    fn advance(&mut self, fraction: f32, message: &'static str) {
+        if fraction >= self.coalesced_fraction {
+            self.coalesced_fraction = fraction.clamp(0.0, 1.0);
+            self.coalesced_message = message;
+        }
+    }
+
+    fn maybe_eprint(&mut self) {
+        let message_changed = self.coalesced_message != self.printed_message;
+        let step = self.coalesced_fraction - self.printed_fraction >= 0.01
+            || self.coalesced_fraction >= 0.99;
+        if !message_changed && !step {
+            return;
+        }
+        eprintln!(
+            "dc2data: [{:>3.0}%] {}",
+            self.coalesced_fraction * 100.0,
+            self.coalesced_message
+        );
+        self.printed_fraction = self.coalesced_fraction;
+        self.printed_message = self.coalesced_message;
+    }
+}
+
+fn extract_cli_progress() -> impl Fn(f32, &'static str) + Sync {
+    let state = Mutex::new(ExtractCliProgress::default());
+    move |fraction, message| {
+        let mut progress = state.lock().expect("extract progress lock");
+        progress.advance(fraction, message);
+        progress.maybe_eprint();
+    }
+}
+
 pub fn extract(source: &Path, data_out: &Path, jobs: usize) -> CoreResult<ExtractReport> {
-    extract_with_progress(source, data_out, jobs, &|_, _| {})
+    extract_with_progress(source, data_out, jobs, &extract_cli_progress())
 }
 
 /// Recognizes a complete, verified archive staged for the unchanged source.
