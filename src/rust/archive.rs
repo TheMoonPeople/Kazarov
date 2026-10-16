@@ -250,7 +250,35 @@ fn open_directory(root: &Path) -> CoreResult<Archive> {
 
 fn open_archive(source: &Path) -> CoreResult<Archive> {
     if source.is_dir() {
-        open_directory(source)
+        match open_directory(source) {
+            Ok(archive) => Ok(archive),
+            Err(dir_error) => {
+                if let Ok(entries) = fs::read_dir(source) {
+                    let isos: Vec<_> = entries
+                        .filter_map(Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.is_file()
+                                && p.extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+                        })
+                        .collect();
+                    if isos.len() == 1 {
+                        return open_image(&isos[0]);
+                    }
+                    if let Some(dc_iso) = isos.iter().find(|p| {
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .contains("dark chronicle")
+                    }) {
+                        return open_image(dc_iso);
+                    }
+                }
+                Err(dir_error)
+            }
+        }
     } else if source.is_file() {
         open_image(source)
     } else {
@@ -865,6 +893,19 @@ mod tests {
         }
         assert!(list_text(&iso)?.contains("1 files"));
         assert!(sound_text(&iso)?.contains("1 entries"));
+        Ok(())
+    }
+
+    #[test]
+    fn folder_holding_iso_opens_the_iso() -> CoreResult<()> {
+        let temp = tempfile::tempdir()?;
+        let folder = temp.path().join("rom_folder");
+        fs::create_dir_all(&folder)?;
+        let iso = folder.join("Dark Chronicle (Europe) (En,Fr,De,Es,It).iso");
+        fs::write(&iso, iso_bytes())?;
+        let archive = open_archive(&folder)?;
+        assert!(archive.image);
+        assert!(!archive.movies.is_empty());
         Ok(())
     }
 

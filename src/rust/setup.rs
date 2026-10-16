@@ -38,7 +38,40 @@ struct Setup {
 impl Setup {
     /// Starts one extraction without blocking the native event loop.
     fn start(&mut self) {
-        let source = PathBuf::from(&self.source);
+        let mut source = PathBuf::from(&self.source);
+        if source.is_dir()
+            && !source.join("DATA.DAT").is_file()
+            && !source.join("data.dat").is_file()
+        {
+            if let Ok(entries) = std::fs::read_dir(&source) {
+                let isos: Vec<_> = entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+                    })
+                    .collect();
+                if isos.len() == 1 {
+                    source = isos[0].clone();
+                    if let Some(path_str) = source.to_str() {
+                        self.source = path_str.into();
+                    }
+                } else if let Some(dc) = isos.iter().find(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("dark chronicle")
+                }) {
+                    source = dc.clone();
+                    if let Some(path_str) = source.to_str() {
+                        self.source = path_str.into();
+                    }
+                }
+            }
+        }
         if !source.is_dir() && !source.is_file() {
             self.error = Some("Choose an existing disc folder or enter a disc image path.".into());
             return;
@@ -103,14 +136,69 @@ impl eframe::App for Setup {
                 ui.label("Disc folder or image");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.source)
-                        .desired_width((ui.available_width() - 125.0).max(100.0)));
+                        .desired_width((ui.available_width() - 215.0).max(100.0)));
+                    if ui.button("Choose ISO").clicked() {
+                        let mut dialog = rfd::FileDialog::new()
+                            .set_title("Choose game disc image")
+                            .add_filter("Disc image (*.iso)", &["iso", "ISO", "bin", "BIN", "img", "IMG"]);
+                        let current = Path::new(&self.source);
+                        if current.is_file() {
+                            if let Some(parent) = current.parent() {
+                                dialog = dialog.set_directory(parent);
+                            }
+                        } else if current.is_dir() {
+                            dialog = dialog.set_directory(current);
+                        } else if Path::new("rom/pal").is_dir() {
+                            dialog = dialog.set_directory("rom/pal");
+                        }
+                        if let Some(path) = dialog.pick_file() {
+                            if let Some(path) = path.to_str() {
+                                self.source = path.into();
+                                self.error = None;
+                            } else {
+                                self.error = Some("This path cannot be displayed as Unicode. Please choose another file.".into());
+                            }
+                        }
+                    }
                     if ui.button("Choose folder").clicked() {
                         let mut dialog = rfd::FileDialog::new().set_title("Choose game disc folder");
-                        if Path::new(&self.source).is_dir() {
-                            dialog = dialog.set_directory(&self.source);
+                        let current = Path::new(&self.source);
+                        if current.is_dir() {
+                            dialog = dialog.set_directory(current);
+                        } else if current.is_file() {
+                            if let Some(parent) = current.parent() {
+                                dialog = dialog.set_directory(parent);
+                            }
+                        } else if Path::new("rom/pal").is_dir() {
+                            dialog = dialog.set_directory("rom/pal");
                         }
                         if let Some(path) = dialog.pick_folder() {
-                            if let Some(path) = path.to_str() {
+                            let mut chosen = path.clone();
+                            if !path.join("DATA.DAT").is_file() && !path.join("data.dat").is_file() {
+                                if let Ok(entries) = std::fs::read_dir(&path) {
+                                    let isos: Vec<_> = entries
+                                        .filter_map(Result::ok)
+                                        .map(|e| e.path())
+                                        .filter(|p| {
+                                            p.is_file()
+                                                && p.extension()
+                                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+                                        })
+                                        .collect();
+                                    if isos.len() == 1 {
+                                        chosen = isos[0].clone();
+                                    } else if let Some(dc) = isos.iter().find(|p| {
+                                        p.file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .to_ascii_lowercase()
+                                            .contains("dark chronicle")
+                                    }) {
+                                        chosen = dc.clone();
+                                    }
+                                }
+                            }
+                            if let Some(path) = chosen.to_str() {
                                 self.source = path.into();
                                 self.error = None;
                             } else {
@@ -237,6 +325,17 @@ mod tests {
         assert!(app.worker.is_none());
         assert!(app.error.is_some());
         assert!(app.completed_at.is_none());
+    }
+
+    #[test]
+    fn folder_holding_iso_resolves_to_the_iso() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let iso = temp.path().join("Dark Chronicle (Europe) (En,Fr,De,Es,It).iso");
+        std::fs::write(&iso, b"dummy").expect("write");
+        let mut app = test_setup();
+        app.source = temp.path().to_string_lossy().into();
+        app.start();
+        assert_eq!(app.source, iso.to_string_lossy());
     }
 
     #[test]
