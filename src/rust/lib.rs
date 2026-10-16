@@ -45,6 +45,9 @@ mod ffi {
         fn archive_path(archive: &Archive) -> String;
         /// Writes a deterministic archive of every file below `source`.
         fn pack_directory(source: &str, output: &str) -> Result<()>;
+        /// Decodes a PNG of exactly `width` by `height` pixels into `out` as 8-bit RGBA (`width * height * 4`
+        /// bytes). Safe to call from any thread.
+        fn png_decode_rgba(png: &[u8], width: u32, height: u32, out: &mut [u8]) -> Result<()>;
     }
 }
 
@@ -134,4 +137,109 @@ fn archive_path(archive: &Archive) -> String {
 
 fn pack_directory(source: &str, output: &str) -> Result<(), core::CoreError> {
     core::zip_archive::pack_directory(source.as_ref(), output.as_ref()).map(|_| ())
+}
+
+fn png_decode_rgba(png: &[u8], width: u32, height: u32, out: &mut [u8]) -> Result<(), String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
+    let info = reader.info();
+    if info.width != width || info.height != height {
+        return Err(format!(
+            "PNG is {}x{}, expected {width}x{height}",
+            info.width, info.height
+        ));
+    }
+    let pixels = width as usize * height as usize;
+    if out.len() != pixels * 4 {
+        return Err("RGBA buffer has the wrong size".into());
+    }
+    let (color, depth) = reader.output_color_type();
+    if depth != png::BitDepth::Eight {
+        return Err("PNG does not decode to 8-bit samples".into());
+    }
+    match color {
+        png::ColorType::Rgba => {
+            reader.next_frame(out).map_err(|error| error.to_string())?;
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut gray = vec![0; pixels * 2];
+            reader
+                .next_frame(&mut gray)
+                .map_err(|error| error.to_string())?;
+            for (rgba, ga) in out.chunks_exact_mut(4).zip(gray.chunks_exact(2)) {
+                rgba.copy_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
+            }
+        }
+        _ => return Err(format!("unexpected PNG output colour {color:?}")),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod png_tests {
+    fn encode(color: png::ColorType, data: &[u8], palette: Option<&[u8]>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, 2, 1);
+        encoder.set_color(color);
+        encoder.set_depth(png::BitDepth::Eight);
+        if let Some(palette) = palette {
+            encoder.set_palette(palette.to_vec());
+        }
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(data)
+            .unwrap();
+        bytes
+    }
+
+    fn decode(png: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; 8];
+        super::png_decode_rgba(png, 2, 1, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn decodes_every_colour_type_to_rgba() {
+        assert_eq!(
+            decode(&encode(
+                png::ColorType::Rgba,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                None
+            )),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            decode(&encode(png::ColorType::Rgb, &[1, 2, 3, 5, 6, 7], None)),
+            [1, 2, 3, 255, 5, 6, 7, 255]
+        );
+        assert_eq!(
+            decode(&encode(png::ColorType::Grayscale, &[9, 10], None)),
+            [9, 9, 9, 255, 10, 10, 10, 255]
+        );
+        assert_eq!(
+            decode(&encode(
+                png::ColorType::GrayscaleAlpha,
+                &[9, 1, 10, 2],
+                None
+            )),
+            [9, 9, 9, 1, 10, 10, 10, 2]
+        );
+        assert_eq!(
+            decode(&encode(
+                png::ColorType::Indexed,
+                &[1, 0],
+                Some(&[1, 2, 3, 4, 5, 6])
+            )),
+            [4, 5, 6, 255, 1, 2, 3, 255]
+        );
+        let mut out = vec![0; 8];
+        assert!(
+            super::png_decode_rgba(&encode(png::ColorType::Rgb, &[0; 6], None), 1, 2, &mut out)
+                .is_err()
+        );
+    }
 }
