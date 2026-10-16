@@ -1,41 +1,18 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "audio/vag.hpp"
+#include "platform/vfs.hpp"
 
 namespace audio {
-
-constexpr std::uint32_t kChunkCreator = 0x53434549; // 'SCEI'
-constexpr std::uint32_t kChunkVers = 0x56657273;
-constexpr std::uint32_t kChunkHead = 0x48656164;
-constexpr std::uint32_t kChunkProg = 0x50726F67;
-constexpr std::uint32_t kChunkSset = 0x53736574;
-constexpr std::uint32_t kChunkSmpl = 0x536D706C;
-constexpr std::uint32_t kChunkVagi = 0x56616769;
-constexpr std::uint32_t kChunkSequ = 0x53657175;
-constexpr std::uint32_t kChunkMidi = 0x4D696469;
-constexpr std::uint32_t kUnused = 0xFFFFFFFF;
-
-// Byte offsets of the fields the player reads, relative to each record's start.
-namespace hd {
-constexpr std::size_t kChunkHeaderSize = 12;
-constexpr std::size_t kHeadProgramAddr = 0x14;
-constexpr std::size_t kHeadSampleSet = 0x18;
-constexpr std::size_t kHeadSample = 0x1C;
-constexpr std::size_t kHeadVagInfo = 0x20;
-constexpr std::size_t kTableCount = 0x0C;
-constexpr std::size_t kTableOffsets = 0x10;
-constexpr std::size_t kProgramParamSize = 0x24;
-constexpr std::size_t kSplitSize = 0x14;
-constexpr std::size_t kSampleParamSize = 0x2A;
-constexpr std::size_t kSampleSpuAttr = 0x29;
-constexpr std::size_t kVagInfoSize = 8;
-} // namespace hd
 
 // Pitches below a semitone (detunes, bend ranges) are in 128ths of a semitone, as the synth adds
 // them: a full bend moves the pitch by exactly the split's range.
@@ -96,7 +73,6 @@ struct HdSample {
 };
 
 struct HdVagInfo {
-    std::uint32_t offset = 0;
     int           rate = 0;
     std::uint8_t  attr = 0;
 };
@@ -107,9 +83,6 @@ struct HdBank {
     std::vector<HdSample>    samples;
     std::vector<HdVagInfo>   vags;
 
-    // Missing or truncated chunks leave their tables empty or short rather than failing: a bank
-    // that plays partly is more useful than none.
-    static std::optional<HdBank> Parse(std::span<const std::uint8_t> hd);
 };
 
 // One playable layer of a key-on: a sample, the split it came through and its decoded VAG.
@@ -121,11 +94,21 @@ struct Layer {
     int              vel_curve;
 };
 
-// A bank as the synth plays it: the HD tables and every VAG of the BD decoded up front, so the
-// audio thread never decodes or allocates.
+/**
+ * Owns semantic instrument tables and PCM samples ready for allocation-free synthesis.
+ */
 class Bank {
 public:
-    static std::shared_ptr<Bank> Create(std::span<const std::uint8_t> hd, std::span<const std::uint8_t> bd);
+    /**
+     * Loads semantic bank tables and standard PCM WAV samples through the asset resolver.
+     */
+    static std::shared_ptr<Bank> CreateFromJson(std::string_view                                                           json,
+                                                const std::function<std::filesystem::path(const std::filesystem::path &)> &resolve);
+    /**
+     * Loads each sample from the first valid WAV in precedence order.
+     */
+    static std::shared_ptr<Bank> CreateFromJsonCandidates(std::string_view                                                           json,
+                                                          const std::function<std::vector<vfs::Ref>(const std::filesystem::path &)> &resolve);
 
     const HdBank &Header() const { return header_; }
 
@@ -143,11 +126,5 @@ private:
     HdBank                 header_;
     std::vector<VagSample> decoded_;
 };
-
-std::uint32_t ReadU32(std::span<const std::uint8_t> data, std::size_t offset);
-std::uint16_t ReadU16(std::span<const std::uint8_t> data, std::size_t offset);
-
-// The offset of the first chunk of type at a 4-byte boundary, or kUnused.
-std::uint32_t FindChunk(std::span<const std::uint8_t> data, std::uint32_t type, std::size_t from = 0);
 
 } // namespace audio

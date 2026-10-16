@@ -18,6 +18,10 @@ FetchContent_MakeAvailable(corrosion)
 
 get_filename_component(KZ_RUST_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/../Cargo.toml" ABSOLUTE)
 corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core)
+find_program(KZ_FFMPEG_EXECUTABLE NAMES ffmpeg.exe ffmpeg HINTS "${KZ_FFMPEG_DIR}/bin")
+if(KZ_FFMPEG_EXECUTABLE)
+    corrosion_set_env_vars(kazarov_core "KAZAROV_FFMPEG=${KZ_FFMPEG_EXECUTABLE}")
+endif()
 corrosion_add_cxxbridge(kazarov_bridge CRATE kazarov_core FILES rust/lib.rs)
 
 # Corrosion imports Rust's standard native libraries, but not the GUI crates'

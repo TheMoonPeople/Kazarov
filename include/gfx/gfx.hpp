@@ -164,6 +164,11 @@ struct TextureDesc {
     uint32_t      mip_levels = 1;
     // False for 24-bit sources: the draw's TEXA state supplies alpha when the texture is sampled.
     bool has_alpha = true;
+    // The size the texture is addressed at, in texels, when its image has more pixels than that: draws give u, v in
+    // these texels and the image is sampled across them, so a redrawn texture with four times the pixels takes the
+    // same draws. 0 for the image's own width or height.
+    uint32_t logical_width = 0;
+    uint32_t logical_height = 0;
 };
 
 struct TextureInfo {
@@ -624,9 +629,9 @@ bool SnapshotFrame(TextureHandle dst);
 // ---- Readback --------------------------------------------------------------------------------
 
 // Queues a read of the main depth buffer over a logical rect, taken at EndFrame. The result is
-// the farthest (smallest) depth in it, 1 near and 0 far, available after EndFrame.
+// the farthest (smallest) depth in it, 1 near and 0 far, available a frame or two later.
 void ReadDepth(uint32_t id, float x, float y, float w = 1.0f, float h = 1.0f);
-// The answer to the last ReadDepth(id); none if the rect was off the target or never asked.
+// The newest answer to ReadDepth(id); none if the rect was off the target or none has landed.
 std::optional<float> DepthResult(uint32_t id);
 // The last presented frame, RGBA8 rows top to bottom. Outside a frame only.
 bool ReadbackFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);

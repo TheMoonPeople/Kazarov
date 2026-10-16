@@ -13,11 +13,8 @@
 
 namespace gfx::detail {
 
-#if defined(__ANDROID__)
-inline constexpr uint32_t kFramesInFlight = 3;
-#else
-inline constexpr uint32_t kFramesInFlight = 2;
-#endif
+inline constexpr uint32_t kFramesInFlight = 4;
+
 // Descriptor slots in the bindless array; a handle's low 16 bits are its slot.
 inline constexpr uint32_t kMaxTextures = 8192;
 inline constexpr uint32_t kBaseSamplerCount = 8;
@@ -122,30 +119,27 @@ struct Mesh {
 };
 
 struct TransientChunk {
-    Buffer          buffer;
-    VkDeviceSize    used = 0;
+    Buffer       buffer;
+    VkDeviceSize used = 0;
+    // The chunk's MeshConstants at set 1, allocated once the chunk first holds a MeshConstants.
     VkDescriptorSet constants_set = VK_NULL_HANDLE;
-    // The chunk's Prog0Constants at set 2; only with RendererConfig::prog0_meshes.
+    // The chunk's Prog0Constants at set 2, likewise; only with RendererConfig::prog0_meshes.
     VkDescriptorSet prog0_set = VK_NULL_HANDLE;
 };
 
 struct TransientSpan {
-    VkBuffer        buffer;
-    VkDeviceSize    offset;
-    uint8_t        *data;
-    VkDescriptorSet constants_set;
-    VkDescriptorSet prog0_set;
+    VkBuffer     buffer;
+    VkDeviceSize offset;
+    uint8_t     *data;
+    // The chunk's uniform block set; only from AllocateConstants.
+    VkDescriptorSet set;
 };
 
 struct DepthQuery {
-    LogicalRect  rect = {};
-    bool         queued = false;
-    bool         recorded = false;
-    bool         valid = false;
-    float        result = 0.0f;
-    VkDeviceSize offset = 0;
-    uint32_t     texels = 0;
-    uint8_t     *data = nullptr;
+    LogicalRect rect = {};
+    bool        queued = false;
+    bool        valid = false;
+    float       result = 0.0f;
 };
 
 struct Frame {
@@ -160,12 +154,16 @@ struct Frame {
     bool        timer_recorded = false;
     bool        timer_canonical = false;
 #endif
-    bool                               pending = false;
-    std::vector<TransientChunk>        chunks;
-    uint32_t                           chunk = 0;
+    bool                        pending = false;
+    std::vector<TransientChunk> chunks;
+    uint32_t                    chunk = 0;
+    // Upload sources, apart from chunks so that a load's worth of texels never takes descriptor sets.
+    std::vector<TransientChunk>        staging_chunks;
+    uint32_t                           staging_chunk = 0;
     std::vector<std::function<void()>> deletions;
     // The only buffer the GPU writes for the host; kept apart from the transients, which it reads.
-    Buffer depth_readback;
+    Buffer                                 depth_readback;
+    std::array<uint32_t, kDepthQueryCount> depth_texels = {};
 };
 
 struct Swapchain {
@@ -344,7 +342,6 @@ struct Context {
     BoundState    bound;
 
     std::array<DepthQuery, kDepthQueryCount> depth_queries;
-    bool                                     depth_queries_recorded = false;
 
     // Display lists. The canonical render of a list draws into main_color like an immediate frame;
     // a display render draws into display_color with display_depth.
@@ -404,6 +401,10 @@ void     DestroyMainTargets();
 
 // memory.cpp
 TransientSpan AllocateTransient(VkDeviceSize size, VkDeviceSize alignment);
+// A MeshConstants block, or a Prog0Constants one when prog0, with the set that binds it.
+TransientSpan AllocateConstants(bool prog0);
+// The source of a copy into a buffer or image.
+TransientSpan AllocateStaging(VkDeviceSize size);
 void          ResetTransients(Frame &frame);
 void          DestroyTransients(Frame &frame);
 
@@ -464,6 +465,6 @@ LogicalRect ExtendRect(LogicalRect rect, uint32_t axes, const LogicalRect &frame
 
 // readback.cpp
 void RecordDepthQueries(VkCommandBuffer cmd);
-void HarvestDepthQueries();
+void HarvestDepthQueries(Frame &frame);
 
 } // namespace gfx::detail

@@ -93,14 +93,13 @@ void PutChunk(std::vector<uint8_t> &out, const char type[4], const std::vector<u
 void RecordDepthQueries(VkCommandBuffer cmd) {
     Image         &depth = g.main_depth;
     LogicalMapping mapping = MainMapping(depth.width, depth.height);
+    Frame         &frame = CurrentFrame();
     bool           transition = false;
     for (DepthQuery &query : g.depth_queries) {
         if (!query.queued) {
             continue;
         }
         query.queued = false;
-        query.recorded = false;
-        query.valid = false;
         float x0 = std::floor(query.rect.x * mapping.scale_x + mapping.offset_x);
         float y0 = std::floor(query.rect.y * mapping.scale_y + mapping.offset_y);
         float x1 = std::ceil((query.rect.x + query.rect.w) * mapping.scale_x + mapping.offset_x);
@@ -110,6 +109,7 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         x1 = std::min(x1, static_cast<float>(depth.width));
         y1 = std::min(y1, static_cast<float>(depth.height));
         if (x1 <= x0 || y1 <= y0) {
+            query.valid = false;
             continue;
         }
         uint32_t width = std::min(static_cast<uint32_t>(x1 - x0), kMaxQuerySide);
@@ -119,58 +119,56 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         x = std::clamp(x, 0, static_cast<int32_t>(depth.width - width));
         y = std::clamp(y, 0, static_cast<int32_t>(depth.height - height));
 
-        Buffer &buffer = CurrentFrame().depth_readback;
+        Buffer &buffer = frame.depth_readback;
         if (buffer.buffer == VK_NULL_HANDLE) {
             buffer = CreateBuffer(kDepthQueryCount * kQueryBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
         }
-        VkDeviceSize offset = static_cast<VkDeviceSize>(&query - g.depth_queries.data()) * kQueryBytes;
+        size_t index = static_cast<size_t>(&query - g.depth_queries.data());
         if (!transition) {
             Transition(cmd, depth, TransferSrc());
             transition = true;
         }
         VkBufferImageCopy region = {};
-        region.bufferOffset = offset;
+        region.bufferOffset = index * kQueryBytes;
         region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
         region.imageOffset = {x, y, 0};
         region.imageExtent = {width, height, 1};
         vkCmdCopyImageToBuffer(cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1,
                                &region);
-        query.data = buffer.memory.mapped + offset;
-        query.texels = width * height;
-        query.recorded = true;
+        frame.depth_texels[index] = width * height;
     }
     if (transition) {
         HostBarrier(cmd);
         ToRest(cmd, depth);
-        g.depth_queries_recorded = true;
     }
 }
 
-void HarvestDepthQueries() {
-    for (DepthQuery &query : g.depth_queries) {
-        if (!query.recorded) {
+void HarvestDepthQueries(Frame &frame) {
+    for (size_t index = 0; index < kDepthQueryCount; index++) {
+        uint32_t texels = frame.depth_texels[index];
+        if (texels == 0) {
             continue;
         }
+        frame.depth_texels[index] = 0;
+        const uint8_t *data = frame.depth_readback.memory.mapped + index * kQueryBytes;
         // The depth aspect copies out as a float for D32S8 and as 24 bits in a word for D24S8.
         bool  unorm = g.depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
         float farthest = 1.0f;
-        for (uint32_t i = 0; i < query.texels; i++) {
+        for (uint32_t i = 0; i < texels; i++) {
             float value;
             if (unorm) {
                 uint32_t word;
-                std::memcpy(&word, query.data + i * sizeof(word), sizeof(word));
+                std::memcpy(&word, data + i * sizeof(word), sizeof(word));
                 value = static_cast<float>(word & 0xFFFFFF) / static_cast<float>(0xFFFFFF);
             } else {
-                std::memcpy(&value, query.data + i * sizeof(float), sizeof(float));
+                std::memcpy(&value, data + i * sizeof(float), sizeof(float));
             }
             farthest = std::min(farthest, value);
         }
+        DepthQuery &query = g.depth_queries[index];
         query.result = farthest;
         query.valid = true;
-        query.recorded = false;
-        query.data = nullptr;
     }
-    g.depth_queries_recorded = false;
 }
 
 } // namespace detail

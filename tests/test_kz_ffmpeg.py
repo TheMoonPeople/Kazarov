@@ -21,16 +21,22 @@ GPL_LICENSE_LINE = 'License: GPL version 2 or later'
 FLAGS = [
     '--disable-everything',
     '--disable-programs',
+    '--enable-ffmpeg',
     '--disable-doc',
     '--disable-network',
     '--disable-autodetect',
-    '--disable-avformat',
-    '--disable-avfilter',
-    '--disable-swscale',
-    '--disable-swresample',
+    '--enable-avformat',
+    '--enable-avfilter',
+    '--enable-swscale',
+    '--enable-swresample',
     '--disable-avdevice',
-    '--enable-decoder=mpeg2video',
-    '--enable-parser=mpegvideo',
+    '--enable-decoder=mpeg2video,h264,alac,aac,pcm_s16le',
+    '--enable-parser=mpegvideo,h264,aac',
+    '--enable-encoder=alac',
+    '--enable-demuxer=mpegps,mov,wav',
+    '--enable-muxer=mp4',
+    '--enable-protocol=file',
+    '--enable-filter=aresample,aformat,anull,abuffer,abuffersink',
     '--enable-pic',
     '--disable-shared',
     '--enable-static',
@@ -45,7 +51,7 @@ for arg in "$@"; do
     --prefix=*) prefix=${arg#--prefix=} ;;
   esac
 done
-printf 'all:\\n\\t@true\\n\\ninstall:\\n\\tmkdir -p %s/lib %s/include/libavcodec\\n\\ttouch %s/lib/libavcodec.a %s/lib/libavutil.a %s/include/libavcodec/avcodec.h\\n' "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" > Makefile
+printf 'all:\\n\\t@true\\n\\ninstall:\\n\\tmkdir -p %s/lib %s/include/libavcodec %s/bin\\n\\ttouch %s/lib/libavcodec.a %s/lib/libavformat.a %s/lib/libavutil.a %s/lib/libswresample.a %s/lib/libswscale.a %s/include/libavcodec/avcodec.h %s/bin/ffmpeg\\n' "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" > Makefile
 '''
 
 needs_make = pytest.mark.skipif(os.name == 'nt', reason='needs sh and make')

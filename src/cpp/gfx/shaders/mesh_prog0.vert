@@ -81,7 +81,8 @@ const float kVuMax    = 3.40282347e38;
 
 layout(location = 0) out vec4 v_color;
 layout(location = 1) out vec2 v_uv;
-layout(location = 2) out float v_fog;
+layout(location = 2) out vec4 v_fog;
+layout(location = 3) flat out vec4 v_fog_mode;
 
 out float gl_ClipDistance[6];
 
@@ -218,11 +219,25 @@ void main() {
         }
     }
 
-    // ftoi0 truncates; the GS fog field is the integer part of F.
+    // ftoi0 truncates the VU's colour channels.
     v_color = floor(clamp(color, 0.0, 255.0)) / 255.0;
     v_uv = uv;
-    // The VU clamps against the near value first and the far value last, so a far value above the
-    // near value fogs nothing; GLSL clamp leaves that order undefined.
-    float f = p0.fog.x + p0.fog.w / clip.w;
-    v_fog = floor(max(max(min(f, p0.fog.y), p0.fog.z), 0.0)) / 255.0;
+    v_fog_mode = vec4(p0.fog.y, p0.fog.z, 1.0, 0.0);
+    if (p0.fog.w == 0.0) {
+        // A constant factor needs no perspective correction; clamp before truncating as VU1 does.
+        float fog = floor(max(max(min(p0.fog.x, p0.fog.y), p0.fog.z), 0.0)) / 255.0;
+        v_fog = vec4(fog, 0.0, 0.0, 0.0);
+        v_fog_mode.z = -2.0;
+        v_fog_mode.w = fog;
+    } else {
+        // Reverse-Z: only near/eye crossings need fresh fog; far-plane vertices retain their F.
+        // The full homogeneous norm keeps the weight continuous at z=w=0 with nonzero x/y.
+        float clip_scale = max(max(abs(clip.x), abs(clip.y)), max(abs(clip.z), abs(clip.w)));
+        float marker = clip.z > clip.w ? min((clip.z - clip.w) / clip_scale, 1.0) : 0.0;
+        float fog = clip.w <= 0.0 ? 0.0 : p0.fog.x + p0.fog.w / clip.w;
+        fog = floor(max(max(min(fog, p0.fog.y), p0.fog.z), 0.0));
+        // Retain weighted vertex F and its weight alongside the unlimited homogeneous numerator.
+        float weight = max(clip.w, 0.0) * (1.0 - marker);
+        v_fog = vec4(fog * weight, p0.fog.x * clip.w + p0.fog.w, marker, weight);
+    }
 }

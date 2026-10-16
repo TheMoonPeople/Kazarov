@@ -1,4 +1,4 @@
-# Links FFmpeg's libavcodec and libavutil into a target as kz::ffmpeg: the static tree kz-ffmpeg builds
+# Links FFmpeg's format, codec, resampling and scaling libraries as kz::ffmpeg: the static tree kz-ffmpeg builds
 # (Linux, macOS) or BtbN's win64-lgpl-shared archive (Windows, DLLs). Only LGPL builds are acceptable
 # inputs; a GPL or nonfree libavcodec must never reach a Kazarov consumer.
 
@@ -33,7 +33,7 @@ function(_kz_ffmpeg_import)
 
     if(WIN32)
         set(runtime_dlls "")
-        foreach(lib avutil avcodec)
+        foreach(lib avutil swresample swscale avcodec avformat)
             file(GLOB dll "${KZ_FFMPEG_DIR}/bin/${lib}-*.dll")
             list(LENGTH dll count)
             if(NOT count EQUAL 1)
@@ -48,12 +48,15 @@ function(_kz_ffmpeg_import)
                 IMPORTED_IMPLIB "${KZ_FFMPEG_DIR}/lib/lib${lib}.dll.a")
             list(APPEND runtime_dlls "${dll}")
         endforeach()
-        # BtbN's avcodec imports swresample, so it is a runtime dependency although nothing links it.
-        file(GLOB swresample_dll "${KZ_FFMPEG_DIR}/bin/swresample-*.dll")
-        list(APPEND runtime_dlls ${swresample_dll})
+        # The extraction program uses the bundled FFmpeg command and all its shared components.
+        file(GLOB runtime_dlls "${KZ_FFMPEG_DIR}/bin/*.dll")
+        if(NOT EXISTS "${KZ_FFMPEG_DIR}/bin/ffmpeg.exe")
+            message(FATAL_ERROR "kz_ffmpeg: the MP4 extractor requires bin/ffmpeg.exe")
+        endif()
+        list(APPEND runtime_dlls "${KZ_FFMPEG_DIR}/bin/ffmpeg.exe")
         set_property(GLOBAL PROPERTY KZ_FFMPEG_RUNTIME_DLLS "${runtime_dlls}")
     else()
-        foreach(lib avutil avcodec)
+        foreach(lib avutil swresample swscale avcodec avformat)
             if(NOT EXISTS "${KZ_FFMPEG_DIR}/lib/lib${lib}.a")
                 message(FATAL_ERROR "kz_ffmpeg: ${KZ_FFMPEG_DIR}/lib/lib${lib}.a is missing")
             endif()
@@ -69,9 +72,12 @@ function(_kz_ffmpeg_import)
     endif()
 
     set_property(TARGET kz::avcodec PROPERTY INTERFACE_LINK_LIBRARIES kz::avutil)
+    set_property(TARGET kz::avformat PROPERTY INTERFACE_LINK_LIBRARIES kz::avcodec)
+    set_property(TARGET kz::swresample PROPERTY INTERFACE_LINK_LIBRARIES kz::avutil)
+    set_property(TARGET kz::swscale PROPERTY INTERFACE_LINK_LIBRARIES kz::avutil)
 
     add_library(kz::ffmpeg INTERFACE IMPORTED GLOBAL)
-    set_property(TARGET kz::ffmpeg PROPERTY INTERFACE_LINK_LIBRARIES kz::avcodec)
+    set_property(TARGET kz::ffmpeg PROPERTY INTERFACE_LINK_LIBRARIES "kz::avformat;kz::avcodec;kz::swscale;kz::swresample")
     target_include_directories(kz::ffmpeg SYSTEM INTERFACE "${KZ_FFMPEG_DIR}/include")
 
     message(STATUS "Kazarov: FFmpeg from ${KZ_FFMPEG_DIR}")

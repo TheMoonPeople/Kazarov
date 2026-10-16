@@ -58,6 +58,9 @@ struct WindowIdentity {
 };
 
 void WindowSetIdentity(const WindowIdentity &identity);
+// Replaces the identity's icon (size x size RGBA8, kept alive by the caller while the window may use it). An
+// open window takes it at once; otherwise the window opens with it.
+void WindowSetIcon(const std::uint8_t *rgba, int size);
 
 // Starts SDL's video subsystem and opens the window. On Windows a headless Vulkan window is hidden.
 // Elsewhere headless uses SDL's offscreen driver, which gives Vulkan a VK_EXT_headless_surface, and

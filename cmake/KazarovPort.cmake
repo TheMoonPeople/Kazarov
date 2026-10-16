@@ -32,6 +32,7 @@ function(_kz_port_headers_target)
 endfunction()
 
 function(kz_port_host_library target)
+    include(${CMAKE_CURRENT_FUNCTION_LIST_DIR}/KazarovGltf.cmake)
     if(NOT TARGET SDL3::SDL3)
         find_package(SDL3 REQUIRED CONFIG)
     endif()
@@ -109,9 +110,13 @@ function(kz_port_host_library target)
     _kz_port_headers_target()
     add_library(${target} OBJECT ${host_sources} ${shader_headers})
     target_include_directories(${target} PRIVATE ${KZ_PORT_INCLUDE_ROOT} ${generated_dir} ${vendor_dirs})
-    target_link_libraries(${target} PRIVATE SDL3::SDL3 Vulkan::Vulkan nlohmann_json::nlohmann_json)
+    target_link_libraries(${target} PRIVATE SDL3::SDL3 Vulkan::Vulkan nlohmann_json::nlohmann_json fastgltf::fastgltf)
     # The game's replacement units include "gfx/gfx.hpp", so the include root is part of this library's interface.
     target_link_libraries(${target} PUBLIC kz_port_headers)
+    if(WIN32)
+        # platform/game_icon.cpp's shortcut beside the executable (IShellLinkW).
+        target_link_libraries(${target} PUBLIC ole32 uuid)
+    endif()
     target_compile_options(${target} PRIVATE -Wall -ffunction-sections -fdata-sections)
     # arm64 clang fuses a*b+c into one rounding and x86-64 has no FMA in its baseline. The logical-to-pixel
     # mapping floors such sums, so a fused one lands a whole pixel off on arm64 alone.

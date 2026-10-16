@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "tests/gfx_fixture.hpp"
@@ -208,6 +210,19 @@ void Render(GfxFixture &fixture, const std::vector<gfx::Vertex3D> &vertices, con
 
 bool Centre(const GfxFixture &fixture, int r, int g, int b, int tolerance = 1) {
     return fixture.PixelNear(fixture.width / 2, fixture.height / 2, r, g, b, tolerance);
+}
+
+// On the y=1 plane, w=1/screen_y. The two near corners share a homogeneous edge weight h.
+float EyePlaneFog(float depth, float inverse_w, float fresh) {
+    const float h = (4.0f - 1.0f / inverse_w) / (4.0f - depth);
+    // Both near corners have |x|=10, which dominates their homogeneous norm.
+    const float marker = (1.0f - depth) / 10.0f;
+    if (depth <= 0.0f) {
+        return h * marker * fresh;
+    }
+    const float vertex_weight = h * depth * (1.0f - marker);
+    const float vertex = 255.0f * vertex_weight / (vertex_weight + (1.0f - h) * 4.0f);
+    return vertex + h * marker * (fresh - vertex);
 }
 
 } // namespace
@@ -505,4 +520,456 @@ TEST(GfxGpuMeshDc2, EditorFogSaturatesAtFarValue) {
     // result is the far value at every w.
     Render(fixture, ScreenVertices({0, 0, 1}), kTriangle, c, {}, state);
     EXPECT_TRUE(Centre(fixture, 255, 255, 255));
+}
+
+TEST(GfxGpuMeshDc2, FogInterpolatesInScreenSpace) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+    Set(c.prog0.object_color, {255, 255, 255, 128});
+    SetFog(c.prog0.fog, 1, 4, 255, 0);
+    std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+    c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = c.mesh.mvp[14] = 1;
+    const std::vector<gfx::Vertex3D> vertices = {
+        Vert({-1, -1, 1}, {0, 0, 1}), Vert({1, -1, 1}, {0, 0, 1}),
+        Vert({4, 4, 4}, {0, 0, 1}), Vert({-4, 4, 4}, {0, 0, 1})};
+    gfx::DrawState state;
+    state.fog = true;
+    for (const auto &indices : {
+             std::vector<uint32_t>{0, 1, 2, 0, 2, 3},
+             std::vector<uint32_t>{0, 1, 3, 1, 2, 3}
+    }) {
+        Render(fixture, vertices, indices, c, {}, state);
+        // The GS interpolates F across screen rows; applying 1/w again biases it toward the near edge.
+        for (int y : {8, 24, 40}) {
+            const int fog = static_cast<int>(255.0f * (1.0f - (y + 0.5f) / kHeight) + 0.5f);
+            EXPECT_TRUE(fixture.PixelNear(kWidth / 2, y, fog, fog, fog)) << "row " << y;
+        }
+    }
+}
+
+TEST(GfxGpuMeshDc2, FogClampsVerticesBeforeScreenInterpolation) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+    Set(c.prog0.object_color, {255, 255, 255, 128});
+    SetFog(c.prog0.fog, 1, 4, 255, 0);
+    std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+    c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = 1;
+    c.mesh.mvp[14] = 0.1f;
+    const std::vector<gfx::Vertex3D> vertices = {
+        Vert({-0.5f, -0.5f, 0.5f}, {0, 0, 1}), Vert({0.5f, -0.5f, 0.5f}, {0, 0, 1}),
+        Vert({0, 4, 4}, {0, 0, 1})};
+    gfx::DrawState state;
+    state.fog = true;
+    for (const auto &indices : {
+             std::vector<uint32_t>{0, 1, 2},
+             std::vector<uint32_t>{1, 2, 0},
+             std::vector<uint32_t>{2, 0, 1}
+    }) {
+        Render(fixture, vertices, indices, c, {}, state);
+        for (int y : {8, 24, 40}) {
+            const int fog = static_cast<int>(255.0f * (1.0f - (y + 0.5f) / kHeight) + 0.5f);
+            EXPECT_TRUE(fixture.PixelNear(kWidth / 2, y, fog, fog, fog, 1)) << "row " << y;
+        }
+    }
+}
+
+// A near-clipped neighbour must agree with the visible triangle on their unchanged edge.
+TEST(GfxGpuMeshDc2, FogIsContinuousAcrossSharedClippedEdge) {
+    for (bool behind_eye : {false, true}) {
+        for (int size : {256, 1024}) {
+            for (bool plain : {false, true}) {
+                GfxFixture fixture(size, size, 1.0f, Prog0Options());
+                Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+                Set(c.prog0.object_color, {255, 255, 255, 128});
+                Set(c.prog0.fog, {-85, 255, 0, 340});
+                c.mesh.flags = gfx::kMeshFog;
+                Set(c.mesh.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+                Set(c.mesh.fog, {-85, 340, 0, 255});
+                std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+                c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = 1;
+                c.mesh.mvp[14] = 0.1f;
+                const std::array<float, 3>       clipped = behind_eye ? std::array<float, 3>{0, -0.9f, -1}
+                                                                      : std::array<float, 3>{0, -0.045f, 0.05f};
+                const std::vector<gfx::Vertex3D> vertices = {
+                    Vert({-0.4f, 0, 0.5f}, {0, 0, 1}), Vert({3.2f, 0, 4}, {0, 0, 1}),
+                    Vert({0, 3.6f, 4}, {0, 0, 1}), Vert(clipped, {0, 0, 1})};
+                gfx::DrawState state;
+                state.fog = true;
+                int max_step = 0;
+                for (const auto &indices : {
+                         std::vector<uint32_t>{0, 1, 2, 0, 3, 1},
+                         std::vector<uint32_t>{1, 2, 0, 3, 1, 0}
+                }) {
+                    if (plain) {
+                        Render(fixture, vertices, indices, c.mesh, {}, state);
+                    } else {
+                        Render(fixture, vertices, indices, c, {}, state);
+                    }
+                    for (int x = size * 5 / 16; x < size * 11 / 16; ++x) {
+                        const int a = fixture.pixels[((size / 2 - 1) * fixture.width + x) * 4];
+                        const int b = fixture.pixels[(size / 2 * fixture.width + x) * 4];
+                        max_step = std::max(max_step, std::abs(a - b));
+                    }
+                }
+                // The one-pixel step must shrink with resolution, rather than retain a fog-range seam.
+                EXPECT_LE(max_step, 2048 / size + 1) << "plain=" << plain << " size=" << size << " behind_eye=" << behind_eye;
+                RecordProperty(std::string(plain ? "plain_edge_step_" : "prog0_edge_step_") + std::to_string(size) + (behind_eye ? "_behind_eye" : ""), max_step);
+            }
+        }
+    }
+}
+
+TEST(GfxGpuMeshDc2, FogChangesContinuouslyAcrossNearPlane) {
+    for (bool plain : {false, true}) {
+        GfxFixture fixture(256, 256, 1.0f, Prog0Options());
+        Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+        Set(c.prog0.object_color, {255, 255, 255, 128});
+        Set(c.prog0.fog, {-85, 255, 0, 340});
+        c.mesh.flags = gfx::kMeshFog;
+        Set(c.mesh.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+        Set(c.mesh.fog, {-85, 340, 0, 255});
+        std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+        c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = 1;
+        c.mesh.mvp[14] = 0.1f;
+        gfx::DrawState state;
+        state.fog = true;
+        std::vector<uint8_t> previous;
+        int                  max_step = 0;
+        // Includes exactly on, immediately inside, and immediately outside z == w.
+        for (int step = -20; step <= 20; ++step) {
+            const float                      w = 0.1f + step * 0.00005f;
+            const std::vector<gfx::Vertex3D> vertices = {
+                Vert({-0.4f, -0.25f, 0.5f}, {0, 0, 1}), Vert({3.2f, -2, 4}, {0, 0, 1}),
+                Vert({0, 0.8f * w, w}, {0, 0, 1})};
+            if (plain) {
+                Render(fixture, vertices, kTriangle, c.mesh, {}, state);
+            } else {
+                Render(fixture, vertices, kTriangle, c, {}, state);
+            }
+            if (!previous.empty()) {
+                for (int y = 80; y < 160; ++y) {
+                    for (int x = 112; x < 144; ++x) {
+                        const int i = (y * fixture.width + x) * 4;
+                        max_step = std::max(max_step, std::abs(int(fixture.pixels[i]) - int(previous[i])));
+                    }
+                }
+            }
+            previous = fixture.pixels;
+        }
+        EXPECT_LE(max_step, 1) << "plain=" << plain;
+        RecordProperty(plain ? "plain_time_step" : "prog0_time_step", max_step);
+    }
+}
+
+TEST(GfxGpuMeshDc2, FogChangesContinuouslyBehindEyeAcrossFarPlane) {
+    for (bool plain : {false, true}) {
+        GfxFixture fixture(256, 256, 1.0f, Prog0Options());
+        Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+        Set(c.prog0.object_color, {255, 255, 255, 128});
+        Set(c.prog0.fog, {-85, 255, 0, 340});
+        c.mesh.flags = gfx::kMeshFog;
+        Set(c.mesh.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+        Set(c.mesh.fog, {-85, 340, 0, 255});
+        std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+        c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = 1;
+        c.mesh.mvp[14] = 0.1f;
+        const std::vector<gfx::Vertex3D> vertices = {
+            Vert({-0.4f, 0, 0.5f}, {0, 0, 1}), Vert({3.2f, 0, 4}, {0, 0, 1}),
+            Vert({0, 1, -1}, {0, 0, 1})};
+        gfx::DrawState state;
+        state.fog = true;
+        std::vector<uint8_t> previous;
+        int                  max_step = 0;
+        for (int step = -10; step <= 10; ++step) {
+            // Only the already eye-clipped corner moves across z=0; projected positions stay fixed.
+            c.mesh.mvp[6] = step * 0.0001f - 0.1f;
+            if (plain) {
+                Render(fixture, vertices, kTriangle, c.mesh, {}, state);
+            } else {
+                Render(fixture, vertices, kTriangle, c, {}, state);
+            }
+            if (!previous.empty()) {
+                for (int y = 144; y < 192; ++y) {
+                    for (int x = 112; x < 144; ++x) {
+                        const int i = (y * fixture.width + x) * 4;
+                        max_step = std::max(max_step, std::abs(int(fixture.pixels[i]) - int(previous[i])));
+                    }
+                }
+            }
+            previous = fixture.pixels;
+        }
+        EXPECT_LE(max_step, 1) << "plain=" << plain;
+        RecordProperty(plain ? "plain_behind_eye_step" : "prog0_behind_eye_step", max_step);
+    }
+}
+
+TEST(GfxGpuMeshDc2, FogChangesContinuouslyThroughZeroDepthAndW) {
+    for (bool plain : {false, true}) {
+        for (float height : {1.0f, 0.01f}) {
+            GfxFixture fixture(256, 256, 1.0f, Prog0Options());
+            Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+            Set(c.prog0.object_color, {255, 255, 255, 128});
+            Set(c.prog0.fog, {-85, 255, 0, 340});
+            c.mesh.flags = gfx::kMeshFog;
+            Set(c.mesh.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+            Set(c.mesh.fog, {-85, 340, 0, 255});
+            std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+            c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = 1;
+            c.mesh.mvp[14] = 0.1f;
+            const std::vector<gfx::Vertex3D> vertices = {
+                Vert({-3.2f, 0, 4}, {0, 0, 1}), Vert({3.2f, 0, 4}, {0, 0, 1}),
+                Vert({0, height, 0}, {0, 0, 1})};
+            gfx::DrawState       state;
+            std::vector<uint8_t> previous;
+            int                  max_step = 0;
+            // C=(0,height,epsilon,0) crosses z=w=0 with nonzero y and unchanged side coverage.
+            for (int step = -20; step <= 20; ++step) {
+                const float epsilon = step * height * 0.00005f;
+                c.mesh.mvp[6] = (epsilon - 0.1f) / height;
+                // Independently verify the entire sampled rectangle is covered at every step.
+                state.fog = false;
+                if (plain) {
+                    Render(fixture, vertices, kTriangle, c.mesh, {}, state);
+                } else {
+                    Render(fixture, vertices, kTriangle, c, {}, state);
+                }
+                for (int y = 176; y < 192; ++y) {
+                    for (int x = 120; x < 136; ++x) {
+                        ASSERT_TRUE(fixture.PixelNear(x, y, 255, 255, 255, 0));
+                    }
+                }
+                state.fog = true;
+                if (plain) {
+                    Render(fixture, vertices, kTriangle, c.mesh, {}, state);
+                } else {
+                    Render(fixture, vertices, kTriangle, c, {}, state);
+                }
+                if (!previous.empty()) {
+                    for (int y = 176; y < 192; ++y) {
+                        for (int x = 120; x < 136; ++x) {
+                            const int i = (y * fixture.width + x) * 4;
+                            max_step = std::max(max_step, std::abs(int(fixture.pixels[i]) - int(previous[i])));
+                        }
+                    }
+                }
+                previous = fixture.pixels;
+            }
+            EXPECT_LE(max_step, 1) << "plain=" << plain << " height=" << height;
+            RecordProperty(std::string(plain ? "plain_zero_zw_step_" : "prog0_zero_zw_step_") + std::to_string(height), max_step);
+        }
+    }
+}
+
+TEST(GfxGpuMeshDc2, PlainFogClampsVerticesBeforeScreenInterpolation) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::MeshConstants c{};
+    c.flags = gfx::kMeshFog;
+    Set(c.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+    Set(c.fog, {-85, 340, 0, 255});
+    c.mvp[0] = c.mvp[5] = c.mvp[11] = 1;
+    c.mvp[14] = 0.1f;
+    const std::vector<gfx::Vertex3D> vertices = {
+        Vert({-0.5f, -0.5f, 0.5f}, {0, 0, 1}), Vert({0.5f, -0.5f, 0.5f}, {0, 0, 1}),
+        Vert({0, 4, 4}, {0, 0, 1})};
+    gfx::DrawState state;
+    state.fog = true;
+    Render(fixture, vertices, kTriangle, c, {}, state);
+    for (int y : {8, 24, 40}) {
+        const int fog = static_cast<int>(255.0f * (1.0f - (y + 0.5f) / kHeight) + 0.5f);
+        EXPECT_TRUE(fixture.PixelNear(kWidth / 2, y, fog, fog, fog, 1)) << "row " << y;
+    }
+}
+
+TEST(GfxGpuMeshDc2, FogFarClippingRetainsVertexInterpolation) {
+    for (bool plain : {false, true}) {
+        GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+        Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+        Set(c.prog0.object_color, {255, 255, 255, 128});
+        Set(c.prog0.fog, {-85, 255, 0, 340});
+        c.mesh.flags = gfx::kMeshFog;
+        Set(c.mesh.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+        Set(c.mesh.fog, {-85, 340, 0, 255});
+        std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+        c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = 1;
+        c.mesh.mvp[10] = -0.1f;
+        c.mesh.mvp[14] = 0.2f;
+        const std::vector<gfx::Vertex3D> vertices = {
+            Vert({-0.5f, -0.5f, 0.5f}, {0, 0, 1}), Vert({0.5f, -0.5f, 0.5f}, {0, 0, 1}),
+            Vert({0, 4, 4}, {0, 0, 1})};
+        gfx::DrawState state;
+        state.fog = true;
+        if (plain) {
+            Render(fixture, vertices, kTriangle, c.mesh, {}, state);
+        } else {
+            Render(fixture, vertices, kTriangle, c, {}, state);
+        }
+        // The far source corner is clipped at w=2, but its finite original F remains valid.
+        for (int y : {8, 24, 40}) {
+            const int fog = static_cast<int>(255.0f * (1.0f - (y + 0.5f) / kHeight) + 0.5f);
+            EXPECT_TRUE(fixture.PixelNear(kWidth / 2, y, fog, fog, fog, 1)) << "plain=" << plain << " row=" << y;
+        }
+    }
+}
+
+TEST(GfxGpuMeshDc2, FogBlendsClippingPerVertexInOneDraw) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+    Set(c.prog0.object_color, {255, 255, 255, 128});
+    SetFog(c.prog0.fog, 2, 4, 255, 0);
+    std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+    c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = 1;
+    c.mesh.mvp[14] = 0.1f;
+    const std::vector<gfx::Vertex3D> vertices = {
+        Vert({-0.5f, -0.5f, 0.5f}, {0, 0, 1}), Vert({0, -0.5f, 0.5f}, {0, 0, 1}),
+        Vert({-2, 4, 4}, {0, 0, 1}), Vert({0, 1, -1}, {0, 0, 1}),
+        Vert({10, 1, -1}, {0, 0, 1}), Vert({0, 1, 4}, {0, 0, 1})};
+    gfx::DrawState state;
+    state.fog = true;
+    for (const auto &indices : {
+             std::vector<uint32_t>{0, 1, 2, 3, 4, 5},
+             std::vector<uint32_t>{2, 0, 1, 5, 3, 4}
+    }) {
+        Render(fixture, vertices, indices, c, {}, state);
+        for (int y : {32, 36, 40}) {
+            const int vertex_fog = static_cast<int>(255.0f * (1.0f - (y + 0.5f) / kHeight) + 0.5f);
+            EXPECT_TRUE(fixture.PixelNear(kWidth / 4, y, vertex_fog, vertex_fog, vertex_fog, 1));
+            const float inverse_w = 2.0f * (y + 0.5f) / kHeight - 1.0f;
+            // The behind-eye corners have markers 1 and 0.11, with weights h-a and a.
+            const float screen_x = 2.0f * (3 * kWidth / 4 + 0.5f) / kWidth - 1.0f;
+            const float marker = (4.0f - 1.0f / inverse_w) / 5.0f - 0.89f * screen_x / (10.0f * inverse_w);
+            const int   clipped_fog = static_cast<int>(marker * std::floor(std::clamp(-255.0f + 1020.0f * inverse_w, 0.0f, 255.0f)) + 0.5f);
+            EXPECT_TRUE(fixture.PixelNear(3 * kWidth / 4, y, clipped_fog, clipped_fog, clipped_fog, 1));
+        }
+    }
+}
+
+TEST(GfxGpuMeshDc2, FogTruncatesEachVisibleVertexBeforeInterpolation) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+    Set(c.prog0.object_color, {255, 255, 255, 128});
+    Set(c.prog0.fog, {127.5666667f, 255, 0, 1.3333333f});
+    std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+    c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = 1;
+    c.mesh.mvp[14] = 0.1f;
+    const std::vector<gfx::Vertex3D> vertices = {
+        Vert({-1, -1, 1}, {0, 0, 1}), Vert({1, -1, 1}, {0, 0, 1}),
+        Vert({0, 4, 4}, {0, 0, 1})};
+    gfx::DrawState state;
+    state.fog = true;
+    Render(fixture, vertices, kTriangle, c, {}, state);
+    // F=128.9 and 127.9 become 128 and 127 at the vertices, before the screen midpoint is blended.
+    EXPECT_TRUE(fixture.PixelNear(kWidth / 2, kHeight / 2, 127, 127, 127, 0));
+}
+
+TEST(GfxGpuMeshDc2, FogTruncatesClampedFractionalVertexLimits) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+    Set(c.prog0.object_color, {255, 255, 255, 128});
+    gfx::DrawState state;
+    state.fog = true;
+    for (float scale : {0.0f, 340.0f}) {
+        // Inverted limits collapse to the far limit before truncation, even for constant fog.
+        Set(c.prog0.fog, {100.9f, 0.2f, 100.8f, scale});
+        Render(fixture, ScreenVertices({0, 0, 1}), kTriangle, c, {}, state);
+        EXPECT_TRUE(fixture.PixelNear(kWidth / 2, kHeight / 2, 100, 100, 100, 0));
+    }
+}
+
+TEST(GfxGpuMeshDc2, PlainFogInvertedLimitsSaturateNearLast) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::MeshConstants c{};
+    Identity(c.mvp);
+    c.flags = gfx::kMeshFog;
+    Set(c.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+    gfx::DrawState state;
+    state.fog = true;
+    for (float scale : {0.0f, 340.0f}) {
+        Set(c.fog, {100, scale, 255, 40});
+        Render(fixture, ScreenVertices({0, 0, 1}), kTriangle, c, {}, state);
+        EXPECT_TRUE(fixture.PixelNear(kWidth / 2, kHeight / 2, 40, 40, 40, 0));
+    }
+}
+
+TEST(GfxGpuMeshDc2, FogCrossingTheEyeBlendsClampedFog) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+    Set(c.prog0.object_color, {255, 255, 255, 128});
+    SetFog(c.prog0.fog, 2, 4, 255, 0);
+    std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+    c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = c.mesh.mvp[14] = 1;
+    gfx::DrawState state;
+    state.fog = true;
+    for (float depth : {-1.0f, 0.0f, 0.5f}) {
+        const std::vector<gfx::Vertex3D> vertices = {
+            Vert({-10, 1, depth}, {0, 0, 1}), Vert({10, 1, depth}, {0, 0, 1}),
+            Vert({0, 1, 4}, {0, 0, 1})};
+        Render(fixture, vertices, kTriangle, c, {}, state);
+        // On this plane 1/w is screen y, including corners behind or exactly on the eye plane.
+        for (int y : {32, 36, 40, 44}) {
+            const float inverse_w = 2.0f * (y + 0.5f) / kHeight - 1.0f;
+            const float fresh = std::floor(std::clamp(-255.0f + 1020.0f * inverse_w, 0.0f, 255.0f));
+            const int   fog = static_cast<int>(EyePlaneFog(depth, inverse_w, fresh) + 0.5f);
+            EXPECT_TRUE(fixture.PixelNear(kWidth / 2, y, fog, fog, fog)) << "row " << y << " depth " << depth;
+        }
+    }
+}
+
+TEST(GfxGpuMeshDc2, PlainFogCrossesTheEyeWithoutDividingByZero) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::MeshConstants c{};
+    c.flags = gfx::kMeshFog;
+    c.mvp[0] = c.mvp[5] = c.mvp[11] = c.mvp[14] = 1;
+    Set(c.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+    Set(c.fog, {-255, 1020, 0, 255});
+    gfx::DrawState state;
+    state.fog = true;
+    for (float depth : {-1.0f, 0.0f, 0.5f}) {
+        const std::vector<gfx::Vertex3D> vertices = {
+            Vert({-10, 1, depth}, {0, 0, 1}), Vert({10, 1, depth}, {0, 0, 1}),
+            Vert({0, 1, 4}, {0, 0, 1})};
+        Render(fixture, vertices, kTriangle, c, {}, state);
+        for (int y : {32, 36, 40, 44}) {
+            const float inverse_w = 2.0f * (y + 0.5f) / kHeight - 1.0f;
+            const float fresh = std::clamp(-255.0f + 1020.0f * inverse_w, 0.0f, 255.0f);
+            const int   fog = static_cast<int>(EyePlaneFog(depth, inverse_w, fresh) + 0.5f);
+            EXPECT_TRUE(fixture.PixelNear(kWidth / 2, y, fog, fog, fog, 1)) << "row " << y << " depth " << depth;
+        }
+    }
+}
+
+TEST(GfxGpuMeshDc2, PlainFogInterpolatesInScreenSpace) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::MeshConstants c{};
+    c.flags = gfx::kMeshFog;
+    c.mvp[0] = c.mvp[5] = c.mvp[11] = c.mvp[14] = 1;
+    Set(c.diffuse, {255.0f / 128.0f, 255.0f / 128.0f, 255.0f / 128.0f, 1});
+    Set(c.fog, {-85, 340, 0, 255});
+    const std::vector<gfx::Vertex3D> vertices = {
+        Vert({-1, -1, 1}, {0, 0, 1}), Vert({1, -1, 1}, {0, 0, 1}),
+        Vert({4, 4, 4}, {0, 0, 1}), Vert({-4, 4, 4}, {0, 0, 1})};
+    gfx::DrawState state;
+    state.fog = true;
+    Render(fixture, vertices, {0, 1, 2, 0, 2, 3}, c, {}, state);
+    for (int y : {8, 24, 40}) {
+        const int fog = static_cast<int>(255.0f * (1.0f - (y + 0.5f) / kHeight) + 0.5f);
+        EXPECT_TRUE(fixture.PixelNear(kWidth / 2, y, fog, fog, fog)) << "row " << y;
+    }
+}
+
+TEST(GfxGpuMeshDc2, ConstantFullFogFactorMatchesUnfoggedPixels) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
+    Set(c.prog0.object_color, {230, 170, 90, 128});
+    std::memset(c.mesh.mvp, 0, sizeof c.mesh.mvp);
+    c.mesh.mvp[0] = c.mesh.mvp[5] = c.mesh.mvp[11] = c.mesh.mvp[14] = 1;
+    const std::vector<gfx::Vertex3D> vertices = {
+        Vert({-1, -1, 1}, {0, 0, 1}), Vert({1, -1, 1}, {0, 0, 1}),
+        Vert({4, 4, 4}, {0, 0, 1}), Vert({-4, 4, 4}, {0, 0, 1})};
+    const std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    gfx::DrawState              state;
+    Render(fixture, vertices, indices, c, {}, state);
+    const auto unfogged = fixture.pixels;
+    state.fog = true;
+    Render(fixture, vertices, indices, c, {}, state);
+    EXPECT_EQ(fixture.pixels, unfogged);
 }

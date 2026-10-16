@@ -15,7 +15,11 @@ namespace imagefile {
 bool LoadPng(const std::filesystem::path &file, int &width, int &height, std::vector<uint8_t> &rgba) {
     std::ifstream stream(file, std::ios::binary);
     if (!stream) return false;
-    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    return LoadPng(bytes, width, height, rgba);
+}
+
+bool LoadPng(std::span<const uint8_t> bytes, int &width, int &height, std::vector<uint8_t> &rgba) {
     constexpr unsigned char signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
     if (bytes.size() < 33 || !std::equal(std::begin(signature), std::end(signature), bytes.begin()) ||
         bytes[8] != 0 || bytes[9] != 0 || bytes[10] != 0 || bytes[11] != 13 ||

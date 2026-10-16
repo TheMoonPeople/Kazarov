@@ -259,7 +259,7 @@ Do not wrap `PORT_RETURN` in a PS2-visible `if`. The PS2 build then compiles tha
 | Directory | Contents |
 |---|---|
 | `gfx/` | Vulkan renderer: display lists, pipelines, readback, `shaders/` (compiled to headers by the consumer) |
-| `audio/` | Sony HD/BD/SQ/VAG stack, mixer, reverb, sequencer, WAV/FLAC/Vorbis decoding |
+| `audio/` | PCM WAV banks, mixer, reverb, versioned JSON musical/effect sequences, WAV/FLAC/Vorbis decoding |
 | `platform/` | Host services: window, input, display, clock, files, paths, settings, glyphs, overlay, TrueType font, memory, audio output, image files |
 | `platform/arena` | Per-owner arena blocks over `platform/memory`: zeroed, 64-byte aligned, 4x headroom, a guard page after each, named overflow aborts, a debug check that a block lies above 4 GiB, `WidenNear` and `PortImagePointer` for truncated pointers |
 | `sce/` | PS2 SDK replacements (eekernel, eekernel_threads, libcdvd, libgraph, libmc, libpad, libvu0, sifdev, sifrpc). `eekernel_threads` runs kernel threads and semaphores as cooperative fibers on the main OS thread, and a switch inside `ClockPump` aborts; `sce/unimplemented.cpp` defines `Ps2Unimplemented`, behind `PS2_UNIMPLEMENTED()` in `kazarov/port.h` |

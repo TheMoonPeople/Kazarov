@@ -160,6 +160,27 @@ impl Drop for Setup {
     }
 }
 
+/// The Moon People's two moons, the setup window's icon in every game: a game's own icon is drawn from its
+/// disc, which is what this window is extracting.
+const ICON_PNG: &[u8] = include_bytes!("../../assets/two-moons-256.png");
+
+fn icon() -> Option<egui::IconData> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(ICON_PNG))
+        .read_info()
+        .ok()?;
+    let mut rgba = vec![0; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut rgba).ok()?;
+    if frame.color_type != png::ColorType::Rgba || frame.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    rgba.truncate(frame.buffer_size());
+    Some(egui::IconData {
+        rgba,
+        width: frame.width,
+        height: frame.height,
+    })
+}
+
 /// Runs on the main thread and returns only after setup closes or succeeds.
 pub fn run(title: &str, output: &Path) -> CoreResult<bool> {
     let succeeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -175,7 +196,8 @@ pub fn run(title: &str, output: &Path) -> CoreResult<bool> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([640.0, 340.0])
-            .with_min_inner_size([520.0, 340.0]),
+            .with_min_inner_size([520.0, 340.0])
+            .with_icon(icon().unwrap_or_default()),
         centered: true,
         run_and_return: true,
         ..Default::default()
@@ -188,6 +210,13 @@ pub fn run(title: &str, output: &Path) -> CoreResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_setup_window_has_the_two_moons_icon() {
+        let icon = icon().expect("the embedded icon decodes");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 
     fn test_setup() -> Setup {
         Setup {

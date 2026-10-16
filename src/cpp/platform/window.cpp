@@ -20,6 +20,18 @@ bool                                     g_mode_event = false;
 std::vector<void (*)(const SDL_Event &)> g_hooks;
 WindowIdentity                          g_identity;
 
+void ApplyIcon() {
+    if (g_identity.icon_rgba == nullptr) {
+        return;
+    }
+    SDL_Surface *icon = SDL_CreateSurfaceFrom(g_identity.icon_size, g_identity.icon_size, SDL_PIXELFORMAT_RGBA32,
+                                              const_cast<std::uint8_t *>(g_identity.icon_rgba), g_identity.icon_size * 4);
+    if (icon != nullptr) {
+        SDL_SetWindowIcon(g_window, icon);
+        SDL_DestroySurface(icon);
+    }
+}
+
 [[noreturn]] void Fatal(const char *what) {
     std::fprintf(stderr, "%s: %s\n", what, SDL_GetError());
     std::exit(1);
@@ -103,13 +115,14 @@ void WindowInit(const WindowConfig &config) {
     if (g_window == nullptr) {
         Fatal("SDL_CreateWindow");
     }
-    if (g_identity.icon_rgba != nullptr) {
-        SDL_Surface *icon = SDL_CreateSurfaceFrom(g_identity.icon_size, g_identity.icon_size, SDL_PIXELFORMAT_RGBA32,
-                                                  const_cast<std::uint8_t *>(g_identity.icon_rgba), g_identity.icon_size * 4);
-        if (icon != nullptr) {
-            SDL_SetWindowIcon(g_window, icon);
-            SDL_DestroySurface(icon);
-        }
+    ApplyIcon();
+}
+
+void WindowSetIcon(const std::uint8_t *rgba, int size) {
+    g_identity.icon_rgba = rgba;
+    g_identity.icon_size = size;
+    if (g_window != nullptr) {
+        ApplyIcon();
     }
 }
 

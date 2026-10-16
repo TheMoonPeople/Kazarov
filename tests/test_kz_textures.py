@@ -1,4 +1,5 @@
 import json
+import hashlib
 import struct
 import sys
 import tempfile
@@ -10,7 +11,17 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from kazarov_textures import (Converter, TextureError, parse_cfg, parse_img, parse_pack,
-                              parse_tim2, png, publish, verify)
+                              parse_tim2, png, publish, verify, document_path)
+
+
+def documents(output):
+    raw = output.parent / "raw"
+    source_paths = {document_path(path.relative_to(raw).as_posix()): path.relative_to(raw).as_posix()
+                    for path in raw.rglob("*") if path.is_file()} if raw.is_dir() else {}
+    root = output / "port_data"
+    return [({"source": source_paths.get(path.relative_to(root).as_posix()),
+              "path": path.relative_to(root).as_posix()}, json.loads(path.read_text()))
+            for path in sorted(root.rglob("*.json"))]
 
 
 def picture(width, height, image_type, pixels, clut=b"", mips=None):
@@ -75,6 +86,25 @@ class TextureConversionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_document_path_rules(self):
+        self.assertEqual(document_path("img/upper.IMG"), "img/upper.json")
+        self.assertEqual(document_path("pack.img/one.img"), "pack-img/one.json")
+        self.assertEqual(document_path("pack.pac/one.img#entry:3"), "pack.pac/one-entry-3.json")
+        self.assertEqual(document_path("model.chr#offset:80"),
+                         "model.chr/embedded-offset-80.json")
+        self.assertEqual(document_path("x.img#entry:1#offset:80"),
+                         "x-entry-1.json/embedded-offset-80.json")
+        self.assertEqual(document_path("opaque"), "opaque/embedded.json")
+        self.assertEqual(document_path("é.img"), "%C3%A9.json")
+        self.assertEqual(document_path("å.img#entry:7#offset:80"),
+                         "%C3%A5-entry-7.json/embedded-offset-80.json")
+        self.assertEqual(document_path("literal%23offset%3A.img"),
+                         "literal%2523offset%253A.json")
+        long_name = "root/segment/" + "x" * 190 + ".img"
+        full = "root/segment/" + "x" * 190 + ".json"
+        digest = hashlib.sha256(full.encode("utf-8")).hexdigest()[:20]
+        self.assertEqual(document_path(long_name), f"root/segment/long-path-{digest}.json")
+
     def test_indexed_sources_become_rgba_pngs(self):
         clut4 = b"".join(bytes((i, 0, 0, 64)) for i in range(16))
         t4 = tim2(picture(2, 2, 4, b"\x10\x32", clut4))
@@ -85,19 +115,17 @@ class TextureConversionTests(unittest.TestCase):
         (raw / "indices.tm2").write_bytes(tim2(picture(2, 2, 5, bytes((4, 5, 6, 7)), clut8)))
         output = self.root / "staged"
         Converter(self.root / "raw", output).run()
-        catalog = json.loads((output / "port_data/catalog.json").read_text())
-        self.assertEqual([source["kind"] for source in catalog["sources"]], ["img3", "tm2"])
-        for source, expected in zip(catalog["sources"], [b"\x00\x01\x02\x03", b"\x04\x05\x06\x07"]):
+        self.assertEqual([record["source"] for record, _ in documents(output)],
+                         ["img/icons.img", "img/indices.tm2"])
+        for record, source, expected in [(r, d, e) for (r, d), e in zip(documents(output),
+                [b"\x00\x01\x02\x03", b"\x04\x05\x06\x07"])]:
             entry = source["entries"][0]
-            level = Path(entry["variants"][0]["levels"][0])
-            self.assertEqual(level.parent.suffix, ".img")
-            bundle = output / "port_data" / level.parent
-            self.assertEqual([p.name for p in bundle.glob("*.json")], ["catalog.json"])
-            local = json.loads((bundle / "catalog.json").read_text())
-            self.assertEqual(local["schema_version"], 1)
-            self.assertEqual(local["source"], source["source"])
-            self.assertEqual(local["entries"][0]["variants"][0]["levels"][0], level.name)
-            image = (bundle / level.name).read_bytes()
+            picture_doc = entry["pictures"][0]
+            level = Path(picture_doc["levels"][0])
+            self.assertEqual(level.name, Path(record["path"]).stem + "_0.png")
+            self.assertEqual(source["schema_version"], 3)
+            self.assertEqual(set(source), {"schema_version", "groups", "entries"})
+            image = (output / "port_data" / Path(record["path"]).parent / level).read_bytes()
             self.assertEqual(image[25], 6)  # PNG IHDR RGBA colour type
             self.assertNotIn(b"PLTE", image)
             start = image.index(b"IDAT") + 4
@@ -105,11 +133,11 @@ class TextureConversionTests(unittest.TestCase):
             scanlines = zlib.decompress(image[start:start + compressed_size])
             rgba = lambda values: b"".join(bytes((i, 0, 0, 128)) for i in values)
             self.assertEqual(scanlines, b"\0" + rgba(expected[:2]) + b"\0" + rgba(expected[2:]))
-            self.assertEqual(entry["bpp"], 32)
-            self.assertNotIn("palette", entry)
+            self.assertEqual(picture_doc["animation"], "copy" if expected[0] == 0 else "copy_variant")
+            self.assertNotIn("palette_asset", picture_doc)
         self.assertFalse((output / "data/img/icons.img").exists())
         self.assertFalse((output / "data/img/indices.tm2").exists())
-        self.assertEqual(verify(output), 5)
+        self.assertEqual(verify(output), 2)
 
     def test_multiple_pictures_and_mips(self):
         first = picture(4, 4, 3, bytes((1, 2, 3, 64)) * 16,
@@ -118,6 +146,61 @@ class TextureConversionTests(unittest.TestCase):
         pictures = parse_tim2(tim2(first, second))
         self.assertEqual((len(pictures), len(pictures[0].levels), pictures[1].bpp), (2, 2, 24))
         self.assertEqual(pictures[0].levels[1][2][:4], bytes((4, 5, 6, 64)))
+
+    def test_multiple_pictures_serialize_under_one_entry(self):
+        raw = self.root / "raw"
+        raw.mkdir()
+        first = picture(1, 1, 3, b"\x01\x02\x03\x40")
+        second = picture(1, 1, 2, b"\x04\x05\x06")
+        (raw / "multi.img").write_bytes(img(b"multi", tim2(first, second)))
+        output = self.root / "output"
+        Converter(raw, output).run()
+        document = documents(output)[0][1]
+        self.assertEqual(document["groups"], [0])
+        self.assertEqual(document["entries"], [{"name": "multi", "pictures": [
+            {"levels": ["multi_0.png"]}, {"levels": ["multi_1.png"]}]}])
+        verify(output)
+
+    def test_img3_groups_animation_modes_and_sampler_defaults(self):
+        clut4 = bytes((0, 0, 0, 64)) * 16
+        clut8 = bytes((0, 0, 0, 64)) * 256
+        bodies = [(b"draw", tim2(picture(1, 1, 3, b"\x01\x02\x03\x40"))),
+                  (b"copy", tim2(picture(1, 1, 4, b"\x01", clut4))),
+                  (b"variant", tim2(picture(1, 1, 5, b"\x01", clut8)))]
+        data = bytearray(img_multi(bodies))
+        for index, block in enumerate((0, 2, 4)):
+            struct.pack_into("<i", data, 16 + index * 64 + 44, block)
+        struct.pack_into("<Q", data, 16 + 64 + 56, 1 | (2 << 2))
+        raw = self.root / "raw"
+        raw.mkdir()
+        (raw / "modes.img").write_bytes(data)
+        output = self.root / "output"
+        Converter(raw, output).run()
+        document = documents(output)[0][1]
+        self.assertEqual(document["groups"], [0, 2, 4])
+        draw, copied, variant = document["entries"]
+        self.assertEqual(draw, {"name": "draw", "pictures": [{"levels": ["modes_0.png"]}]})
+        self.assertEqual(copied["block"], 2)
+        self.assertEqual(copied["pictures"][0]["animation"], "copy")
+        self.assertEqual(copied["pictures"][0]["sampler"],
+                         {"wrap_u": "clamp", "wrap_v": "clamp"})
+        self.assertEqual(variant["block"], 4)
+        self.assertEqual(variant["pictures"][0]["animation"], "copy_variant")
+        self.assertNotIn("sampler", variant["pictures"][0])
+        verify(output)
+
+    def test_16_bit_copy_mode_and_single_axis_sampler(self):
+        data = bytearray(img(b"sixteen", tim2(picture(1, 1, 1, b"\xff\x7f"))))
+        struct.pack_into("<Q", data, 16 + 56, 1)
+        raw = self.root / "raw"
+        raw.mkdir()
+        (raw / "sixteen.img").write_bytes(data)
+        output = self.root / "output"
+        Converter(raw, output).run()
+        picture_doc = documents(output)[0][1]["entries"][0]["pictures"][0]
+        self.assertEqual(picture_doc["animation"], "copy")
+        self.assertEqual(picture_doc["sampler"], {"wrap_u": "clamp"})
+        verify(output)
 
     def test_cfg_palette_copy_has_baked_rgba_destination_variant(self):
         red = b"".join(bytes((i, 0, 0, 64)) for i in range(256))
@@ -132,11 +215,12 @@ class TextureConversionTests(unittest.TestCase):
         ]))
         output = self.root / "output"
         Converter(raw, output).run()
-        entries = json.loads((output / "port_data/catalog.json").read_text())["sources"][0]["entries"]
-        dest = next(entry for entry in entries if entry["type"] == "texture" and entry["name"] == "dest")
-        variants = {item["palette_source"]: item["levels"][0] for item in dest["variants"]}
-        self.assertEqual(set(variants), {"dest", "source"})
-        image = (output / "port_data" / variants["source"]).read_bytes()
+        record, document = documents(output)[0]
+        entries = document["entries"]
+        dest = next(entry for entry in entries if entry["name"] == "dest")
+        variants = {item["selector"]: item["levels"][0] for item in dest["pictures"][0]["variants"]}
+        self.assertEqual(set(variants), {"source"})
+        image = (output / "port_data" / Path(record["path"]).parent / variants["source"]).read_bytes()
         start = image.index(b"IDAT") + 4
         size = struct.unpack_from(">I", image, start - 8)[0]
         self.assertEqual(zlib.decompress(image[start:start + size]), b"\0\x00\x00\x07\x80")
@@ -157,21 +241,41 @@ class TextureConversionTests(unittest.TestCase):
         ]))
         output = self.root / "out"
         Converter(raw, output).run()
-        entries = json.loads((output / "port_data/catalog.json").read_text())["sources"][0]["entries"]
-        dest = next(entry for entry in entries if entry["type"] == "texture" and entry["name"] == "dest")
-        self.assertEqual({variant["palette_source"] for variant in dest["variants"]},
-                         {"source", "middle", "dest"})
+        entries = documents(output)[0][1]["entries"]
+        dest = next(entry for entry in entries if entry["name"] == "dest")
+        self.assertEqual({variant["selector"] for variant in dest["pictures"][0]["variants"]},
+                         {"source", "middle"})
 
-    def test_cfg_only_img_has_bundle_catalog_without_png(self):
+    def test_cross_document_palette_variant_keeps_local_png(self):
+        palette = b"".join(bytes((i, 0, 0, 64)) for i in range(256))
+        raw = self.root / "raw"
+        (raw / "donors").mkdir(parents=True)
+        (raw / "targets").mkdir()
+        (raw / "donors/source.img").write_bytes(img(b"source", tim2(picture(1, 1, 5, b"\x07", palette))))
+        (raw / "targets/dest.img").write_bytes(img(b"dest", tim2(picture(1, 1, 5, b"\x07", palette))))
+        script = b'SRC_TEX "source",0,0,1,1;DEST_TEX "dest",0,0,1,1;TEX_ANIME_DATA_END;'
+        (raw / "anime.img").write_bytes(img_multi([(b"#anime", script)]))
+        output = self.root / "output"
+        Converter(raw, output).run()
+        target = next((record, doc) for record, doc in documents(output)
+                      if record["source"] == "targets/dest.img")
+        variant = next(item for item in target[1]["entries"][0]["pictures"][0]["variants"]
+                       if item["selector"] == "source")
+        self.assertEqual(set(variant), {"selector", "levels"})
+        self.assertEqual(variant["levels"], ["dest_1.png"])
+        verify(output)
+
+    def test_cfg_only_img_has_document_without_png(self):
         raw = self.root / "raw"
         raw.mkdir()
         (raw / "only.img").write_bytes(img_multi([(b"#texanime", b"TEX_ANIME_END;")]))
         output = self.root / "output"
         Converter(raw, output).run()
-        bundle = output / "port_data/only.img"
-        self.assertEqual([path.name for path in bundle.iterdir()], ["catalog.json"])
-        local = json.loads((bundle / "catalog.json").read_text())
-        self.assertEqual(local["entries"][0]["type"], "cfg")
+        bundle = output / "port_data"
+        self.assertEqual(sorted(path.name for path in bundle.iterdir()), ["only.json"])
+        local = json.loads((bundle / "only.json").read_text())
+        self.assertEqual(set(local["entries"][0]), {"name", "script"})
+        self.assertEqual(local["groups"], [])
         verify(output)
 
     def test_no_image_entry_keeps_metadata_without_png(self):
@@ -182,12 +286,85 @@ class TextureConversionTests(unittest.TestCase):
         (raw / "empty.img").write_bytes(texture)
         output = self.root / "output"
         Converter(raw, output).run()
-        bundle = output / "port_data/empty.img"
-        local = json.loads((bundle / "catalog.json").read_text())
+        bundle = output / "port_data"
+        local = json.loads((bundle / "empty.json").read_text())
         entry = local["entries"][0]
-        self.assertTrue(entry["no_image"])
-        self.assertEqual(entry["variants"][0]["levels"], [])
-        self.assertEqual([path.name for path in bundle.iterdir()], ["catalog.json"])
+        self.assertEqual(entry["pictures"], [{"canvas": {"width": 1, "height": 1}}])
+        self.assertFalse(list(bundle.glob("*.png")))
+
+    def test_empty_img_has_minimal_document_without_png(self):
+        raw = self.root / "raw"
+        raw.mkdir()
+        (raw / "vacant.IMG").write_bytes(b"")
+        output = self.root / "output"
+        Converter(raw, output).run()
+        record, document = documents(output)[0]
+        self.assertEqual(record, {"source": "vacant.IMG", "path": "vacant.json"})
+        self.assertEqual(document, {"schema_version": 3, "groups": [0], "entries": []})
+        self.assertFalse(list((output / "port_data").rglob("*.png")))
+        verify(output)
+
+    def test_document_excludes_original_bytes_and_retains_animation_script(self):
+        raw = self.root / "raw"
+        raw.mkdir()
+        original = img_multi([(b"one", tim2(picture(1, 1, 3, b"\x01\x02\x03\x40"))),
+                              (b"#cfg", b"TEX_ANIME_END;\x00")]) + b"\xa5" * 17
+        (raw / "archive.img").write_bytes(original)
+        output = self.root / "output"
+        Converter(raw, output).run()
+        record, document = documents(output)[0]
+        self.assertEqual(record["path"], "archive.json")
+        self.assertEqual(set(document), {"schema_version", "groups", "entries"})
+        self.assertEqual([entry["name"] for entry in document["entries"]], ["one", "#cfg"])
+        self.assertEqual(document["entries"][1]["script"][0]["command"], "TEX_ANIME_END")
+        self.assertTrue((output / "port_data/archive.json").read_text().endswith("\n"))
+        verify(output)
+
+    def test_verifier_rejects_provenance_and_redundant_fields(self):
+        raw = self.root / "raw"
+        raw.mkdir()
+        (raw / "one.img").write_bytes(img(b"one", tim2(picture(1, 1, 3, b"\x01\x02\x03\x40"))))
+        output = self.root / "output"
+        Converter(raw, output).run()
+        document_path_ = output / "port_data/one.json"
+        baseline = json.loads(document_path_.read_text())
+        changes = [lambda doc: doc.update({"original": {"bytes": ""}}),
+                   lambda doc: doc["entries"][0]["pictures"][0].update({"palette_asset": "one_0.png"}),
+                   lambda doc: doc["entries"][0]["pictures"][0].update({"animation": "draw"}),
+                   lambda doc: doc["entries"][0]["pictures"][0].update({"sampler": {"wrap_u": "repeat"}})]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                payload = json.loads(json.dumps(baseline))
+                change(payload)
+                document_path_.write_text(json.dumps(payload, indent=2) + "\n")
+                with self.assertRaises(TextureError):
+                    verify(output)
+
+    def test_verifier_traverses_textures_among_other_native_json(self):
+        raw = self.root / "raw"
+        raw.mkdir()
+        (raw / "one.img").write_bytes(img(b"one", tim2(picture(1, 1, 3, b"\x01\x02\x03\x40"))))
+        output = self.root / "output"
+        Converter(raw, output).run()
+        assets = output / "port_data"
+        (assets / "audio").mkdir()
+        (assets / "audio/bank.json").write_text('{"schema_version":1,"kind":"bank","entries":[]}', encoding="utf-8")
+        self.assertEqual(verify(output), 1)
+        document = assets / "one.json"
+        payload = json.loads(document.read_text())
+        del payload["groups"]
+        document.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(TextureError, "invalid texture document"):
+            verify(output)
+
+    def test_filename_collision_is_rejected(self):
+        raw = self.root / "raw"
+        raw.mkdir()
+        body = tim2(picture(1, 1, 3, b"\x01\x02\x03\x40"))
+        (raw / "same.img").write_bytes(img(b"one", body))
+        (raw / "same.tm2").write_bytes(body)
+        with self.assertRaisesRegex(TextureError, "collision"):
+            Converter(raw, self.root / "output").run()
 
     def test_transient_png_write_error_retries(self):
         converter = Converter(self.root / "raw", self.root / "output")
@@ -199,7 +376,7 @@ class TextureConversionTests(unittest.TestCase):
                 raise OSError(22, "transient Windows write failure")
             return original_write(path, content)
         with patch.object(Path, "write_bytes", flaky_write), patch("kazarov_textures.time.sleep"):
-            relative = converter.write_asset("bundle.img", "image", b"PNG")
+            relative = converter.write_asset("bundle.json", b"PNG")
         self.assertEqual(attempts[0], 2)
         self.assertEqual((converter.assets / relative).read_bytes(), b"PNG")
 
@@ -251,8 +428,7 @@ class TextureConversionTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<I", stripped, 68)[0], 0)
         self.assertNotIn(b"TIM2", stripped)
         self.assertIn(b"keep me", stripped)
-        catalog = json.loads((self.root / "out/port_data/catalog.json").read_text())
-        self.assertEqual(catalog["sources"][0]["source"], "bundle.pac/one.img")
+        self.assertTrue((self.root / "out/port_data/bundle.pac/one.json").is_file())
 
     def test_malformed_picture_and_cfg_rejected(self):
         with self.assertRaises(TextureError):
@@ -270,10 +446,9 @@ class TextureConversionTests(unittest.TestCase):
         Converter(raw, output).run()
         converted = (output / "data/model.chr").read_bytes()
         self.assertEqual(converted, b"W" * 80 + bytes(len(texture)) + b"TRAILER")
-        catalog = json.loads((output / "port_data/catalog.json").read_text())
-        self.assertEqual(catalog["sources"][0]["source"], "model.chr#offset:80")
+        self.assertTrue((output / "port_data/model.chr/embedded-offset-80.json").is_file())
 
-    def test_versioned_json_manifests_and_publish_check(self):
+    def test_direct_documents_and_publish_check(self):
         raw = self.root / "raw"
         raw.mkdir()
         (raw / "ordinary.txt").write_text("ordinary data")
@@ -281,12 +456,25 @@ class TextureConversionTests(unittest.TestCase):
         Converter(raw, staged).run()
         destination = self.root / "game"
         publish(staged, destination)
-        data_manifest = json.loads((destination / "data/manifest.json").read_text())
-        self.assertEqual(data_manifest["schema_version"], 1)
-        self.assertEqual(verify(destination), 1)
+        self.assertFalse((destination / "data/manifest.json").exists())
+        self.assertFalse((destination / "port_data/catalog.json").exists())
+        self.assertFalse((destination / "port_data/manifest.json").exists())
+        self.assertEqual(verify(destination), 0)
         (destination / "data/ordinary.txt").write_text("changed")
-        with self.assertRaises(TextureError):
-            verify(destination)
+        self.assertEqual(verify(destination), 0)
+
+    def test_rust_marker_source_metadata_is_accepted(self):
+        raw = self.root / "raw"
+        raw.mkdir()
+        (raw / "ordinary.txt").write_text("data")
+        output = self.root / "output"
+        Converter(raw, output).run()
+        marker_path = output / "data.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker.update({"source_state": {"path": "disc.iso", "files": []},
+                       "source_sha256": "0" * 64})
+        marker_path.write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(verify(output), 0)
 
     def test_publish_restores_both_trees_and_marker_on_failed_verification(self):
         destination = self.root / "game"
@@ -310,6 +498,25 @@ class TextureConversionTests(unittest.TestCase):
         self.assertEqual((destination / "data.json").read_bytes(), old_marker)
         verify(destination)
         verify(new_stage)
+
+    def test_publish_replaces_existing_marker_and_data(self):
+        destination = self.root / "game"
+        first_raw = self.root / "first-raw"
+        first_raw.mkdir()
+        (first_raw / "first.txt").write_text("first")
+        first_stage = self.root / "first-stage"
+        Converter(first_raw, first_stage).run()
+        publish(first_stage, destination)
+        second_raw = self.root / "second-raw"
+        second_raw.mkdir()
+        (second_raw / "second.txt").write_text("second")
+        second_stage = self.root / "second-stage"
+        Converter(second_raw, second_stage).run()
+        publish(second_stage, destination)
+        self.assertTrue((destination / "data/second.txt").is_file())
+        self.assertFalse((destination / "data/first.txt").exists())
+        self.assertEqual(verify(destination), 0)
+        self.assertFalse(list(destination.glob(".dc2data-*-backup-*")))
 
 
 if __name__ == "__main__":

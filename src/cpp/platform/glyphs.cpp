@@ -1,5 +1,7 @@
 #include "platform/glyphs.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -8,16 +10,14 @@
 #include <string_view>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_NO_STDIO
 #include "stb_image.h"
 
-#include "platform/settings.hpp"
 #include "platform/input.hpp"
 #include "platform/paths.hpp"
+#include "platform/settings.hpp"
 
 namespace glyphs {
 
@@ -38,11 +38,13 @@ struct Style {
     gfx::TextureHandle          texture = gfx::kNullTexture;
     int                         width = 0;
     int                         height = 0;
+    std::vector<unsigned char>  pixels;
     bool                        failed = false;
     bool                        keyboard = false;
 };
 
 struct State {
+    nlohmann::json               targets = nlohmann::json::object();
     bool                         indexed = false;
     std::map<std::string, Style> styles;
 };
@@ -53,6 +55,10 @@ State &Get() {
 }
 
 bool ReadFile(const fs::path &file, std::vector<unsigned char> &bytes) {
+    std::error_code error;
+    if (fs::file_size(file, error) > 64ull * 1024 * 1024 || error) {
+        return false;
+    }
     std::ifstream stream(file, std::ios::binary);
     if (!stream) {
         return false;
@@ -89,6 +95,9 @@ void Index() {
             std::fprintf(stderr, "glyphs: %s is not a glyph index\n", (directory / "glyphs.json").string().c_str());
             continue;
         }
+        if (root.contains("targets") && root["targets"].is_object()) {
+            Get().targets = root["targets"];
+        }
         for (auto &[name, value] : root["styles"].items()) {
             if (!value.is_object() || !value.contains("atlas") || !value.contains("glyphs")) {
                 continue;
@@ -102,15 +111,16 @@ void Index() {
                                            rect[3].get<int>()};
                 }
             }
-            state.styles.emplace(name, std::move(style));
+            state.styles.insert_or_assign(name, std::move(style));
         }
-        return;
     }
 }
 
-// Decodes the style's atlas into a texture the first time a symbol of it is wanted.
-bool Load(Style &style) {
-    if (style.texture != gfx::kNullTexture) {
+/**
+ * Decodes an atlas once for CPU stamping and optional GPU upload.
+ */
+bool LoadPixels(Style &style) {
+    if (!style.pixels.empty()) {
         return true;
     }
     if (style.failed) {
@@ -119,32 +129,36 @@ bool Load(Style &style) {
     style.failed = true;
     std::vector<unsigned char> bytes;
     if (!ReadFile(style.file, bytes)) {
-        std::fprintf(stderr, "glyphs: cannot read %s\n", style.file.string().c_str());
         return false;
     }
-    int            width = 0;
-    int            height = 0;
-    int            channels = 0;
-    unsigned char *pixels = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &width, &height,
-                                                  &channels, 4);
-    if (pixels == nullptr) {
-        std::fprintf(stderr, "glyphs: cannot decode %s\n", style.file.string().c_str());
+    int   components = 0;
+    auto *pixels = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &style.width, &style.height, &components, 4);
+    if (!pixels || style.width <= 0 || style.height <= 0 || style.width > 8192 || style.height > 8192) {
+        stbi_image_free(pixels);
+        return false;
+    }
+    style.pixels.assign(pixels, pixels + static_cast<std::size_t>(style.width) * style.height * 4);
+    stbi_image_free(pixels);
+    style.failed = false;
+    return true;
+}
+
+bool Load(Style &style) {
+    if (style.texture != gfx::kNullTexture) {
+        return true;
+    }
+    if (!LoadPixels(style)) {
         return false;
     }
     gfx::TextureDesc desc;
-    desc.width = static_cast<uint32_t>(width);
-    desc.height = static_cast<uint32_t>(height);
+    desc.width = static_cast<uint32_t>(style.width);
+    desc.height = static_cast<uint32_t>(style.height);
     desc.format = gfx::TextureFormat::Rgba8;
     desc.has_alpha = true;
-    gfx::TextureHandle texture = gfx::CreateTexture(desc);
-    if (texture != gfx::kNullTexture) {
-        gfx::UpdateTexture(texture, 0, 0, 0, static_cast<uint32_t>(width), static_cast<uint32_t>(height), pixels);
-        style.texture = texture;
-        style.width = width;
-        style.height = height;
-        style.failed = false;
+    style.texture = gfx::CreateTexture(desc);
+    if (style.texture != gfx::kNullTexture) {
+        gfx::UpdateTexture(style.texture, 0, 0, 0, desc.width, desc.height, style.pixels.data());
     }
-    stbi_image_free(pixels);
     return style.texture != gfx::kNullTexture;
 }
 
@@ -167,34 +181,57 @@ bool Fill(Style &style, const Rect &rect, Image &out) {
 
 const char *ActionName(Button button) {
     switch (button) {
-        case Button::Cross: return "cross";
-        case Button::Circle: return "circle";
-        case Button::Square: return "square";
-        case Button::Triangle: return "triangle";
-        case Button::L1: return "l1";
-        case Button::R1: return "r1";
-        case Button::L2: return "l2";
-        case Button::R2: return "r2";
-        case Button::Start: return "start";
-        case Button::Select: return "select";
-        case Button::Up: return "up";
-        case Button::Down: return "down";
-        case Button::Left: return "left";
-        case Button::Right: return "right";
-        case Button::L3: return "l3";
-        case Button::R3: return "r3";
-        default: return nullptr;
+        case Button::Cross:
+            return "cross";
+        case Button::Circle:
+            return "circle";
+        case Button::Square:
+            return "square";
+        case Button::Triangle:
+            return "triangle";
+        case Button::L1:
+            return "l1";
+        case Button::R1:
+            return "r1";
+        case Button::L2:
+            return "l2";
+        case Button::R2:
+            return "r2";
+        case Button::Start:
+            return "start";
+        case Button::Select:
+            return "select";
+        case Button::Up:
+            return "up";
+        case Button::Down:
+            return "down";
+        case Button::Left:
+            return "left";
+        case Button::Right:
+            return "right";
+        case Button::L3:
+            return "l3";
+        case Button::R3:
+            return "r3";
+        default:
+            return nullptr;
     }
 }
 
 const char *GlyphName(Button button) {
     switch (button) {
-        case Button::Dpad: return "dpad";
-        case Button::DpadUpDown: return "dpad_ud";
-        case Button::DpadSides: return "dpad_lr";
-        case Button::LStick: return "lstick";
-        case Button::RStick: return "rstick";
-        default: return ActionName(button);
+        case Button::Dpad:
+            return "dpad";
+        case Button::DpadUpDown:
+            return "dpad_ud";
+        case Button::DpadSides:
+            return "dpad_lr";
+        case Button::LStick:
+            return "lstick";
+        case Button::RStick:
+            return "rstick";
+        default:
+            return ActionName(button);
     }
 }
 
@@ -204,30 +241,98 @@ const char *StyleName(const HostSettings &config) {
     }
     InputGlyphFamily family = InputGlyphFamily::Ps4;
     switch (config.glyph_device) {
-        case ConfigGlyphDevice::Auto: family = InputActiveGlyphFamily(); break;
-        case ConfigGlyphDevice::Ps3: family = InputGlyphFamily::Ps3; break;
-        case ConfigGlyphDevice::Ps4: family = InputGlyphFamily::Ps4; break;
-        case ConfigGlyphDevice::Ps5: family = InputGlyphFamily::Ps5; break;
-        case ConfigGlyphDevice::Ps5Color: family = InputGlyphFamily::Ps5; break;
-        case ConfigGlyphDevice::Xbox: family = InputGlyphFamily::Xbox; break;
-        case ConfigGlyphDevice::Switch: family = InputGlyphFamily::Switch; break;
-        case ConfigGlyphDevice::SteamDeck: family = InputGlyphFamily::SteamDeck; break;
-        case ConfigGlyphDevice::SteamController: family = InputGlyphFamily::SteamController; break;
-        case ConfigGlyphDevice::Keyboard: family = InputGlyphFamily::Keyboard; break;
+        case ConfigGlyphDevice::Auto:
+            family = InputActiveGlyphFamily();
+            break;
+        case ConfigGlyphDevice::Ps3:
+            family = InputGlyphFamily::Ps3;
+            break;
+        case ConfigGlyphDevice::Ps4:
+            family = InputGlyphFamily::Ps4;
+            break;
+        case ConfigGlyphDevice::Ps5:
+            family = InputGlyphFamily::Ps5;
+            break;
+        case ConfigGlyphDevice::Ps5Color:
+            family = InputGlyphFamily::Ps5;
+            break;
+        case ConfigGlyphDevice::Xbox:
+            family = InputGlyphFamily::Xbox;
+            break;
+        case ConfigGlyphDevice::Switch:
+            family = InputGlyphFamily::Switch;
+            break;
+        case ConfigGlyphDevice::SteamDeck:
+            family = InputGlyphFamily::SteamDeck;
+            break;
+        case ConfigGlyphDevice::SteamController:
+            family = InputGlyphFamily::SteamController;
+            break;
+        case ConfigGlyphDevice::Keyboard:
+            family = InputGlyphFamily::Keyboard;
+            break;
     }
     switch (family) {
-        case InputGlyphFamily::Ps3: return "ps3";
-        case InputGlyphFamily::Ps5: return "ps5";
-        case InputGlyphFamily::SteamDeck: return "steamdeck";
-        case InputGlyphFamily::SteamController: return "steamcontroller";
-        case InputGlyphFamily::Xbox: return "xbox";
-        case InputGlyphFamily::Switch: return "switch";
-        case InputGlyphFamily::Keyboard: return "keyboard";
-        default: return "ps4";
+        case InputGlyphFamily::Ps3:
+            return "ps3";
+        case InputGlyphFamily::Ps5:
+            return "ps5";
+        case InputGlyphFamily::SteamDeck:
+            return "steamdeck";
+        case InputGlyphFamily::SteamController:
+            return "steamcontroller";
+        case InputGlyphFamily::Xbox:
+            return "xbox";
+        case InputGlyphFamily::Switch:
+            return "switch";
+        case InputGlyphFamily::Keyboard:
+            return "keyboard";
+        default:
+            return "ps4";
     }
 }
 
 } // namespace
+
+bool FindAtlasPixels(const char *style_name, CpuImage &out) {
+    out = {};
+    Index();
+    const auto style = Get().styles.find(style_name);
+    if (style == Get().styles.end() || !LoadPixels(style->second)) {
+        return false;
+    }
+    out = {style->second.pixels, style->second.width, style->second.height, 0, 0, style->second.width, style->second.height};
+    return true;
+}
+
+bool FindNamedPixels(const char *style_name, const char *name, CpuImage &out) {
+    out = {};
+    Index();
+    const auto style = Get().styles.find(style_name);
+    if (style == Get().styles.end()) {
+        return false;
+    }
+    const auto rect = style->second.glyphs.find(name);
+    if (rect == style->second.glyphs.end() || !LoadPixels(style->second)) {
+        return false;
+    }
+    const auto &cell = rect->second;
+    if (cell.x < 0 || cell.y < 0 || cell.w <= 0 || cell.h <= 0 || cell.x > style->second.width - cell.w || cell.y > style->second.height - cell.h) {
+        return false;
+    }
+    out = {style->second.pixels, style->second.width, style->second.height, cell.x, cell.y, cell.w, cell.h};
+    return true;
+}
+
+std::string CurrentStyle() {
+    const auto &config = SettingsGet();
+    return config.glyphs_new ? StyleName(config) : "";
+}
+
+const nlohmann::json &TargetCells() {
+    Index();
+    return Get().targets;
+}
 
 bool FindNamed(const char *style_name, const char *name, Image &out) {
     Index();
@@ -272,6 +377,7 @@ void Reset() {
         }
     }
     state.styles.clear();
+    state.targets = nlohmann::json::object();
     state.indexed = false;
 }
 

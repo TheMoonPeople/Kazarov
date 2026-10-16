@@ -752,6 +752,7 @@ void WaitFrame(Frame &frame, bool depth = false) {
         Check(vkWaitForFences(g.device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 #endif
         frame.pending = false;
+        HarvestDepthQueries(frame);
     }
 }
 
@@ -912,6 +913,10 @@ void RunOneShot(const std::function<void(VkCommandBuffer)> &record) {
     Check(vkQueueSubmit2(g.queue, 1, &submit, fence), "vkQueueSubmit2");
 #endif
     Check(vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    // Synchronous readback completes earlier submissions; publish their depth answers oldest first.
+    for (uint32_t frame_offset = 1; frame_offset <= kFramesInFlight; ++frame_offset) {
+        WaitFrame(g.frames[(g.frame_slot + frame_offset) % kFramesInFlight]);
+    }
     vkDestroyFence(g.device, fence, nullptr);
     vkFreeCommandBuffers(g.device, g_oneshot_pool, 1, &cmd);
 }
@@ -1213,11 +1218,7 @@ bool OpenFrame() {
     return true;
 }
 
-void FinishFrame(Frame &frame) {
-    if (g.depth_queries_recorded) {
-        WaitFrame(frame, true);
-        HarvestDepthQueries();
-    }
+void FinishFrame() {
     g.main_current ^= 1;
     AdvanceSlot();
 }
@@ -1387,7 +1388,7 @@ void CloseListFrame(bool canonical, bool present) {
     if (canonical) {
         RecordDepthQueries(cmd);
         SubmitWithoutPresent(cmd, CurrentMainColor());
-        FinishFrame(frame);
+        FinishFrame();
         g.canonical_newest = true;
         g.presented_display = false;
         return;
@@ -1446,7 +1447,7 @@ void EndFrame() {
     } else {
         PresentImage(frame, cmd, CurrentMainColor());
     }
-    FinishFrame(frame);
+    FinishFrame();
 }
 
 bool PresentCanonical() {

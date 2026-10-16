@@ -554,6 +554,12 @@ pub fn extract_raw(source: &Path, raw_out: &Path, jobs: usize) -> CoreResult<(u6
 }
 
 /// Reports each raw file after copying or verifying its cached contents.
+/// Returns the retail data-file totals without copying extraction payloads.
+pub fn extraction_totals(source: &Path) -> CoreResult<(u64, u64)> {
+    let (_, files, bytes) = plan_archive(&open_archive(source)?)?;
+    Ok((files, bytes))
+}
+
 pub fn extract_raw_with_progress(
     source: &Path,
     raw_out: &Path,
@@ -801,6 +807,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let disc = temp.path().join("disc");
         disc_dir(&disc)?;
+        fs::remove_file(disc.join("MOVIE/INTRO.PSS"))?;
         let output = temp.path().join("game/data");
         let updates = std::sync::Mutex::new(Vec::new());
         super::super::extract_with_progress(&disc, &output, 2, &|fraction, _| {

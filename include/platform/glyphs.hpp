@@ -1,5 +1,10 @@
 #pragma once
 
+#include <nlohmann/json_fwd.hpp>
+
+#include <span>
+#include <string>
+
 #include "gfx/gfx.hpp"
 
 // The button symbols the game draws in its text and menus, redrawn from glyphs/ (beside the executable,
@@ -46,6 +51,36 @@ struct Image {
     // A keycap or mouse of the keyboard style: wider or narrower than a round button, and drawn bigger.
     bool key = false;
 };
+
+/**
+ * Views a decoded atlas region until the shared glyph state is reset.
+ */
+struct CpuImage {
+    std::span<const uint8_t> rgba;             /**< Shared atlas pixels in RGBA order. */
+    int                      atlas_width = 0;  /**< Atlas row width in pixels. */
+    int                      atlas_height = 0; /**< Atlas row count. */
+    int                      x = 0;            /**< Region's left pixel. */
+    int                      y = 0;            /**< Region's top pixel. */
+    int                      width = 0;        /**< Region's pixel width. */
+    int                      height = 0;       /**< Region's pixel height. */
+};
+
+/**
+ * Resolves an explicitly named glyph without allocating a GPU texture.
+ */
+bool FindNamedPixels(const char *style, const char *name, CpuImage &out);
+/**
+ * Views an entire decoded style atlas without allocating a GPU texture.
+ */
+bool FindAtlasPixels(const char *style, CpuImage &out);
+/**
+ * Returns the selected style, or an empty string for original game artwork.
+ */
+std::string CurrentStyle();
+/**
+ * Returns optional game-texture cell overrides from the selected glyph index.
+ */
+const nlohmann::json &TargetCells();
 
 constexpr float kReference = 64.0f;
 

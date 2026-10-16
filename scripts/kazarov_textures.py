@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import posixpath
 import re
 import shutil
 import struct
@@ -283,25 +283,91 @@ def data_version() -> int:
 
 
 def safe_component(value: str) -> str:
-    return "".join(c if re.fullmatch(r"[A-Za-z0-9._-]", c) else f"%{ord(c):02X}" for c in value)
+    if value in ("", ".", ".."):
+        return "".join(f"%{ord(c):02X}" for c in value)
+    return "".join(chr(c) if re.fullmatch(rb"[A-Za-z0-9._-]", bytes([c]))
+                   else f"%{c:02X}" for c in value.encode("utf-8"))
 
 
-def asset_folder(key: str) -> str:
-    parts = [safe_component(x) for x in key.split("/") if x]
+def document_path(key: str) -> str:
+    raw = [part for part in key.split("/") if part]
+    position = 0
+    while position < len(raw):
+        part = raw[position]
+        if "#offset:" in part:
+            base, offset = part.rsplit("#offset:", 1)
+            raw[position] = base
+            raw.insert(position + 1, f"embedded-offset-{offset}.json")
+            continue
+        if "#entry:" in part:
+            base, ordinal = part.split("#entry:", 1)
+            stem = base.rsplit(".", 1)[0] if "." in base else base
+            raw[position] = f"{stem}-entry-{ordinal}.json"
+        position += 1
+    parts = [safe_component(x) for x in raw]
     if not parts:
         raise TextureError("empty texture source key")
-    if "#offset:" in parts[-1]:
-        base, offset = parts[-1].split("#offset:", 1)
-        parts[-1] = base
-        parts.append(f"embedded-offset-{offset}.img")
-    elif parts[-1].lower().endswith(".tm2"):
-        parts[-1] += ".img"
-    elif not parts[-1].lower().endswith(".img"):
-        parts.append("embedded.img")
+    for index, part in enumerate(parts[:-1]):
+        if part.lower().endswith(".img"):
+            parts[index] = part[:-4] + "-img"
+    last = parts[-1]
+    if last.lower().endswith((".img", ".tm2")):
+        parts[-1] = last.rsplit(".", 1)[0] + ".json"
+    elif not last.endswith(".json"):
+        parts.append("embedded.json")
     path = "/".join(parts)
     if len(path) > 180:
-        path = "/".join(parts[:2] + ["long-path-" + hashlib.sha256(path.encode()).hexdigest()[:20] + ".img"])
+        path = "/".join(parts[:2] + ["long-path-" + hashlib.sha256(path.encode()).hexdigest()[:20] + ".json"])
     return path
+
+
+def relative_to_document(document: str, asset: str) -> str:
+    return posixpath.relpath(asset, posixpath.dirname(document) or ".")
+
+
+def pretty_json(value: dict) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+def serialize_source(source: dict) -> dict:
+    """Keep only game-facing metadata after all PNGs and variants are baked."""
+    textures = [entry for entry in source["entries"] if entry["type"] == "texture"]
+    raw_blocks = sorted({entry["block"] for entry in textures}) if source["kind"] == "img3" else [0]
+    entries = []
+    by_ordinal = {}
+    for item in source["entries"]:
+        if item["type"] == "cfg":
+            entries.append({"name": item["name"], "script": item["script"]})
+            continue
+        ordinal = item["_ordinal"]
+        if ordinal not in by_ordinal:
+            block = item["block"] if source["kind"] == "img3" else 0
+            entry = {"name": item["name"], "pictures": []}
+            if block:
+                entry["block"] = block
+            by_ordinal[ordinal] = entry
+            entries.append(entry)
+        picture = {"levels": item["variants"][0]["levels"]} if item["variants"][0]["levels"] else {
+            "canvas": {"width": item["width"], "height": item["height"]}}
+        variants = [{"selector": variant["palette_source"], "levels": variant["levels"]}
+                    for variant in item["variants"][1:]]
+        if variants:
+            picture["variants"] = variants
+        clamp = item["clamp"]
+        wrap_u = "repeat" if clamp & 3 == 0 else "clamp"
+        wrap_v = "repeat" if (clamp >> 2) & 3 == 0 else "clamp"
+        if wrap_u != "repeat" or wrap_v != "repeat":
+            picture["sampler"] = {}
+            if wrap_u != "repeat":
+                picture["sampler"]["wrap_u"] = wrap_u
+            if wrap_v != "repeat":
+                picture["sampler"]["wrap_v"] = wrap_v
+        animation = {24: "draw", 32: "draw", 4: "copy", 16: "copy",
+                     8: "copy_variant"}[item["source_bpp"]]
+        if animation != "draw":
+            picture["animation"] = animation
+        by_ordinal[ordinal]["pictures"].append(picture)
+    return {"schema_version": 3, "groups": raw_blocks, "entries": entries}
 
 
 def file_hash(path: Path) -> str:
@@ -370,9 +436,13 @@ class Converter:
         self.data_hashes: dict[str, str] = {}
         self.pictures: list[dict] = []
         self.animation_pairs: list[tuple[str, str, str]] = []
+        self.next_asset_index: dict[str, int] = {}
 
-    def write_asset(self, folder: str, label: str, content: bytes) -> str:
-        relative = f"{folder}/{label}.png"
+    def write_asset(self, document: str, content: bytes) -> str:
+        index = self.next_asset_index.get(document, 0)
+        self.next_asset_index[document] = index + 1
+        relative = posixpath.join(posixpath.dirname(document),
+                                  f"{posixpath.basename(document)[:-5]}_{index}.png")
         path = self.assets / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(content).hexdigest()
@@ -395,22 +465,23 @@ class Converter:
     def convert_pictures(self, key: str, name: str, pictures: list[Picture], metadata: dict,
                          ordinal: int = 0) -> list[dict]:
         out = []
+        document = document_path(key)
         for index, picture in enumerate(pictures):
-            folder = asset_folder(key)
-            label = f"{safe_component(name)}-entry-{ordinal}-picture-{index}"
-            levels = [self.write_asset(folder, f"{label}-variant-self-mip-{i}",
+            levels = [self.write_asset(document,
                                        png(w, h, colorize(raster, picture.palette)
                                            if channels == 1 else raster))
-                      for i, (w, h, raster, channels) in enumerate(picture.levels)]
+                      for w, h, raster, channels in picture.levels]
             entry = {"type": "texture", "name": name, "picture": index,
+                     "_ordinal": ordinal,
                      "width": picture.width, "height": picture.height,
                      "bpp": 32, "source_bpp": picture.bpp,
                      "tex0": picture.tex0, "tex1": picture.tex1,
-                     "format": "rgba8", "variants": [{"palette_source": name, "levels": levels}],
+                     "format": "rgba8", "variants": [{"palette_source": name,
+                     "levels": [relative_to_document(document, level) for level in levels]}],
                      **metadata}
             if picture.palette is not None:
                 self.pictures.append({"source": key, "name": name, "picture": picture,
-                                      "entry": entry, "folder": folder, "label": label})
+                                      "entry": entry, "document": document})
             out.append(entry)
         return out
 
@@ -456,11 +527,11 @@ class Converter:
                     entry = dest["entry"]
                     if any(v["palette_source"] == origin for v in entry["variants"]):
                         continue
-                    levels = [self.write_asset(dest["folder"],
-                                               f"{dest['label']}-variant-{safe_component(origin)}-mip-{i}",
+                    levels = [self.write_asset(dest["document"],
                                                png(w, h, colorize(raster, source_palette)))
-                              for i, (w, h, raster, _) in enumerate(picture.levels)]
-                    entry["variants"].append({"palette_source": origin, "levels": levels})
+                              for w, h, raster, _ in picture.levels]
+                    entry["variants"].append({"palette_source": origin,
+                        "levels": [relative_to_document(dest["document"], level) for level in levels]})
 
     def collect_animation_pairs(self, container: str, script: list[dict]) -> None:
         source = dest = None
@@ -498,11 +569,11 @@ class Converter:
                 pictures = parse_tim2(original[e["offset"]:], e["swizzled"], e["no_image"])
                 converted.extend(self.convert_pictures(key, e["name"], pictures,
                     {k: e[k] for k in ("block", "swizzled", "clamp", "no_image")}, ordinal))
-            self.sources.append({"source": key, "kind": kind, "size": len(original), "entries": converted})
+            self.sources.append({"source": key, "kind": kind, "entries": converted})
             return None
         if original[:4] == b"TIM2":
             pictures = parse_tim2(original)
-            self.sources.append({"source": key, "kind": "tm2", "size": len(original), "entries":
+            self.sources.append({"source": key, "kind": "tm2", "entries":
                                  self.convert_pictures(key, Path(key).stem, pictures,
                                                        {"block": 0, "swizzled": False,
                                                         "clamp": 0, "no_image": False})})
@@ -559,6 +630,7 @@ class Converter:
         key = relative.as_posix()
         target = self.data / relative
         if path.suffix.lower() in (".img", ".tm2") and path.stat().st_size == 0:
+            self.sources.append({"source": key, "kind": "empty", "entries": []})
             return
         if may_have_textures(path):
             transformed = self.transform(path.read_bytes(), key)
@@ -570,6 +642,8 @@ class Converter:
             if not target.is_file() or file_hash(target) != hashlib.sha256(transformed).hexdigest():
                 target.write_bytes(transformed)
         else:
+            if path.suffix.lower() in (".img", ".tm2"):
+                raise TextureError(f"unrecognized standalone texture format: {key}")
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.is_file() or file_hash(target) != file_hash(path):
                 shutil.copyfile(path, target)
@@ -608,36 +682,21 @@ class Converter:
             self.animation_pairs.extend(unit.animation_pairs)
             self.written.update(unit.written)
             self.data_hashes.update(unit.data_hashes)
+            self.next_asset_index.update(unit.next_asset_index)
         self.bake_animation_variants()
-        bundle_folders = set()
+        document_paths = set()
         for source in self.sources:
-            folder = asset_folder(source["source"])
-            if folder in bundle_folders:
-                raise TextureError(f"texture bundle folder collision: {folder}")
-            bundle_folders.add(folder)
-            local = copy.deepcopy(source)
-            for entry in local["entries"]:
-                if entry["type"] == "texture":
-                    for variant in entry["variants"]:
-                        variant["levels"] = [Path(level).name for level in variant["levels"]]
-            bundle_path = self.assets / folder / "catalog.json"
-            bundle_path.parent.mkdir(parents=True, exist_ok=True)
-            bundle_path.write_text(json.dumps({"schema_version": 1, **local}, sort_keys=True,
-                                              separators=(",", ":")) + "\n", encoding="utf-8")
-            self.written[f"{folder}/catalog.json"] = file_hash(bundle_path)
-        data_manifest = {"schema_version": 1, "files": self.data_hashes}
-        (self.data / "manifest.json").write_text(
-            json.dumps(data_manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-        catalog = {"schema_version": 1, "sources": self.sources}
-        text = json.dumps(catalog, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
-        (self.assets / "catalog.json").write_text(text, encoding="utf-8")
-        self.written["catalog.json"] = file_hash(self.assets / "catalog.json")
-        self.data_hashes["manifest.json"] = file_hash(self.data / "manifest.json")
-        manifest = {"schema_version": 1, "files": self.written, "data_files": self.data_hashes}
-        (self.assets / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+            relative = document_path(source["source"])
+            collision_key = relative.casefold()
+            if collision_key in document_paths or collision_key in ("catalog.json", "manifest.json"):
+                raise TextureError(f"texture document path collision: {relative}")
+            document_paths.add(collision_key)
+            document = self.assets / relative
+            document.parent.mkdir(parents=True, exist_ok=True)
+            document.write_text(pretty_json(serialize_source(source)), encoding="utf-8")
+            self.written[relative] = file_hash(document)
         (self.output / "data.json").write_text(
-            json.dumps({"schema_version": 1, "data_version": data_version()}, sort_keys=True,
-                       separators=(",", ":")) + "\n", encoding="utf-8")
+            pretty_json({"schema_version": 1, "data_version": data_version()}), encoding="utf-8")
         return {"sources": len(self.sources), "pngs": sum(path.endswith(".png") for path in self.written)}
 
 
@@ -668,29 +727,100 @@ def parse_cfg(raw: bytes) -> list[dict]:
 
 def verify(output: Path) -> int:
     marker = json.loads((output / "data.json").read_text(encoding="utf-8"))
-    if marker != {"schema_version": 1, "data_version": data_version()}:
+    if (not isinstance(marker, dict) or type(marker.get("schema_version")) is not int
+            or marker["schema_version"] != 1 or type(marker.get("data_version")) is not int
+            or marker["data_version"] != data_version()):
         raise TextureError("data.json has an unsupported data version")
     assets = output / "port_data"
-    manifest = json.loads((assets / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 1:
-        raise TextureError("unsupported texture manifest version")
-    for relative, expected in manifest["files"].items():
-        actual = file_hash(assets / relative)
-        if actual != expected:
-            raise TextureError(f"texture asset changed: {relative}")
-    for relative, expected in manifest["data_files"].items():
-        actual = file_hash(output / "data" / relative)
-        if actual != expected:
-            raise TextureError(f"extracted data changed: {relative}")
-    data_manifest = json.loads((output / "data" / "manifest.json").read_text(encoding="utf-8"))
-    if data_manifest.get("schema_version") != 1 or data_manifest.get("files") != {
-        key: value for key, value in manifest["data_files"].items() if key != "manifest.json"
-    }:
-        raise TextureError("data manifest disagrees with texture manifest")
-    catalog = json.loads((assets / "catalog.json").read_text(encoding="utf-8"))
-    if catalog.get("schema_version") != 1:
-        raise TextureError("unsupported texture catalog version")
-    return len(manifest["files"])
+    seen = set()
+    texture_count = 0
+    for document in sorted(assets.rglob("*.json")):
+        relative = document.relative_to(assets).as_posix()
+        if relative.casefold() in ("catalog.json", "manifest.json"):
+            raise TextureError(f"obsolete global texture metadata: {relative}")
+        payload = document.read_text(encoding="utf-8")
+        local = json.loads(payload)
+        if not isinstance(local, dict) or not (
+                "groups" in local or local.get("schema_version") == 3 and "entries" in local):
+            # Audio, model, and configuration JSON documents share port_data.
+            continue
+        if relative.casefold() in seen:
+            raise TextureError(f"colliding texture document path: {relative}")
+        seen.add(relative.casefold())
+        texture_count += 1
+        if (not payload.endswith("\n") or set(local) != {"schema_version", "groups", "entries"}
+                or type(local.get("schema_version")) is not int or local["schema_version"] != 3):
+            raise TextureError(f"invalid texture document: {relative}")
+        groups = local["groups"]
+        if (not isinstance(groups, list) or any(type(group) is not int for group in groups)
+                or groups != sorted(set(groups)) or any(group < 0 for group in groups)
+                or not isinstance(local["entries"], list)):
+            raise TextureError(f"invalid texture groups or entries: {relative}")
+        for entry in local["entries"]:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                raise TextureError(f"invalid texture entry: {relative}")
+            if "script" in entry:
+                if set(entry) != {"name", "script"} or not isinstance(entry["script"], list):
+                    raise TextureError(f"invalid animation entry: {relative}")
+                continue
+            if (not set(entry) <= {"name", "block", "pictures"}
+                    or not isinstance(entry.get("pictures"), list) or not entry["pictures"]
+                    or type(entry.get("block", 0)) is not int
+                    or entry.get("block", 0) not in groups
+                    or "block" in entry and entry["block"] == 0):
+                raise TextureError(f"invalid texture entry: {relative}")
+            for picture in entry["pictures"]:
+                if (not isinstance(picture, dict) or not set(picture) <=
+                        {"levels", "canvas", "variants", "sampler", "animation"}
+                        or ("levels" in picture) == ("canvas" in picture)):
+                    raise TextureError(f"invalid picture: {relative}")
+                if "canvas" in picture:
+                    canvas = picture["canvas"]
+                    if (not isinstance(canvas, dict) or set(canvas) != {"width", "height"}
+                            or any(type(value) is not int or value <= 0 for value in canvas.values())):
+                        raise TextureError(f"invalid texture canvas: {relative}")
+                if "animation" in picture and picture["animation"] not in ("copy", "copy_variant"):
+                    raise TextureError(f"invalid texture animation: {relative}")
+                if "sampler" in picture:
+                    sampler = picture["sampler"]
+                    allowed = {"wrap_u": "repeat", "wrap_v": "repeat", "filter": "linear"}
+                    if (not isinstance(sampler, dict) or not sampler or not set(sampler) <= set(allowed)
+                            or any(value not in ({"repeat", "clamp"} if key.startswith("wrap") else {"linear", "nearest"})
+                                   or value == allowed[key] for key, value in sampler.items())):
+                        raise TextureError(f"invalid texture sampler: {relative}")
+                variants = picture.get("variants", [])
+                if not isinstance(variants, list) or "variants" in picture and not variants:
+                    raise TextureError(f"invalid texture variants: {relative}")
+                level_sets = [picture["levels"]] if "levels" in picture else []
+                for variant in variants:
+                    if (not isinstance(variant, dict) or set(variant) != {"selector", "levels"}
+                            or not isinstance(variant["selector"], str)
+                            or variant["selector"] == entry["name"]):
+                        raise TextureError(f"invalid texture variant: {relative}")
+                    level_sets.append(variant["levels"])
+                for levels in level_sets:
+                    if not isinstance(levels, list) or not levels:
+                        raise TextureError(f"missing PNG levels: {relative}")
+                    for reference in levels:
+                        if (not isinstance(reference, str) or not reference.lower().endswith(".png")
+                                or "/" in reference or "\\" in reference or reference in (".", "..")):
+                            raise TextureError(f"invalid texture asset path: {reference}")
+                        canonical = (Path(relative).parent / reference).as_posix()
+                        if not (assets / canonical).is_file():
+                            raise TextureError(f"texture asset missing: {reference}")
+                        with (assets / canonical).open("rb") as image:
+                            header = image.read(24)
+                        if header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR" or not all(
+                                struct.unpack_from(">II", header, 16)):
+                            raise TextureError(f"invalid texture PNG: {reference}")
+    for tree in (output / "data", assets):
+        for item in tree.rglob("*"):
+            if item.suffix.lower() == ".img":
+                raise TextureError(f"published IMG path remains: {item}")
+    for legacy in (output / "data/manifest.json", assets / "manifest.json", assets / "catalog.json"):
+        if legacy.exists():
+            raise TextureError(f"obsolete global metadata remains: {legacy}")
+    return texture_count
 
 
 def publish(staged: Path, destination: Path) -> None:
@@ -703,14 +833,6 @@ def publish(staged: Path, destination: Path) -> None:
     staged_textures = staged / "port_data"
     if staged_data.resolve() == data or staged_textures.resolve() == textures:
         raise TextureError("staging and published trees overlap")
-    if (textures / "manifest.json").is_file() and (
-        (textures / "manifest.json").read_bytes() == (staged_textures / "manifest.json").read_bytes()
-    ):
-        try:
-            verify(destination)
-            return
-        except (OSError, TextureError, ValueError):
-            pass
     destination.mkdir(parents=True, exist_ok=True)
     textures.parent.mkdir(parents=True, exist_ok=True)
     nonce = uuid.uuid4().hex
@@ -722,9 +844,11 @@ def publish(staged: Path, destination: Path) -> None:
     def replace(source: Path, target: Path) -> None:
         # Indexers and antivirus scanners may hold a newly created PNG briefly
         # on Windows. A bounded retry keeps publication atomic in that case.
+        if target.exists():
+            raise TextureError(f"publication target already exists: {target}")
         for attempt in range(30):
             try:
-                source.replace(target)
+                source.rename(target)
                 return
             except PermissionError:
                 if attempt == 29:
@@ -733,7 +857,7 @@ def publish(staged: Path, destination: Path) -> None:
 
     try:
         if marker.exists():
-            shutil.copy2(marker, backup_marker)
+            replace(marker, backup_marker)
             old_marker = True
         if data.exists():
             replace(data, backup_data)

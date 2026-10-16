@@ -4,17 +4,12 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace audio {
 
-namespace sq {
-constexpr std::size_t kMidiCount = 0x0C;
-constexpr std::size_t kMidiOffsets = 0x10;
-constexpr std::size_t kBlockDataOffset = 0;
-constexpr std::size_t kBlockDivision = 4;
-constexpr std::size_t kBlockMinSize = 6;
-} // namespace sq
+struct SqEvent;
 
 struct SqSong {
     std::size_t begin = 0;
@@ -24,18 +19,19 @@ struct SqSong {
 
 class SqFile {
 public:
-    // Copies the file: the game reuses its load buffer as soon as the call returns.
-    static std::shared_ptr<SqFile> Create(std::span<const std::uint8_t> sq);
+    /**
+     * Loads and owns normalized musical events from the published JSON schema.
+     */
+    static std::shared_ptr<SqFile> CreateFromJson(std::string_view json);
 
     const std::vector<SqSong> &Songs() const { return songs_; }
 
-    std::span<const std::uint8_t> Events(const SqSong &song) const {
-        return std::span<const std::uint8_t>(data_).subspan(song.begin, song.end - song.begin);
-    }
+    std::span<const SqEvent> Events(const SqSong &song) const;
 
 private:
-    std::vector<std::uint8_t> data_;
-    std::vector<SqSong>       songs_;
+    std::vector<SqEvent>                    events_;
+    std::vector<std::vector<std::uint8_t> > payloads_;
+    std::vector<SqSong>                     songs_;
 };
 
 enum class SqEventKind {
@@ -54,42 +50,31 @@ struct SqEvent {
     std::span<const std::uint8_t> payload;
 };
 
-// Sony's SQ track data: SMF-style variable-length deltas, running status, meta and SysEx events,
-// with two differences every sequence on the disc relies on. A note-off carries only its note
-// number. Bit 7 of a channel message's last data byte means the next event follows at once and
-// its delta is left out.
+/**
+ * Iterates normalized sequence events while retaining cursor positions for playback loops.
+ */
 class SqReader {
 public:
     SqReader() = default;
 
-    explicit SqReader(std::span<const std::uint8_t> events) : events_(events) {}
+    explicit SqReader(std::span<const SqEvent> events) : events_(events) {}
 
     // Reads the next event; a truncated stream reads as End.
     SqEvent Next();
 
     struct State {
-        std::size_t  position = 0;
-        std::uint8_t running = 0;
-        bool         no_delta = false;
+        std::size_t position = 0;
     };
 
-    State Save() const { return {position_, running_, no_delta_}; }
+    State Save() const { return {position_}; }
 
     void Restore(const State &state) {
         position_ = state.position;
-        running_ = state.running;
-        no_delta_ = state.no_delta;
     }
 
-    static int DataBytes(std::uint8_t status);
-
 private:
-    bool ReadVarLen(std::uint32_t &value);
-
-    std::span<const std::uint8_t> events_;
-    std::size_t                   position_ = 0;
-    std::uint8_t                  running_ = 0;
-    bool                          no_delta_ = false;
+    std::span<const SqEvent> events_;
+    std::size_t              position_ = 0;
 };
 
 } // namespace audio
