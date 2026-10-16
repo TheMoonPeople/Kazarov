@@ -662,50 +662,73 @@ void MoveSprites(const DisplayList &list, const std::vector<Mat4> &views, const 
     }
 }
 
-// The last rewrite of each mesh's vertices in a list.
-std::unordered_map<MeshHandle, const UpdateMeshEntry *> LastPoses(const DisplayList &list) {
-    std::unordered_map<MeshHandle, const UpdateMeshEntry *> poses;
+// For each record, the rewrite of its mesh's vertices that the draw saw (the latest before it), or null.
+std::vector<const UpdateMeshEntry *> RecordPoses(const DisplayList &list) {
+    std::vector<const UpdateMeshEntry *>                    poses(list.records.size(), nullptr);
+    std::unordered_map<MeshHandle, const UpdateMeshEntry *> latest;
     for (const Entry &entry : list.entries) {
         if (const UpdateMeshEntry *update = std::get_if<UpdateMeshEntry>(&entry)) {
-            poses[update->mesh] = update;
+            latest[update->mesh] = update;
+        } else if (const MeshEntry *mesh = std::get_if<MeshEntry>(&entry); mesh != nullptr && mesh->mesh != kNullMesh) {
+            if (auto pose = latest.find(mesh->mesh); pose != latest.end()) {
+                poses[mesh->record] = pose->second;
+            }
         }
     }
     return poses;
+}
+
+uint64_t RewriteKey(const UpdateMeshEntry &update) {
+    return (static_cast<uint64_t>(update.mesh) << 32) | update.first;
+}
+
+// The last rewrite of each mesh range in a list, and the ranges rewritten more than once.
+struct Rewrites {
+    std::unordered_map<uint64_t, const UpdateMeshEntry *> last;
+    std::unordered_set<uint64_t>                          repeated;
+};
+
+Rewrites ListRewrites(const DisplayList &list) {
+    Rewrites rewrites;
+    for (const Entry &entry : list.entries) {
+        if (const UpdateMeshEntry *update = std::get_if<UpdateMeshEntry>(&entry)) {
+            auto [it, added] = rewrites.last.insert_or_assign(RewriteKey(*update), update);
+            if (!added) {
+                rewrites.repeated.insert(it->first);
+            }
+        }
+    }
+    return rewrites;
 }
 
 // A skinned mesh is rewritten every tick in its model's space and drawn under the model's matrix.
 // The matrix is interpolated, and so is everything that hangs from the body by a matrix or vertices
 // of its own (a weapon in the hand, the cloth), so a body left in the tick's pose stands ahead of
 // them by what is left of the tick: the cloth cuts through it and the hand leaves the weapon, the
-// further the faster the pose changes. The rewrite a matched draw's mesh took is blended with the
-// one its match's mesh took in the previous tick (the two are different meshes where the game keeps
-// a buffer per display buffer), unless a vertex moved further than the draw's teleport distance.
+// further the faster the pose changes. The rewrite a matched draw saw is blended with the one its
+// match saw in the previous tick (the two are different meshes where the game keeps a buffer per
+// display buffer), unless a vertex moved further than the draw's teleport distance. Each draw of a
+// mesh shared by several models takes its own rewrite.
 void PosesBetween(const DisplayList &list, const DisplayList &previous, float alpha, Overrides &out) {
-    std::unordered_map<MeshHandle, const UpdateMeshEntry *> now = LastPoses(list);
-    if (now.empty()) {
+    std::vector<const UpdateMeshEntry *> now = RecordPoses(list);
+    if (std::ranges::none_of(now, [](const UpdateMeshEntry *pose) { return pose != nullptr; })) {
         return;
     }
-    std::unordered_map<MeshHandle, const UpdateMeshEntry *> before = LastPoses(previous);
-    const MatchCache                                       &cache = list.cache;
+    std::vector<const UpdateMeshEntry *> before = RecordPoses(previous);
+    const MatchCache                    &cache = list.cache;
     for (size_t i = 0; i < list.records.size(); i++) {
         const MeshRecord &record = list.records[i];
         int32_t           match = cache.match[i];
-        if (match < 0) {
+        const UpdateMeshEntry *pose = now[i];
+        if (match < 0 || pose == nullptr || out.poses.contains(pose)) {
             continue;
         }
-        const MeshEntry &drawn = std::get<MeshEntry>(list.entries[record.entry]);
-        auto             pose = drawn.mesh != kNullMesh ? now.find(drawn.mesh) : now.end();
-        if (pose == now.end() || out.poses.contains(pose->second)) {
+        const UpdateMeshEntry *old = before[match];
+        if (old == nullptr || old->first != pose->first || old->vertices.size() != pose->vertices.size()) {
             continue;
         }
-        const MeshEntry &earlier = std::get<MeshEntry>(previous.entries[previous.records[match].entry]);
-        auto             old = before.find(earlier.mesh);
-        if (old == before.end() || old->second->first != pose->second->first ||
-            old->second->vertices.size() != pose->second->vertices.size()) {
-            continue;
-        }
-        const std::vector<Vertex3D> &a = old->second->vertices;
-        const std::vector<Vertex3D> &b = pose->second->vertices;
+        const std::vector<Vertex3D> &a = old->vertices;
+        const std::vector<Vertex3D> &b = pose->vertices;
         bool                         same = true;
         bool                         teleported = false;
         for (size_t v = 0; v < b.size() && !teleported; v++) {
@@ -718,7 +741,7 @@ void PosesBetween(const DisplayList &list, const DisplayList &previous, float al
         if (same || teleported) {
             continue;
         }
-        BlendVertices(a, b, alpha, out.poses[pose->second]);
+        BlendVertices(a, b, alpha, out.poses[pose]);
     }
 }
 
@@ -1133,8 +1156,10 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
     g.replaying = true;
     g.quiet = !canonical;
     g.host_draws = host;
+    Rewrites rewrites;
     if (!canonical) {
         ResetGrabTwins();
+        rewrites = ListRewrites(list);
     }
     for (const Entry &entry : list.entries) {
         g.interpolation_tint = 0;
@@ -1227,10 +1252,18 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                 } else if constexpr (std::is_same_v<T, CopyEntry>) {
                     GrabAgain(e);
                 } else if constexpr (std::is_same_v<T, UpdateMeshEntry>) {
+                    // A range rewritten more than once holds the tick's last rewrite, so each takes its own.
+                    const std::vector<Vertex3D> *vertices = nullptr;
                     if (overrides != nullptr) {
                         if (auto pose = overrides->poses.find(&e); pose != overrides->poses.end()) {
-                            UpdateMeshVertices(e.mesh, e.first, pose->second);
+                            vertices = &pose->second;
                         }
+                    }
+                    if (vertices == nullptr && rewrites.repeated.contains(RewriteKey(e))) {
+                        vertices = &e.vertices;
+                    }
+                    if (vertices != nullptr) {
+                        UpdateMeshVertices(e.mesh, e.first, *vertices);
                     }
                 }
             },
@@ -1239,7 +1272,9 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
     // The meshes hold the tick's pose again for whoever draws them next.
     if (!canonical && overrides != nullptr) {
         for (const auto &[update, pose] : overrides->poses) {
-            UpdateMeshVertices(update->mesh, update->first, update->vertices);
+            if (rewrites.last.at(RewriteKey(*update)) == update) {
+                UpdateMeshVertices(update->mesh, update->first, update->vertices);
+            }
         }
     }
     g.interpolation_tint = 0;

@@ -368,6 +368,77 @@ TEST(GfxGpuMeshDc2, SkinnedPaletteInterpolatesInDisplayFrame) {
     EXPECT_NEAR(after_cut.x, at_b.x, 1.0);
 }
 
+// One mesh drawn by two models, rewritten before each draw: every display frame takes each draw's
+// own rewrite, interpolated with the one its match took.
+TEST(GfxGpuMeshDc2, SharedMeshRewritesInterpolatePerDraw) {
+    GfxFixture fixture(kWidth, kHeight);
+    auto       triangle = [](float x) {
+        return std::vector<gfx::Vertex3D>{Vert({x - 0.1f, -0.1f, 0.5f}, {0, 0, 1}),
+                                          Vert({x + 0.1f, -0.1f, 0.5f}, {0, 0, 1}),
+                                          Vert({x, 0.1f, 0.5f}, {0, 0, 1})};
+    };
+    auto mesh = gfx::CreateMesh(triangle(0), kTriangle);
+    auto record = [&](float left, float right) {
+        gfx::BeginRecording();
+        gfx::Clear(true, kClear.data(), true, 0);
+        uint32_t key = 1;
+        for (float x : {left, right}) {
+            gfx::SetInterpKey(key++, false, 200.0f);
+            EXPECT_TRUE(gfx::UpdateMeshVertices(mesh, 0, triangle(x)));
+            auto               transform = gfx::IdentityMeshTransform();
+            gfx::MeshConstants constants = {};
+            Identity(constants.mvp);
+            constants.diffuse[0] = constants.diffuse[3] = 1;
+            gfx::DrawMesh(mesh, 0, 3, constants, {}, {}, &transform);
+        }
+        return gfx::EndRecording();
+    };
+    // The mean x of the lit pixels in each half of the frame.
+    auto halves = [&]() {
+        EXPECT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+        std::array<Coverage, 2> out;
+        std::array<double, 2>   sum = {};
+        for (uint32_t y = 0; y < fixture.height; y++) {
+            for (uint32_t x = 0; x < fixture.width; x++) {
+                if (fixture.Pixel(x, y)[0] > 100) {
+                    size_t half = x < fixture.width / 2 ? 0 : 1;
+                    sum[half] += x;
+                    out[half].count++;
+                }
+            }
+        }
+        for (size_t half = 0; half < 2; half++) {
+            out[half].x = out[half].count > 0 ? sum[half] / out[half].count : 0.0;
+        }
+        return out;
+    };
+    auto canonical = [&](const gfx::DisplayList &list) {
+        EXPECT_TRUE(gfx::RenderList(list, 1.0f, {.canonical = true}));
+        return halves();
+    };
+
+    gfx::DisplayListRef before = record(-0.6f, 0.4f);
+    gfx::DisplayListRef after = record(-0.4f, 0.6f);
+    std::array<Coverage, 2> at_before = canonical(*before);
+    std::array<Coverage, 2> at_after = canonical(*after);
+    ASSERT_TRUE(gfx::RenderList(*after, 0.5f, {.previous = before.get(), .present = true}));
+    std::array<Coverage, 2> halfway = halves();
+    for (size_t half = 0; half < 2; half++) {
+        ASSERT_GT(at_before[half].count, 0);
+        ASSERT_GT(at_after[half].count, 0);
+        EXPECT_GT(halfway[half].count, 0) << half;
+        EXPECT_NEAR(halfway[half].x, (at_before[half].x + at_after[half].x) / 2.0, 1.0) << half;
+    }
+
+    // Without a previous list each draw still takes its own rewrite.
+    ASSERT_TRUE(gfx::RenderList(*after, 0.5f, {.present = true}));
+    std::array<Coverage, 2> uninterpolated = halves();
+    for (size_t half = 0; half < 2; half++) {
+        EXPECT_NEAR(uninterpolated[half].x, at_after[half].x, 1.0) << half;
+    }
+    gfx::DestroyMesh(mesh);
+}
+
 // A 16:9 window on the 4:3 logical frame leaves a 16 px bar at the right, which the right anchor
 // shifts the quad into.
 TEST(GfxGpuMeshDc2, AnchoredScissorMovesWithTheDraw) {
