@@ -97,7 +97,11 @@ void MemoryBarrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAcces
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
+#ifdef __ANDROID__
+    g.cmd_pipeline_barrier2(cmd, &dependency);
+#else
     vkCmdPipelineBarrier2(cmd, &dependency);
+#endif
 }
 
 constexpr VkPipelineStageFlags2 kVertexInput =
@@ -138,8 +142,9 @@ uint32_t ScaledSize(uint32_t logical, float scale) {
 void TargetPixelSize(const Texture &texture, uint32_t &width, uint32_t &height) {
     const Image &main = g.main_color[0];
     if (texture.shares_main_depth) {
-        width = main.width;
-        height = main.height;
+        const Image &target = texture.display_sized_shared ? g.display_color : main;
+        width = target.width;
+        height = target.height;
     } else if (FrameShaped(texture)) {
         width = main.width;
         height = ScaledSize(texture.logical_height, MainMapping(main.width, main.height).scale_y);
@@ -292,7 +297,11 @@ void Transition(VkCommandBuffer cmd, Image &image, const ImageState &to) {
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.imageMemoryBarrierCount = 1;
     dependency.pImageMemoryBarriers = &barrier;
+#ifdef __ANDROID__
+    g.cmd_pipeline_barrier2(cmd, &dependency);
+#else
     vkCmdPipelineBarrier2(cmd, &dependency);
+#endif
     image.state = to;
 }
 
@@ -450,7 +459,8 @@ void RecreateSharedTargets() {
             if (!texture.live || !texture.shares_main_depth) {
                 continue;
             }
-            Image image = CreateTargetImage(main.width, main.height);
+            const Image &target = texture.display_sized_shared ? g.display_color : main;
+            Image        image = CreateTargetImage(target.width, target.height);
             ClearImage(cmd, image,
                        VkClearColorValue{
                            {0.0f, 0.0f, 0.0f, 1.0f}
@@ -536,6 +546,7 @@ TextureHandle CreateTexture(const TextureDesc &desc) {
     texture.desc = desc;
     texture.render_target = false;
     texture.shares_main_depth = false;
+    texture.display_sized_shared = false;
     texture.frame = false;
     texture.logical_width = desc.logical_width != 0 ? desc.logical_width : desc.width;
     texture.logical_height = desc.logical_height != 0 ? desc.logical_height : desc.height;
@@ -581,6 +592,7 @@ TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height
     texture.desc = TextureDesc{logical_width, logical_height, TextureFormat::Rgba8, 1, has_alpha};
     texture.render_target = true;
     texture.shares_main_depth = share_main_depth;
+    texture.display_sized_shared = false;
     texture.frame = frame_target;
     texture.logical_width = logical_width;
     texture.logical_height = logical_height;
@@ -595,6 +607,45 @@ TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height
         texture.depth = CreateTargetDepth(width, height);
         ClearDepth(cmd, texture.depth);
     }
+    WriteTextureDescriptor(slot, texture.image.view);
+    return MakeHandle(texture.generation, slot);
+}
+
+TextureHandle detail::CreateDisplaySharedTarget(uint32_t logical_width, uint32_t logical_height, bool has_alpha) {
+    logical_width = static_cast<uint32_t>(g.config.logical_width);
+    logical_height = static_cast<uint32_t>(g.config.logical_height);
+    Texture shape;
+    shape.shares_main_depth = true;
+    shape.display_sized_shared = true;
+    shape.logical_width = logical_width;
+    shape.logical_height = logical_height;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    TargetPixelSize(shape, width, height);
+    if (!CheckSize(width, height)) {
+        return kNullTexture;
+    }
+    uint32_t slot = AllocateTextureSlot();
+    if (slot == 0) {
+        Error("out of texture slots (%u)", g.texture_slot_limit);
+        return kNullTexture;
+    }
+    Texture &texture = g.textures[slot];
+    texture.live = true;
+    texture.generation = NextGeneration(texture.generation);
+    texture.desc = TextureDesc{logical_width, logical_height, TextureFormat::Rgba8, 1, has_alpha};
+    texture.render_target = true;
+    texture.shares_main_depth = true;
+    texture.display_sized_shared = true;
+    texture.frame = false;
+    texture.logical_width = logical_width;
+    texture.logical_height = logical_height;
+    texture.last_draw_use = 0;
+    texture.image = CreateTargetImage(width, height);
+    ClearImage(UploadCommands(), texture.image,
+               VkClearColorValue{
+                   {0.0f, 0.0f, 0.0f, 1.0f}
+    });
     WriteTextureDescriptor(slot, texture.image.view);
     return MakeHandle(texture.generation, slot);
 }

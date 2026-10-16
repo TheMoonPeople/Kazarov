@@ -29,7 +29,11 @@ void HostBarrier(VkCommandBuffer cmd) {
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
+#ifdef __ANDROID__
+    g.cmd_pipeline_barrier2(cmd, &dependency);
+#else
     vkCmdPipelineBarrier2(cmd, &dependency);
+#endif
 }
 
 bool ReadImage(Image &image, uint32_t texel_size, std::vector<uint8_t> &pixels) {

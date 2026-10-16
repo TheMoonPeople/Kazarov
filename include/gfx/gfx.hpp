@@ -136,12 +136,11 @@ uint32_t PipelineCount();
 // distinguishable through Vulkan, so this is only the time RendererInit spent creating them.
 double PipelineCompileSeconds();
 float  RenderScale();
-// Recreates every render target at the new scale, carrying its contents over.
+// Selects a fraction of the derived native render scale, from 0.5x to 2x.
 void SetRenderScale(float scale);
 // Outside a frame; frame targets are recreated for the new aspect, carrying their logical frame over.
 void        SetFrameLayout(const FrameLayout &layout);
 FrameLayout CurrentFrameLayout();
-
 // ---- Textures --------------------------------------------------------------------------------
 
 using TextureHandle = uint32_t;

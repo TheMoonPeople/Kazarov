@@ -37,7 +37,15 @@ function(kz_port_host_library target)
         find_package(SDL3 REQUIRED CONFIG)
     endif()
     if(NOT TARGET Vulkan::Vulkan)
-        find_package(Vulkan 1.4 REQUIRED)
+        if(ANDROID)
+            # The Android NDK ships the Vulkan headers and dispatch loader, but not
+            # CMake's Vulkan SDK package or a versioned loader library.
+            find_library(KZ_VULKAN_LIBRARY vulkan REQUIRED)
+            add_library(Vulkan::Vulkan UNKNOWN IMPORTED GLOBAL)
+            set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_LOCATION "${KZ_VULKAN_LIBRARY}")
+        else()
+            find_package(Vulkan 1.4 REQUIRED)
+        endif()
     endif()
     if(NOT GLSLANG_VALIDATOR)
         find_program(GLSLANG_VALIDATOR NAMES glslangValidator REQUIRED)
@@ -84,7 +92,7 @@ function(kz_port_host_library target)
         list(APPEND shader_headers ${header})
         if(NOT shaders_defined)
             add_custom_command(OUTPUT ${header}
-                COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.4 --quiet --vn ${shader_symbol}
+                COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.3 --quiet --vn ${shader_symbol}
                     --depfile ${header}.d -o ${header} ${shader}
                 DEPENDS ${shader}
                 DEPFILE ${header}.d

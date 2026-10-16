@@ -481,7 +481,7 @@ void BuildMatches(const DisplayList &list, const DisplayList &previous) {
     cache.blend.assign(list.records.size(), false);
     cache.draws_2d.clear();
     if (!list.camera_cut && !list.tagged_2d.empty()) {
-        std::unordered_map<InterpKey, std::vector<uint32_t> > before_2d;
+        std::unordered_map<InterpKey, std::vector<uint32_t>> before_2d;
         for (uint32_t entry : previous.tagged_2d) {
             before_2d[std::get<Draw2DEntry>(previous.entries[entry]).interpolation.key].push_back(entry);
         }
@@ -561,8 +561,8 @@ struct Overrides {
     // The vertex rewrites of meshes a matched draw uses (skinning), between the previous tick's
     // rewrite and this one's.
     std::unordered_map<const UpdateMeshEntry *, std::vector<Vertex3D>> poses;
-    std::vector<int32_t>                                           prog0_index; // per record, into prog0, or -1
-    std::vector<Prog0Constants>                                    prog0;
+    std::vector<int32_t>                                               prog0_index; // per record, into prog0, or -1
+    std::vector<Prog0Constants>                                        prog0;
 };
 
 bool Invert(const Mat4 &m, Mat4 &out) {
@@ -967,7 +967,13 @@ void ResetGrabTwins() {
 }
 
 // The twin this display render samples in place of texture, if it has grabbed into one.
+TextureHandle ActivateGrabTwin(TextureHandle dst);
+
 TextureHandle GrabbedTwin(TextureHandle texture) {
+    if (std::optional<TextureInfo> info = GetTextureInfo(texture); info && info->shares_main_depth) {
+        TextureHandle twin = ActivateGrabTwin(texture);
+        return twin != kNullTexture ? twin : texture;
+    }
     auto it = g_grab_twins.find(texture);
     return it != g_grab_twins.end() && it->second.active ? it->second.twin : texture;
 }
@@ -975,7 +981,7 @@ TextureHandle GrabbedTwin(TextureHandle texture) {
 // dst's twin, created to its shape and holding its contents from this render's first grab on.
 TextureHandle ActivateGrabTwin(TextureHandle dst) {
     std::optional<TextureInfo> info = GetTextureInfo(dst);
-    if (!info || dst == kMainTarget || dst == kPreviousFrame || info->shares_main_depth) {
+    if (!info || dst == kMainTarget || dst == kPreviousFrame) {
         return kNullTexture;
     }
     auto it = g_grab_twins.find(dst);
@@ -985,10 +991,13 @@ TextureHandle ActivateGrabTwin(TextureHandle dst) {
         it = g_grab_twins.end();
     }
     if (it == g_grab_twins.end()) {
-        TextureHandle twin =
-            info->render_target
-                ? CreateRenderTarget(info->width, info->height, info->has_alpha, false, info->frame_target)
-                : CreateTexture({info->width, info->height, info->format, info->mip_levels, info->has_alpha});
+        TextureHandle twin = info->shares_main_depth
+                                 ? detail::CreateDisplaySharedTarget(info->width, info->height, info->has_alpha)
+                             : info->render_target
+                                 ? CreateRenderTarget(info->width, info->height, info->has_alpha, false,
+                                                      info->frame_target)
+                                 : CreateTexture({info->width, info->height, info->format, info->mip_levels,
+                                                  info->has_alpha});
         if (twin == kNullTexture) {
             return kNullTexture;
         }
@@ -1449,8 +1458,8 @@ void BlendProg0Bones(const Prog0Constants &before, const Prog0Constants &after, 
         if (std::memcmp(before.bones[slot], after.bones[slot], sizeof after.bones[slot]) == 0) {
             continue;
         }
-        Mat4 a = BoneMatrix(before.bones[slot]);
-        Mat4 b = BoneMatrix(after.bones[slot]);
+        Mat4  a = BoneMatrix(before.bones[slot]);
+        Mat4  b = BoneMatrix(after.bones[slot]);
         float dx = b[12] - a[12];
         float dy = b[13] - a[13];
         float dz = b[14] - a[14];

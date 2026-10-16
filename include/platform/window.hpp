@@ -15,6 +15,9 @@ struct WindowConfig {
     int  height = 0;
     bool headless = false;
     bool fullscreen = false;
+    // Android presents inside a platform-managed fullscreen surface. The game cannot resize that
+    // surface or switch it into a desktop window, so those settings are ignored by SDL.
+    bool fixed_display = false;
     // False for a renderer without a surface (gfx::RendererConfig::offscreen): SDL then loads no
     // Vulkan library and asks for no surface extension.
     bool vulkan = true;
@@ -80,6 +83,7 @@ bool WindowSize(int &width, int &height);
 // The display's size, or with windowed the room a window has on it: the desktop's panels and the
 // window's borders taken off. False headless or with no window.
 bool WindowDisplaySize(int &width, int &height, bool windowed);
+bool WindowHasFixedDisplay();
 
 // A size in pixels, as a display lists its modes.
 struct DisplayModeSize {

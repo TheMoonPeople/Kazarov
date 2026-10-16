@@ -72,11 +72,17 @@ WindowConfig DisplayWindowConfig(const HostSettings &settings) {
 }
 
 void DisplayChanged(const HostSettings &before, const HostSettings &after) {
+#if defined(__ANDROID__)
+    (void) before;
+    (void) after;
+    return;
+#else
     if (g_reconciling || (after.window_width == before.window_width && after.window_height == before.window_height &&
                           after.fullscreen == before.fullscreen)) {
         return;
     }
     g_report = g_ops.set_mode(DisplayWindowConfig(after));
+#endif
 }
 
 bool DisplayApply(const std::function<bool()> &change) {

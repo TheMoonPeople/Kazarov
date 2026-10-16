@@ -85,7 +85,11 @@ void EnsureRendering(Target &target) {
     info.pColorAttachments = &color;
     info.pDepthAttachment = &depth;
     info.pStencilAttachment = &depth;
+#ifdef __ANDROID__
+    g.cmd_begin_rendering(cmd, &info);
+#else
     vkCmdBeginRendering(cmd, &info);
+#endif
     g.rendering = true;
 
     VkViewport viewport = {
@@ -182,8 +186,13 @@ void SetStencilFace(VkCommandBuffer cmd, uint32_t index, const StencilFace &face
     int                ops = PackStencilOps(face);
     if (g.bound.stencil_ops[index] != ops) {
         g.bound.stencil_ops[index] = ops;
+#ifdef __ANDROID__
+        g.cmd_set_stencil_op(cmd, flags, StencilOpOf(face.fail), StencilOpOf(face.pass),
+                             StencilOpOf(face.depth_fail), static_cast<VkCompareOp>(face.compare));
+#else
         vkCmdSetStencilOp(cmd, flags, StencilOpOf(face.fail), StencilOpOf(face.pass), StencilOpOf(face.depth_fail),
                           static_cast<VkCompareOp>(face.compare));
+#endif
     }
     if (g.bound.stencil_reference[index] != masks.reference) {
         g.bound.stencil_reference[index] = masks.reference;
@@ -242,7 +251,12 @@ VkRect2D ClearArea(const LogicalRect *rect, const Target &target) {
                                {0,                          0                          },
                                {target.mapping.pixel_width, target.mapping.pixel_height}
     };
-    return ClipsToFrame(g.target) ? Intersect(area, FramePixels(target.mapping)) : area;
+    // Host letterbox bars are cleared outside the logical game frame. Do not clip an
+    // explicit clear that lies entirely in a bar back to the game frame.
+    const bool outside_frame = rect != nullptr &&
+                               (rect->x + rect->w <= 0.0f || rect->x >= g.config.logical_width ||
+                                rect->y + rect->h <= 0.0f || rect->y >= g.config.logical_height);
+    return ClipsToFrame(g.target) && !outside_frame ? Intersect(area, FramePixels(target.mapping)) : area;
 }
 
 // The pixels an anchored UI draw moves by: on each anchored axis, from the UI frame's edge to the
@@ -392,9 +406,15 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     int cull = static_cast<int>(state.cull);
     if (g.bound.cull != cull) {
         g.bound.cull = cull;
+#ifdef __ANDROID__
+        g.cmd_set_cull_mode(cmd, state.cull == CullMode::None   ? VK_CULL_MODE_NONE
+                                 : state.cull == CullMode::Back ? VK_CULL_MODE_BACK_BIT
+                                                                : VK_CULL_MODE_FRONT_BIT);
+#else
         vkCmdSetCullMode(cmd, state.cull == CullMode::None   ? VK_CULL_MODE_NONE
                               : state.cull == CullMode::Back ? VK_CULL_MODE_BACK_BIT
                                                              : VK_CULL_MODE_FRONT_BIT);
+#endif
     }
     // An always-passing test that writes nothing is the same as no test, and cheaper.
     int test = state.depth_test == DepthTest::Always && !state.depth_write ? 0 : 1;
@@ -402,20 +422,36 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     int op = static_cast<int>(DepthOp(state.depth_test));
     if (g.bound.depth_test != test) {
         g.bound.depth_test = test;
+#ifdef __ANDROID__
+        g.cmd_set_depth_test_enable(cmd, test);
+#else
         vkCmdSetDepthTestEnable(cmd, test);
+#endif
     }
     if (g.bound.depth_write != write) {
         g.bound.depth_write = write;
+#ifdef __ANDROID__
+        g.cmd_set_depth_write_enable(cmd, write);
+#else
         vkCmdSetDepthWriteEnable(cmd, write);
+#endif
     }
     if (g.bound.depth_op != op) {
         g.bound.depth_op = op;
+#ifdef __ANDROID__
+        g.cmd_set_depth_compare_op(cmd, static_cast<VkCompareOp>(op));
+#else
         vkCmdSetDepthCompareOp(cmd, static_cast<VkCompareOp>(op));
+#endif
     }
     int stencil = state.stencil_test ? 1 : 0;
     if (g.bound.stencil_test != stencil) {
         g.bound.stencil_test = stencil;
+#ifdef __ANDROID__
+        g.cmd_set_stencil_test_enable(cmd, stencil);
+#else
         vkCmdSetStencilTestEnable(cmd, stencil);
+#endif
     }
     // The pipelines declare every stencil parameter dynamic, so each must be set once before
     // the first draw even while the test is off.
@@ -444,7 +480,11 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     }
     if (g.bound.topology != static_cast<int>(topology)) {
         g.bound.topology = static_cast<int>(topology);
+#ifdef __ANDROID__
+        g.cmd_set_primitive_topology(cmd, topology);
+#else
         vkCmdSetPrimitiveTopology(cmd, topology);
+#endif
     }
     VkRect2D scissor = state.scissor ? PixelRect(mapping, (state.extend_scissor ? ExtendClearRect(ScissorRect(state.scissor_rect), mapping) : ScissorRect(state.scissor_rect)),
                                                  side.scissor ? dx : 0.0f, side.scissor ? dy : 0.0f)
@@ -481,8 +521,9 @@ void BindVertices(VkBuffer buffer, VkDeviceSize offset) {
 // prog0 is the draw's Vu_prog0 block at set 2, or nullptr for a plain draw.
 void BindConstants(VkPipelineLayout layout, const MeshConstants &constants, const Prog0Constants *prog0) {
     TransientSpan span = AllocateConstants(false);
+
     std::memcpy(span.data, &constants, sizeof(MeshConstants));
-    uint32_t offset = static_cast<uint32_t>(span.offset);
+    uint32_t        offset = static_cast<uint32_t>(span.offset);
     VkCommandBuffer cmd = DrawCommands();
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &span.set, 1, &offset);
     if (prog0 == nullptr) {
@@ -747,8 +788,10 @@ UiSide AnchoredSide(std::span<const Vertex2D> vertices) {
     float  x = (low_x + high_x) * 0.5f;
     float  y = (low_y + high_y) * 0.5f;
     UiSide side;
-    side.x = x < anchor.left_until ? -1 : x >= anchor.right_from ? 1 : 0;
-    side.y = y < anchor.top_until ? -1 : y >= anchor.bottom_from ? 1 : 0;
+    side.x = x < anchor.left_until ? -1 : x >= anchor.right_from ? 1
+                                                                 : 0;
+    side.y = y < anchor.top_until ? -1 : y >= anchor.bottom_from ? 1
+                                                                 : 0;
     side.scissor = (side.x != 0 || side.y != 0) && anchor.scissor;
     return side;
 }
@@ -834,8 +877,8 @@ void Transfer(VkCommandBuffer cmd, Image &src, const VkOffset3D src_offsets[2], 
 } // namespace
 
 LogicalMapping MainMapping(uint32_t width, uint32_t height) {
-    float w = static_cast<float>(width);
-    float h = static_cast<float>(height);
+    float       w = static_cast<float>(width);
+    float       h = static_cast<float>(height);
     const float logical_w = g.config.logical_width;
     const float logical_h = g.config.logical_height;
     const float aspect = g.config.display_aspect;
@@ -936,7 +979,11 @@ LogicalRect ExtendRect(LogicalRect rect, uint32_t axes, const LogicalRect &frame
 
 void EndRendering() {
     if (g.rendering) {
+#ifdef __ANDROID__
+        g.cmd_end_rendering(DrawCommands());
+#else
         vkCmdEndRendering(DrawCommands());
+#endif
         g.rendering = false;
     }
 }
@@ -946,7 +993,11 @@ void ResetDrawState() {
     VkCommandBuffer cmd = DrawCommands();
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline_layout, 0, 1, &g.texture_set, 0,
                             nullptr);
+#ifdef __ANDROID__
+    g.cmd_set_front_face(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+#else
     vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+#endif
 }
 
 void ReleaseTarget() {
@@ -1044,8 +1095,8 @@ void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const 
         DrawPrepared(primitive, vertices, binding, state, ui, side);
         return;
     }
-    uint32_t        extend = ExtentAxes(g.target);
-    LogicalMapping  mapping = GetLogicalMapping(g.target);
+    uint32_t       extend = ExtentAxes(g.target);
+    LogicalMapping mapping = GetLogicalMapping(g.target);
     if (ui && g.target == kMainTarget) {
         mapping = UiMapping(mapping);
     }

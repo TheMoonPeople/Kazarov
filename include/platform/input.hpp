@@ -200,6 +200,20 @@ InputMenuMouse InputTakeMenuMouse();
 // Pending live/touch motion only; scripts remain sampled once per logic tick.
 // Does not drain motion, wheel, buttons or tap edges.
 void InputPeekMenuMouseMotion(float &dx, float &dy);
+#if defined(__ANDROID__)
+bool InputTouchOverlayVisible();
+
+// Active-high PS2 button word plus normalized left and right stick positions.
+struct InputTouchOverlayState {
+    std::uint16_t buttons = 0;
+    float         left_x = 0.0f;
+    float         left_y = 0.0f;
+    float         right_x = 0.0f;
+    float         right_y = 0.0f;
+};
+
+void InputSetTouchOverlay(const InputTouchOverlayState &state);
+#endif
 
 // The family of button symbols that matches the device last used: keyboard and mouse after a key,
 // a mouse button or the mouse moved, otherwise the first gamepad's make (PS4 before one has been

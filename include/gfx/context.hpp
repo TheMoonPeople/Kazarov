@@ -14,6 +14,7 @@
 namespace gfx::detail {
 
 inline constexpr uint32_t kFramesInFlight = 4;
+
 // Descriptor slots in the bindless array; a handle's low 16 bits are its slot.
 inline constexpr uint32_t kMaxTextures = 8192;
 inline constexpr uint32_t kBaseSamplerCount = 8;
@@ -95,6 +96,7 @@ struct Texture {
     Image       depth; // render targets that keep their own only
     bool        render_target = false;
     bool        shares_main_depth = false;
+    bool        display_sized_shared = false;
     bool        frame = false;
     uint32_t    logical_width = 0;
     uint32_t    logical_height = 0;
@@ -104,19 +106,21 @@ struct Texture {
     const DisplayList *doomed = nullptr;
 };
 
+TextureHandle CreateDisplaySharedTarget(uint32_t logical_width, uint32_t logical_height, bool has_alpha);
+
 struct Mesh {
-    bool     live = false;
-    uint16_t generation = 0;
-    Buffer   buffer; // vertices, then indices
-    uint32_t vertex_count = 0;
-    uint32_t index_count = 0;
-    uint64_t last_draw_use = 0;
+    bool               live = false;
+    uint16_t           generation = 0;
+    Buffer             buffer; // vertices, then indices
+    uint32_t           vertex_count = 0;
+    uint32_t           index_count = 0;
+    uint64_t           last_draw_use = 0;
     const DisplayList *doomed = nullptr;
 };
 
 struct TransientChunk {
-    Buffer          buffer;
-    VkDeviceSize    used = 0;
+    Buffer       buffer;
+    VkDeviceSize used = 0;
     // The chunk's MeshConstants at set 1, allocated once the chunk first holds a MeshConstants.
     VkDescriptorSet constants_set = VK_NULL_HANDLE;
     // The chunk's Prog0Constants at set 2, likewise; only with RendererConfig::prog0_meshes.
@@ -124,9 +128,9 @@ struct TransientChunk {
 };
 
 struct TransientSpan {
-    VkBuffer        buffer;
-    VkDeviceSize    offset;
-    uint8_t        *data;
+    VkBuffer     buffer;
+    VkDeviceSize offset;
+    uint8_t     *data;
     // The chunk's uniform block set; only from AllocateConstants.
     VkDescriptorSet set;
 };
@@ -139,28 +143,37 @@ struct DepthQuery {
 };
 
 struct Frame {
-    VkCommandPool                      pool = VK_NULL_HANDLE;
-    VkCommandBuffer                    upload_cmd = VK_NULL_HANDLE;
-    VkCommandBuffer                    draw_cmd = VK_NULL_HANDLE;
-    bool                               upload_open = false;
-    VkSemaphore                        image_available = VK_NULL_HANDLE;
-    VkFence                            fence = VK_NULL_HANDLE;
-    bool                               pending = false;
-    std::vector<TransientChunk>        chunks;
-    uint32_t                           chunk = 0;
+    VkCommandPool   pool = VK_NULL_HANDLE;
+    VkCommandBuffer upload_cmd = VK_NULL_HANDLE;
+    VkCommandBuffer draw_cmd = VK_NULL_HANDLE;
+    bool            upload_open = false;
+    VkSemaphore     image_available = VK_NULL_HANDLE;
+    VkFence         fence = VK_NULL_HANDLE;
+#if defined(__ANDROID__)
+    VkQueryPool timer_pool = VK_NULL_HANDLE;
+    bool        timer_recorded = false;
+    bool        timer_canonical = false;
+#endif
+    bool                        pending = false;
+    std::vector<TransientChunk> chunks;
+    uint32_t                    chunk = 0;
     // Upload sources, apart from chunks so that a load's worth of texels never takes descriptor sets.
     std::vector<TransientChunk>        staging_chunks;
     uint32_t                           staging_chunk = 0;
     std::vector<std::function<void()>> deletions;
     // The only buffer the GPU writes for the host; kept apart from the transients, which it reads.
-    Buffer depth_readback;
+    Buffer                                 depth_readback;
     std::array<uint32_t, kDepthQueryCount> depth_texels = {};
 };
 
 struct Swapchain {
-    VkSwapchainKHR           handle = VK_NULL_HANDLE;
-    VkFormat                 format = VK_FORMAT_UNDEFINED;
-    VkExtent2D               extent = {};
+    VkSwapchainKHR handle = VK_NULL_HANDLE;
+    VkFormat       format = VK_FORMAT_UNDEFINED;
+    VkExtent2D     extent = {};
+#if defined(__ANDROID__)
+    VkSurfaceCapabilitiesKHR surface_capabilities = {};
+    bool                     compositor_rotation = false;
+#endif
     std::vector<VkImage>     images;
     std::vector<VkSemaphore> render_finished;
 };
@@ -269,8 +282,22 @@ struct Context {
     bool                          sampler_anisotropy = false;
     uint32_t                      anisotropy_level = 0;
     PFN_vkCmdSetColorWriteMaskEXT cmd_set_color_write_mask = nullptr;
-    Swapchain                     swapchain;
-    bool                          resize_pending = false;
+#ifdef __ANDROID__
+    PFN_vkCmdPipelineBarrier2     cmd_pipeline_barrier2 = nullptr;
+    PFN_vkQueueSubmit2            queue_submit2 = nullptr;
+    PFN_vkCmdBeginRendering       cmd_begin_rendering = nullptr;
+    PFN_vkCmdEndRendering         cmd_end_rendering = nullptr;
+    PFN_vkCmdSetCullMode          cmd_set_cull_mode = nullptr;
+    PFN_vkCmdSetDepthTestEnable   cmd_set_depth_test_enable = nullptr;
+    PFN_vkCmdSetDepthWriteEnable  cmd_set_depth_write_enable = nullptr;
+    PFN_vkCmdSetDepthCompareOp    cmd_set_depth_compare_op = nullptr;
+    PFN_vkCmdSetStencilTestEnable cmd_set_stencil_test_enable = nullptr;
+    PFN_vkCmdSetPrimitiveTopology cmd_set_primitive_topology = nullptr;
+    PFN_vkCmdSetStencilOp         cmd_set_stencil_op = nullptr;
+    PFN_vkCmdSetFrontFace         cmd_set_front_face = nullptr;
+#endif
+    Swapchain swapchain;
+    bool      resize_pending = false;
 
     std::array<Frame, kFramesInFlight> frames;
     uint32_t                           frame_slot = 0;
@@ -283,6 +310,8 @@ struct Context {
     Image                main_depth;
     uint32_t             main_current = 0;
     float                render_scale = 1.0f;
+    float                render_scale_factor = 1.0f;
+    bool                 render_scale_pending = false;
     FrameLayout          layout;
     UiAnchor             ui_anchor;
 
@@ -329,7 +358,7 @@ struct Context {
     bool                         display_pass = false;
     // Errors are reported by the canonical render; display renders of the same list stay quiet.
     uint32_t interpolation_tint = 0; // display replay only, packed into push flags bits 8-10
-    bool  quiet = false;
+    bool     quiet = false;
     // The list being replayed is the host's own 2D, which the full-frame rule leaves as drawn.
     bool  host_draws = false;
     Image display_color;

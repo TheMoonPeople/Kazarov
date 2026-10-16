@@ -27,7 +27,8 @@ int OverlayPixelSize(const gfx::LogicalMapping &mapping);
 // Draws text on the current target, which mapping describes, with its top-left corner at target
 // pixel (x, y): a translucent black backdrop kOverlayPadding font pixels around it, then white glyphs,
 // each font pixel `pixel` target pixels square. Inside a frame or a recording.
-void OverlayDrawText(std::string_view text, const gfx::LogicalMapping &mapping, int pixel, int x, int y);
+void OverlayDrawText(std::string_view text, const gfx::LogicalMapping &mapping, int pixel, int x, int y,
+                     bool backdrop = true);
 
 // text at the top-left corner of the main target, as it is mapped now, recorded into a display list
 // of its own for RenderOptions::overlay. Outside a frame or a recording.

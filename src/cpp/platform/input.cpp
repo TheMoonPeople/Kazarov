@@ -8,6 +8,8 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -15,10 +17,13 @@
 #include <vector>
 
 #include "platform/clock.hpp"
-#include "platform/settings.hpp"
 #include "platform/gamepad_map.hpp"
 #include "platform/mouse.hpp"
+#include "platform/settings.hpp"
 #include "platform/touchpad.hpp"
+#if defined(__ANDROID__)
+#include "platform/touch_overlay.hpp"
+#endif
 #include "platform/window.hpp"
 
 namespace {
@@ -158,8 +163,8 @@ struct PadSlot {
     bool         rumble_sent = false;
     Uint64       rumble_time = 0;
     // The lightbar colour the game asked for, kept to restore when the pad reconnects.
-    bool         led_wanted = false;
-    Uint8        led[3] = {};
+    bool  led_wanted = false;
+    Uint8 led[3] = {};
 };
 
 // Which device the player touched last (InputActiveGlyphFamily): false until a key or the mouse is
@@ -176,18 +181,27 @@ std::array<InputPadState, kInputPadCount>                g_state;
 std::array<InputPadState, kInputPadCount>                g_view;
 std::array<std::optional<InputPadState>, kInputPadCount> g_override;
 std::array<bool, SDL_SCANCODE_COUNT>                     g_keys{};
-float                                                    g_mouse_dx = 0.0f;
-float                                                    g_mouse_dy = 0.0f;
-InputMouseLook                                           g_mouse_look;
-InputMouseLookTotal                                      g_mouse_look_total;
-bool                                                     g_mouse_zoom = false;
-float                                                    g_scripted_wheel = 0.0f;
-std::int64_t                                             g_last_latch_tick = -1;
-std::int64_t                                             g_latch_serial = 0;
-std::int64_t                                             g_stick_read_serial = -1;
-bool                                                     g_stick_live = false;
-bool                                                     g_gamepad_subsystem = false;
-InputKeyboardMouse                                       g_scripted;
+#if defined(__ANDROID__)
+std::uint16_t g_android_overlay_buttons = 0;
+float         g_android_overlay_lx = 0.0f;
+float         g_android_overlay_ly = 0.0f;
+float         g_android_overlay_rx = 0.0f;
+float         g_android_overlay_ry = 0.0f;
+bool          g_android_overlay_enabled = true;
+bool          g_android_physical_mouse_connected = false;
+#endif
+float               g_mouse_dx = 0.0f;
+float               g_mouse_dy = 0.0f;
+InputMouseLook      g_mouse_look;
+InputMouseLookTotal g_mouse_look_total;
+bool                g_mouse_zoom = false;
+float               g_scripted_wheel = 0.0f;
+std::int64_t        g_last_latch_tick = -1;
+std::int64_t        g_latch_serial = 0;
+std::int64_t        g_stick_read_serial = -1;
+bool                g_stick_live = false;
+bool                g_gamepad_subsystem = false;
+InputKeyboardMouse  g_scripted;
 // The mouse is a menu's pointer (InputSetMenuMouse); the motion it has gathered for it.
 bool  g_menu_mouse = false;
 bool  g_menu_navigation = false;
@@ -242,8 +256,16 @@ bool ParseSource(std::string_view name, ActionKind kind, Source &source) {
         std::size_t star = text.find('*');
         if (star != std::string_view::npos) {
             std::string_view factor = Trim(text.substr(star + 1));
+#ifdef __ANDROID__
+            std::string factor_copy(factor);
+            char       *end = nullptr;
+            scale = std::strtof(factor_copy.c_str(), &end);
+            bool parsed = end == factor_copy.c_str() + factor_copy.size();
+#else
             auto [end, error] = std::from_chars(factor.data(), factor.data() + factor.size(), scale);
-            if (error != std::errc{} || end != factor.data() + factor.size() || !std::isfinite(scale)) {
+            bool parsed = error == std::errc{} && end == factor.data() + factor.size();
+#endif
+            if (!parsed || !std::isfinite(scale)) {
                 return false;
             }
             text = Trim(text.substr(0, star));
@@ -803,6 +825,35 @@ void InputPoll() {
     if (g_slots[0].gamepad != nullptr) {
         g_pad_family = GamepadFamily(g_slots[0].gamepad);
     }
+#if defined(__ANDROID__)
+    int             keyboard_count = 0;
+    SDL_KeyboardID *keyboards = SDL_GetKeyboards(&keyboard_count);
+    int             mouse_count = 0;
+    SDL_MouseID    *mice = SDL_GetMice(&mouse_count);
+    int             physical_mouse_count = 0;
+    for (int i = 0; i < mouse_count; ++i) {
+        if (mice[i] != SDL_TOUCH_MOUSEID && mice[i] != SDL_PEN_MOUSEID) {
+            ++physical_mouse_count;
+        }
+    }
+    SDL_free(keyboards);
+    SDL_free(mice);
+    g_android_physical_mouse_connected = physical_mouse_count != 0;
+    g_android_overlay_enabled = g_slots[0].gamepad == nullptr && g_slots[1].gamepad == nullptr &&
+                                keyboard_count == 0 && physical_mouse_count == 0;
+    if (g_android_overlay_enabled) {
+        for (bool down : g_keys) {
+            if (down) {
+                g_android_overlay_enabled = false;
+                break;
+            }
+        }
+        if (MouseButtons() != 0) {
+            g_android_overlay_enabled = false;
+        }
+    }
+    TouchOverlaySetVisible(g_android_overlay_enabled);
+#endif
     for (int pad = 0; pad < kInputPadCount; ++pad) {
         InputPadState state;
         state.connected = pad == 0 || g_slots[pad].gamepad != nullptr;
@@ -810,17 +861,72 @@ void InputPoll() {
             ReadGamepad(g_slots[pad].gamepad, state);
         }
         g_device[pad] = state;
-        if (pad == 0 && g_slots[0].gamepad != nullptr && (state.buttons != 0 || Deflected(state.left_x) || Deflected(state.left_y) ||
-                                                           Deflected(state.right_x) || Deflected(state.right_y))) {
+        if (pad == 0 && g_slots[0].gamepad != nullptr && (state.buttons != 0 || Deflected(state.left_x) || Deflected(state.left_y) || Deflected(state.right_x) || Deflected(state.right_y))) {
             g_last_keyboard = false;
         }
         Compose(pad);
     }
     ReadTouchpad(g_slots[0].gamepad);
+#if defined(__ANDROID__)
+    InputSetTouchOverlay(TouchOverlayState());
+#endif
     PollHostActions();
 }
 
 void InputHandleEvent(const SDL_Event &event) {
+#if defined(__ANDROID__)
+    if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEYBOARD_ADDED) {
+        g_android_overlay_enabled = false;
+        TouchOverlaySetVisible(false);
+    }
+    bool                    touch_pointer = false;
+    TouchOverlayEvent::Kind touch_kind = TouchOverlayEvent::Kind::Move;
+    float                   touch_x = 0.0f;
+    float                   touch_y = 0.0f;
+    SDL_MouseID             mouse_id = 0;
+    if (event.type == SDL_EVENT_MOUSE_MOTION) {
+        mouse_id = event.motion.which;
+        touch_x = event.motion.x;
+        touch_y = event.motion.y;
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        mouse_id = event.button.which;
+        touch_x = event.button.x;
+        touch_y = event.button.y;
+        touch_kind = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? TouchOverlayEvent::Kind::Down : TouchOverlayEvent::Kind::Up;
+    }
+    const bool pointer_event = event.type == SDL_EVENT_MOUSE_MOTION ||
+                               event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                               event.type == SDL_EVENT_MOUSE_BUTTON_UP;
+    touch_pointer = pointer_event && (mouse_id == SDL_TOUCH_MOUSEID || mouse_id == SDL_PEN_MOUSEID ||
+                                      !g_android_physical_mouse_connected);
+    if (touch_pointer) {
+        int width = 0;
+        int height = 0;
+        WindowSize(width, height);
+        if (g_android_overlay_enabled && width > 0 && height > 0) {
+            if (TouchOverlayHandleEvent({touch_kind, std::numeric_limits<std::uint64_t>::max(),
+                                         touch_x / width, touch_y / height},
+                                        true)) {
+                return;
+            }
+        }
+    }
+    if ((event.type == SDL_EVENT_MOUSE_MOTION && !touch_pointer) ||
+        (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !touch_pointer) ||
+        (event.type == SDL_EVENT_MOUSE_ADDED && event.mdevice.which != SDL_TOUCH_MOUSEID &&
+         event.mdevice.which != SDL_PEN_MOUSEID)) {
+        g_android_overlay_enabled = false;
+        TouchOverlaySetVisible(false);
+    }
+    if (event.type == SDL_EVENT_FINGER_DOWN || event.type == SDL_EVENT_FINGER_MOTION ||
+        event.type == SDL_EVENT_FINGER_UP) {
+        const TouchOverlayEvent::Kind kind = event.type == SDL_EVENT_FINGER_DOWN ? TouchOverlayEvent::Kind::Down : event.type == SDL_EVENT_FINGER_UP ? TouchOverlayEvent::Kind::Up
+                                                                                                                                                     : TouchOverlayEvent::Kind::Move;
+        TouchOverlayHandleEvent({kind, event.tfinger.fingerID, event.tfinger.x, event.tfinger.y},
+                                g_android_overlay_enabled);
+        return;
+    }
+#endif
     if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
         (event.type == SDL_EVENT_MOUSE_MOTION && (event.motion.xrel != 0.0f || event.motion.yrel != 0.0f))) {
         g_last_keyboard = true;
@@ -871,6 +977,9 @@ void InputHandleEvent(const SDL_Event &event) {
         case SDL_EVENT_WINDOW_FOCUS_LOST:
             g_mouse_look_total = {0, 0, g_mouse_look_total.epoch + 1};
             g_keys.fill(false);
+#if defined(__ANDROID__)
+            g_touch_held = 0;
+#endif
             g_mouse_look.yaw = g_mouse_look.pitch = 0.0f;
             g_mouse_look.zoom = 0.0f;
             g_mouse_look.zoom_reset = false;
@@ -1001,6 +1110,22 @@ InputMenuMouse InputTakeMenuMouse() {
     return mouse;
 }
 
+#if defined(__ANDROID__)
+bool InputTouchOverlayVisible() { return g_android_overlay_enabled; }
+
+void InputSetTouchOverlay(const InputTouchOverlayState &state) {
+    g_android_overlay_buttons = state.buttons;
+    g_android_overlay_lx = std::clamp(state.left_x, -1.0f, 1.0f);
+    g_android_overlay_ly = std::clamp(state.left_y, -1.0f, 1.0f);
+    g_android_overlay_rx = std::clamp(state.right_x, -1.0f, 1.0f);
+    g_android_overlay_ry = std::clamp(state.right_y, -1.0f, 1.0f);
+    if (state.buttons != 0 || state.left_x != 0.0f || state.left_y != 0.0f ||
+        state.right_x != 0.0f || state.right_y != 0.0f) {
+        g_last_keyboard = false;
+    }
+}
+#endif
+
 const InputMouseLook &InputGetMouseLook() { return g_mouse_look; }
 
 InputMouseLookTotal InputPeekMouseLookTotal() {
@@ -1035,6 +1160,15 @@ const InputPadState &InputGetPad(int pad) {
         return kAbsent;
     }
     g_view[pad] = g_override[pad] ? *g_override[pad] : g_state[pad];
+#if defined(__ANDROID__)
+    if (pad == 0 && g_android_overlay_enabled && !g_override[pad]) {
+        g_view[pad].buttons |= g_android_overlay_buttons;
+        g_view[pad].left_x = InputStickByte(g_android_overlay_lx);
+        g_view[pad].left_y = InputStickByte(g_android_overlay_ly);
+        g_view[pad].right_x = InputStickByte(g_android_overlay_rx);
+        g_view[pad].right_y = InputStickByte(g_android_overlay_ry);
+    }
+#endif
     if (g_keyboard_stick_navigation && !g_stick_live) {
         g_view[pad].buttons |= g_view[pad].stick_dpad;
     }
