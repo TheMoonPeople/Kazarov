@@ -756,6 +756,18 @@ fn textures(
                         .join("port_data")
                         .join(Path::new(&document).parent().unwrap()),
                 });
+            } else if entry["pictures"][0].get("canvas").is_some() {
+                // A canvas (an animation destination drawn at run time) still claims its name for the
+                // models beside it; otherwise an unrelated document's picture of that name is embedded,
+                // and with it that document's texture animation.
+                out.push(Texture {
+                    source: source.clone(),
+                    name: entry["name"].as_str().unwrap_or("").into(),
+                    sampler: entry["pictures"][0]["sampler"].clone(),
+                    asset: String::new(),
+                    pictures: Value::Null,
+                    directory: PathBuf::new(),
+                });
             }
         }
     }
@@ -803,7 +815,8 @@ fn material(
     let power = floats(b, at + 48, 1)?[0];
     let texture = name(bytes(b, at + 52, 32)?);
     let mut pbr = json!({"baseColorFactor":diffuse.iter().map(|v|v.clamp(0.,1.)).collect::<Vec<_>>(),"metallicFactor":0,"roughnessFactor":1});
-    let selected_texture = resolve_texture(all, alias, &texture)?;
+    // A canvas has no image to embed: the model binds it by name to the one its map's IMG entered.
+    let selected_texture = resolve_texture(all, alias, &texture)?.filter(|t| !t.asset.is_empty());
     let mut embedded_pictures = Value::Null;
     if let Some(t) = selected_texture {
         used.insert(t.source.clone());
@@ -3969,6 +3982,103 @@ mod tests {
         remap_image_metadata(&mut pictures, 4);
         assert!(pictures[0].get("levels").is_none());
         assert!(pictures[0].get("variants").is_none());
+    }
+    fn canvas_document(source: &str) -> super::super::textures::ConvertedTextureDocument {
+        super::super::textures::ConvertedTextureDocument {
+            source_alias: format!("{source}.img"),
+            document_path: format!("{source}.json"),
+            document: json!({"schema_version":3,"groups":[],"entries":[{"name":"wave","pictures":[{"canvas":{"width":64,"height":64}}]}]}),
+        }
+    }
+    fn picture_document(source: &str) -> super::super::textures::ConvertedTextureDocument {
+        super::super::textures::ConvertedTextureDocument {
+            source_alias: format!("{source}.img"),
+            document_path: format!("{source}.json"),
+            document: json!({"schema_version":3,"groups":[],"entries":[{"name":"WAVE","pictures":[{"levels":["wave.png"]}]}]}),
+        }
+    }
+    /// Resolves a 96-byte material record naming `wave` for a model at `alias`.
+    fn wave_material(
+        alias: &str,
+        documents: &[super::super::textures::ConvertedTextureDocument],
+    ) -> (Gltf, Value, BTreeSet<String>) {
+        let all = textures(Path::new("published"), documents).unwrap();
+        let mut record = vec![0; 96];
+        for at in (0..48).step_by(4) {
+            record[at..at + 4].copy_from_slice(&1f32.to_le_bytes());
+        }
+        record[52..56].copy_from_slice(b"wave");
+        let mut gltf = Gltf::new();
+        let mut used = BTreeSet::new();
+        let material = material(&mut gltf, &record, 0, alias, &all, &mut used).unwrap();
+        (gltf, material, used)
+    }
+    fn assert_canvas_binds_by_name(gltf: &Gltf, material: &Value, used: &BTreeSet<String>) {
+        assert_eq!(material["texture"], "wave");
+        assert!(material["texture_source"].is_null());
+        assert!(material["texture_path"].is_null());
+        assert!(material["texture_images"].is_null());
+        assert_eq!(gltf.doc["materials"][0]["name"], "wave");
+        assert!(
+            gltf.doc["materials"][0]["pbrMetallicRoughness"]
+                .get("baseColorTexture")
+                .is_none()
+        );
+        assert!(gltf.doc.get("images").is_none());
+        assert!(gltf.doc.get("textures").is_none());
+        assert!(used.is_empty());
+    }
+    fn assert_picture_embeds(gltf: &Gltf, material: &Value, used: &BTreeSet<String>, source: &str) {
+        assert_eq!(material["texture"], "wave");
+        assert_eq!(material["texture_source"], format!("{source}.img"));
+        assert_eq!(
+            material["texture_path"],
+            format!("{}/wave.png", parent(source))
+        );
+        assert_eq!(material["texture_images"], json!([{"levels":[0]}]));
+        assert_eq!(
+            gltf.doc["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"],
+            json!({"index":0})
+        );
+        assert_eq!(
+            gltf.doc["images"][0]["extras"]["chronicle_two"]["png"],
+            format!("{}/wave.png", parent(source))
+        );
+        assert_eq!(used, &BTreeSet::from([format!("{source}.img")]));
+    }
+    #[test]
+    fn nearer_canvas_keeps_its_name_from_a_remote_picture_in_either_order() {
+        // Veniccio's shore waves: the map's own canvas, and Luna Lab's picture of the same name.
+        let alias = "map/g0301/g0301_20.mds";
+        let canvas = || canvas_document("map/g0301/g0301");
+        let remote = || picture_document("map/s59/s59");
+        for documents in [[canvas(), remote()], [remote(), canvas()]] {
+            let (gltf, material, used) = wave_material(alias, &documents);
+            assert_canvas_binds_by_name(&gltf, &material, &used);
+        }
+    }
+    #[test]
+    fn nearer_picture_still_embeds_over_a_remote_canvas_in_either_order() {
+        let alias = "map/g0301/g0301_20.mds";
+        let local = || picture_document("map/g0301/g0301");
+        let canvas = || canvas_document("map/s59/s59");
+        for documents in [[local(), canvas()], [canvas(), local()]] {
+            let (gltf, material, used) = wave_material(alias, &documents);
+            assert_picture_embeds(&gltf, &material, &used, "map/g0301/g0301");
+        }
+    }
+    #[test]
+    fn equally_near_canvas_and_picture_resolve_to_the_first_document() {
+        // Both sources share only "map/" with the model's directory, so the earlier document wins.
+        let alias = "map/g0301/g0301_20.mds";
+        let canvas = canvas_document("map/a01/a01");
+        let picture = picture_document("map/b01/b01");
+        let (gltf, material, used) = wave_material(alias, &[canvas, picture]);
+        assert_canvas_binds_by_name(&gltf, &material, &used);
+        let canvas = canvas_document("map/a01/a01");
+        let picture = picture_document("map/b01/b01");
+        let (gltf, material, used) = wave_material(alias, &[picture, canvas]);
+        assert_picture_embeds(&gltf, &material, &used, "map/b01/b01");
     }
 
     fn test_quaternion_matrix(q: &[f32]) -> Vec<f32> {

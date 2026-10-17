@@ -168,15 +168,33 @@ fn open_image(image: &Path) -> CoreResult<Archive> {
     if !movies_dir.flags.directory {
         return Err(error("ISO /MOVIE is not a directory"));
     }
+    // The manual's movies are in /MOVIE/TUTO and /MOVIE/TUTO2, so subdirectories are walked too.
     let mut movies = Vec::new();
-    for entry in DirectoryIterator::new(&mut io, movies_dir.extent_lba, movies_dir.data_length) {
-        let entry = entry
-            .map_err(|cause| error(format!("{}: ISO /MOVIE entry: {cause}", image.display())))?;
-        if !entry.flags.directory && entry.name.to_ascii_lowercase().ends_with(".pss") {
-            movies.push(NamedExtent {
-                name: entry.name.as_bytes().to_vec(),
-                extent: image_extent(image, &entry)?,
-            });
+    let mut visited = HashSet::new();
+    let mut pending = vec![(String::new(), movies_dir.extent_lba, movies_dir.data_length)];
+    while let Some((prefix, lba, length)) = pending.pop() {
+        if !visited.insert(lba) {
+            continue;
+        }
+        for entry in DirectoryIterator::new(&mut io, lba, length) {
+            let entry = entry.map_err(|cause| {
+                error(format!(
+                    "{}: ISO /MOVIE/{prefix} entry: {cause}",
+                    image.display()
+                ))
+            })?;
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            let name = format!("{prefix}{}", entry.name);
+            if entry.flags.directory {
+                pending.push((format!("{name}/"), entry.extent_lba, entry.data_length));
+            } else if name.to_ascii_lowercase().ends_with(".pss") {
+                movies.push(NamedExtent {
+                    name: name.into_bytes(),
+                    extent: image_extent(image, &entry)?,
+                });
+            }
         }
     }
     movies.sort_by(|a, b| a.name.cmp(&b.name));
@@ -221,19 +239,26 @@ fn open_directory(root: &Path) -> CoreResult<Archive> {
                     .eq_ignore_ascii_case("MOVIE")
         })
         .ok_or_else(|| error(format!("{} holds no MOVIE directory", root.display())))?;
+    // As on the disc image, the manual's movies in MOVIE/TUTO and MOVIE/TUTO2 are included.
     let mut movies = Vec::new();
-    for entry in fs::read_dir(movies_dir.path())? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().as_bytes().to_vec();
-        if entry.file_type()?.is_file() && folded(&name).ends_with(b".pss") {
-            movies.push(NamedExtent {
-                name,
-                extent: Extent {
-                    file: entry.path(),
-                    offset: 0,
-                    size: entry.metadata()?.len(),
-                },
-            });
+    let mut pending = vec![(String::new(), movies_dir.path())];
+    while let Some((prefix, directory)) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push((format!("{name}/"), entry.path()));
+            } else if kind.is_file() && folded(name.as_bytes()).ends_with(b".pss") {
+                movies.push(NamedExtent {
+                    name: name.into_bytes(),
+                    extent: Extent {
+                        file: entry.path(),
+                        offset: 0,
+                        size: entry.metadata()?.len(),
+                    },
+                });
+            }
         }
     }
     movies.sort_by(|a, b| a.name.cmp(&b.name));
@@ -735,6 +760,8 @@ mod tests {
         fs::write(root.join("SOUND.HD3"), sound_index())?;
         fs::write(root.join("SOUND.DAT"), b"SND")?;
         fs::write(root.join("MOVIE/INTRO.PSS"), b"PSS")?;
+        fs::create_dir_all(root.join("MOVIE/TUTO2"))?;
+        fs::write(root.join("MOVIE/TUTO2/VTUTO24.PSS"), b"TUTO")?;
         Ok(())
     }
 
@@ -755,7 +782,7 @@ mod tests {
     }
 
     fn iso_bytes() -> Vec<u8> {
-        let mut iso = vec![0u8; 25 * SECTOR as usize];
+        let mut iso = vec![0u8; 27 * SECTOR as usize];
         let descriptor = 16 * SECTOR as usize;
         iso[descriptor] = 1;
         iso[descriptor + 1..descriptor + 6].copy_from_slice(b"CD001");
@@ -787,14 +814,22 @@ mod tests {
         movie_entries.extend_from_slice(&record(&[0], 19, SECTOR as u32, true));
         movie_entries.extend_from_slice(&record(&[1], 18, SECTOR as u32, true));
         movie_entries.extend_from_slice(&record(b"INTRO.PSS;1", 24, 3, false));
+        movie_entries.extend_from_slice(&record(b"TUTO2", 25, SECTOR as u32, true));
         iso[19 * SECTOR as usize..19 * SECTOR as usize + movie_entries.len()]
             .copy_from_slice(&movie_entries);
+        let mut manual_entries = Vec::new();
+        manual_entries.extend_from_slice(&record(&[0], 25, SECTOR as u32, true));
+        manual_entries.extend_from_slice(&record(&[1], 19, SECTOR as u32, true));
+        manual_entries.extend_from_slice(&record(b"VTUTO24.PSS;1", 26, 4, false));
+        iso[25 * SECTOR as usize..25 * SECTOR as usize + manual_entries.len()]
+            .copy_from_slice(&manual_entries);
         for (sector, payload) in [
             (20, index()),
             (21, b"DATA".to_vec()),
             (22, sound_index()),
             (23, b"SND".to_vec()),
             (24, b"PSS".to_vec()),
+            (26, b"TUTO".to_vec()),
         ] {
             let offset = sector * SECTOR as usize;
             iso[offset..offset + payload.len()].copy_from_slice(&payload);
@@ -808,6 +843,7 @@ mod tests {
         let disc = temp.path().join("disc");
         disc_dir(&disc)?;
         fs::remove_file(disc.join("MOVIE/INTRO.PSS"))?;
+        fs::remove_dir_all(disc.join("MOVIE/TUTO2"))?;
         let output = temp.path().join("game/data");
         let updates = std::sync::Mutex::new(Vec::new());
         super::super::extract_with_progress(&disc, &output, 2, &|fraction, _| {
@@ -856,6 +892,7 @@ mod tests {
             "sound/sound.hd3",
             "sound/bgm_a.str",
             "movie/intro.pss",
+            "movie/tuto2/vtuto24.pss",
         ] {
             assert_eq!(
                 fs::read(directory_out.join(rel))?,
@@ -863,6 +900,7 @@ mod tests {
                 "{rel}"
             );
         }
+        assert_eq!(fs::read(iso_out.join("movie/tuto2/vtuto24.pss"))?, b"TUTO");
         assert!(list_text(&iso)?.contains("1 files"));
         assert!(sound_text(&iso)?.contains("1 entries"));
         Ok(())
@@ -917,7 +955,14 @@ mod tests {
                 .count(),
             8751
         );
-        assert!(!archive.movies.is_empty());
+        // 9 movies in /MOVIE and the manual's 22 in each of /MOVIE/TUTO and /MOVIE/TUTO2.
+        assert_eq!(archive.movies.len(), 53);
+        assert!(
+            archive
+                .movies
+                .iter()
+                .any(|movie| movie.name == b"TUTO2/VTUTO44.PSS")
+        );
         assert!(!read_sound_index(&archive)?.entries.is_empty());
         Ok(())
     }
