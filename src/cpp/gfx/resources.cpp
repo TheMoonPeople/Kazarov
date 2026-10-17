@@ -180,8 +180,9 @@ LogicalMapping TextureMapping(const Texture &texture) {
     }
     if (FrameShaped(texture)) {
         // Full-height captures retain the main frame's vertical margins as well as its sides.
-        LogicalMapping main = MainMapping(g.main_color[0].width, g.main_color[0].height);
         const bool     full_height = texture.logical_height == g.config.logical_height;
+        LogicalMapping main = full_height ? MainMapping(texture.image.width, texture.image.height)
+                                          : MainMapping(g.main_color[0].width, g.main_color[0].height);
         float          rows = full_height ? main.scale_y : static_cast<float>(texture.image.height) / static_cast<float>(texture.logical_height);
         return LogicalMapping{main.scale_x * g.config.logical_width / static_cast<float>(texture.logical_width),
                               rows,
