@@ -133,8 +133,8 @@ uint32_t ScaledSize(uint32_t logical, float scale) {
 }
 
 // What a render target's image measures now: the main target's for one sharing its depth, the main
-// target's width and the main frame's scale in rows for a frame target filling the window, its
-// logical size at the render scale otherwise.
+// target's full extent for a full-height frame target, the main frame's row scale for a partial
+// frame target, and its logical size at the render scale otherwise.
 void TargetPixelSize(const Texture &texture, uint32_t &width, uint32_t &height) {
     const Image &main = g.main_color[0];
     if (texture.shares_main_depth) {
@@ -142,7 +142,9 @@ void TargetPixelSize(const Texture &texture, uint32_t &width, uint32_t &height) 
         height = main.height;
     } else if (FrameShaped(texture)) {
         width = main.width;
-        height = ScaledSize(texture.logical_height, MainMapping(main.width, main.height).scale_y);
+        height = texture.logical_height == g.config.logical_height
+                     ? main.height
+                     : ScaledSize(texture.logical_height, MainMapping(main.width, main.height).scale_y);
     } else {
         width = ScaledSize(texture.logical_width, g.render_scale);
         height = ScaledSize(texture.logical_height, g.render_scale);
@@ -177,14 +179,15 @@ LogicalMapping TextureMapping(const Texture &texture) {
         return MainMapping(texture.image.width, texture.image.height);
     }
     if (FrameShaped(texture)) {
-        // The logical width lies over the main target's logical frame, whose sides it keeps.
-        LogicalMapping main = MainMapping(g.main_color[0].width, g.main_color[0].height);
-        float          rows =
-            static_cast<float>(texture.image.height) / static_cast<float>(texture.logical_height);
+        // Full-height captures retain the main frame's vertical margins as well as its sides.
+        const bool     full_height = texture.logical_height == g.config.logical_height;
+        LogicalMapping main = full_height ? MainMapping(texture.image.width, texture.image.height)
+                                          : MainMapping(g.main_color[0].width, g.main_color[0].height);
+        float          rows = full_height ? main.scale_y : static_cast<float>(texture.image.height) / static_cast<float>(texture.logical_height);
         return LogicalMapping{main.scale_x * g.config.logical_width / static_cast<float>(texture.logical_width),
                               rows,
                               main.offset_x,
-                              0.0f,
+                              full_height ? main.offset_y : 0.0f,
                               texture.image.width,
                               texture.image.height};
     }

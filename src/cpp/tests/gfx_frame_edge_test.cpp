@@ -178,3 +178,62 @@ TEST(GfxGpuMeshDc2, FillScissorCanKeepItsLogicalExtent) {
         }
     }
 }
+
+TEST(GfxGpuMeshDc2, FullHeightSnapshotPreservesExtendedFrameEdges) {
+    for (const auto &size : {
+             std::array{800,  720},
+             std::array{1280, 720},
+             std::array{640,  480}
+    }) {
+        SCOPED_TRACE(testing::Message() << size[0] << "x" << size[1]);
+        GfxFixture fixture(size[0], size[1], 1.0f, true, kLogicalWidth, kLogicalHeight);
+        gfx::SetFrameLayout({gfx::AspectMode::Fill, 1.0f});
+        gfx::TextureHandle snapshot = gfx::CreateRenderTarget(512, 480, true, false, true);
+        ASSERT_NE(snapshot, gfx::kNullTexture);
+        fixture.Frame(kRed, [&] {
+            ASSERT_TRUE(gfx::SnapshotFrame(snapshot));
+            gfx::Clear(true, kBlue.data(), false, 0.0f);
+            gfx::TextureBinding binding;
+            binding.texture = snapshot;
+            auto quad = Quad(0, 0, 512, 480, {0x80, 0x80, 0x80, 0x80}, 0, 0, 512, 480);
+            gfx::Draw2D(gfx::Primitive::Quads, quad, binding, gfx::DrawState{});
+        });
+        for (const auto &point : {
+                 std::array{1,           1          },
+                 std::array{size[0] / 2, size[1] / 2},
+                 std::array{size[0] - 2, size[1] - 2}
+        }) {
+            EXPECT_TRUE(fixture.PixelNear(point[0], point[1], 255, 0, 0));
+        }
+        gfx::DestroyTexture(snapshot);
+    }
+}
+TEST(GfxGpuMeshDc2, FullHeightSnapshotKeepsLogicalRowsAcrossResize) {
+    GfxFixture fixture(800, 720, 1.0f, true, kLogicalWidth, kLogicalHeight);
+    gfx::SetFrameLayout({gfx::AspectMode::Fill, 1.0f});
+    gfx::TextureHandle snapshot = gfx::CreateRenderTarget(512, 480, true, false, true);
+    ASSERT_NE(snapshot, gfx::kNullTexture);
+    fixture.Frame(kRed, [&] {
+        auto stripe = Quad(0, 200, 512, 80, kBlue);
+        gfx::Draw2D(gfx::Primitive::Quads, stripe, {}, gfx::DrawState{});
+        ASSERT_TRUE(gfx::SnapshotFrame(snapshot));
+    });
+    for (int height : {800, 720}) {
+        SCOPED_TRACE(height);
+        ASSERT_TRUE(SDL_SetWindowSize(WindowHandle(), 800, height));
+        SDL_PumpEvents();
+        gfx::RendererResize();
+        fixture.Frame(kBlack, [&] {
+            gfx::TextureBinding binding;
+            binding.texture = snapshot;
+            auto quad = Quad(0, 0, 512, 480, {0x80, 0x80, 0x80, 0x80}, 0, 0, 512, 480);
+            gfx::Draw2D(gfx::Primitive::Quads, quad, binding, gfx::DrawState{});
+        });
+        ASSERT_EQ(fixture.height, height);
+        const int top = (height - 600) / 2;
+        EXPECT_TRUE(fixture.PixelNear(400, top + 237, 255, 0, 0));
+        EXPECT_TRUE(fixture.PixelNear(400, top + 275, 0, 0, 255));
+        EXPECT_TRUE(fixture.PixelNear(400, top + 362, 255, 0, 0));
+    }
+    gfx::DestroyTexture(snapshot);
+}

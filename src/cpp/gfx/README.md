@@ -81,7 +81,8 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
     keeps the frame's width and shows more above and below). `VisibleLogicalRect(target)` is the
     logical rect the target's pixels cover; the game's culls test against it.
   - **The full-frame rule.** Along each axis on which the target shows past its frame (both on the
-    main target and the targets mapped like it, x on a frame target), a scissor or clear rect, and
+    main target and targets mapped like it, both on a full-height frame target, x on a partial-height
+    frame target), a scissor or clear rect, and
     every axis-aligned rectangle of a `Quads` or four-vertex strip `Draw2D` whose texture is none, an
     image of the frame (`kPreviousFrame`, a frame target, a target sharing the main depth) or
     another image that shows past its frame, is carried to the target's edge on every side where it
