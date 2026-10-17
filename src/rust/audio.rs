@@ -69,7 +69,7 @@ fn adpcm(b: &[u8]) -> CoreResult<(Vec<i16>, usize, bool)> {
     const FILTER: [[i32; 2]; 5] = [[0, 0], [60, 0], [115, -52], [98, -55], [122, -60]];
     let mut out = Vec::new();
     let (mut h0, mut h1, mut loop_start, mut loops) = (0, 0, 0, false);
-    for block in b.chunks_exact(16) {
+    for block in b.as_chunks::<16>().0 {
         let shift = if block[0] & 15 > 12 { 9 } else { block[0] & 15 };
         let filter = FILTER[usize::from(block[0] >> 4).min(4)];
         if block[1] & 4 != 0 {
@@ -94,7 +94,7 @@ fn adpcm(b: &[u8]) -> CoreResult<(Vec<i16>, usize, bool)> {
     Ok((out, loop_start, loops))
 }
 fn wav(pcm: &[i16], rate: u32, channels: u16) -> CoreResult<Vec<u8>> {
-    if rate == 0 || !(1..=2).contains(&channels) || pcm.len() % channels as usize != 0 {
+    if rate == 0 || !(1..=2).contains(&channels) || !pcm.len().is_multiple_of(channels as usize) {
         return Err(fail("invalid PCM layout"));
     }
     let bytes = u32::try_from(pcm.len() * 2).map_err(|_| fail("PCM WAV exceeds RIFF size"))?;
@@ -496,11 +496,11 @@ fn atoi(b: &[u8]) -> i32 {
     }) * sign
 }
 fn scene_reverb(b: &[u8]) -> CoreResult<Value> {
-    if b.len() % 8 != 0 || b.len() / 8 > 256 {
+    if !b.len().is_multiple_of(8) || b.len() / 8 > 256 {
         return Err(fail("invalid scene reverb table size"));
     }
     let mut rows = Vec::new();
-    for record in b.chunks_exact(8) {
+    for record in b.as_chunks::<8>().0 {
         rows.push(json!({"id":u16le(record,0)? as i16,"type":u16le(record,2)? as i16,"depth":u16le(record,4)? as i16}));
     }
     Ok(json!({"schema_version":1,"kind":"scene_reverb","rows":rows}))
@@ -669,7 +669,7 @@ fn sshd(b: &[u8]) -> CoreResult<(Vec<i16>, u32, u16)> {
     let rate = u32le(b, 12)?;
     let channels = u32le(b, 16)? as usize;
     let interleave = u32le(b, 20)? as usize;
-    if !(1..=2).contains(&channels) || interleave == 0 || interleave % 2 != 0 {
+    if !(1..=2).contains(&channels) || interleave == 0 || !interleave.is_multiple_of(2) {
         return Err(fail("invalid SShd layout"));
     }
     let bytes = u32le(b, body + 4)? as usize;
@@ -679,7 +679,7 @@ fn sshd(b: &[u8]) -> CoreResult<(Vec<i16>, u32, u16)> {
     let mut pcm = Vec::with_capacity(bytes / 2);
     for group in data.chunks(interleave * channels) {
         let stride = group.len() / channels;
-        if stride % 2 != 0 {
+        if !stride.is_multiple_of(2) {
             return Err(fail("unaligned SShd group"));
         }
         for frame in 0..stride / 2 {
@@ -720,8 +720,10 @@ fn stream(b: &[u8]) -> CoreResult<Vec<u8>> {
     let rate = u32le(f, 4)?;
     if codec == 1 && u16le(f, 14)? == 16 {
         return wav(
-            &d.chunks_exact(2)
-                .map(|s| i16::from_le_bytes([s[0], s[1]]))
+            &d.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| i16::from_le_bytes(*s))
                 .collect::<Vec<_>>(),
             rate,
             channels,
@@ -731,7 +733,7 @@ fn stream(b: &[u8]) -> CoreResult<Vec<u8>> {
         return Err(fail(format!("unsupported WAV codec {codec:#x}")));
     }
     let block_align = u16le(f, 12)? as usize;
-    if block_align < 16 * channels as usize || block_align % (16 * channels as usize) != 0 {
+    if block_align < 16 * channels as usize || !block_align.is_multiple_of(16 * channels as usize) {
         return Err(fail("invalid SPU WAV block alignment"));
     }
     // Each block contains one planar run per channel; predictor history continues between blocks.
@@ -1277,14 +1279,12 @@ fn strip_pack(original: &[u8], current: &mut [u8], depth: usize) -> CoreResult<(
                 .get_mut(cursor + offset..cursor + offset + b.len())
                 .ok_or_else(|| fail("published PACK payload missing"))?
                 .fill(0);
-        } else if pack(b).is_some() {
-            if u32le(current, cursor + 68)? as usize == b.len() {
-                strip_pack(
-                    b,
-                    &mut current[cursor + offset..cursor + offset + b.len()],
-                    depth + 1,
-                )?;
-            }
+        } else if pack(b).is_some() && u32le(current, cursor + 68)? as usize == b.len() {
+            strip_pack(
+                b,
+                &mut current[cursor + offset..cursor + offset + b.len()],
+                depth + 1,
+            )?;
         }
         cursor += u32le(original, cursor + 72)? as usize;
     }

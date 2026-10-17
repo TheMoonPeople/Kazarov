@@ -24,9 +24,11 @@ fn i32le(b: &[u8], at: usize) -> CoreResult<i32> {
 }
 fn floats(b: &[u8], at: usize, n: usize) -> CoreResult<Vec<f32>> {
     bytes(b, at, n * 4)?
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|x| {
-            let f = f32::from_le_bytes(x.try_into().unwrap());
+            let f = f32::from_le_bytes(*x);
             if f.is_finite() {
                 Ok(f)
             } else {
@@ -463,7 +465,7 @@ fn memory_card_icon(data: &[u8], image_uri: &str) -> CoreResult<(Value, Vec<u8>)
     if u32le(data, 0)? != 0x10000
         || shapes != 1
         || count == 0
-        || count % 3 != 0
+        || !count.is_multiple_of(3)
         || count > 1_000_000
     {
         return Err(fail("unsupported memory card icon model"));
@@ -1033,6 +1035,8 @@ fn prune_metadata(value: &mut Value) {
                             .map(|v| v.as_f64().unwrap() as f32)
                             .collect();
                         let length = original[..3].iter().map(|v| v * v).sum::<f32>().sqrt();
+                        // `component` also picks the default past `width`, so this stays a range loop.
+                        #[allow(clippy::needless_range_loop)]
                         for component in 0..4 {
                             let standard = if !used.contains(&index) {
                                 0.
@@ -1194,14 +1198,15 @@ fn inverse(m: &[f32]) -> CoreResult<Vec<f32>> {
         if d.abs() < 1e-20 {
             return Err(fail("singular bind matrix"));
         }
-        for k in 0..8 {
-            a[c][k] /= d
+        for v in &mut a[c] {
+            *v /= d
         }
         for r in 0..4 {
             if r != c {
                 let f = a[r][c];
-                for k in 0..8 {
-                    a[r][k] -= f * a[c][k]
+                let pivot = a[c];
+                for (v, p) in a[r].iter_mut().zip(pivot) {
+                    *v -= f * p
                 }
             }
         }
@@ -1228,15 +1233,14 @@ fn trs(m: &[f32]) -> Value {
         })
         .collect();
     let trace = r[0] + r[4] + r[8];
-    let q;
-    if trace > 0. {
+    let q = if trace > 0. {
         let s = (trace + 1.).sqrt() * 2.;
-        q = vec![
+        vec![
             (r[5] - r[7]) / s,
             (r[6] - r[2]) / s,
             (r[1] - r[3]) / s,
             s / 4.,
-        ];
+        ]
     } else {
         let i = (0..3)
             .max_by(|&a, &b| r[a * 3 + a].total_cmp(&r[b * 3 + b]))
@@ -1252,8 +1256,8 @@ fn trs(m: &[f32]) -> Value {
         v[j] = (r[i * 3 + j] + r[j * 3 + i]) / s;
         v[k] = (r[i * 3 + k] + r[k * 3 + i]) / s;
         v[3] = (r[j * 3 + k] - r[k * 3 + j]) / s;
-        q = v;
-    }
+        v
+    };
     let norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
     let q = if norm > 1e-20 {
         q.iter().map(|v| v / norm).collect::<Vec<_>>()
@@ -1359,6 +1363,7 @@ fn rotation_map(gltf: &Gltf) -> Value {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mesh(
     gltf: &mut Gltf,
     b: &[u8],
@@ -1690,10 +1695,10 @@ fn animation(gltf: &mut Gltf, alias: &str, channels: &[Value]) -> CoreResult<Opt
         } else {
             frame
         };
-        if let Some(matrix) = gltf.doc["nodes"][node as usize]["matrix"].as_array() {
+        if let Some(matrix) = gltf.doc["nodes"][node]["matrix"].as_array() {
             let matrix: Vec<f32> = matrix.iter().map(|v| v.as_f64().unwrap() as f32).collect();
             let decomposed = trs(&matrix);
-            let object = gltf.doc["nodes"][node as usize].as_object_mut().unwrap();
+            let object = gltf.doc["nodes"][node].as_object_mut().unwrap();
             object.remove("matrix");
             for (key, value) in decomposed.as_object().unwrap() {
                 object.insert(key.clone(), value.clone());
@@ -2373,11 +2378,10 @@ fn publish_native(
             let mut dependencies = BTreeSet::new();
             for mesh in model["meshes"].as_array().unwrap() {
                 for material in mesh["materials"].as_array().unwrap() {
-                    if let Some(source) = material["texture_source"].as_str() {
-                        if let Some(index) = references.get(&("texture_set".into(), source.into()))
-                        {
-                            dependencies.insert(*index);
-                        }
+                    if let Some(source) = material["texture_source"].as_str()
+                        && let Some(index) = references.get(&("texture_set".into(), source.into()))
+                    {
+                        dependencies.insert(*index);
                     }
                 }
             }
@@ -2394,11 +2398,11 @@ fn publish_native(
             .filter(|r| extension(&r.alias) == "stb" && r.alias.starts_with(&format!("{alias}/")))
         {
             let key = ("script".into(), resource.alias.clone());
-            if !references.contains_key(&key) {
+            references.entry(key).or_insert_with(|| {
                 let index = native["resources"]["scripts"].as_array().unwrap().len();
                 native["resources"]["scripts"].as_array_mut().unwrap().push(json!({"name":leaf_stem(&resource.alias),"path":super::configs::native_path(&resource.alias,"stb"),"character":super::configs::native_path(character_parent(&resource.alias).unwrap(),"gltf")}));
-                references.insert(key, index);
-            }
+                index
+            });
         }
         for profile in resources.iter().filter(|r| {
             extension(&r.alias) == "cfg" && character_parent(&r.alias) == Some(alias.as_str())
@@ -2950,7 +2954,7 @@ fn decode_uri(uri: &str, prefix: &str) -> CoreResult<Vec<u8>> {
         return Err(fail("invalid glTF base64 length"));
     }
     let mut out = Vec::with_capacity(encoded.len() / 4 * 3);
-    for (index, chunk) in encoded.as_bytes().chunks_exact(4).enumerate() {
+    for (index, chunk) in encoded.as_bytes().as_chunks::<4>().0.iter().enumerate() {
         let mut value = 0u32;
         let mut padding = 0;
         for (i, &c) in chunk.iter().enumerate() {

@@ -169,8 +169,13 @@ fn png_decode_rgba(png: &[u8], width: u32, height: u32, out: &mut [u8]) -> Resul
             reader
                 .next_frame(&mut gray)
                 .map_err(|error| error.to_string())?;
-            for (rgba, ga) in out.chunks_exact_mut(4).zip(gray.chunks_exact(2)) {
-                rgba.copy_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
+            for (rgba, ga) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(gray.as_chunks::<2>().0)
+            {
+                *rgba = [ga[0], ga[0], ga[0], ga[1]];
             }
         }
         _ => return Err(format!("unexpected PNG output colour {color:?}")),

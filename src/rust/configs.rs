@@ -235,7 +235,7 @@ fn parse_binary(b: &[u8]) -> CoreResult<Vec<Value>> {
         }
         let count = short(b, at)?;
         at += 2;
-        if count < 0 || count > 256 {
+        if !(0..=256).contains(&count) {
             return Err(fail("invalid binary CFG argument count"));
         }
         let count = count as usize;
