@@ -21,6 +21,7 @@ struct UiSide {
     int8_t x = 0;
     int8_t y = 0;
     bool   scissor = false;
+    float  max_aspect = 0.0f; // UiAnchor::max_aspect of the draw
 };
 
 struct Draw2DEntry {

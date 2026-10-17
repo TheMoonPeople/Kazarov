@@ -249,6 +249,13 @@ VkRect2D ClearArea(const LogicalRect *rect, const Target &target) {
 // edge of what the main target shows.
 void UiSideShift(UiSide side, const LogicalMapping &logical, const LogicalMapping &ui, float &dx, float &dy) {
     LogicalRect visible = VisibleLogicalRect(kMainTarget);
+    if (side.max_aspect > 0.0f && g.config.display_aspect > 0.0f) {
+        const float cap = static_cast<float>(g.config.logical_width) * side.max_aspect / g.config.display_aspect;
+        if (visible.w > cap) {
+            visible.x += (visible.w - cap) * 0.5f;
+            visible.w = cap;
+        }
+    }
     dx = 0.0f;
     dy = 0.0f;
     if (side.x < 0) {
@@ -750,6 +757,7 @@ UiSide AnchoredSide(std::span<const Vertex2D> vertices) {
     side.x = x < anchor.left_until ? -1 : x >= anchor.right_from ? 1 : 0;
     side.y = y < anchor.top_until ? -1 : y >= anchor.bottom_from ? 1 : 0;
     side.scissor = (side.x != 0 || side.y != 0) && anchor.scissor;
+    side.max_aspect = anchor.max_aspect;
     return side;
 }
 
