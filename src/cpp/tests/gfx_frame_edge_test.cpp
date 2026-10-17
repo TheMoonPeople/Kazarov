@@ -178,3 +178,33 @@ TEST(GfxGpuMeshDc2, FillScissorCanKeepItsLogicalExtent) {
         }
     }
 }
+
+TEST(GfxGpuMeshDc2, FullHeightSnapshotPreservesExtendedFrameEdges) {
+    for (const auto &size : {
+             std::array{800,  720},
+             std::array{1280, 720},
+             std::array{640,  480}
+    }) {
+        SCOPED_TRACE(testing::Message() << size[0] << "x" << size[1]);
+        GfxFixture fixture(size[0], size[1], 1.0f, true, kLogicalWidth, kLogicalHeight);
+        gfx::SetFrameLayout({gfx::AspectMode::Fill, 1.0f});
+        gfx::TextureHandle snapshot = gfx::CreateRenderTarget(512, 480, true, false, true);
+        ASSERT_NE(snapshot, gfx::kNullTexture);
+        fixture.Frame(kRed, [&] {
+            ASSERT_TRUE(gfx::SnapshotFrame(snapshot));
+            gfx::Clear(true, kBlue.data(), false, 0.0f);
+            gfx::TextureBinding binding;
+            binding.texture = snapshot;
+            auto quad = Quad(0, 0, 512, 480, {0x80, 0x80, 0x80, 0x80}, 0, 0, 512, 480);
+            gfx::Draw2D(gfx::Primitive::Quads, quad, binding, gfx::DrawState{});
+        });
+        for (const auto &point : {
+                 std::array{1,           1          },
+                 std::array{size[0] / 2, size[1] / 2},
+                 std::array{size[0] - 2, size[1] - 2}
+        }) {
+            EXPECT_TRUE(fixture.PixelNear(point[0], point[1], 255, 0, 0));
+        }
+        gfx::DestroyTexture(snapshot);
+    }
+}

@@ -900,7 +900,7 @@ uint32_t ExtentAxes(TextureHandle handle) {
     if (texture->shares_main_depth) {
         return kAxisX | kAxisY;
     }
-    return texture->frame ? kAxisX : 0;
+    return texture->frame ? kAxisX | (texture->logical_height == g.config.logical_height ? kAxisY : 0) : 0;
 }
 
 LogicalRect LogicalFrame(TextureHandle handle) {
