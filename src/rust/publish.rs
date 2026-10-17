@@ -204,18 +204,17 @@ fn verify_catalog(port: &Path, catalog: &Value, expected: &BTreeSet<String>) -> 
                 if let Some(levels) = picture.get("levels") {
                     check_levels(port, path, levels, expected)?;
                 }
-                if let Some(canvas) = picture.get("canvas") {
-                    if !keys(canvas, &["width", "height"])
+                if let Some(canvas) = picture.get("canvas")
+                    && (!keys(canvas, &["width", "height"])
                         || canvas["width"].as_u64().is_none_or(|n| n == 0)
-                        || canvas["height"].as_u64().is_none_or(|n| n == 0)
-                    {
-                        return Err(fail("invalid texture canvas"));
-                    }
+                        || canvas["height"].as_u64().is_none_or(|n| n == 0))
+                {
+                    return Err(fail("invalid texture canvas"));
                 }
-                if let Some(animation) = picture.get("animation") {
-                    if !matches!(animation.as_str(), Some("draw" | "copy" | "copy_variant")) {
-                        return Err(fail("invalid texture animation"));
-                    }
+                if let Some(animation) = picture.get("animation")
+                    && !matches!(animation.as_str(), Some("draw" | "copy" | "copy_variant"))
+                {
+                    return Err(fail("invalid texture animation"));
                 }
                 if let Some(sampler) = picture.get("sampler") {
                     if !keys_optional(sampler, &[], &["wrap_u", "wrap_v", "filter"]) {

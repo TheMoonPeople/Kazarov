@@ -26,7 +26,7 @@ struct Instruction {
     a2: i32,
 }
 fn function(b: &[u8], code: usize, block: usize) -> CoreResult<Vec<Instruction>> {
-    if block < 28 || block % 4 != 0 {
+    if block < 28 || !block.is_multiple_of(4) {
         return Err(fail("invalid script function block"));
     }
     let local = word(b, block + 8)?;
@@ -120,14 +120,16 @@ fn decode(b: &[u8]) -> CoreResult<(usize, Vec<Vec<Instruction>>)> {
         if word(b, at)? as usize == at - code + 0x38 && !covered[at] && !seen.contains(&at) {
             let local = word(b, at + 8)?;
             let args = word(b, at + 12)?;
-            if args >= 0 && args <= local && local < 256 && (1..=30).contains(&word(b, at + 0x38)?)
+            if args >= 0
+                && args <= local
+                && local < 256
+                && (1..=30).contains(&word(b, at + 0x38)?)
+                && let Ok(instructions) = function(b, code, at)
             {
-                if let Ok(instructions) = function(b, code, at) {
-                    seen.insert(at);
-                    covered[instructions[0].at..instructions.last().unwrap().at + 12].fill(true);
-                    at = instructions.last().unwrap().at + 8;
-                    functions.push(instructions);
-                }
+                seen.insert(at);
+                covered[instructions[0].at..instructions.last().unwrap().at + 12].fill(true);
+                at = instructions.last().unwrap().at + 8;
+                functions.push(instructions);
             }
         }
         at += 4;
@@ -226,14 +228,13 @@ impl Inventory {
             return None;
         }
         let stem = key.trim_end_matches(".cfg");
-        if let Some(character) = character {
-            if self
+        if let Some(character) = character
+            && self
                 .profiles
                 .get(&normalize(character))
                 .is_some_and(|p| p.contains(stem))
-            {
-                return Some(stem.to_owned());
-            }
+        {
+            return Some(stem.to_owned());
         }
         None
     }
