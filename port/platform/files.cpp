@@ -187,6 +187,13 @@ void Remove(const fs::path &path) {
     unlink(path.c_str());
 }
 
+#ifdef __SWITCH__
+// Horizon opens no directory as a file and has no directory sync: the file system commits a name
+// when the call that made it returns.
+bool SyncDirectory(const fs::path &) {
+    return true;
+}
+#else
 bool SyncDirectory(const fs::path &path) {
     File directory = open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory == kNoFile) {
@@ -195,6 +202,7 @@ bool SyncDirectory(const fs::path &path) {
     bool synced = Fsync(directory);
     return close(directory) == 0 && synced;
 }
+#endif
 
 // Moves temp onto path unless path exists, in one step where the system can: -1 with errno set
 // otherwise.
@@ -204,15 +212,42 @@ int RenameExclusive(const fs::path &temp, const fs::path &path) {
     return static_cast<int>(syscall(SYS_renameat2, AT_FDCWD, temp.c_str(), AT_FDCWD, path.c_str(), kNoReplace));
 #elif defined(__APPLE__)
     return renamex_np(temp.c_str(), path.c_str(), RENAME_EXCL);
+#elif defined(__SWITCH__)
+    // Horizon's rename never replaces: it fails with EEXIST when path is taken.
+    return rename(temp.c_str(), path.c_str());
 #else
     errno = ENOSYS;
     return -1;
 #endif
 }
 
+// Horizon's rename cannot replace a file, so the old one is moved aside first and removed once the
+// new one has its name: an interruption leaves one of the two under a name, never neither.
+int RenameReplacing(const fs::path &temp, const fs::path &path) {
+#ifdef __SWITCH__
+    fs::path old = TempPath(path);
+    bool     moved = rename(path.c_str(), old.c_str()) == 0;
+    if (!moved && errno != ENOENT) {
+        return -1;
+    }
+    if (rename(temp.c_str(), path.c_str()) != 0) {
+        if (moved) {
+            rename(old.c_str(), path.c_str());
+        }
+        return -1;
+    }
+    if (moved) {
+        Remove(old);
+    }
+    return 0;
+#else
+    return rename(temp.c_str(), path.c_str());
+#endif
+}
+
 FilesResult Commit(const fs::path &temp, const fs::path &path, bool replace) {
     if (replace) {
-        if (rename(temp.c_str(), path.c_str()) != 0) {
+        if (RenameReplacing(temp, path) != 0) {
             return FilesResult::kFailed;
         }
     } else if (RenameExclusive(temp, path) != 0) {
