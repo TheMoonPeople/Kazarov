@@ -114,6 +114,10 @@ struct RendererConfig {
     uint32_t mesh_slots = 0;
     // KZ_RENDER_THREAD=off|lockstep|async in the environment overrides this.
     RenderThreadMode render_thread = RenderThreadMode::Off;
+    // Draws an index texture from an RGBA expansion of it and its palette, made on the CPU when
+    // either changes, so the sampler filters it instead of the shader looking the palette up four
+    // times a pixel. For GPUs where that lookup is the frame's cost (the Switch's).
+    bool expand_palettes = false;
 };
 
 // What RendererInit settled on, from the config and the device.

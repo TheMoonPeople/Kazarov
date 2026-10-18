@@ -336,9 +336,16 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
                     Error("index texture %#x is drawn without a palette", binding.texture);
                     return false;
                 }
-                palette->last_draw_use = g.frame_serial;
-                push.palette_slot = binding.palette & kSlotMask;
-                mode = kTexturePalette;
+                TextureHandle expanded = PaletteExpansion(binding.texture, binding.palette);
+                if (expanded != kNullTexture) {
+                    LookupTexture(expanded)->last_draw_use = g.frame_serial;
+                    push.texture_slot = expanded & kSlotMask;
+                    mode = kTextureRgba;
+                } else {
+                    LookupTexture(binding.palette)->last_draw_use = g.frame_serial;
+                    push.palette_slot = binding.palette & kSlotMask;
+                    mode = kTexturePalette;
+                }
             } else {
                 mode = kTextureRgba;
                 texa = !texture->desc.has_alpha || binding.ignore_alpha;
@@ -1518,6 +1525,7 @@ bool CopyTexture(TextureHandle src, Rect src_rect, TextureHandle dst, int32_t ds
         MarkUsed(src_texture);
         MarkUsed(dst_texture);
         Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, VK_FILTER_NEAREST);
+        ForgetContents(dst_texture);
     });
     return true;
 }
@@ -1549,6 +1557,7 @@ bool BlitTexture(TextureHandle src, Rect src_rect, TextureHandle dst, Rect dst_r
         MarkUsed(src_texture);
         MarkUsed(dst_texture);
         Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, vk_filter);
+        ForgetContents(dst_texture);
     });
     return true;
 }
