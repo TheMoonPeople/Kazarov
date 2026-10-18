@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -217,7 +218,15 @@ struct PushConstants {
     uint32_t flags;
     uint32_t alpha; // ref 0-7, func 8-10, fix 16-23, ta0 24-31
     uint32_t fog_color;
+    // The fragment shader's per-draw choices as values it can select between without branching
+    // (draw.frag): only it reads these, so the vertex shaders' blocks end at fog_color.
+    uint32_t alpha_pass; // which of less, equal, greater (bits 0-2) pass the alpha test
+    uint32_t pad;
+    float    fog[4];   // the fog colour as unpackUnorm4x8 gives it; a: 1 when the draw is fogged
+    float    blend[4]; // x: 1 when C is FIX, y: FIX / 0x80, z: 1 for transform 1, w: 1 for transform 2
+    float    target[4]; // x: 1 when the target has no alpha, y: TA0 / 0x80
 };
+static_assert(sizeof(PushConstants) == 112 && offsetof(PushConstants, fog) == 64);
 
 enum PushFlags : uint32_t {
     kPushFog = 1u << 0,

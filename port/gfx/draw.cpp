@@ -353,6 +353,24 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     push.alpha = state.alpha_ref | (static_cast<uint32_t>(state.alpha_func) & 7) << 8 |
                  static_cast<uint32_t>(state.alpha.fix) << 16 | static_cast<uint32_t>(state.texa_ta0) << 24;
     push.fog_color = state.fog_color[0] | state.fog_color[1] << 8 | state.fog_color[2] << 16;
+    // The same values the shader would compute from flags, alpha and fog_color: unpackUnorm4x8 is a
+    // multiply by 1/255, and the divisions by 0x80 are exact.
+    for (int i = 0; i < 3; i++) {
+        push.fog[i] = static_cast<float>(state.fog_color[i]) * (1.0f / 255.0f);
+    }
+    push.fog[3] = state.fog ? 1.0f : 0.0f;
+    push.blend[0] = blend.fix ? 1.0f : 0.0f;
+    push.blend[1] = static_cast<float>(state.alpha.fix) / 128.0f;
+    push.blend[2] = blend.transform == 1 ? 1.0f : 0.0f;
+    push.blend[3] = blend.transform == 2 ? 1.0f : 0.0f;
+    push.target[0] = target.has_alpha ? 0.0f : 1.0f;
+    push.target[1] = static_cast<float>(state.texa_ta0) / 128.0f;
+    push.target[2] = 0.0f;
+    push.target[3] = 0.0f;
+    // AlphaFunc's order: never, always, less, lequal, equal, gequal, greater, notequal.
+    constexpr uint32_t kAlphaPass[8] = {0b000, 0b111, 0b001, 0b011, 0b010, 0b110, 0b100, 0b101};
+    push.alpha_pass = kAlphaPass[static_cast<uint32_t>(state.alpha_func) & 7];
+    push.pad = 0;
     vkCmdPushConstants(cmd, PipelineLayoutOf(family), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(push), &push);
 

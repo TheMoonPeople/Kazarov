@@ -19,6 +19,13 @@ layout(push_constant, std430) uniform Push {
     uint flags;
     uint alpha; // ref 0-7, func 8-10, fix 16-23, ta0 24-31
     uint fog_color;
+    // flags, alpha and fog_color as values to select between: a uniform branch costs NAK (the
+    // Switch's NVK) an ssy/bra/sync and padding each, which on Maxwell outweighed the work it skipped.
+    uint  alpha_pass; // the alpha test's result for less, equal, greater (bits 0-2)
+    uint  pad;
+    vec4  fog;    // the colour as unpackUnorm4x8 gives it; a: 1 when fogged
+    vec4  blend;  // x: 1 when C is FIX, y: FIX / 0x80, z: 1 for transform 1, w: 1 for transform 2
+    vec4  target; // x: 1 when the target has no alpha, y: TA0 / 0x80
 }
 pc;
 
@@ -76,43 +83,29 @@ vec4 SamplePalette() {
 // TEXA expands alpha per texel before filtering too: with AEM a filtered edge between black and
 // coloured texels fades out instead of taking TA0 throughout.
 vec4 SampleRgba() {
-    vec4 t = texture(TEXTURE, v_uv);
-    if ((pc.flags & kTexa) != 0u) {
-        float ta0 = float(pc.alpha >> 24) / 128.0;
-        bool  aem = (pc.flags & kAem) != 0u;
-        if (aem && (pc.flags & kLinear) != 0u) {
-            vec2 corner = FootprintCorner();
-            vec4 sum    = textureGather(TEXTURE, corner, 0) + textureGather(TEXTURE, corner, 1) + textureGather(TEXTURE, corner, 2);
-            t.a      = Bilerp(vec4(greaterThan(sum, vec4(0.0))) * ta0, Footprint());
-        } else {
-            t.a = aem && t.r + t.g + t.b == 0.0 ? 0.0 : ta0;
-        }
+    vec4  t   = texture(TEXTURE, v_uv);
+    float ta0 = pc.target.y;
+    bool  aem = (pc.flags & kAem) != 0u;
+    if ((pc.flags & (kTexa | kAem | kLinear)) == (kTexa | kAem | kLinear)) {
+        vec2 corner = FootprintCorner();
+        vec4 sum    = textureGather(TEXTURE, corner, 0) + textureGather(TEXTURE, corner, 1) + textureGather(TEXTURE, corner, 2);
+        t.a         = Bilerp(vec4(greaterThan(sum, vec4(0.0))) * ta0, Footprint());
+    } else {
+        // Both sides evaluated and combined as integers: && is a branch to NAK.
+        bool  black = t.r + t.g + t.b == 0.0;
+        float texa  = mix(ta0, 0.0, (uint(aem) & uint(black)) != 0u);
+        t.a        = mix(t.a, texa, (pc.flags & kTexa) != 0u);
     }
     return t;
 }
 
+// The function's verdict on less, equal and greater is a bit each of alpha_pass, so the test
+// takes no branch per function.
 bool AlphaPasses(float alpha) {
     int  value = int(alpha * 128.0 + 0.5);
     int  ref   = int(pc.alpha & 0xFFu);
-    uint func  = (pc.alpha >> 8) & 7u;
-    switch (func) {
-        case 0u:
-            return false;
-        case 1u:
-            return true;
-        case 2u:
-            return value < ref;
-        case 3u:
-            return value <= ref;
-        case 4u:
-            return value == ref;
-        case 5u:
-            return value >= ref;
-        case 6u:
-            return value > ref;
-        default:
-            return value != ref;
-    }
+    uint order = value < ref ? 0u : value == ref ? 1u : 2u;
+    return ((pc.alpha_pass >> order) & 1u) != 0u;
 }
 
 void main() {
@@ -126,17 +119,15 @@ void main() {
         color  = vec4(t.rgb * v_color.rgb * kModulate, t.a * v_color.a * kModulate);
     }
 
-    if ((pc.flags & kFog) != 0u) {
-        color.rgb = mix(unpackUnorm4x8(pc.fog_color).rgb, color.rgb, v_fog);
-    }
+    color.rgb = mix(color.rgb, mix(pc.fog.rgb, color.rgb, v_fog), bvec3(pc.fog.a != 0.0));
 
     if (kAlphaTest && !AlphaPasses(color.a)) {
         discard;
     }
 
-    float factor    = (pc.flags & kFactorFix) != 0u ? float((pc.alpha >> 16) & 0xFFu) / 128.0 : color.a;
-    uint  transform = (pc.flags >> kTransformShift) & 3u;
-    vec3  rgb       = transform == 1u ? color.rgb * (1.0 + factor) : transform == 2u ? vec3(factor) : color.rgb;
-    o_color         = vec4(rgb, (pc.flags & kOpaqueTarget) != 0u ? 1.0 : color.a);
-    o_factor        = vec4(factor);
+    float factor = mix(color.a, pc.blend.y, pc.blend.x != 0.0);
+    vec3  rgb    = mix(color.rgb, color.rgb * (1.0 + factor), bvec3(pc.blend.z != 0.0));
+    rgb          = mix(rgb, vec3(factor), bvec3(pc.blend.w != 0.0));
+    o_color      = vec4(rgb, mix(color.a, 1.0, pc.target.x != 0.0));
+    o_factor     = vec4(factor);
 }
