@@ -13,7 +13,15 @@
 
 namespace gfx::detail {
 
+// Submission slots, each with its fence. A game tick submits twice (its canonical render, then the
+// present), so two slots keep one tick in flight: the CPU waits for the GPU's last tick before
+// recording the next. The Switch's GPU is slow enough that this serialises the two, so it keeps two
+// ticks in flight. ReadDepth's results then come a tick later.
+#ifdef __SWITCH__
+inline constexpr uint32_t kFramesInFlight = 4;
+#else
 inline constexpr uint32_t kFramesInFlight = 2;
+#endif
 // Descriptor slots in the bindless array; a handle's low 16 bits are its slot.
 inline constexpr uint32_t kMaxTextures = 8192;
 inline constexpr uint32_t kBaseSamplerCount = 8;
