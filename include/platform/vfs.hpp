@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <span>
@@ -183,6 +184,11 @@ std::shared_ptr<const Mount> OpenDirectories(const std::vector<std::filesystem::
  * Mounts one directory tree.
  */
 std::shared_ptr<const Mount> OpenDirectory(const std::filesystem::path &root, bool unique = false);
+
+/**
+ * Layers mounts into one tree; later mounts win on names that differ only by ASCII case and can add new names.
+ */
+std::shared_ptr<const Mount> Overlay(std::initializer_list<std::shared_ptr<const Mount>> layers);
 
 /**
  * Refers to one host file by path, whether or not it exists yet.

@@ -263,6 +263,142 @@ private:
 };
 
 /**
+ * Layers mounts; later layers win on the same folded name and can add names absent below.
+ */
+class OverlayMount final : public Mount {
+public:
+    explicit OverlayMount(std::vector<std::shared_ptr<const Mount>> mounts) : mounts_(std::move(mounts)) {
+        for (const auto &mount : mounts_) {
+            if (!mount) {
+                continue;
+            }
+            for (std::size_t index = 0; index < mount->Count(); ++index) {
+                Assign(mount, index, mount->Name(index));
+            }
+        }
+    }
+
+    std::size_t Count() const override {
+        const std::shared_lock lock(mutex_);
+        return slots_.size();
+    }
+
+    std::string Name(std::size_t index) const override {
+        const std::shared_lock lock(mutex_);
+        return slots_.at(index).name;
+    }
+
+    std::string Display(std::size_t index) const override {
+        const auto slot = SlotAt(index);
+        return slot.mount->Display(slot.index);
+    }
+
+    std::optional<std::size_t> Find(std::string_view relative) const override {
+        if (!SafeRelative(relative)) {
+            return std::nullopt;
+        }
+        for (auto mount = mounts_.rbegin(); mount != mounts_.rend(); ++mount) {
+            if (!*mount) {
+                continue;
+            }
+            if (const auto index = (*mount)->Find(relative)) {
+                return Assign(*mount, *index, std::string(relative));
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::uint64_t> Size(std::size_t index) const override {
+        const auto slot = SlotAt(index);
+        return slot.mount->Size(slot.index);
+    }
+
+    bool Read(std::size_t index, std::vector<std::uint8_t> &bytes, std::uint64_t max_bytes) const override {
+        const auto slot = SlotAt(index);
+        return slot.mount->Read(slot.index, bytes, max_bytes);
+    }
+
+    bool ReadInto(std::size_t index, void *buffer, std::size_t size) const override {
+        const auto slot = SlotAt(index);
+        return slot.mount->ReadInto(slot.index, buffer, size);
+    }
+
+    bool ReadPrefix(std::size_t index, std::span<std::uint8_t> out) const override {
+        const auto slot = SlotAt(index);
+        return slot.mount->ReadPrefix(slot.index, out);
+    }
+
+    std::string Stamp(std::size_t index) const override {
+        const auto slot = SlotAt(index);
+        return slot.mount->Stamp(slot.index);
+    }
+
+    std::optional<StoredRange> Stored(std::size_t index) const override {
+        const auto slot = SlotAt(index);
+        return slot.mount->Stored(slot.index);
+    }
+
+    std::optional<fs::path> HostPath(std::size_t index) const override {
+        const auto slot = SlotAt(index);
+        return slot.mount->HostPath(slot.index);
+    }
+
+    std::vector<Member> List(std::string_view directory) const override {
+        std::unordered_map<std::string, Member> members;
+        for (const auto &mount : mounts_) {
+            if (!mount) {
+                continue;
+            }
+            for (const auto &member : mount->List(directory)) {
+                members.insert_or_assign(FoldKey(member.name), member);
+            }
+        }
+        std::vector<Member> result;
+        result.reserve(members.size());
+        for (auto &[key, member] : members) {
+            result.push_back(std::move(member));
+        }
+        return result;
+    }
+
+private:
+    struct Slot {
+        std::string                  name;
+        std::shared_ptr<const Mount> mount;
+        std::size_t                  index = 0;
+    };
+
+    struct SlotRef {
+        std::shared_ptr<const Mount> mount;
+        std::size_t                  index = 0;
+    };
+
+    SlotRef SlotAt(std::size_t overlay_index) const {
+        const std::shared_lock lock(mutex_);
+        const auto &slot = slots_.at(overlay_index);
+        return {slot.mount, slot.index};
+    }
+
+    std::size_t Assign(const std::shared_ptr<const Mount> &mount, std::size_t index, std::string name) const {
+        const auto key = FoldKey(name);
+        std::unique_lock           lock(mutex_);
+        if (const auto found = keys_.find(key); found != keys_.end()) {
+            slots_[found->second] = Slot{std::move(name), mount, index};
+            return found->second;
+        }
+        const std::size_t overlay_index = slots_.size();
+        slots_.push_back(Slot{std::move(name), mount, index});
+        keys_.emplace(key, overlay_index);
+        return overlay_index;
+    }
+
+    std::vector<std::shared_ptr<const Mount>>            mounts_;
+    mutable std::shared_mutex                            mutex_;
+    mutable std::vector<Slot>                            slots_;
+    mutable std::unordered_map<std::string, std::size_t> keys_;
+};
+
+/**
  * Serves one host file, which may not exist yet.
  */
 class HostFileMount final : public Mount {
@@ -407,6 +543,10 @@ std::shared_ptr<const Mount> OpenDirectories(const std::vector<fs::path> &roots,
 
 std::shared_ptr<const Mount> OpenDirectory(const fs::path &root, bool unique) {
     return OpenDirectories({root}, unique);
+}
+
+std::shared_ptr<const Mount> Overlay(std::initializer_list<std::shared_ptr<const Mount>> layers) {
+    return std::make_shared<OverlayMount>(std::vector(layers));
 }
 
 Ref HostFile(const fs::path &path) {
