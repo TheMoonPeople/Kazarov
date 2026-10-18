@@ -60,6 +60,31 @@ void ClearDepth(VkCommandBuffer cmd, Image &image) {
     ToRest(cmd, image);
 }
 
+// Zeroed, as the image is cleared.
+void KeepContents(Texture &texture) {
+    uint32_t texel = TexelSize(texture.desc.format);
+    texture.contents.resize(texture.desc.mip_levels);
+    for (uint32_t mip = 0; mip < texture.desc.mip_levels; mip++) {
+        uint32_t width = std::max(1u, texture.desc.width >> mip);
+        uint32_t height = std::max(1u, texture.desc.height >> mip);
+        texture.contents[mip].assign(static_cast<size_t>(width) * height * texel, 0);
+    }
+}
+
+// The expansions made from a texture, once nothing draws it any more.
+void ForgetExpansions(TextureHandle handle) {
+    for (auto it = g.expansions.begin(); it != g.expansions.end();) {
+        if (static_cast<TextureHandle>(it->first >> 32) == handle ||
+            static_cast<TextureHandle>(it->first) == handle) {
+            TextureHandle rgba = it->second.rgba;
+            it = g.expansions.erase(it);
+            DestroyDoomedTexture(rgba);
+        } else {
+            ++it;
+        }
+    }
+}
+
 uint32_t AllocateTextureSlot() {
     if (!g.free_texture_slots.empty()) {
         uint32_t slot = g.free_texture_slots.back();
@@ -476,6 +501,7 @@ void DestroyDoomedTexture(TextureHandle handle) {
     }
     Image image = texture.image;
     Image depth = texture.depth;
+    texture.contents = {};
     texture.live = false;
     texture.doomed = false;
     texture.image = {};
@@ -486,6 +512,7 @@ void DestroyDoomedTexture(TextureHandle handle) {
         DestroyImage(depth);
         g.free_texture_slots.push_back(slot);
     });
+    ForgetExpansions(handle);
 }
 
 void DestroyDoomedMesh(MeshHandle handle) {
@@ -535,6 +562,11 @@ TextureHandle CreateTexture(const TextureDesc &desc) {
     texture.logical_width = desc.width;
     texture.logical_height = desc.height;
     texture.last_draw_use = 0;
+    texture.contents.clear();
+    texture.contents_version = 0;
+    if (g.config.expand_palettes && desc.format == TextureFormat::Index8) {
+        KeepContents(texture);
+    }
     texture.image = CreateImage(desc.width, desc.height, desc.mip_levels, VulkanFormat(desc.format),
                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -543,7 +575,14 @@ TextureHandle CreateTexture(const TextureDesc &desc) {
     return MakeHandle(texture.generation, slot);
 }
 
-TextureHandle CreatePalette() { return CreateTexture(TextureDesc{256, 1, TextureFormat::Rgba8, 1, true}); }
+TextureHandle CreatePalette() {
+    TextureHandle palette = CreateTexture(TextureDesc{256, 1, TextureFormat::Rgba8, 1, true});
+    Texture      *texture = LookupTexture(palette);
+    if (texture != nullptr && g.config.expand_palettes) {
+        KeepContents(*texture);
+    }
+    return palette;
+}
 
 TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height, bool has_alpha,
                                  bool share_main_depth, bool frame_target) {
@@ -580,6 +619,8 @@ TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height
     texture.logical_width = logical_width;
     texture.logical_height = logical_height;
     texture.last_draw_use = 0;
+    texture.contents.clear();
+    texture.contents_version = 0;
     texture.image = CreateTargetImage(width, height);
     VkCommandBuffer cmd = UploadCommands();
     ClearImage(cmd, texture.image,
@@ -670,6 +711,15 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
         return true;
     }
 
+    if (!texture->contents.empty()) {
+        uint8_t *contents = texture->contents[mip].data();
+        for (uint32_t i = 0; i < h; i++) {
+            std::memcpy(contents + (static_cast<size_t>(y + i) * mip_width + x) * texel,
+                        static_cast<const uint8_t *>(pixels) + static_cast<size_t>(i) * stride, row);
+        }
+        texture->contents_version++;
+    }
+
     TransientSpan staging = AllocateTransient(static_cast<VkDeviceSize>(row) * h, 16);
     for (uint32_t i = 0; i < h; i++) {
         std::memcpy(staging.data + static_cast<size_t>(i) * row,
@@ -689,7 +739,89 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
     return true;
 }
 
+// A pair that changes again this soon after its last expansion counts as churning; churning this
+// often, it keeps the shader lookup for kChurnRest frames before it is tried again.
+constexpr uint64_t kChurnFrames = 60;
+constexpr uint32_t kChurnLimit = 3;
+constexpr uint64_t kChurnRest = 600;
+// Texels expanded in a frame beyond the first pair, so a scene's first frame spreads its expansions
+// over the next few instead of stalling on them.
+constexpr size_t kExpansionBudget = 1 << 20;
+
 } // namespace
+
+TextureHandle detail::PaletteExpansion(TextureHandle index_handle, TextureHandle palette_handle) {
+    const Texture *index = LookupTexture(index_handle);
+    const Texture *palette = LookupTexture(palette_handle);
+    if (index == nullptr || palette == nullptr || index->contents.empty() || palette->contents.empty()) {
+        return kNullTexture;
+    }
+    Expansion &expansion = g.expansions[static_cast<uint64_t>(index_handle) << 32 | palette_handle];
+    Texture   *rgba = LookupTexture(expansion.rgba);
+    if (rgba != nullptr && expansion.index_version == index->contents_version &&
+        expansion.palette_version == palette->contents_version) {
+        return expansion.rgba;
+    }
+    // Drawn earlier this frame, the expansion holds what those draws need until the frame ends.
+    if (g.frame_serial < expansion.lookup_until || (rgba != nullptr && rgba->last_draw_use == g.frame_serial)) {
+        return kNullTexture;
+    }
+    if (rgba != nullptr) {
+        expansion.churn = g.frame_serial - expansion.expanded < kChurnFrames ? expansion.churn + 1 : 0;
+        if (expansion.churn >= kChurnLimit) {
+            expansion.churn = 0;
+            expansion.lookup_until = g.frame_serial + kChurnRest;
+            return kNullTexture;
+        }
+    }
+    if (g.expansion_frame != g.frame_serial) {
+        g.expansion_frame = g.frame_serial;
+        g.expansion_texels = 0;
+    }
+    size_t texels = static_cast<size_t>(index->desc.width) * index->desc.height;
+    if (g.expansion_texels != 0 && g.expansion_texels + texels > kExpansionBudget) {
+        return kNullTexture;
+    }
+    g.expansion_texels += texels;
+
+    TextureHandle rgba_handle = expansion.rgba;
+    if (rgba == nullptr) {
+        TextureDesc desc = index->desc;
+        desc.format = TextureFormat::Rgba8;
+        desc.has_alpha = true;
+        rgba_handle = CreateTexture(desc);
+        if (rgba_handle == kNullTexture) {
+            return kNullTexture;
+        }
+        // Creating it may have moved the textures and the expansions.
+        index = LookupTexture(index_handle);
+        palette = LookupTexture(palette_handle);
+    }
+    const auto           *colors = reinterpret_cast<const uint32_t *>(palette->contents[0].data());
+    std::vector<uint32_t> texels_rgba;
+    for (uint32_t mip = 0; mip < index->contents.size(); mip++) {
+        const std::vector<uint8_t> &indices = index->contents[mip];
+        texels_rgba.resize(indices.size());
+        for (size_t i = 0; i < indices.size(); i++) {
+            texels_rgba[i] = colors[indices[i]];
+        }
+        UpdateTextureImpl(rgba_handle, mip, 0, 0, std::max(1u, index->desc.width >> mip),
+                          std::max(1u, index->desc.height >> mip), texels_rgba.data(), 0, false);
+    }
+    Expansion &made = g.expansions[static_cast<uint64_t>(index_handle) << 32 | palette_handle];
+    made.rgba = rgba_handle;
+    made.index_version = index->contents_version;
+    made.palette_version = palette->contents_version;
+    made.expanded = g.frame_serial;
+    return rgba_handle;
+}
+
+void detail::ForgetContents(Texture *texture) {
+    if (texture != nullptr && !texture->contents.empty()) {
+        texture->contents = {};
+        texture->contents_version++;
+    }
+}
 
 bool UpdateTexture(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                    const void *pixels, uint32_t row_length) {

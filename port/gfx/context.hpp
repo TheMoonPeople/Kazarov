@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gfx.hpp"
@@ -111,6 +112,20 @@ struct Texture {
     uint64_t last_draw_use = 0;
     // Destroyed while a list that may draw it was recorded: dead to the API, alive to replays.
     bool doomed = false;
+    // RendererConfig::expand_palettes, for index textures and palettes: the texels last uploaded,
+    // mip by mip, and a count of the uploads. Empty once the image is written any other way.
+    std::vector<std::vector<uint8_t>> contents;
+    uint32_t                          contents_version = 0;
+};
+
+// An index texture and palette pair's RGBA expansion (RendererConfig::expand_palettes).
+struct Expansion {
+    TextureHandle rgba = kNullTexture;
+    uint32_t      index_version = 0;
+    uint32_t      palette_version = 0;
+    uint64_t      expanded = 0; // frame serial
+    uint32_t      churn = 0;    // re-expansions each soon after the last
+    uint64_t      lookup_until = 0; // frame serial before which the pair keeps the shader lookup
 };
 
 struct Mesh {
@@ -319,6 +334,9 @@ struct Context {
     std::vector<Texture>                              textures;
     std::map<std::string, TextureHandle, std::less<>> named_targets;
     std::vector<uint32_t>                             free_texture_slots;
+    std::unordered_map<uint64_t, Expansion>           expansions; // by index texture << 32 | palette
+    uint64_t                                          expansion_frame = 0;
+    size_t                                            expansion_texels = 0; // in expansion_frame
     std::vector<Mesh>                                 meshes;
     std::vector<uint32_t>                             free_mesh_slots;
 
@@ -406,6 +424,11 @@ LogicalMapping TextureMapping(const Texture &texture);
 bool           FrameShaped(const Texture &texture);
 // What DestroyTexture and DestroyMesh do once no list may draw the resource any more.
 void DestroyDoomedTexture(TextureHandle handle);
+// The RGBA expansion to draw the pair from, made or remade now if it must be; kNullTexture keeps
+// the shader lookup. May add texture slots, so earlier Texture pointers are stale after it.
+TextureHandle PaletteExpansion(TextureHandle index, TextureHandle palette);
+// The image was written other than by an upload: no expansion is made from it any more.
+void ForgetContents(Texture *texture);
 void DestroyDoomedMesh(MeshHandle handle);
 
 // pipelines.cpp

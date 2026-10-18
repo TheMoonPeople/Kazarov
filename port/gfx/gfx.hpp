@@ -93,6 +93,10 @@ struct RendererConfig {
     bool separate_stencil_masks = true;
     // Also precompiles the Vu_prog0 pipelines, and the set 2 layout, that DrawMeshProg0 needs (Dark Chronicle).
     bool prog0_meshes = false;
+    // Draws an index texture from an RGBA expansion of it and its palette, made on the CPU when
+    // either changes, so the sampler filters it instead of the shader looking the palette up four
+    // times a pixel. For GPUs where that lookup is the frame's cost (the Switch's).
+    bool expand_palettes = false;
 };
 
 // What RendererInit settled on, from the config and the device.
