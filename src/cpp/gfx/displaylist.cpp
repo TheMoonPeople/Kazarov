@@ -860,7 +860,8 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
             continue;
         }
         const MeshRecord &record = list.records[mesh->record];
-        if (!record.has_transform) {
+        // Fixed auxiliary passes must retain their recorded camera as well as their model.
+        if (!record.has_transform || record.no_interpolation) {
             continue;
         }
         Mat4    model = record.model;
@@ -1234,7 +1235,13 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         Clear(e.color, e.rgba, e.depth, e.z, rect);
                     }
                 } else if constexpr (std::is_same_v<T, TargetEntry>) {
-                    SetRenderTarget(canonical ? e.target : GrabbedTwin(e.target));
+                    // A display replay must not clear or draw into a canonical cached target.
+                    TextureHandle target = e.target;
+                    if (!canonical && target != kMainTarget && target != kPreviousFrame) {
+                        TextureHandle twin = ActivateGrabTwin(target);
+                        if (twin != kNullTexture) target = twin;
+                    }
+                    SetRenderTarget(target);
                 } else if (canonical) {
                     if constexpr (std::is_same_v<T, CopyEntry>) {
                         if (e.kind == CopyEntry::Copy) {
