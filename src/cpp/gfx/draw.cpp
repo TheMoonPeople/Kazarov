@@ -1307,8 +1307,9 @@ void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint3
         if (!vertices.empty() && !indices.empty()) {
             MeshEntry entry{kNullMesh, 0, 0, {}, {}, constants, binding, state, 0};
             entry.index_count = static_cast<uint32_t>(indices.size());
+            entry.vertices.assign(vertices.begin(), vertices.end());
             entry.indices.assign(indices.begin(), indices.end());
-            RecordImmediateMesh(std::move(entry), vertices, transform, prog0);
+            RecordMesh(std::move(entry), transform, prog0);
         }
         return;
     }
@@ -1319,23 +1320,8 @@ void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint3
         return;
     }
     VkCommandBuffer cmd = DrawCommands();
-    // A replayed list's draws that share their vertices (DisplayList's shared_vertices) pass the same
-    // array, which is uploaded once a frame.
-    static struct {
-        const Vertex3D *data = nullptr;
-        size_t          size = 0;
-        uint64_t        frame = 0;
-        TransientSpan   span = {};
-    } last_upload;
-    TransientSpan vertex_data;
-    if (g.replaying && last_upload.data == vertices.data() && last_upload.size == vertices.size() &&
-        last_upload.frame == g.frame_serial) {
-        vertex_data = last_upload.span;
-    } else {
-        vertex_data = AllocateTransient(vertices.size_bytes(), sizeof(float));
-        std::memcpy(vertex_data.data, vertices.data(), vertices.size_bytes());
-        last_upload = {g.replaying ? vertices.data() : nullptr, vertices.size(), g.frame_serial, vertex_data};
-    }
+    TransientSpan   vertex_data = AllocateTransient(vertices.size_bytes(), sizeof(float));
+    std::memcpy(vertex_data.data, vertices.data(), vertices.size_bytes());
     TransientSpan index_data = AllocateTransient(indices.size_bytes(), sizeof(uint32_t));
     std::memcpy(index_data.data, indices.data(), indices.size_bytes());
     BindConstants(PipelineLayoutOf(family), constants, family > kFamilyMesh ? prog0 : nullptr);
