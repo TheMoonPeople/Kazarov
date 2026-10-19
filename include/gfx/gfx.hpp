@@ -69,8 +69,12 @@ struct RendererConfig {
     float display_aspect = 4.0f / 3.0f; // width / height the logical frame is shown at
     PresentMode           present_mode = PresentMode::Fifo;
     std::filesystem::path pipeline_cache = "save/pipeline_cache.bin";
-    // Pixels per logical texel of render targets; 0 derives it from the window height at init.
+    // The main targets' size over the window's, which also multiplies the render targets' scale;
+    // 0 is 1.
     float       render_scale = 0.0f;
+    // Pixels per logical texel of render targets at a render scale of 1; 0 rounds the window
+    // height over the logical height (720 / 480 to 2).
+    float       target_scale = 0.0f;
     FrameLayout layout;
 #ifdef NDEBUG
     bool validation = false;

@@ -978,6 +978,14 @@ void CreateMainTargets() {
     vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
 }
 
+// Render targets' pixels per logical texel before the render scale multiplies them.
+float BaseTargetScale() {
+    if (g.config.target_scale > 0.0f) {
+        return g.config.target_scale;
+    }
+    return std::max(1.0f, std::round(static_cast<float>(g.swapchain.extent.height) / g.config.logical_height));
+}
+
 void RecreateScaledMainTargets() {
     if (g.offscreen || g.device == VK_NULL_HANDLE) {
         return;
@@ -1095,9 +1103,7 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
     }
     g.render_scale_factor = config.render_scale > 0.0f ? config.render_scale : 1.0f;
     CreateMainTargets();
-    g.render_scale = std::max(1.0f, std::round(static_cast<float>(g.swapchain.extent.height) /
-                                               g.config.logical_height)) *
-                     g.render_scale_factor;
+    g.render_scale = BaseTargetScale() * g.render_scale_factor;
     CreatePipelines();
 }
 
@@ -1542,9 +1548,7 @@ void SetRenderScale(float scale) {
         return;
     }
     g.render_scale_factor = scale;
-    g.render_scale = std::max(1.0f, std::round(static_cast<float>(g.swapchain.extent.height) /
-                                               g.config.logical_height)) *
-                     g.render_scale_factor;
+    g.render_scale = BaseTargetScale() * g.render_scale_factor;
     if (g.device == VK_NULL_HANDLE) {
         return;
     }
