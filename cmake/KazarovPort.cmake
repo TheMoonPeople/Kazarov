@@ -92,6 +92,18 @@ function(kz_port_host_library target)
         # A second host library in the same project would declare the same outputs.
         set_property(GLOBAL PROPERTY KZ_PORT_SHADERS_DEFINED ON)
     endif()
+    # The interpolation tint (KZ_INTERPOLATION_TINT=1) costs every pixel of every draw a few
+    # instructions; on the Switch's GPU that was a third of a frame in a busy town.
+    if(NINTENDO_SWITCH)
+        set(kz_tint_default OFF)
+    else()
+        set(kz_tint_default ON)
+    endif()
+    option(KZ_PORT_INTERPOLATION_TINT "Build the interpolation tint into the draw shader" ${kz_tint_default})
+    set(shader_defines "")
+    if(KZ_PORT_INTERPOLATION_TINT)
+        list(APPEND shader_defines -DKZ_INTERPOLATION_TINT)
+    endif()
     foreach(shader IN LISTS shader_sources)
         get_filename_component(shader_name ${shader} NAME)
         string(REPLACE "." "_" shader_symbol ${shader_name})
@@ -99,7 +111,7 @@ function(kz_port_host_library target)
         list(APPEND shader_headers ${header})
         if(NOT shaders_defined)
             add_custom_command(OUTPUT ${header}
-                COMMAND ${GLSLANG_VALIDATOR} -V --target-env ${shader_env} --quiet --vn ${shader_symbol}
+                COMMAND ${GLSLANG_VALIDATOR} -V --target-env ${shader_env} --quiet --vn ${shader_symbol} ${shader_defines}
                     --depfile ${header}.d -o ${header} ${shader}
                 DEPENDS ${shader}
                 DEPFILE ${header}.d
