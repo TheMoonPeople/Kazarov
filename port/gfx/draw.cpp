@@ -314,7 +314,9 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     EnsureRendering(target);
     VkCommandBuffer cmd = DrawCommands();
 
-    BlendMapping blend = MapBlend(state.alpha, state.blend);
+    // The shader writes As as the factor when C is not FIX, which premultiplied takes as its own.
+    BlendMapping blend = state.blend && state.premultiplied ? BlendMapping{g.premultiplied_slot, kSourceColor, false}
+                                                            : MapBlend(state.alpha, state.blend);
     uint32_t     pipeline = !g.dynamic_color_write_mask && state.color_write_mask == 0
                                 ? NoColorPipelineIndex(family, mode, state.alpha_test)
                                 : PipelineIndex(family, blend.slot, mode, state.alpha_test);
