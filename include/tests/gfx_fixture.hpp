@@ -25,16 +25,20 @@ inline bool OffscreenByDefault() {
 
 // What a fixture changes in gfx::RendererConfig beyond its size and scale.
 struct GfxOptions {
-    bool dynamic_color_write_mask = true;
-    bool offscreen = OffscreenByDefault();
-    bool triangle_fans = true;
-    bool separate_stencil_masks = true;
-    bool prog0_meshes = false;
+    float frame_scale =
+        1.0f; /**< Frame-resolution fraction requested by the fixture. */
+    bool                  dynamic_color_write_mask = true;
+    bool                  offscreen = OffscreenByDefault();
+    bool                  triangle_fans = true;
+    bool                  separate_stencil_masks = true;
+    bool                  prog0_meshes = false;
     uint32_t              texture_slots = 0;
     uint32_t              mesh_slots = 0;
     float                 logical_width = 640.0f;
     float                 logical_height = 480.0f;
-    std::filesystem::path pipeline_cache = std::filesystem::temp_directory_path() / "dc_gfx_test" / "pipeline_cache.bin";
+    std::filesystem::path pipeline_cache =
+        std::filesystem::temp_directory_path() / "dc_gfx_test" /
+        "pipeline_cache.bin";
 };
 
 // A headless window and renderer with validation on. Any validation message fails the test.
@@ -60,6 +64,7 @@ struct GfxFixture {
         config.display_aspect = 4.0f / 3.0f;
         config.validation = true;
         config.render_scale = render_scale;
+        config.frame_scale = options.frame_scale;
         config.dynamic_color_write_mask = options.dynamic_color_write_mask;
         config.offscreen = options.offscreen;
         config.triangle_fans = options.triangle_fans;

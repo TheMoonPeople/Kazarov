@@ -593,15 +593,32 @@ bool ResizeOffscreen() {
     return true;
 }
 
-// The main targets follow the swapchain's size, losing their contents.
+/**
+ * Returns the requested frame extent within the device image-size limit.
+ */
+VkExtent2D FrameExtent() {
+    const float scale = g.config.frame_scale;
+    const auto  limit = g.properties.limits.maxImageDimension2D;
+    const auto  dimension = [scale, limit](uint32_t size) {
+        return static_cast<uint32_t>(
+            std::clamp(std::round(static_cast<double>(size) * scale), 1.0,
+                       static_cast<double>(limit)));
+    };
+    return {dimension(g.swapchain.extent.width),
+            dimension(g.swapchain.extent.height)};
+}
+
+// The main targets follow the requested frame extent, losing their contents.
 void SyncMainTargets() {
     const Image &main = g.main_color[0];
-    if (main.width != g.swapchain.extent.width || main.height != g.swapchain.extent.height) {
+    const VkExtent2D extent = FrameExtent();
+    if (main.width != extent.width || main.height != extent.height) {
         vkDeviceWaitIdle(g.device);
         DestroyMainTargets();
         CreateMainTargets();
         RecreateSharedTargets();
         RecreateRenderTargets();
+        g.canonical_newest = false;
     }
 }
 
@@ -826,12 +843,14 @@ Image &CurrentMainColor() { return g.main_color[g.main_current]; }
 Image &PreviousMainColor() { return g.main_color[g.main_current ^ 1]; }
 
 void CreateMainTargets() {
-    uint32_t width = g.swapchain.extent.width;
-    uint32_t height = g.swapchain.extent.height;
+    const VkExtent2D extent = FrameExtent();
+    uint32_t         width = extent.width;
+    uint32_t         height = extent.height;
     for (Image &image : g.main_color) {
-        image = CreateImage(width, height, 1, kColorFormat,
-                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        image = CreateImage(
+            width, height, 1, kColorFormat,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     }
     g.display_color = CreateImage(width, height, 1, kColorFormat,
                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -912,6 +931,10 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
     g.renderer_instance = ++instances;
     g.window = window;
     g.config = config;
+    if (!std::isfinite(g.config.frame_scale) || g.config.frame_scale < 0.5f ||
+        g.config.frame_scale > 2.0f) {
+        g.config.frame_scale = 1.0f;
+    }
     g.texture_slot_limit = config.texture_slots == 0 ? kMaxTextures : std::min(config.texture_slots, kMaxTextures);
     g.mesh_slot_limit = config.mesh_slots == 0 ? kMaxMeshes : std::min(config.mesh_slots, kMaxMeshes);
     g.offscreen = config.offscreen;
@@ -1118,7 +1141,7 @@ void SubmitWithoutPresent(VkCommandBuffer cmd, Image &main) {
 void PrepareRecording() {
     if (g.resize_pending) {
         RecreateSwapchain();
-    } else if (!g.offscreen) {
+    } else {
         SyncMainTargets();
     }
 }
@@ -1135,6 +1158,7 @@ bool OpenListFrame(bool canonical, bool present, bool base) {
         } else {
             SyncMainTargets();
         }
+        SyncMainTargets();
         return OpenFrame();
     }
     if (present && !g.offscreen && !AcquireImage(false)) {
@@ -1204,11 +1228,13 @@ bool BeginFrame() {
             SubmitUploadsAndWait();
             return false;
         }
+        SyncMainTargets();
         return OpenFrame();
     }
     if (!AcquireImage(true)) {
         return false;
     }
+    SyncMainTargets();
     return OpenFrame();
 }
 
@@ -1279,6 +1305,12 @@ void SetFrameLayout(const FrameLayout &layout) {
 }
 
 FrameLayout CurrentFrameLayout() { return g.layout; }
+
+void SetFrameScale(float scale) {
+    if (std::isfinite(scale) && scale >= 0.5f && scale <= 2.0f) {
+        g.config.frame_scale = scale;
+    }
+}
 
 void SetRenderScale(float scale) {
     if (scale <= 0.0f || scale == g.render_scale || g.in_frame || g.list != nullptr) {
