@@ -53,6 +53,9 @@ struct MeshEntry {
     DrawState             state;
     uint32_t              record = 0;
     int32_t               prog0 = -1; // index into DisplayList::prog0_blocks, or -1 for a plain draw
+    // An immediate draw with the same vertices as an earlier one (a shadow volume's adding and
+    // subtracting passes): that entry's index in DisplayList::entries, its own vertices left empty.
+    int32_t shared_vertices = -1;
 };
 
 struct ClearEntry {
@@ -143,6 +146,8 @@ struct DisplayList {
     bool                            camera_cut = false;
     // A draw reaches the main target before a clear covers its logical frame, so whatever the
     // target held shows through; a display render starts from the canonical image.
+    // While recording: the last immediate mesh entry that holds its own vertices, or -1.
+    int32_t                                 last_immediate = -1;
     bool                                    needs_base = false;
     bool                                    main_cleared = false;
     std::unordered_map<InterpKey, uint32_t> occurrences;
@@ -164,6 +169,12 @@ void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const 
 // displaylist.cpp
 void RecordEntry(Entry &&entry);
 void RecordMesh(MeshEntry &&entry, const MeshTransform *transform, const Prog0Constants *prog0);
+// An immediate mesh: its vertices are copied, or shared with the last immediate mesh's when they
+// are the same and the draw does not blend its vertices between ticks.
+void RecordImmediateMesh(MeshEntry &&entry, std::span<const Vertex3D> vertices, const MeshTransform *transform,
+                         const Prog0Constants *prog0);
+// The vertices an immediate mesh entry draws.
+const std::vector<Vertex3D> &ImmediateVertices(const DisplayList &list, const MeshEntry &entry);
 void RecordClear(const ClearEntry &entry);
 void RecordDoomedTexture(TextureHandle handle);
 void RecordDoomedMesh(MeshHandle handle);

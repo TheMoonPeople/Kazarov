@@ -890,7 +890,7 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                             DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, e.state);
                         }
                     } else {
-                        const std::vector<Vertex3D> *vertices = &e.vertices;
+                        const std::vector<Vertex3D> *vertices = &ImmediateVertices(list, e);
                         if (overrides != nullptr && overrides->vertex_index[e.record] >= 0) {
                             vertices = &overrides->vertices[overrides->vertex_index[e.record]];
                         }
@@ -1061,6 +1061,30 @@ void RecordMesh(MeshEntry &&entry, const MeshTransform *transform, const Prog0Co
     record.entry = static_cast<uint32_t>(list.entries.size());
     list.records.push_back(record);
     list.entries.push_back(std::move(entry));
+}
+
+void RecordImmediateMesh(MeshEntry &&entry, std::span<const Vertex3D> vertices, const MeshTransform *transform,
+                         const Prog0Constants *prog0) {
+    DisplayList &list = *g.list;
+    if (!g.interp_blend_vertices && list.last_immediate >= 0) {
+        const auto &last = std::get<MeshEntry>(list.entries[static_cast<size_t>(list.last_immediate)]);
+        if (last.vertices.size() == vertices.size() &&
+            std::memcmp(last.vertices.data(), vertices.data(), vertices.size_bytes()) == 0) {
+            entry.shared_vertices = list.last_immediate;
+            RecordMesh(std::move(entry), transform, prog0);
+            return;
+        }
+    }
+    entry.vertices.assign(vertices.begin(), vertices.end());
+    list.last_immediate = static_cast<int32_t>(list.entries.size());
+    RecordMesh(std::move(entry), transform, prog0);
+}
+
+const std::vector<Vertex3D> &ImmediateVertices(const DisplayList &list, const MeshEntry &entry) {
+    if (entry.shared_vertices >= 0) {
+        return std::get<MeshEntry>(list.entries[static_cast<size_t>(entry.shared_vertices)]).vertices;
+    }
+    return entry.vertices;
 }
 
 void RecordClear(const ClearEntry &entry) {
