@@ -160,6 +160,9 @@ void BuildBlendTable() {
             }
         }
     }
+    g_equations.push_back(
+        Equation{VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_OP_ADD, kSourceColor});
+    g.premultiplied_slot = static_cast<uint16_t>(g_equations.size() - 1);
     g.blend_slot_count = static_cast<uint32_t>(g_equations.size());
 }
 

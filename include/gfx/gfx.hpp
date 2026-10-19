@@ -413,6 +413,9 @@ struct DrawState {
     bool      operator==(const DrawState &) const = default;
     bool      blend = false; // GS PRIM.ABE
     GsBlend   alpha;
+    // With blend, Cs + Cd * (1 - As) in place of alpha's equation, which the GS cannot express: a
+    // premultiplied source drawn over the target in one draw where the GS needs two.
+    bool      premultiplied = false;
     DepthTest depth_test = DepthTest::Always;
     bool      depth_write = false;
     bool      alpha_test = false;

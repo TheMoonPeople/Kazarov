@@ -368,6 +368,7 @@ struct Context {
     VkPipelineCache              pipeline_cache = VK_NULL_HANDLE;
     std::vector<VkPipeline>      pipelines;
     uint32_t                     blend_slot_count = 0;
+    uint16_t                     premultiplied_slot = 0; // DrawState::premultiplied's blend state
     std::array<BlendMapping, 81> blend_map = {};
     double                       pipeline_seconds = 0.0;
 
