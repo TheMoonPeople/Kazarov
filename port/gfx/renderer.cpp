@@ -567,6 +567,8 @@ void AdvanceSlot() {
     g.frame_slot = (g.frame_slot + 1) % kFramesInFlight;
     Frame &frame = CurrentFrame();
     WaitFrame(frame);
+    // The oldest frame in flight: nothing newer has been answered yet.
+    HarvestFrameDepthQueries(frame);
     RunDeletions(frame);
     ResetTransients(frame);
     Check(vkResetCommandPool(g.device, frame.pool, 0), "vkResetCommandPool");
@@ -898,6 +900,9 @@ void FinishFrame(Frame &frame) {
     if (g.depth_queries_recorded) {
         WaitFrame(frame);
         HarvestDepthQueries();
+    }
+    if (kAsyncDepthQueries) {
+        HarvestReadyDepthQueries();
     }
     g.main_current ^= 1;
     AdvanceSlot();

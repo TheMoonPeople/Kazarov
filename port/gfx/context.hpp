@@ -165,6 +165,23 @@ struct DepthQuery {
     uint8_t     *data = nullptr;
 };
 
+// A depth query read into a frame's readback buffer, answered once the frame is done
+// (kAsyncDepthQueries).
+struct PendingDepth {
+    uint32_t     id;
+    VkDeviceSize offset;
+    uint32_t     texels;
+};
+
+// The Switch's GPU is the slower side, and a frame that waited for its own depth queries kept the
+// CPU from recording the next tick while the GPU drew this one: there a query is answered when its
+// frame is done, a tick or two later. Elsewhere EndFrame waits, so DepthResult answers this frame.
+#ifdef __SWITCH__
+inline constexpr bool kAsyncDepthQueries = true;
+#else
+inline constexpr bool kAsyncDepthQueries = false;
+#endif
+
 struct Frame {
     VkCommandPool                      pool = VK_NULL_HANDLE;
     VkCommandBuffer                    upload_cmd = VK_NULL_HANDLE;
@@ -178,6 +195,9 @@ struct Frame {
     std::vector<std::function<void()>> deletions;
     // The only buffer the GPU writes for the host; kept apart from the transients, which it reads.
     Buffer depth_readback;
+    // kAsyncDepthQueries: the queries this frame read, and the frame serial they were read in.
+    std::vector<PendingDepth> depth_pending;
+    uint64_t                  depth_serial = 0;
 };
 
 struct Swapchain {
@@ -469,5 +489,9 @@ LogicalRect ExtendRect(LogicalRect rect, uint32_t axes, const LogicalRect &frame
 // readback.cpp
 void RecordDepthQueries(VkCommandBuffer cmd);
 void HarvestDepthQueries();
+// kAsyncDepthQueries: answers the queries of a frame that is done, and of every frame whose fence
+// has passed, in the order they were read.
+void HarvestFrameDepthQueries(Frame &frame);
+void HarvestReadyDepthQueries();
 
 } // namespace gfx::detail

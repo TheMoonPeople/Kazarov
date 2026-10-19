@@ -96,7 +96,9 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         }
         query.queued = false;
         query.recorded = false;
-        query.valid = false;
+        if (!kAsyncDepthQueries) {
+            query.valid = false;
+        }
         float x0 = std::floor(query.rect.x * mapping.scale_x + mapping.offset_x);
         float y0 = std::floor(query.rect.y * mapping.scale_y + mapping.offset_y);
         float x1 = std::ceil((query.rect.x + query.rect.w) * mapping.scale_x + mapping.offset_x);
@@ -106,6 +108,7 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         x1 = std::min(x1, static_cast<float>(depth.width));
         y1 = std::min(y1, static_cast<float>(depth.height));
         if (x1 <= x0 || y1 <= y0) {
+            query.valid = false;
             continue;
         }
         uint32_t width = std::min(static_cast<uint32_t>(x1 - x0), kMaxQuerySide);
@@ -131,6 +134,12 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         region.imageExtent = {width, height, 1};
         vkCmdCopyImageToBuffer(cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1,
                                &region);
+        if (kAsyncDepthQueries) {
+            Frame &frame = CurrentFrame();
+            frame.depth_pending.push_back({static_cast<uint32_t>(&query - g.depth_queries.data()), offset, width * height});
+            frame.depth_serial = g.frame_serial;
+            continue;
+        }
         query.data = buffer.memory.mapped + offset;
         query.texels = width * height;
         query.recorded = true;
@@ -138,7 +147,53 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
     if (transition) {
         HostBarrier(cmd);
         ToRest(cmd, depth);
-        g.depth_queries_recorded = true;
+        g.depth_queries_recorded = !kAsyncDepthQueries;
+    }
+}
+
+namespace {
+
+// The farthest of texels depth values, which copy out as a float for D32S8 and as 24 bits in a
+// word for D24S8.
+float Farthest(const uint8_t *data, uint32_t texels) {
+    bool  unorm = g.depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
+    float farthest = 1.0f;
+    for (uint32_t i = 0; i < texels; i++) {
+        float value;
+        if (unorm) {
+            uint32_t word;
+            std::memcpy(&word, data + i * sizeof(word), sizeof(word));
+            value = static_cast<float>(word & 0xFFFFFF) / static_cast<float>(0xFFFFFF);
+        } else {
+            std::memcpy(&value, data + i * sizeof(float), sizeof(float));
+        }
+        farthest = std::min(farthest, value);
+    }
+    return farthest;
+}
+
+} // namespace
+
+void HarvestFrameDepthQueries(Frame &frame) {
+    for (const PendingDepth &pending : frame.depth_pending) {
+        DepthQuery &query = g.depth_queries[pending.id];
+        query.result = Farthest(frame.depth_readback.memory.mapped + pending.offset, pending.texels);
+        query.valid = true;
+    }
+    frame.depth_pending.clear();
+}
+
+void HarvestReadyDepthQueries() {
+    std::vector<Frame *> ready;
+    for (Frame &frame : g.frames) {
+        if (!frame.depth_pending.empty() &&
+            (!frame.pending || vkGetFenceStatus(g.device, frame.fence) == VK_SUCCESS)) {
+            ready.push_back(&frame);
+        }
+    }
+    std::sort(ready.begin(), ready.end(), [](const Frame *a, const Frame *b) { return a->depth_serial < b->depth_serial; });
+    for (Frame *frame : ready) {
+        HarvestFrameDepthQueries(*frame);
     }
 }
 
@@ -147,21 +202,7 @@ void HarvestDepthQueries() {
         if (!query.recorded) {
             continue;
         }
-        // The depth aspect copies out as a float for D32S8 and as 24 bits in a word for D24S8.
-        bool  unorm = g.depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
-        float farthest = 1.0f;
-        for (uint32_t i = 0; i < query.texels; i++) {
-            float value;
-            if (unorm) {
-                uint32_t word;
-                std::memcpy(&word, query.data + i * sizeof(word), sizeof(word));
-                value = static_cast<float>(word & 0xFFFFFF) / static_cast<float>(0xFFFFFF);
-            } else {
-                std::memcpy(&value, query.data + i * sizeof(float), sizeof(float));
-            }
-            farthest = std::min(farthest, value);
-        }
-        query.result = farthest;
+        query.result = Farthest(query.data, query.texels);
         query.valid = true;
         query.recorded = false;
         query.data = nullptr;
