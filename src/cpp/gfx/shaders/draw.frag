@@ -125,6 +125,7 @@ void main() {
         discard;
     }
 
+#ifdef KZ_INTERPOLATION_TINT
     // Keep the original coverage, alpha test and blending. Only presentation RGB is tinted: selected,
     // not branched on, as everything per draw here (a uniform branch costs NAK a sync).
     uint status = (pc.flags >> 8) & 7u;
@@ -132,6 +133,7 @@ void main() {
                 : status == 3u ? vec3(0.1, 0.2, 1.0) : status == 4u ? vec3(1.0, 1.0, 0.1)
                                : vec3(0.1, 1.0, 1.0);
     color.rgb   = mix(color.rgb, tint, status != 0u ? 0.8 : 0.0);
+#endif
 
     float factor = mix(color.a, pc.blend.y, pc.blend.x != 0.0);
     vec3  rgb    = mix(color.rgb, color.rgb * (1.0 + factor), bvec3(pc.blend.z != 0.0));
