@@ -18,6 +18,9 @@ struct WindowConfig {
     // False for a renderer without a surface (gfx::RendererConfig::offscreen): SDL then loads no
     // Vulkan library and asks for no surface extension.
     bool vulkan = true;
+    // An OpenGL window for a GL renderer, in place of a Vulkan one: an OpenGL 4.3 core context
+    // with no depth of its own (the renderer draws into its own targets).
+    bool opengl = false;
 };
 
 // A window's mode: fullscreen, or a window whose inside is width by height (in the units of
