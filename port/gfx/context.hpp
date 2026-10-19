@@ -6,7 +6,9 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -373,7 +375,9 @@ struct Context {
     uint64_t                     renderer_instance = 0;
     uint64_t                     list_serial = 0;
     std::shared_ptr<DisplayList> list;
-    TextureHandle                record_target = kMainTarget;
+    // BeginFrame took the renderer's lock, which EndFrame gives back.
+    bool          frame_locked = false;
+    TextureHandle record_target = kMainTarget;
     InterpKey                    interp_key = 0;
     bool                         interp_no_interpolation = false;
     float                        interp_teleport_distance = INFINITY;
@@ -466,8 +470,29 @@ PipelineFamily MeshFamily(const Prog0Constants *prog0);
 VkPipelineLayout PipelineLayoutOf(PipelineFamily family);
 
 // displaylist.cpp
-// The public resource calls that record instead of executing while a list is recorded.
+// The public resource calls that record instead of executing while this thread records a list.
 bool RecordingCalls();
+// A frame is open on this thread (BeginFrame, or a list's render).
+bool FrameOnThisThread();
+// The thread that records, and the one whose frame is open; none when nothing is (README,
+// "Threads"). Atomic: other threads ask whether it is them.
+void SetRecordingThread(std::thread::id thread);
+void SetFrameThread(std::thread::id thread);
+// The main targets' pixel size, published for the threads that lay out draws against it without
+// the lock (GetLogicalMapping, GetTextureInfo of the main target).
+void     PublishMainSize(uint32_t width, uint32_t height);
+uint32_t MainWidth();
+uint32_t MainHeight();
+// The renderer's lock (README, "Threads"): held by a list's render, BeginFrame to EndFrame and every
+// call that changes the renderer's state outside a recording. Recording takes it only to create or
+// destroy something.
+using RendererLock = std::unique_lock<std::recursive_mutex>;
+std::recursive_mutex &RendererMutex();
+RendererLock          LockRenderer();
+// Not taken while this thread records: the call only appends to the list.
+RendererLock LockUnlessRecording();
+// This thread replays a list, which may still draw what the API has destroyed (Context::replaying).
+bool ReplayingHere();
 
 // draw.cpp
 void           EndRendering();

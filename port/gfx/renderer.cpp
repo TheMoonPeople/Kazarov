@@ -702,6 +702,7 @@ Image &PreviousMainColor() { return g.main_color[g.main_current ^ 1]; }
 void CreateMainTargets() {
     uint32_t width = g.swapchain.extent.width;
     uint32_t height = g.swapchain.extent.height;
+    PublishMainSize(width, height);
     for (Image &image : g.main_color) {
         image = CreateImage(width, height, 1, kColorFormat,
                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -815,10 +816,13 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
 }
 
 void RendererShutdown() {
+    RendererLock lock = LockRenderer();
     if (g.device == VK_NULL_HANDLE) {
         return;
     }
     g.list.reset();
+    SetRecordingThread({});
+    SetFrameThread({});
     vkDeviceWaitIdle(g.device);
     for (Frame &frame : g.frames) {
         RunDeletions(frame);
@@ -889,6 +893,7 @@ namespace {
 bool OpenFrame() {
     BeginCommands(CurrentFrame().draw_cmd);
     g.in_frame = true;
+    SetFrameThread(std::this_thread::get_id());
     g.frame_serial++;
     g.target = kMainTarget;
     g.rendering = false;
@@ -961,6 +966,7 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     VkSemaphore render_finished = g.swapchain.render_finished[g.image_index];
     Submit(true, frame.image_available, render_finished);
     g.in_frame = false;
+    SetFrameThread({});
 
     VkPresentInfoKHR present = {};
     present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -984,11 +990,21 @@ void SubmitWithoutPresent(VkCommandBuffer cmd, Image &main) {
     Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
     Submit(true, VK_NULL_HANDLE, VK_NULL_HANDLE);
     g.in_frame = false;
+    SetFrameThread({});
 }
 
 } // namespace
 
 void PrepareRecording() {
+    // Read without the lock, as a render on another thread may hold it: the main targets change
+    // only under it, and only when they must follow the window.
+    const Image &main = g.main_color[0];
+    bool follow = g.resize_pending || (!g.offscreen && (main.width != g.swapchain.extent.width ||
+                                                         main.height != g.swapchain.extent.height));
+    if (!follow) {
+        return;
+    }
+    RendererLock lock = LockRenderer();
     if (g.resize_pending) {
         RecreateSwapchain();
     } else if (!g.offscreen) {
@@ -1068,26 +1084,35 @@ void CloseListFrame(bool canonical, bool present) {
 } // namespace detail
 
 bool BeginFrame() {
-    if (g.in_frame || g.list != nullptr) {
+    if (FrameOnThisThread() || RecordingCalls()) {
         Error("BeginFrame inside a frame");
         return true;
     }
+    // Held until EndFrame: the frame's draws run as they are called.
+    RendererLock lock = LockRenderer();
     if (g.offscreen) {
         if (g.resize_pending && !ResizeOffscreen()) {
             SubmitUploadsAndWait();
             return false;
         }
-        return OpenFrame();
-    }
-    if (!AcquireImage(true)) {
+    } else if (!AcquireImage(true)) {
         return false;
     }
-    return OpenFrame();
+    OpenFrame();
+    g.frame_locked = true;
+    lock.release();
+    return true;
 }
 
 void EndFrame() {
-    if (!g.in_frame) {
+    if (!FrameOnThisThread()) {
         return;
+    }
+    // The lock BeginFrame took, given back as the frame ends.
+    RendererLock lock;
+    if (g.frame_locked) {
+        g.frame_locked = false;
+        lock = RendererLock(RendererMutex(), std::adopt_lock);
     }
     Frame          &frame = CurrentFrame();
     VkCommandBuffer cmd = frame.draw_cmd;
@@ -1105,7 +1130,8 @@ void EndFrame() {
 }
 
 bool PresentCanonical() {
-    if (!g.canonical_newest || g.in_frame || g.list != nullptr) {
+    RendererLock lock = LockRenderer();
+    if (!g.canonical_newest || g.in_frame || RecordingCalls()) {
         return false;
     }
     g.presented_display = false;
@@ -1123,7 +1149,7 @@ bool PresentCanonical() {
     return true;
 }
 
-bool InFrame() { return g.in_frame || g.list != nullptr; }
+bool InFrame() { return FrameOnThisThread() || RecordingCalls(); }
 
 RendererFeatures ActiveRendererFeatures() {
     return {g.properties.apiVersion, g.offscreen, g.triangle_fans, g.separate_stencil_masks,
@@ -1137,7 +1163,8 @@ uint32_t ValidationMessageCount() { return g.validation_messages; }
 float RenderScale() { return g.render_scale; }
 
 void SetFrameLayout(const FrameLayout &layout) {
-    if (g.in_frame || g.list != nullptr) {
+    RendererLock lock = LockRenderer();
+    if (g.in_frame || RecordingCalls()) {
         Error("SetFrameLayout inside a frame");
         return;
     }
@@ -1154,7 +1181,8 @@ void SetFrameLayout(const FrameLayout &layout) {
 FrameLayout CurrentFrameLayout() { return g.layout; }
 
 void SetRenderScale(float scale) {
-    if (scale <= 0.0f || scale == g.render_scale || g.in_frame || g.list != nullptr) {
+    RendererLock lock = LockRenderer();
+    if (scale <= 0.0f || scale == g.render_scale || g.in_frame || RecordingCalls()) {
         return;
     }
     g.render_scale = scale;

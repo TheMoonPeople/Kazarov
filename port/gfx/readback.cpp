@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -12,6 +13,17 @@ namespace gfx {
 namespace detail {
 
 namespace {
+
+// The answers, published for DepthResult, which another thread may call while a render harvests
+// (README, "Threads"): bit 32 set when there is one, the float's bits below.
+std::atomic<uint64_t> g_answers[kDepthQueryCount];
+
+void Publish(uint32_t id) {
+    const DepthQuery &query = g.depth_queries[id];
+    uint32_t          bits;
+    std::memcpy(&bits, &query.result, sizeof(bits));
+    g_answers[id].store(query.valid ? (uint64_t{1} << 32 | bits) : 0, std::memory_order_relaxed);
+}
 
 // A query reads at most this many pixels on a side; at high resolutions a small logical rect
 // still covers hundreds of pixels and the farthest of them is as good as the farthest of all.
@@ -98,6 +110,7 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         query.recorded = false;
         if (!kAsyncDepthQueries) {
             query.valid = false;
+            Publish(static_cast<uint32_t>(&query - g.depth_queries.data()));
         }
         float x0 = std::floor(query.rect.x * mapping.scale_x + mapping.offset_x);
         float y0 = std::floor(query.rect.y * mapping.scale_y + mapping.offset_y);
@@ -109,6 +122,7 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         y1 = std::min(y1, static_cast<float>(depth.height));
         if (x1 <= x0 || y1 <= y0) {
             query.valid = false;
+            Publish(static_cast<uint32_t>(&query - g.depth_queries.data()));
             continue;
         }
         uint32_t width = std::min(static_cast<uint32_t>(x1 - x0), kMaxQuerySide);
@@ -179,6 +193,7 @@ void HarvestFrameDepthQueries(Frame &frame) {
         DepthQuery &query = g.depth_queries[pending.id];
         query.result = Farthest(frame.depth_readback.memory.mapped + pending.offset, pending.texels);
         query.valid = true;
+        Publish(pending.id);
     }
     frame.depth_pending.clear();
 }
@@ -206,6 +221,7 @@ void HarvestDepthQueries() {
         query.valid = true;
         query.recorded = false;
         query.data = nullptr;
+        Publish(static_cast<uint32_t>(&query - g.depth_queries.data()));
     }
     g.depth_queries_recorded = false;
 }
@@ -215,6 +231,7 @@ void HarvestDepthQueries() {
 using namespace detail;
 
 void ReadDepth(uint32_t id, float x, float y, float w, float h) {
+    RendererLock lock = LockUnlessRecording();
     if (id >= kDepthQueryCount) {
         Error("ReadDepth: query %u is past %u", id, kDepthQueryCount);
         return;
@@ -231,13 +248,21 @@ void ReadDepth(uint32_t id, float x, float y, float w, float h) {
 }
 
 std::optional<float> DepthResult(uint32_t id) {
-    if (id >= kDepthQueryCount || !g.depth_queries[id].valid) {
+    if (id >= kDepthQueryCount) {
         return std::nullopt;
     }
-    return g.depth_queries[id].result;
+    uint64_t answer = g_answers[id].load(std::memory_order_relaxed);
+    if ((answer >> 32) == 0) {
+        return std::nullopt;
+    }
+    uint32_t bits = static_cast<uint32_t>(answer);
+    float    result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
 }
 
 bool ReadbackFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) {
+    RendererLock lock = LockRenderer();
     if (g.in_frame || RecordingCalls()) {
         Error("ReadbackFrame inside a frame");
         return false;
@@ -249,6 +274,7 @@ bool ReadbackFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height
 }
 
 bool ReadbackTexture(TextureHandle handle, std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height) {
+    RendererLock lock = LockRenderer();
     if (g.in_frame || RecordingCalls()) {
         Error("ReadbackTexture inside a frame");
         return false;

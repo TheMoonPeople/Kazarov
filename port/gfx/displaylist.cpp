@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -1017,7 +1018,38 @@ void BlendProg0Bones(const Prog0Constants &before, const Prog0Constants &after, 
     }
 }
 
-bool RecordingCalls() { return g.list != nullptr; }
+namespace {
+std::atomic<std::thread::id> g_record_thread;
+std::atomic<std::thread::id> g_frame_thread;
+std::atomic<uint64_t>        g_main_size;
+} // namespace
+
+bool RecordingCalls() { return g_record_thread.load(std::memory_order_relaxed) == std::this_thread::get_id(); }
+
+bool FrameOnThisThread() { return g_frame_thread.load(std::memory_order_relaxed) == std::this_thread::get_id(); }
+
+void SetRecordingThread(std::thread::id thread) { g_record_thread.store(thread, std::memory_order_relaxed); }
+
+void SetFrameThread(std::thread::id thread) { g_frame_thread.store(thread, std::memory_order_relaxed); }
+
+void PublishMainSize(uint32_t width, uint32_t height) {
+    g_main_size.store(static_cast<uint64_t>(width) << 32 | height, std::memory_order_relaxed);
+}
+
+uint32_t MainWidth() { return static_cast<uint32_t>(g_main_size.load(std::memory_order_relaxed) >> 32); }
+
+uint32_t MainHeight() { return static_cast<uint32_t>(g_main_size.load(std::memory_order_relaxed)); }
+
+std::recursive_mutex &RendererMutex() {
+    static std::recursive_mutex mutex;
+    return mutex;
+}
+
+RendererLock LockRenderer() { return RendererLock(RendererMutex()); }
+
+RendererLock LockUnlessRecording() { return RecordingCalls() ? RendererLock() : LockRenderer(); }
+
+bool ReplayingHere() { return g.replaying && !RecordingCalls(); }
 
 void RecordEntry(Entry &&entry) {
     DisplayList &list = *g.list;
@@ -1105,9 +1137,11 @@ void RecordDoomedMesh(MeshHandle handle) { g.list->doomed_meshes.push_back(handl
 using namespace detail;
 
 DisplayList::~DisplayList() {
-    if (instance != g.renderer_instance || g.device == VK_NULL_HANDLE) {
+    if (instance != g.renderer_instance || g.device == VK_NULL_HANDLE ||
+        (doomed_textures.empty() && doomed_meshes.empty())) {
         return;
     }
+    RendererLock lock = LockRenderer();
     for (TextureHandle texture : doomed_textures) {
         DestroyDoomedTexture(texture);
     }
@@ -1146,15 +1180,16 @@ InterpKey CurrentInterpKey() { return g.interp_key; }
 bool CurrentNoInterpolation() { return g.interp_no_interpolation; }
 
 void BeginRecording() {
-    if (g.list != nullptr) {
+    if (RecordingCalls()) {
         return;
     }
-    if (g.in_frame) {
+    if (FrameOnThisThread()) {
         Error("BeginRecording inside a frame");
         return;
     }
     PrepareRecording();
     g.list = std::make_shared<DisplayList>();
+    SetRecordingThread(std::this_thread::get_id());
     g.list->instance = g.renderer_instance;
     g.list->serial = ++g.list_serial;
     g.record_target = kMainTarget;
@@ -1165,22 +1200,26 @@ void BeginRecording() {
 }
 
 DisplayListRef EndRecording() {
+    if (!RecordingCalls()) {
+        return nullptr;
+    }
+    SetRecordingThread({});
     std::shared_ptr<DisplayList> list = std::move(g.list);
     g.list = nullptr;
     return list;
 }
 
-bool Recording() { return g.list != nullptr; }
+bool Recording() { return RecordingCalls(); }
 
 void CutInterpolation() {
-    if (g.list != nullptr) {
+    if (RecordingCalls()) {
         g.list->cut = true;
     }
     g_instanced_keys.clear();
 }
 
 void CutCameraInterpolation() {
-    if (g.list != nullptr) {
+    if (RecordingCalls()) {
         g.list->camera_cut = true;
     }
 }
@@ -1189,7 +1228,8 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
     if (list.instance != g.renderer_instance || g.device == VK_NULL_HANDLE) {
         return false;
     }
-    if (g.in_frame || g.list != nullptr) {
+    RendererLock lock = LockRenderer();
+    if (g.in_frame || RecordingCalls()) {
         Error("RenderList inside a frame");
         return false;
     }

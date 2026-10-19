@@ -330,9 +330,13 @@ VkCommandBuffer CommandsForWrite(uint64_t &last_draw_use) {
 
 void InitResources() {
     g.textures.clear();
+    // Never reallocated: a recording thread looks handles up without the renderer's lock while a
+    // render on another thread may add textures (README, "Threads").
+    g.textures.reserve(kMaxTextures);
     g.textures.resize(kFirstUserSlot);
     g.free_texture_slots.clear();
     g.meshes.clear();
+    g.meshes.reserve(kMaxMeshes);
     g.meshes.resize(1);
     g.free_mesh_slots.clear();
 
@@ -367,7 +371,7 @@ Texture *LookupTexture(TextureHandle handle) {
         return nullptr;
     }
     Texture &texture = g.textures[slot];
-    if (!texture.live || texture.generation != handle >> kSlotBits || (texture.doomed && !g.replaying)) {
+    if (!texture.live || texture.generation != handle >> kSlotBits || (texture.doomed && !ReplayingHere())) {
         return nullptr;
     }
     return &texture;
@@ -379,7 +383,7 @@ Mesh *LookupMesh(MeshHandle handle) {
         return nullptr;
     }
     Mesh &mesh = g.meshes[slot];
-    if (!mesh.live || mesh.generation != handle >> kSlotBits || (mesh.doomed && !g.replaying)) {
+    if (!mesh.live || mesh.generation != handle >> kSlotBits || (mesh.doomed && !ReplayingHere())) {
         return nullptr;
     }
     return &mesh;
@@ -539,6 +543,7 @@ void DestroyDoomedMesh(MeshHandle handle) {
 using namespace detail;
 
 TextureHandle CreateTexture(const TextureDesc &desc) {
+    RendererLock lock = LockRenderer();
     if (!CheckSize(desc.width, desc.height)) {
         return kNullTexture;
     }
@@ -576,6 +581,7 @@ TextureHandle CreateTexture(const TextureDesc &desc) {
 }
 
 TextureHandle CreatePalette() {
+    RendererLock lock = LockRenderer();
     TextureHandle palette = CreateTexture(TextureDesc{256, 1, TextureFormat::Rgba8, 1, true});
     Texture      *texture = LookupTexture(palette);
     if (texture != nullptr && g.config.expand_palettes) {
@@ -586,6 +592,7 @@ TextureHandle CreatePalette() {
 
 TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height, bool has_alpha,
                                  bool share_main_depth, bool frame_target) {
+    RendererLock lock = LockRenderer();
     if (share_main_depth) {
         logical_width = static_cast<uint32_t>(g.config.logical_width);
         logical_height = static_cast<uint32_t>(g.config.logical_height);
@@ -637,7 +644,9 @@ TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height
 
 TextureHandle NamedRenderTarget(std::string_view name, uint32_t logical_width, uint32_t logical_height,
                                 bool has_alpha, bool share_main_depth, bool frame_target) {
+    // Found as asked for, without the lock: the names change only on the thread that names them.
     TextureHandle existing = FindNamedRenderTarget(name);
+    RendererLock  lock;
     if (existing != kNullTexture) {
         const Texture &texture = *LookupTexture(existing);
         bool           same_size = share_main_depth || (texture.logical_width == logical_width &&
@@ -647,7 +656,10 @@ TextureHandle NamedRenderTarget(std::string_view name, uint32_t logical_width, u
         if (same_size && same_shape && texture.desc.has_alpha == has_alpha) {
             return existing;
         }
+        lock = LockRenderer();
         DestroyTexture(existing);
+    } else {
+        lock = LockRenderer();
     }
     TextureHandle created =
         CreateRenderTarget(logical_width, logical_height, has_alpha, share_main_depth, frame_target);
@@ -663,7 +675,9 @@ TextureHandle FindNamedRenderTarget(std::string_view name) {
 }
 
 void DestroyTexture(TextureHandle handle) {
-    Texture *texture = LookupTexture(handle);
+    // Even while recording: the doom marks a texture a render on another thread looks up.
+    RendererLock lock = LockRenderer();
+    Texture     *texture = LookupTexture(handle);
     if (texture == nullptr) {
         return;
     }
@@ -685,7 +699,8 @@ void DestroyTexture(TextureHandle handle) {
 namespace {
 bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                        const void *pixels, uint32_t row_length, bool record) {
-    Texture *texture = LookupTexture(handle);
+    RendererLock lock = record ? LockUnlessRecording() : LockRenderer();
+    Texture     *texture = LookupTexture(handle);
     if (texture == nullptr || pixels == nullptr) {
         Error("UpdateTexture: no texture %#x", handle);
         return false;
@@ -843,11 +858,10 @@ bool UpdatePalette(TextureHandle palette, const uint32_t *rgba, uint32_t first, 
 
 std::optional<TextureInfo> GetTextureInfo(TextureHandle handle) {
     if (handle == kMainTarget || handle == kPreviousFrame) {
-        const Image &image = *ColorImageOf(handle);
         return TextureInfo{static_cast<uint32_t>(g.config.logical_width),
                            static_cast<uint32_t>(g.config.logical_height),
-                           image.width,
-                           image.height,
+                           MainWidth(),
+                           MainHeight(),
                            TextureFormat::Rgba8,
                            1,
                            true,
@@ -874,6 +888,7 @@ void ConvertPs2Alpha(uint32_t *rgba, size_t count) {
 }
 
 MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32_t> indices) {
+    RendererLock lock = LockRenderer();
     if (vertices.empty() || indices.empty()) {
         Error("CreateMesh: empty mesh");
         return kNullMesh;
@@ -907,7 +922,8 @@ MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32
 }
 
 bool UpdateMeshVertices(MeshHandle handle, uint32_t first, std::span<const Vertex3D> vertices) {
-    Mesh *mesh = LookupMesh(handle);
+    RendererLock lock = LockUnlessRecording();
+    Mesh        *mesh = LookupMesh(handle);
     if (mesh == nullptr || first + vertices.size() > mesh->vertex_count) {
         Error("UpdateMeshVertices: bad mesh %#x or range", handle);
         return false;
@@ -924,7 +940,8 @@ bool UpdateMeshVertices(MeshHandle handle, uint32_t first, std::span<const Verte
 }
 
 void DestroyMesh(MeshHandle handle) {
-    Mesh *mesh = LookupMesh(handle);
+    RendererLock lock = LockRenderer();
+    Mesh        *mesh = LookupMesh(handle);
     if (mesh == nullptr) {
         return;
     }

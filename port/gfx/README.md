@@ -25,10 +25,34 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
   `--offscreen` forces it.
 - `RendererResize()` after the window's pixel size changes (`WindowPollEvents` does it); the
   swapchain and main target follow at the next `BeginFrame`. Main-target contents are lost.
-- Single-threaded: call everything from one thread.
+- Threads: see "Threads" below. One thread records while another renders; nothing else is shared.
 - Textures, palettes, meshes and render targets can be created, updated and destroyed at any time,
   inside or outside a frame. Destruction is deferred until the GPU is done with them; a handle is
   dead as soon as it is destroyed (handles carry a generation).
+
+## Threads
+
+A list can be recorded on one thread while lists recorded earlier render on another: a game runs a
+tick while the tick before is rendered and presented.
+
+- Recording belongs to the thread that called `BeginRecording`: `Recording()`, `InFrame()` and the
+  calls that record answer for the calling thread, so a render on another thread executes its
+  entries instead of recording them. A frame opened by `BeginFrame` or a list's render belongs to
+  its thread the same way.
+- The renderer's state is guarded by one recursive lock. A list's render (`RenderList`,
+  `PresentCanonical`) holds it throughout, `BeginFrame` takes it until `EndFrame`, and every call that
+  changes the renderer outside a recording takes it: creating and destroying textures, meshes and
+  targets, uploads that run at once (`UpdateTextureNow`), readback, the render scale and layout, and
+  a list's release when it destroys what it held. A call that only records takes no lock, so a
+  recording does not wait for a render; creating something while recording waits for the render
+  in progress.
+- Calls that record still look handles up: the texture and mesh tables are reserved whole at init
+  and never move, and `NamedRenderTarget` finds an existing target without the lock (the names are
+  the recording thread's alone).
+- The answers a render leaves (`DepthResult`, `GetTextureInfo` of the main target) are read without
+  the lock and may be a render behind.
+- A caller that needs its own frame (a loading screen) after a render on another thread waits for
+  that render first: the lock orders the two, not their submission order.
 
 ## Spaces
 

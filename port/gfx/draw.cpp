@@ -488,7 +488,17 @@ bool ResolveCopyRect(TextureHandle handle, const Rect &rect, uint32_t extend, Im
     texture = nullptr;
     LogicalMapping mapping;
     if (handle == kMainTarget || handle == kPreviousFrame) {
-        image = ColorImageOf(handle);
+        // A recording only checks the rect, against the published size: another thread may be
+        // drawing the main images (README, "Threads").
+        static thread_local Image recorded;
+        if (RecordingCalls()) {
+            recorded.width = MainWidth();
+            recorded.height = MainHeight();
+            recorded.format = kColorFormat;
+            image = &recorded;
+        } else {
+            image = ColorImageOf(handle);
+        }
         mapping = MainMapping(image->width, image->height);
     } else {
         texture = LookupTexture(handle);
@@ -948,6 +958,7 @@ void ReleaseTarget() {
 using namespace detail;
 
 void SetRenderTarget(TextureHandle handle) {
+    RendererLock lock = LockUnlessRecording();
     if (handle == (RecordingCalls() ? g.record_target : g.target)) {
         return;
     }
@@ -974,8 +985,8 @@ TextureHandle CurrentRenderTarget() { return RecordingCalls() ? g.record_target 
 
 LogicalMapping GetLogicalMapping(TextureHandle handle) {
     if (handle == kMainTarget || handle == kPreviousFrame) {
-        const Image &image = *ColorImageOf(handle);
-        return MainMapping(image.width, image.height);
+        // Published, as another thread may be drawing the main targets (README, "Threads").
+        return MainMapping(MainWidth(), MainHeight());
     }
     Texture *texture = LookupTexture(handle);
     if (texture == nullptr) {
@@ -1014,6 +1025,7 @@ namespace detail {
 
 void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &binding,
                  const DrawState &state, UiSide side) {
+    RendererLock lock = LockUnlessRecording();
     if (RecordingCalls()) {
         RecordEntry(Draw2DEntry{primitive, std::vector<Vertex2D>(vertices.begin(), vertices.end()), binding,
                                 state, side});
@@ -1147,7 +1159,8 @@ void ReportPlainProg0Flag(const MeshConstants &constants) {
 void DrawIndexedMesh(MeshHandle handle, uint32_t first_index, uint32_t index_count, const MeshConstants &constants,
                      const Prog0Constants *prog0, const TextureBinding &binding, const DrawState &state,
                      const MeshTransform *transform) {
-    Mesh *mesh = LookupMesh(handle);
+    RendererLock lock = LockUnlessRecording();
+    Mesh        *mesh = LookupMesh(handle);
     if (mesh == nullptr || first_index + index_count > mesh->index_count) {
         Error("DrawMesh: bad mesh %#x or index range", handle);
         return;
@@ -1193,6 +1206,7 @@ namespace {
 void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint32_t> indices,
                        const MeshConstants &constants, const Prog0Constants *prog0,
                        const TextureBinding &binding, const DrawState &state, const MeshTransform *transform) {
+    RendererLock lock = LockUnlessRecording();
     if (RecordingCalls()) {
         if (!vertices.empty() && !indices.empty()) {
             MeshEntry entry{kNullMesh, 0, 0, {}, {}, constants, binding, state, 0};
@@ -1250,6 +1264,7 @@ void DrawMeshImmediateProg0(std::span<const Vertex3D> vertices, std::span<const 
 }
 
 void Clear(bool clear_color, const uint8_t color[4], bool clear_depth, float depth, const LogicalRect *rect) {
+    RendererLock lock = LockUnlessRecording();
     if (RecordingCalls() && (clear_color || clear_depth)) {
         ClearEntry entry;
         entry.color = clear_color;
@@ -1293,6 +1308,7 @@ void Clear(bool clear_color, const uint8_t color[4], bool clear_depth, float dep
 }
 
 void ClearStencil(uint8_t value, const LogicalRect *rect) {
+    RendererLock lock = LockUnlessRecording();
     if (RecordingCalls()) {
         ClearEntry entry;
         entry.stencil = true;
@@ -1320,6 +1336,7 @@ void ClearStencil(uint8_t value, const LogicalRect *rect) {
 }
 
 bool CopyTexture(TextureHandle src, Rect src_rect, TextureHandle dst, int32_t dst_x, int32_t dst_y) {
+    RendererLock lock = LockUnlessRecording();
     Image     *src_image;
     Image     *dst_image;
     Texture   *src_texture;
@@ -1360,6 +1377,7 @@ bool CopyTexture(TextureHandle src, Rect src_rect, TextureHandle dst, int32_t ds
 }
 
 bool BlitTexture(TextureHandle src, Rect src_rect, TextureHandle dst, Rect dst_rect, Filter filter) {
+    RendererLock lock = LockUnlessRecording();
     Image     *src_image;
     Image     *dst_image;
     Texture   *src_texture;
