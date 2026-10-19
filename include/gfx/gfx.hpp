@@ -99,6 +99,8 @@ struct RendererConfig {
     // Lowers the texture and mesh tables for tests; 0 is the build maximum, larger values are clamped to it.
     uint32_t texture_slots = 0;
     uint32_t mesh_slots = 0;
+    float    frame_scale = 1.0f; /**< Fraction of window resolution used by
+                                    canonical and display frames. */
 };
 
 // What RendererInit settled on, from the config and the device.
@@ -139,6 +141,11 @@ uint32_t PipelineCount();
 // distinguishable through Vulkan, so this is only the time RendererInit spent creating them.
 double PipelineCompileSeconds();
 float  RenderScale();
+/**
+ * Requests a frame-resolution fraction from 0.5 to 2.0 at the next safe drawing
+ * boundary.
+ */
+void SetFrameScale(float scale);
 // Recreates every render target at the new scale, carrying its contents over.
 void SetRenderScale(float scale);
 // Outside a frame; frame targets are recreated for the new aspect, carrying their logical frame over.

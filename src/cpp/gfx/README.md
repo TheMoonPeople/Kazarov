@@ -522,3 +522,14 @@ also CPU-only. Existing renderer/texture GPU families retain their existing excl
 A consumer that previously excluded only `^(GfxMisc|TexDecode)\.` must add
 `|(^|/)GfxGpu` to its CTest exclusion before adopting this dependency, or label
 this family and use `-LE gpu`. CPU display-list coverage continues to run.
+
+### Frame resolution
+
+`RendererConfig::frame_scale` and `SetFrameScale` select 0.5 to 2.0 times the
+window dimensions for the canonical and interpolated frame color/depth targets.
+The default is 1.0 and does not change existing clients. Presentation still fills
+the native swapchain. This also scales the game's 2D UI; a platform-native touch
+view is independent. The offscreen path uses the same fraction for readback.
+Changes take effect at the next recording or canonical/immediate frame boundary,
+where frame history is cleared. Ordinary render-target texel scaling remains
+controlled separately by `render_scale` and `SetRenderScale`.
