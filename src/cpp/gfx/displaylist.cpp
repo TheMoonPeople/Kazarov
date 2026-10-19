@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -25,14 +26,15 @@ bool CanRecordBinding(const TextureBinding &binding) {
     if (binding.texture == kNullTexture || binding.texture == kPreviousFrame) {
         return true;
     }
-    const Texture *texture = LookupTexture(binding.texture);
-    if (texture == nullptr) {
+    // Through GetTextureInfo, which every renderer has, rather than one renderer's records.
+    const std::optional<TextureInfo> texture = GetTextureInfo(binding.texture);
+    if (!texture) {
         Error("a recorded draw names unavailable texture %#x", binding.texture);
         return false;
     }
-    if (texture->desc.format == TextureFormat::Index8) {
-        const Texture *palette = LookupTexture(binding.palette);
-        if (palette == nullptr || palette->desc.format != TextureFormat::Rgba8) {
+    if (texture->format == TextureFormat::Index8) {
+        const std::optional<TextureInfo> palette = GetTextureInfo(binding.palette);
+        if (!palette || palette->format != TextureFormat::Rgba8) {
             Error("a recorded indexed draw names unavailable palette %#x", binding.palette);
             return false;
         }
