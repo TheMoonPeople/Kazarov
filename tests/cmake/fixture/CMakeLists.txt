@@ -11,7 +11,7 @@ set(KZ_MWCC ${FIX}/../fake_cc.py)
 set(KZ_MWCC_RUNNER python3)
 set(KZ_AS "python3 ${FIX}/tools/fake_as.py")
 
-include(${FIX}/../../../cmake/Kazarov.cmake)
+include(${FIX}/../../../CMakeLists.txt)
 
 set(ASM_DIR ${CMAKE_BINARY_DIR}/asm)
 set(OBJ_DIR ${CMAKE_BINARY_DIR}/obj)

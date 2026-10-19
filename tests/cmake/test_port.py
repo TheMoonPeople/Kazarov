@@ -15,7 +15,7 @@ import pytest
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 FIXTURE = HERE / "port_fixture"
-PORT = ROOT / "port"
+PORT = ROOT / "src" / "cpp"
 FAMILIES = ["libvu0", "libpad", "libmc", "sifdev", "sifrpc", "eekernel", "libcdvd", "libgraph", "libdma", "libpkt"]
 MISSING_DEPENDENCY = re.compile(
     r'package configuration file provided by "SDL3"|Could NOT find (SDL3|Vulkan)|Could not find (SDL3|Vulkan)')

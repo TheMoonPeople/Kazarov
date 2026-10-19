@@ -8,12 +8,33 @@ permissions:
   contents: read
 
 jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-2025, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux desktop build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libegl1-mesa-dev
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Test extraction and setup
+        run: cargo test --locked
+      - name: Lint Rust
+        run: cargo clippy --all-targets --locked -- -D warnings
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck bin/kazarov bin/kz-pcsx2 lib/*.sh tests/port_h/run.sh
+        run: shellcheck scripts/kazarov scripts/run/kz-pcsx2 scripts/lib/*.sh tests/port_h/run.sh
 
   pytest:
     runs-on: ubuntu-latest
@@ -28,7 +49,7 @@ jobs:
       - name: Install cmake, ninja and pytest
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake ninja-build g++
           python -m pip install pytest
       - name: pytest
         run: >
@@ -39,6 +60,8 @@ jobs:
           tests/test_kz_split_stamp.py
           tests/test_kz_cached.py
           tests/test_kazarov_elf.py
+          tests/test_port_override.py
+          tests/test_port_test_discovery.py
           tests/cmake
 
   image:
@@ -48,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build the image
-        run: docker build --platform linux/amd64 --build-arg KZ_IMAGE_ID=ci -t kazarov-dev:ci image
+        run: docker build --platform linux/amd64 --build-arg KZ_IMAGE_ID=ci -t kazarov-dev:ci -f image/Dockerfile .
       - name: Smoke test the image
         run: |
           docker run --rm -v "$PWD:/k" kazarov-dev:ci sh -ec 'command -v wibo satansfiddle objdiff-cli clangd clang lldb-server-19 || true; mips-ps2-decompals-as --version >/dev/null; python3 -c "import splat, pycdlib, clang.cindex, graphviz"; python3 $M2C --help >/dev/null; cat /opt/kazarov/image-id'

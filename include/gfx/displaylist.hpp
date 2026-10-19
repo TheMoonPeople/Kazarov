@@ -1,0 +1,209 @@
+#pragma once
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+#include "gfx/gfx.hpp"
+
+namespace gfx {
+
+namespace detail {
+
+using Mat4 = std::array<float, 16>;
+
+// The visible edges a UI draw keeps its distance to: -1 the low edge, 1 the high edge, 0 neither.
+struct UiSide {
+    bool   operator==(const UiSide &) const = default;
+    int8_t x = 0;
+    int8_t y = 0;
+    bool   scissor = false;
+};
+
+struct Draw2DEntry {
+    Primitive             primitive;
+    std::vector<Vertex2D> vertices;
+    TextureBinding        binding;
+    DrawState             state;
+    UiSide                side;
+    // DisplayList::scenes: the scene a draw that tests depth (a 3D sprite) stands in, or -1.
+    int32_t scene = -1;
+    Interp2D              interpolation;
+    uint32_t              occurrence = 0;
+    TextureHandle         target = kMainTarget;
+    std::vector<Vertex2D> presentation_vertices;
+    DrawState             presentation_state;
+};
+
+// The projection and camera the meshes around a 3D sprite were drawn with, and where the target's
+// logical space lay in clip space (x and y: scale, then offset). A display render carries the
+// sprite's corners from the tick's camera to the interpolated one through them.
+struct SpriteScene {
+    uint32_t camera = 0;
+    Mat4     projection = {};
+    float    to_clip[4] = {};
+};
+
+// One record of DisplayList::meshes per entry.
+struct MeshEntry {
+    MeshHandle            mesh = kNullMesh; // kNullMesh: immediate, vertices and indices below
+    uint32_t              first_index = 0;
+    uint32_t              index_count = 0;
+    std::vector<Vertex3D> vertices;
+    std::vector<uint32_t> indices;
+    MeshConstants         constants;
+    TextureBinding        binding;
+    DrawState             state;
+    uint32_t              record = 0;
+    int32_t               prog0 = -1; // index into DisplayList::prog0_blocks, or -1 for a plain draw
+    // An immediate draw with the same vertices as an earlier one (a shadow volume's adding and
+    // subtracting passes): that entry's index in DisplayList::entries, its own vertices left empty.
+    int32_t shared_vertices = -1;
+};
+
+struct ClearEntry {
+    bool        stencil = false;
+    bool        color = false;
+    bool        depth = false;
+    uint8_t     rgba[4] = {};
+    float       z = 0.0f;
+    uint8_t     stencil_value = 0;
+    bool        has_rect = false;
+    LogicalRect rect = {};
+    bool        has_presentation_rect = false;
+    LogicalRect presentation_rect = {};
+};
+
+struct TargetEntry {
+    TextureHandle target;
+};
+
+struct CopyEntry {
+    enum Kind : uint8_t { Copy, Blit, Snapshot } kind;
+
+    TextureHandle src;
+    Rect          src_rect;
+    TextureHandle dst;
+    Rect          dst_rect;
+    Filter        filter;
+};
+
+struct UpdateTextureEntry {
+    TextureHandle        texture;
+    uint32_t             mip, x, y, w, h;
+    std::vector<uint8_t> pixels;
+};
+
+struct UpdateMeshEntry {
+    MeshHandle            mesh;
+    uint32_t              first;
+    std::vector<Vertex3D> vertices;
+};
+
+struct ReadDepthEntry {
+    uint32_t    id;
+    LogicalRect rect;
+};
+
+using Entry = std::variant<Draw2DEntry, MeshEntry, ClearEntry, TargetEntry, CopyEntry, UpdateTextureEntry,
+                           UpdateMeshEntry, ReadDepthEntry>;
+
+struct MeshRecord {
+    InterpKey key = 0;
+    uint32_t  occurrence = 0;
+    uint32_t  entry = 0; // its MeshEntry in DisplayList::entries
+    bool      no_interpolation = false;
+    float     teleport_distance = INFINITY;
+    bool      blend_vertices = false;
+    bool      has_transform = false;
+    uint32_t  camera = 0;
+    Mat4      projection = {};
+    Mat4      middle = {};
+    Mat4      model = {};
+    Mat4      local = {};
+};
+
+// What a display render of a list against one predecessor reuses from frame to frame.
+struct MatchCache {
+    std::vector<std::array<uint32_t, 2> > draws_2d; // matched entry indices, newest then previous
+    uint64_t             previous_serial = 0;
+    std::vector<int32_t> match;   // per record, the previous list's record, or -1
+    std::vector<bool>    blend;   // per record, whether its immediate vertices moved since the match's
+    std::vector<int32_t> cameras; // per camera, the previous list's, or -1
+};
+
+} // namespace detail
+
+struct DisplayList {
+    uint64_t                        instance = 0;
+    uint64_t                        serial = 0;
+    std::vector<detail::Entry>      entries;
+    std::vector<detail::MeshRecord> records;
+    std::vector<detail::Mat4>       cameras;
+    std::vector<detail::SpriteScene> scenes;
+    std::vector<Prog0Constants>      prog0_blocks;
+    // While recording: the scene of the last mesh drawn on the current target, or -1, and on each
+    // target drawn into so far (the fire's texture is blended between the map and its sprites).
+    int32_t                                    scene = -1;
+    std::unordered_map<TextureHandle, int32_t> target_scenes;
+    std::vector<TextureHandle>      doomed_textures;
+    std::vector<MeshHandle>         doomed_meshes;
+    bool                            cut = false;
+    bool                            camera_cut = false;
+    // A draw reaches the main target before a clear covers its logical frame, so whatever the
+    // target held shows through; a display render starts from the canonical image.
+    // While recording: the last immediate mesh entry that holds its own vertices, or -1.
+    int32_t                                 last_immediate = -1;
+    bool                                    needs_base = false;
+    bool                                    main_cleared = false;
+    std::unordered_map<InterpKey, uint32_t> occurrences;
+    std::unordered_map<InterpKey, uint32_t> occurrences_2d;
+    std::vector<uint32_t>                   tagged_2d;
+    mutable detail::MatchCache              cache;
+
+    DisplayList() = default;
+    DisplayList(const DisplayList &) = delete;
+    DisplayList &operator=(const DisplayList &) = delete;
+    ~DisplayList();
+};
+
+namespace detail {
+
+// draw.cpp
+// Draw2D with the sides its anchor chose.
+void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &binding,
+                 const DrawState &state, UiSide side, const Presentation2D *presentation = nullptr);
+
+// displaylist.cpp
+void RecordEntry(Entry &&entry);
+void RecordMesh(MeshEntry &&entry, const MeshTransform *transform, const Prog0Constants *prog0);
+// An immediate mesh: its vertices are copied, or shared with the last immediate mesh's when they
+// are the same and the draw does not blend its vertices between ticks.
+void RecordImmediateMesh(MeshEntry &&entry, std::span<const Vertex3D> vertices, const MeshTransform *transform,
+                         const Prog0Constants *prog0);
+// The vertices an immediate mesh entry draws.
+const std::vector<Vertex3D> &ImmediateVertices(const DisplayList &list, const MeshEntry &entry);
+void RecordClear(const ClearEntry &entry);
+void RecordDoomedTexture(TextureHandle handle);
+void RecordDoomedMesh(MeshHandle handle);
+
+// Interpolation, exposed for tests through the pure functions below.
+Mat4 Multiply(const Mat4 &a, const Mat4 &b);
+bool InvertAffine(const Mat4 &m, Mat4 &out);
+// a at alpha 0, b at 1: translation lerped, rotation slerped, the rest of the 3x3 (scale, shear)
+// lerped in the rotation's frame. False (out = b) when either is not an invertible affine.
+bool InterpolateAffine(const Mat4 &a, const Mat4 &b, float alpha, Mat4 &out);
+bool Interpolate2D(const Draw2DEntry &before, const Draw2DEntry &after, float alpha, std::vector<Vertex2D> &out);
+bool InterpolateSprite(const Draw2DEntry &before, const SpriteScene &before_scene, const Mat4 &before_view,
+                       const Draw2DEntry &after, const SpriteScene &after_scene, const Mat4 &after_view,
+                       const Mat4 &display_view, float alpha, std::vector<Vertex2D> &out);
+// A bone that moved past teleport_distance is a cut, not motion, so it keeps after's pose.
+void BlendProg0Bones(const Prog0Constants &before, const Prog0Constants &after, float alpha, float teleport_distance,
+                     Prog0Constants &out);
+
+} // namespace detail
+
+} // namespace gfx

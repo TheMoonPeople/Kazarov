@@ -27,7 +27,7 @@ function(_kz_ffmpeg_import)
     if(NOT EXISTS "${KZ_FFMPEG_DIR}/include/libavcodec/avcodec.h")
         message(FATAL_ERROR "kz_ffmpeg: no include/libavcodec/avcodec.h under ${KZ_FFMPEG_DIR}. "
             "Linux: the Kazarov image provides /opt/kazarov/ffmpeg. "
-            "macOS: run tools/kazarov/bin/kz-ffmpeg --out <dir>. "
+            "macOS: run tools/kazarov/scripts/build/kz-ffmpeg --out <dir>. "
             "Windows: run tools/windows/acquire.ps1 and pass -DKZ_FFMPEG_DIR=<dir>.")
     endif()
 

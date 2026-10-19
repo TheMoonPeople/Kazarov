@@ -30,8 +30,8 @@ function(kz_ctx)
 
     add_custom_command(
         OUTPUT "${c_abs}" "${cpp_abs}"
-        COMMAND ${KZ_PYTHON} ${KZ_ROOT}/scripts/m2ctx.py -o "${c_abs}" ${KZC_ARGS}
-        DEPENDS ${headers} ${KZ_ROOT}/scripts/m2ctx.py
+        COMMAND ${KZ_PYTHON} ${KZ_ROOT}/scripts/build/m2ctx.py -o "${c_abs}" ${KZC_ARGS}
+        DEPENDS ${headers} ${KZ_ROOT}/scripts/build/m2ctx.py
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "Generating m2c context"
         VERBATIM)

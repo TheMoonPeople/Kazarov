@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-BIN = Path(__file__).resolve().parent.parent / 'bin'
+BIN = Path(__file__).resolve().parent.parent / 'scripts' / 'lib'
 KZ_LOCK = BIN / 'kz-lock'
 
 

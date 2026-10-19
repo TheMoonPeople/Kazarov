@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Convert staged retail textures for a PC port."""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from kazarov_textures import Converter, TextureError, publish, verify
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    convert = subcommands.add_parser("convert")
+    convert.add_argument("raw", type=Path)
+    convert.add_argument("output", type=Path)
+    convert.add_argument("--jobs", type=int, default=None,
+                         help="parallel conversion workers (default: up to 8 CPU cores)")
+    check = subcommands.add_parser("check")
+    check.add_argument("output", type=Path)
+    commit = subcommands.add_parser("publish")
+    commit.add_argument("staged", type=Path)
+    commit.add_argument("destination", type=Path)
+    args = parser.parse_args()
+    try:
+        if args.command == "convert":
+            report = Converter(args.raw, args.output).run(jobs=args.jobs)
+            print(f"converted {report['sources']} texture sources to {report['pngs']} PNGs")
+        elif args.command == "check":
+            print(f"checked {verify(args.output)} texture assets")
+        else:
+            publish(args.staged, args.destination)
+            print("published converted data and textures")
+        return 0
+    except (OSError, TextureError, ValueError) as error:
+        print(f"kz-textures: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

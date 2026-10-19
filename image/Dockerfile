@@ -1,5 +1,5 @@
 # Toolchain image for Chronicle and ChronicleTwo. Built locally, one tag per
-# checkout state: docker build --build-arg KZ_IMAGE_ID=<tag> -t kazarov-dev:<tag> image
+# checkout state: docker build --build-arg KZ_IMAGE_ID=<tag> -t kazarov-dev:<tag> -f image/Dockerfile .
 #
 # linux/amd64 only: wibo runs the Windows-hosted Metrowerks compiler and linker
 # and needs a real x86_64 Linux kernel.
@@ -21,16 +21,16 @@ RUN git init \
     && git remote add origin https://github.com/Adubbz/SatansFiddle.git \
     && git fetch --depth 1 origin ${SATANSFIDDLE_REV} \
     && git checkout --detach FETCH_HEAD
-COPY patches/satansfiddle-nested-arguments.patch /tmp/satansfiddle-nested-arguments.patch
+COPY image/patches/satansfiddle-nested-arguments.patch /tmp/satansfiddle-nested-arguments.patch
 RUN git apply --check /tmp/satansfiddle-nested-arguments.patch \
     && git apply /tmp/satansfiddle-nested-arguments.patch
-COPY patches/satansfiddle-control-context.patch /tmp/satansfiddle-control-context.patch
+COPY image/patches/satansfiddle-control-context.patch /tmp/satansfiddle-control-context.patch
 RUN git apply --check /tmp/satansfiddle-control-context.patch \
     && git apply /tmp/satansfiddle-control-context.patch
-COPY patches/satansfiddle-placement-new.patch /tmp/satansfiddle-placement-new.patch
+COPY image/patches/satansfiddle-placement-new.patch /tmp/satansfiddle-placement-new.patch
 RUN git apply --check /tmp/satansfiddle-placement-new.patch \
     && git apply /tmp/satansfiddle-placement-new.patch
-COPY patches/satansfiddle-external-constructors.patch /tmp/satansfiddle-external-constructors.patch
+COPY image/patches/satansfiddle-external-constructors.patch /tmp/satansfiddle-external-constructors.patch
 RUN git apply --check /tmp/satansfiddle-external-constructors.patch \
     && git apply /tmp/satansfiddle-external-constructors.patch
 # Rust 1.85 can place native libraries before the LLDB C++ archive, so the
@@ -62,7 +62,6 @@ ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=${VIRTUAL_ENV}/bin:/usr/lib/llvm-${LLVM_VERSION}/bin:${PATH}:${BINUTILS}
 ENV M2C=/opt/kazarov/m2c/m2c.py
 ENV MWCCPS2_DEBUGGER_DIR=/opt/kazarov/mwccps2-debugger
-ENV KZ_MWCC_DEBUG_DIR=/opt/kazarov/mwcc-debug
 ENV LLDB_DEBUGSERVER_PATH=/usr/lib/llvm-19/bin/lldb-server
 
 # Build tools, debuggers, and the libraries the PC port links against.
@@ -86,6 +85,14 @@ RUN apt-get update \
         build-essential \
         doxygen \
         libsdl3-dev \
+        pkg-config \
+        libxkbcommon-dev \
+        libwayland-dev \
+        libx11-dev \
+        libxcursor-dev \
+        libxi-dev \
+        libxrandr-dev \
+        libegl1-mesa-dev \
         libvulkan-dev \
         mesa-vulkan-drivers \
         vulkan-validationlayers \
@@ -151,18 +158,35 @@ RUN mkdir -p /opt/kazarov/m2c /opt/kazarov/mwccps2-debugger \
     && git -C /opt/kazarov/mwccps2-debugger fetch --depth 1 origin 3bca7ed2146f85d4e3be478b3d166fce77724499 \
     && git -C /opt/kazarov/mwccps2-debugger checkout --detach FETCH_HEAD
 
-# MWCC 2.3.3 capture tools: capture.py, gdb_capture.py, replay.py and the profile.
-COPY mwcc-debug /opt/kazarov/mwcc-debug
 RUN chmod -R a+rX /opt/kazarov
 
 # Minimal LGPL FFmpeg (MPEG-2 video decoder only) for the PC port's movies, linked statically.
-COPY kz-ffmpeg /opt/kazarov/bin/kz-ffmpeg
+COPY tools/ffmpeg/kz-ffmpeg /opt/kazarov/tools/ffmpeg/kz-ffmpeg
 RUN apt-get update \
     && apt-get install -y --no-install-recommends nasm \
     && rm -rf /var/lib/apt/lists/* \
-    && python3 /opt/kazarov/bin/kz-ffmpeg --out /opt/kazarov/ffmpeg --jobs "$(nproc)" \
+    && python3 /opt/kazarov/tools/ffmpeg/kz-ffmpeg --out /opt/kazarov/ffmpeg --jobs "$(nproc)" \
     && chmod -R a+rX /opt/kazarov/ffmpeg
 ENV KZ_FFMPEG_DIR=/opt/kazarov/ffmpeg
+
+# The native data publisher is Rust 1.99.0, linked to its C++ CLI through cxx.
+# Install the official release only after its digest matches the pinned source.
+RUN wget -O /tmp/rust.tar.xz \
+        https://static.rust-lang.org/dist/2026-10-01/rust-1.99.0-x86_64-unknown-linux-gnu.tar.xz \
+    && echo '891c6366d7100feda0bca4c03ce63f3c9ac827cbebbc283e7433061d42c6a376  /tmp/rust.tar.xz' | sha256sum -c - \
+    && tar -xJf /tmp/rust.tar.xz -C /tmp \
+    && sh /tmp/rust-1.99.0-x86_64-unknown-linux-gnu/install.sh --prefix=/opt/rust-1.99.0 --disable-ldconfig \
+    && rm -rf /tmp/rust.tar.xz /tmp/rust-1.99.0-x86_64-unknown-linux-gnu
+ENV PATH=/opt/rust-1.99.0/bin:${PATH}
+RUN cargo install cxxbridge-cmd --version 1.0.205 --locked
+
+RUN wget -O /tmp/corrosion.zip \
+        https://github.com/corrosion-rs/corrosion/archive/refs/tags/v0.6.1.zip \
+    && echo '5c1c5c6ab7196fe4466321c14e9698ec2d0a977c89fd9f1639a37fcffdf604f2  /tmp/corrosion.zip' | sha256sum -c - \
+    && unzip -q /tmp/corrosion.zip -d /opt/kazarov \
+    && mv /opt/kazarov/corrosion-0.6.1 /opt/kazarov/corrosion \
+    && rm /tmp/corrosion.zip
+ENV KZ_CORROSION_SOURCE_DIR=/opt/kazarov/corrosion
 
 # Last layer, so a new KZ_IMAGE_ID rebuilds nothing else.
 ARG KZ_IMAGE_ID

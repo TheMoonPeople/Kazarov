@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-BIN = Path(__file__).resolve().parent.parent / 'bin'
-KZ_FFMPEG = Path(__file__).resolve().parent.parent / 'image' / 'kz-ffmpeg'
+BIN = Path(__file__).resolve().parent.parent / 'scripts' / 'build'
+KZ_FFMPEG = Path(__file__).resolve().parent.parent / 'tools' / 'ffmpeg' / 'kz-ffmpeg'
 KZ_FFMPEG_LAUNCHER = BIN / 'kz-ffmpeg'
 LICENSE_LINE = 'License: LGPL version 2.1 or later'
 GPL_LICENSE_LINE = 'License: GPL version 2 or later'
@@ -65,9 +65,9 @@ def _print_configure():
 
 def _fake_tarball(tmp_path, license_line):
     script = CONFIGURE_SH.replace('@LICENSE@', license_line).encode()
-    path = tmp_path / 'ffmpeg-7.1.1.tar.xz'
+    path = tmp_path / 'ffmpeg-9.0.2.tar.xz'
     with tarfile.open(path, 'w:xz') as tf:
-        info = tarfile.TarInfo('ffmpeg-7.1.1/configure')
+        info = tarfile.TarInfo('ffmpeg-9.0.2/configure')
         info.size = len(script)
         info.mode = 0o755
         tf.addfile(info, io.BytesIO(script))
@@ -105,7 +105,7 @@ def test_build_writes_a_stamp_that_round_trips(tmp_path):
     assert built.returncode == 0, built.stderr
 
     stamp = json.loads((out / 'kz-ffmpeg.json').read_text())
-    assert stamp['version'] == '7.1.1'
+    assert stamp['version'] == '9.0.2'
     assert stamp['sha256'] == sha
     assert stamp['configure'] == shlex.split(_print_configure())[1:]
     assert stamp['license'] == LICENSE_LINE

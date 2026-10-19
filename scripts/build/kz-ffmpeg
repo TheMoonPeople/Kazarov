@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Build FFmpeg with the shared tool in tools/ffmpeg/."""
+
+import os
+import runpy
+
+runpy.run_path(
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'tools', 'ffmpeg', 'kz-ffmpeg'),
+    run_name='__main__',
+)

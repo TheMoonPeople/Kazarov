@@ -1,10 +1,10 @@
-# Paths and tools the Kazarov rules run. Included by Kazarov.cmake, after KZ_ROOT is set.
+# Paths and tools the Kazarov rules run. Included by CMakeLists.txt, after KZ_ROOT is set.
 
 file(RELATIVE_PATH KZ_ROOT_REL "${CMAKE_SOURCE_DIR}" "${KZ_ROOT}")
 file(RELATIVE_PATH KZ_BUILD_REL "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
-set(KZ_BIN "${KZ_ROOT}/bin")
+set(KZ_BUILD_SCRIPTS "${KZ_ROOT}/scripts/build")
 set(KZ_INCLUDE_REL "${KZ_ROOT_REL}/include")
-set(KZ_PYTHONPATH "${KZ_ROOT}/python")
+set(KZ_PYTHONPATH "${KZ_ROOT}/scripts")
 
 find_program(KZ_PYTHON NAMES python3 python HINTS $ENV{VIRTUAL_ENV}/bin REQUIRED)
 
@@ -62,7 +62,7 @@ endif()
 # Every compile and assembly depends on these, so a changed tool or image rebuilds
 # the objects. The image id file exists only inside the container image; KZ_IMAGE_ID is
 # also put in each command line, so a changed image changes the command.
-set(KZ_TOOL_DEPENDS ${KZ_BIN}/kz-mwcc ${KZ_BIN}/kz-mwcc-exec)
+set(KZ_TOOL_DEPENDS ${KZ_BUILD_SCRIPTS}/kz-mwcc ${KZ_BUILD_SCRIPTS}/kz-mwcc-exec)
 set(KZ_IMAGE_ID "")
 if(EXISTS /opt/kazarov/image-id)
     file(READ /opt/kazarov/image-id KZ_IMAGE_ID)

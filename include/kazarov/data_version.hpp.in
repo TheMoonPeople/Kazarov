@@ -1,0 +1,4 @@
+#pragma once
+
+// Generated from tools/kazarov/data_version.json by CMake.
+#define KAZAROV_DATA_VERSION @KZ_DATA_VERSION@

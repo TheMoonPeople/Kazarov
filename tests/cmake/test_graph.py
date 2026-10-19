@@ -1,8 +1,8 @@
-"""Ninja graph checks for cmake/Kazarov.cmake, on the fixture in fixture/.
+"""Ninja graph checks for CMakeLists.txt, on the fixture in fixture/.
 
 Each test configures the fixture into its own build directory, with the fake compiler and
 assembler, and asks ninja what it would do. Skipped while kz-mwcc, kz-mwcc-exec or
-kz-split-stamp is not in bin/.
+kz-split-stamp is not in scripts/build/.
 """
 
 import os
@@ -17,7 +17,7 @@ import pytest
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 FIXTURE = HERE / "fixture"
-BIN = ROOT / "bin"
+BIN = ROOT / "scripts" / "build"
 NEEDED_TOOLS = ("kz-mwcc", "kz-mwcc-exec", "kz-split-stamp")
 DESCRIPTION = re.compile(r"^\[\d+/\d+\] (.*)$", re.M)
 
@@ -26,7 +26,7 @@ DESCRIPTION = re.compile(r"^\[\d+/\d+\] (.*)$", re.M)
 def require_tools():
     missing = [name for name in NEEDED_TOOLS if not (BIN / name).is_file()]
     if missing:
-        pytest.skip("not present yet in bin/: " + ", ".join(missing))
+        pytest.skip("not present yet in scripts/build/: " + ", ".join(missing))
     for tool in ("cmake", "ninja"):
         if shutil.which(tool) is None:
             pytest.skip(tool + " is not on PATH")

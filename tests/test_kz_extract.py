@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-BIN = Path(__file__).resolve().parent.parent / 'bin'
+BIN = Path(__file__).resolve().parent.parent / 'scripts' / 'extract'
 KZ_EXTRACT = BIN / 'kz-extract'
 SECTOR = 2048
 

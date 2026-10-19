@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BIN = Path(__file__).resolve().parent.parent / 'bin'
+BIN = Path(__file__).resolve().parent.parent / 'scripts' / 'build'
 KZ_SPLIT_STAMP = BIN / 'kz-split-stamp'
 OLD = 1_500_000_000
 

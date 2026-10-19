@@ -1,4 +1,4 @@
-"""host/kazarov.ps1 dispatch and container argv, run under pwsh against a scratch project.
+"""scripts/kazarov.ps1 dispatch and container argv, run under pwsh against a scratch project.
 
 A fake docker records its argv, and a fake Windows host script records its argv. Skipped
 when no pwsh is found: KZ_PWSH names one, otherwise pwsh is taken from PATH.
@@ -16,7 +16,7 @@ import pytest
 
 HERE = Path(__file__).resolve().parent
 KZ = HERE.parent
-SCRIPT = KZ / "host" / "kazarov.ps1"
+SCRIPT = KZ / "scripts" / "kazarov.ps1"
 IMAGE_ID = "sha256:" + "ab" * 32
 
 CONF = """\
@@ -128,7 +128,7 @@ def test_listed_container_config_runs_in_the_container(pwsh, project):
     assert result.returncode == 0, result.stderr
     assert windows_argv is None
     run = container_run(calls)
-    assert run[-4:] == ["tools/kazarov/bin/kazarov", "--inside", "build", "ps2"]
+    assert run[-4:] == ["tools/kazarov/scripts/kazarov", "--inside", "build", "ps2"]
     assert IMAGE_ID in run
     assert f"{project[0]}:/work/scratch" in run
 
@@ -153,7 +153,7 @@ def test_argument_with_metacharacters_reaches_docker_intact(pwsh, project):
     assert result.returncode == 0, result.stderr
     assert windows_argv is None
     run = container_run(calls)
-    assert run[-6:] == [IMAGE_ID, "tools/kazarov/bin/kazarov", "--inside", "build", "ps2", tricky]
+    assert run[-6:] == [IMAGE_ID, "tools/kazarov/scripts/kazarov", "--inside", "build", "ps2", tricky]
 
 
 def test_container_default_is_passed_in_the_config_slot(pwsh, project):
@@ -162,7 +162,7 @@ def test_container_default_is_passed_in_the_config_slot(pwsh, project):
     assert result.returncode == 0, result.stderr
     assert windows_argv is None
     run = container_run(calls)
-    assert run[-5:] == ["tools/kazarov/bin/kazarov", "--inside", "build", "ps2", "-x"]
+    assert run[-5:] == ["tools/kazarov/scripts/kazarov", "--inside", "build", "ps2", "-x"]
 
 
 def test_exe_launch_passes_arguments_as_separate_words(pwsh, project):
@@ -202,7 +202,7 @@ def test_iso_path_with_spaces_stays_one_argument(pwsh, project):
     assert out.read_text(encoding="utf-8").splitlines() == ["-fastboot", "--", str(iso_dir / "game.iso")]
 
 
-QUOTE_FILE = KZ / "host" / "kazarov-quote.ps1"
+QUOTE_FILE = KZ / "scripts" / "kazarov-quote.ps1"
 
 # Each case: the argument, and what it must become on a command line.
 QUOTE_CASES = [

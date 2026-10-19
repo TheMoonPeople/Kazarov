@@ -1,4 +1,4 @@
-"""Tests for bin/kz-mwcc and bin/kz-mwcc-exec, using tests/fake_mwcc.py as the compiler.
+"""Tests for scripts/build/kz-mwcc and scripts/build/kz-mwcc-exec, using tests/fake_mwcc.py as the compiler.
 
 The fake is the EXE and the runner is this interpreter (KZ_MWCC_RUNNER=sys.executable).
 test_relative_runner runs the runner from the project root instead.
@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 TESTS = Path(__file__).resolve().parent
-BIN = TESTS.parent / "bin"
+BIN = TESTS.parent / "scripts" / "build"
 KZ_MWCC = BIN / "kz-mwcc"
 FAKE = TESTS / "fake_mwcc.py"
 SOURCES = ("a/foo.cpp", "b/foo.cpp")

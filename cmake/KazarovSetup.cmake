@@ -51,10 +51,10 @@ function(kz_disc_setup)
         add_custom_command(
             OUTPUT "${extract_id}"
             BYPRODUCTS ${inputs}
-            COMMAND ${KZ_PYTHON} ${KZ_BIN}/kz-extract
+            COMMAND ${KZ_PYTHON} ${KZ_ROOT}/scripts/extract/kz-extract
                     --iso "${iso}" --checksum "${iso_checksum}"
                     --out "${extract_dir}" --id-file "${extract_id}"
-            DEPENDS "${iso}" "${iso_checksum}" ${KZ_BIN}/kz-extract
+            DEPENDS "${iso}" "${iso_checksum}" ${KZ_ROOT}/scripts/extract/kz-extract
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             COMMENT "Extracting ${iso}"
             USES_TERMINAL
@@ -85,16 +85,16 @@ function(kz_disc_setup)
     set(chain
         COMMAND ${CMAKE_COMMAND} -E chdir "${inputs_checksum_dir}"
                 sha256sum -c "${inputs_checksum}"
-        COMMAND ${KZ_PYTHON} ${KZ_BIN}/kz-split-stamp snapshot "${split_dir}" "${snapshot}"
+        COMMAND ${KZ_PYTHON} ${KZ_BUILD_SCRIPTS}/kz-split-stamp snapshot "${split_dir}" "${snapshot}"
         ${KZD_SPLIT_COMMAND}
-        COMMAND ${KZ_PYTHON} ${KZ_BIN}/kz-split-stamp restore "${split_dir}" "${snapshot}" "${split_stamp}")
+        COMMAND ${KZ_PYTHON} ${KZ_BUILD_SCRIPTS}/kz-split-stamp restore "${split_dir}" "${snapshot}" "${split_stamp}")
 
     add_custom_command(
         OUTPUT "${split_stamp}"
         BYPRODUCTS ${split_byproducts}
         ${chain}
         DEPENDS ${split_input} "${inputs_checksum}" ${inputs} ${split_depends}
-                ${KZ_BIN}/kz-split-stamp
+                ${KZ_BUILD_SCRIPTS}/kz-split-stamp
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "Splitting ${split_dir}"
         USES_TERMINAL

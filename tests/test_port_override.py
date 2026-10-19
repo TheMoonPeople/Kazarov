@@ -5,14 +5,158 @@ Each case writes a port/src unit and a ps2/src unit under tmp_path and runs the 
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parent.parent / 'scripts' / 'port_override.py'
+SCRIPT = Path(__file__).resolve().parent.parent / 'scripts' / 'build' / 'port_override.py'
 MARKER = 'g_retail_marker'
+
+
+@pytest.mark.parametrize('prototype', ['static int F(int);', 'static int F(int);\nstatic int F(int);'])
+@pytest.mark.parametrize('storage', ['static ', ''])
+def test_private_callback_with_forward_declarations_links_external_override(tmp_path, prototype, storage):
+    compiler = os.environ.get('CXX') or shutil.which('clang++') or shutil.which('g++')
+    if not compiler:
+        pytest.skip('a C++ compiler is required for the linkage regression')
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'F(int)\n')
+    write(ps2 / 'a.cpp', prototype + f'\n{storage}int F(int x) {{ return x + 7; }}\n'
+          'static int F(float x) { return 9; }\n'
+          'static int (*table[])(int) = {F};\n'
+          'int main() { return table[0](3) == 42 && F(0.0f) == 9 ? 0 : 1; }\n')
+    assert check(tmp_path, overrides, ps2, stubs, '--private-functions').returncode == 0
+    copied = strip(tmp_path, overrides, ps2, '--private-functions')
+    write(tmp_path / 'replacement.cpp', 'int F(int) { return 42; }\n')
+    executable = tmp_path / ('callback.exe' if os.name == 'nt' else 'callback')
+    result = subprocess.run([compiler, str(tmp_path / 'stripped.cpp'),
+                             str(tmp_path / 'replacement.cpp'), '-o', str(executable)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'static int F(float x)' in copied
+    assert subprocess.run([str(executable)], capture_output=True).returncode == 0
+
+
+def test_static_prototype_keeps_inherited_linkage_override_opt_in(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'F(int)\n')
+    source = 'static int F(int);\nint F(int x) { return x + 7; }\n'
+    write(ps2 / 'a.cpp', source)
+    assert check(tmp_path, overrides, ps2, stubs).returncode != 0
+    assert source in strip(tmp_path, overrides, ps2)
+    assert check(tmp_path, overrides, ps2, stubs, '--private-functions').returncode == 0
+    copied = strip(tmp_path, overrides, ps2, '--private-functions')
+    assert 'static int F' not in copied
+    assert 'return x + 7' not in copied
+
+
+def test_private_variable_override_is_opt_in(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'state\n')
+    write(ps2 / 'a.cpp', 'static int state = 7;\nint Read() { return state; }\n')
+    assert check(tmp_path, overrides, ps2, stubs).returncode != 0
+    assert 'static int state = 7;' in strip(tmp_path, overrides, ps2)
+    assert check(tmp_path, overrides, ps2, stubs, '--private-variables').returncode == 0
+    copied = strip(tmp_path, overrides, ps2, '--private-variables')
+    assert 'extern int state;' in copied
+    assert 'return state;' in copied
+    assert 'static' not in copied
+
+
+def test_private_function_is_not_exported_by_variable_mode(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'F(int)\n')
+    write(ps2 / 'a.cpp', 'static void F(int x) { }\n')
+    assert check(tmp_path, overrides, ps2, stubs, '--private-variables').returncode != 0
+    assert 'static void F' in strip(tmp_path, overrides, ps2, '--private-variables')
+
+
+def test_private_function_override_is_opt_in_and_keeps_callback_binding(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'F(int)\n')
+    source = 'static int F(int x) { return x + 7; }\nstatic int (*table[])(int) = {F};\n'
+    write(ps2 / 'a.cpp', source)
+    assert check(tmp_path, overrides, ps2, stubs).returncode != 0
+    assert source in strip(tmp_path, overrides, ps2)
+    assert check(tmp_path, overrides, ps2, stubs, '--private-functions').returncode == 0
+    copied = strip(tmp_path, overrides, ps2, '--private-functions')
+    assert 'int F(int x);' in copied
+    assert 'static int F' not in copied
+    assert 'return x + 7' not in copied
+    assert 'static int (*table[])(int) = {F};' in copied
+    assert (ps2 / 'a.cpp').read_text() == source
+
+
+def test_private_function_mode_leaves_private_variables_and_unlisted_functions(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'F(int)\nstate\n')
+    write(ps2 / 'a.cpp', 'static int state = 7;\nstatic void F(int x) { }\nstatic void G() { }\n')
+    assert check(tmp_path, overrides, ps2, stubs, '--private-functions').returncode != 0
+    copied = strip(tmp_path, overrides, ps2, '--private-functions')
+    assert 'static int state = 7;' in copied
+    assert 'static void G() { }' in copied
+    assert 'void F(int x);' in copied
+    assert check(tmp_path, overrides, ps2, stubs, '--private-functions', '--private-variables').returncode == 0
+
+
+def test_private_function_mode_updates_cache_and_split_entries(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'F(int)\n')
+    write(ps2 / 'a.cpp', 'static void F(int x) { }\n')
+    flags = ['--cache', tmp_path / 'cache.json', '--split', tmp_path / 'split']
+    assert check(tmp_path, overrides, ps2, stubs, *flags).returncode != 0
+    assert check(tmp_path, overrides, ps2, stubs, *flags, '--private-functions').returncode == 0
+    assert (tmp_path / 'split/a.cpp.txt').read_text() == 'F(int)\n'
+    assert check(tmp_path, overrides, ps2, stubs, *flags).returncode != 0
+
+
+def test_private_function_replacement_still_needs_external_linkage(tmp_path):
+    port = tmp_path / 'port'
+    write(port / 'a.cpp', 'PORT_OVERRIDE static void F(int x) { }\n')
+    result = run('list', port, '-o', tmp_path / 'overrides.txt')
+    assert result.returncode != 0
+    assert 'a static definition replaces nothing' in result.stderr
+
+
+def test_private_function_units_preserve_unrelated_same_name_callbacks_and_cache(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'F(int)\nCallback(int)\n')
+    write(ps2 / 'a.cpp', 'int F(int x) { return x; }\n')
+    private = 'static int F(int);\nstatic int F(int x) { return x + 7; }\n'
+    write(ps2 / 'b.cpp', private)
+    write(ps2 / 'c.cpp', 'static int Callback(int x) { return x; }\n')
+    flags = ['--cache', tmp_path / 'cache.json', '--split', tmp_path / 'split', '--private-functions']
+    assert check(tmp_path, overrides, ps2, stubs, *flags).returncode == 0
+    assert (tmp_path / 'split/b.cpp.txt').read_text() == 'F(int)\n'
+    assert check(tmp_path, overrides, ps2, stubs, *flags, '--private-function-unit', 'c.cpp').returncode == 0
+    assert (tmp_path / 'split/b.cpp.txt').read_text() == ''
+    assert (tmp_path / 'split/c.cpp.txt').read_text() == 'Callback(int)\n'
+    out = tmp_path / 'b-copy.cpp'
+    result = run('strip', '--overrides', tmp_path / 'split/b.cpp.txt', ps2 / 'b.cpp', out)
+    assert result.returncode == 0
+    assert private in out.read_text()
+    assert check(tmp_path, overrides, ps2, stubs, *flags).returncode == 0
+    assert (tmp_path / 'split/b.cpp.txt').read_text() == 'F(int)\n'
+
+
+def test_private_function_unit_filter_cannot_enable_mode_implicitly(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    result = check(tmp_path, overrides, ps2, stubs, '--private-function-unit', 'a.cpp')
+    assert result.returncode != 0
+    assert 'requires --private-functions' in result.stderr
+
+
+def test_private_pointer_and_array_keep_declarations(tmp_path):
+    overrides, ps2, stubs = scenario(tmp_path, 'int x', 'int x')
+    write(overrides, 'ptr\nslots\n')
+    write(ps2 / 'a.cpp', 'static Thing *ptr;\nstatic int slots[6] = {1, 2};\n')
+    assert check(tmp_path, overrides, ps2, stubs, '--private-variables').returncode == 0
+    copied = strip(tmp_path, overrides, ps2, '--private-variables')
+    assert 'extern Thing *ptr;' in copied
+    assert 'extern int slots[6];' in copied
 
 
 def run(*args):

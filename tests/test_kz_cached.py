@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BIN = Path(__file__).resolve().parent.parent / 'bin'
+BIN = Path(__file__).resolve().parent.parent / 'scripts' / 'build'
 KZ_CACHED = BIN / 'kz-cached'
 
 

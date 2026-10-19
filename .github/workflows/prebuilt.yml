@@ -1,0 +1,134 @@
+# Builds the dependencies that no package manager ships as needed and publishes them as release assets,
+# so consumers' CI downloads and verifies them instead of compiling. A merge that changes a version publishes
+# deps-ffmpeg-<version>-cxxbridge-<version>; an existing release is never rebuilt, so its digests stay valid.
+name: Prebuilt dependencies
+
+on:
+  push:
+    branches: [main]
+    paths: [tools/ffmpeg/kz-ffmpeg, .github/workflows/prebuilt.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CXXBRIDGE_VERSION: 1.0.205
+  RUST_VERSION: 1.99.0
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      publish: ${{ steps.tag.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ffmpeg=$(python3 -c "import runpy; print(runpy.run_path('tools/ffmpeg/kz-ffmpeg')['VERSION'])")
+          tag="deps-ffmpeg-$ffmpeg-cxxbridge-$CXXBRIDGE_VERSION"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag is already published"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  ffmpeg:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    strategy:
+      matrix:
+        include:
+          # The oldest glibc a consumer links against, so the static archives need no newer symbols.
+          - { name: linux-x64, os: ubuntu-latest, container: 'debian:trixie-slim' }
+          - { name: macos-arm64, os: macos-26 }
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+    steps:
+      - name: Install the build tools
+        if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential nasm python3 curl ca-certificates xz-utils
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          version=$(python3 -c "import runpy; print(runpy.run_path('tools/ffmpeg/kz-ffmpeg')['VERSION'])")
+          curl -fL --retry 3 -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-$version.tar.xz"
+          python3 tools/ffmpeg/kz-ffmpeg --tarball ffmpeg.tar.xz --out "$PWD/out"
+          tar -xJf ffmpeg.tar.xz -O "ffmpeg-$version/COPYING.LGPLv2.1" > out/COPYING.LGPLv2.1
+          rm out/configure.log
+          tar -czf "kz-ffmpeg-$version-${{ matrix.name }}.tar.gz" -C out .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.name }}
+          path: kz-ffmpeg-*.tar.gz
+          if-no-files-found: error
+
+  cxxbridge:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    strategy:
+      matrix:
+        include:
+          - { name: linux-x64, os: ubuntu-latest, container: 'debian:trixie-slim' }
+          - { name: macos-arm64, os: macos-26 }
+          # Without the static CRT the MSVC build needs vcruntime140.dll beside it.
+          - { name: windows-x64, os: windows-2025, rustflags: '-C target-feature=+crt-static' }
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - name: Install the build tools
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends build-essential curl ca-certificates
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install pinned Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
+      - name: Build
+        run: |
+          cargo install cxxbridge-cmd --version "$CXXBRIDGE_VERSION" --locked --root out
+          archive="cxxbridge-$CXXBRIDGE_VERSION-${{ matrix.name }}"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a "$archive.zip" ./out/bin/cxxbridge.exe
+          else
+            tar -czf "$archive.tar.gz" -C out/bin cxxbridge
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cxxbridge-${{ matrix.name }}
+          path: cxxbridge-*
+          if-no-files-found: error
+
+  release:
+    needs: [plan, ffmpeg, cxxbridge]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          cd assets
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$TAG" * --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" \
+            --notes "Prebuilt LGPL FFmpeg (kz-ffmpeg) and cxxbridge-cmd $CXXBRIDGE_VERSION. Checksums in SHA256SUMS."

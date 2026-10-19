@@ -134,7 +134,7 @@ function(kz_mwcc_object obj src)
             KZ_PROJECT_ROOT=${CMAKE_SOURCE_DIR}
             "MWCIncludes=${include_dirs}"
             ${KZM_ENV}
-            ${KZ_PYTHON} ${KZ_BIN}/kz-mwcc
+            ${KZ_PYTHON} ${KZ_BUILD_SCRIPTS}/kz-mwcc
             --obj "${compiled_abs}" --depfile "${depfile}" --
             ${flags} "${src}")
 
