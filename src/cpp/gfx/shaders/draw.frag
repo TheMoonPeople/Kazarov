@@ -6,6 +6,9 @@
 
 layout(constant_id = 0) const int kTextureMode = 0; // 0 none, 1 RGBA, 2 index + palette
 layout(constant_id = 1) const bool kAlphaTest  = false;
+// DrawState::depth_coverage: palette_slot names the depth buffer, pad counts the planes and fog and
+// blend hold their depths (unused ones -1), since such a draw has no palette, fog or blending.
+layout(constant_id = 2) const bool kDepthCoverage = false;
 
 layout(set = 0, binding = 0) uniform texture2D u_textures[8192];
 layout(set = 0, binding = 1) uniform sampler u_samplers[24];
@@ -48,6 +51,7 @@ const float kModulate = 255.0 / 128.0;
 
 #define TEXTURE sampler2D(u_textures[pc.texture_slot], u_samplers[pc.sampler_slot])
 #define PALETTE sampler2D(u_textures[pc.palette_slot], u_samplers[0])
+#define DEPTH sampler2D(u_textures[pc.palette_slot], u_samplers[0])
 
 // textureGather returns texels (0,1), (1,1), (1,0), (0,0) of the 2x2 footprint.
 float Bilerp(vec4 gathered, vec2 f) {
@@ -117,6 +121,17 @@ void main() {
     } else {
         vec4 t = kTextureMode == 1 ? SampleRgba() : SamplePalette();
         color  = vec4(t.rgb * v_color.rgb * kModulate, t.a * v_color.a * kModulate);
+    }
+
+    if (kDepthCoverage) {
+        // The planes at or nearer than the scene here, as GEqual depth tests at them would pass.
+        float depth   = texelFetch(DEPTH, ivec2(gl_FragCoord.xy), 0).r;
+        float covered = dot(vec4(greaterThanEqual(pc.fog, vec4(depth))), vec4(1.0)) +
+                        dot(vec4(greaterThanEqual(pc.blend, vec4(depth))), vec4(1.0));
+        color *= covered / float(pc.pad);
+        o_color  = vec4(color.rgb, mix(color.a, 1.0, pc.target.x != 0.0));
+        o_factor = vec4(color.a);
+        return;
     }
 
     color.rgb = mix(color.rgb, mix(pc.fog.rgb, color.rgb, v_fog), bvec3(pc.fog.a != 0.0));

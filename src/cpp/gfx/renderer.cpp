@@ -386,6 +386,9 @@ bool SupportsDynamicColorWriteMask() {
 
 void CreateDevice() {
     g.depth_format = PickDepthFormat();
+    VkFormatProperties depth_properties;
+    vkGetPhysicalDeviceFormatProperties(g.physical_device, g.depth_format, &depth_properties);
+    g.depth_sampling = (depth_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
     g.dynamic_color_write_mask = g.config.dynamic_color_write_mask && SupportsDynamicColorWriteMask();
 
     float                   priority = 1.0f;
@@ -922,6 +925,12 @@ Image &CurrentMainColor() { return g.main_color[g.main_current]; }
 
 Image &PreviousMainColor() { return g.main_color[g.main_current ^ 1]; }
 
+// The main and display depth buffers; sampled too where depth_coverage draws read them.
+VkImageUsageFlags MainDepthUsage() {
+    return VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+           VK_IMAGE_USAGE_TRANSFER_DST_BIT | (g.depth_sampling ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
+}
+
 void CreateMainTargets() {
     uint32_t width = g.swapchain.extent.width;
     uint32_t height = g.swapchain.extent.height;
@@ -937,11 +946,9 @@ void CreateMainTargets() {
                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     g.main_depth = CreateImage(render_width, render_height, 1, g.depth_format,
-                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                               MainDepthUsage());
     g.display_depth = CreateImage(width, height, 1, g.depth_format,
-                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                                  MainDepthUsage());
 
     RunOneShot([](VkCommandBuffer cmd) {
         VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -976,6 +983,7 @@ void CreateMainTargets() {
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     write.pImageInfo = images;
     vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+    WriteDepthDescriptors();
 }
 
 // Render targets' pixels per logical texel before the render scale multiplies them.
@@ -1003,8 +1011,7 @@ void RecreateScaledMainTargets() {
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     }
     g.main_depth = CreateImage(width, height, 1, g.depth_format,
-                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                               MainDepthUsage());
     RunOneShot([&](VkCommandBuffer cmd) {
         VkImageSubresourceRange color_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkClearColorValue       black = {
@@ -1035,6 +1042,7 @@ void RecreateScaledMainTargets() {
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     write.pImageInfo = images;
     vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+    WriteDepthDescriptors();
     DeferDestroy([old_main, old_depth]() mutable {
         DestroyImage(old_main[0]);
         DestroyImage(old_main[1]);
@@ -1515,7 +1523,7 @@ bool InFrame() { return FrameOnThisThread() || RecordingCalls(); }
 
 RendererFeatures ActiveRendererFeatures() {
     return {g.properties.apiVersion, g.offscreen, g.triangle_fans, g.separate_stencil_masks,
-            g.dynamic_color_write_mask, g.portability_subset};
+            g.dynamic_color_write_mask, g.portability_subset, g.depth_sampling};
 }
 
 bool HeadlessSurfaceAvailable() { return InstanceHasExtension(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME); }

@@ -595,9 +595,13 @@ void CreatePipelines() {
     uint32_t families = family_count;
     uint32_t modes = kTextureModeCount;
     uint32_t total = blended + (g.dynamic_color_write_mask ? 0 : families * modes * 2);
+    // DrawState::depth_coverage's one pipeline last: 2D triangles from an RGBA texture, unblended,
+    // into a rendering without the depth attachment it samples.
+    g.coverage_pipeline = total;
+    uint32_t pipeline_count = total + (g.depth_sampling ? 1 : 0);
 
-    std::vector<VkPipelineShaderStageCreateInfo> stages(total * 2);
-    std::vector<VkGraphicsPipelineCreateInfo>    infos(total);
+    std::vector<VkPipelineShaderStageCreateInfo> stages(pipeline_count * 2);
+    std::vector<VkGraphicsPipelineCreateInfo>    infos(pipeline_count);
     uint32_t                                     blend_variants = g.blend_slot_count + (g.dynamic_color_write_mask ? 0 : 1);
     for (uint32_t family = 0; family < family_count; family++) {
         for (uint32_t blend = 0; blend < blend_variants; blend++) {
@@ -647,6 +651,33 @@ void CreatePipelines() {
             }
         }
     }
+
+    struct CoverageSpecialization {
+        int32_t  mode;
+        VkBool32 alpha_test;
+        VkBool32 coverage;
+    };
+    CoverageSpecialization   coverage_data = {kTextureRgba, VK_FALSE, VK_TRUE};
+    VkSpecializationMapEntry coverage_entries[3] = {
+        {0, offsetof(CoverageSpecialization, mode),       sizeof(int32_t) },
+        {1, offsetof(CoverageSpecialization, alpha_test), sizeof(VkBool32)},
+        {2, offsetof(CoverageSpecialization, coverage),   sizeof(VkBool32)},
+    };
+    VkSpecializationInfo          coverage_info = {3, coverage_entries, sizeof(coverage_data), &coverage_data};
+    VkPipelineRenderingCreateInfo color_only = rendering;
+    color_only.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+    color_only.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+    if (g.depth_sampling) {
+        VkPipelineShaderStageCreateInfo *stage = &stages[total * 2];
+        stage[0] = stages[PipelineIndex(kFamily2DTriangles, 0, kTextureRgba, false) * 2];
+        stage[1] = stages[PipelineIndex(kFamily2DTriangles, 0, kTextureRgba, false) * 2 + 1];
+        stage[1].pSpecializationInfo = &coverage_info;
+        infos[total] = infos[PipelineIndex(kFamily2DTriangles, 0, kTextureRgba, false)];
+        infos[total].pNext = &color_only;
+        infos[total].pStages = stage;
+        infos[total].pColorBlendState = &blends[0];
+    }
+    total = pipeline_count;
 
     // Pipeline creation is thread-safe against one cache, and on a cold cache it is the whole
     // cost of starting up, so it is spread over the cores while the caller reports progress.

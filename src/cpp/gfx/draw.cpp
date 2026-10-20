@@ -51,18 +51,23 @@ ImageState DepthAttachment() {
             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
 }
 
-void EnsureRendering(Target &target) {
+// With sample_depth the rendering leaves the depth buffer unattached, for a depth_coverage draw to
+// read; a rendering begun the other way is ended and begun again.
+void EnsureRendering(Target &target, bool sample_depth = false) {
     target = ResolveTarget(g.target);
     if (target.color == nullptr) {
         g.target = kMainTarget;
         target = ResolveTarget(g.target);
+    }
+    if (g.rendering && g.rendering_samples_depth != sample_depth) {
+        EndRendering();
     }
     if (g.rendering) {
         return;
     }
     VkCommandBuffer cmd = DrawCommands();
     Transition(cmd, *target.color, ColorAttachment());
-    Transition(cmd, *target.depth, DepthAttachment());
+    Transition(cmd, *target.depth, sample_depth ? DepthSampled() : DepthAttachment());
     if (target.texture != nullptr) {
         target.texture->last_draw_use = g.frame_serial;
     }
@@ -83,14 +88,16 @@ void EnsureRendering(Target &target) {
     info.layerCount = 1;
     info.colorAttachmentCount = 1;
     info.pColorAttachments = &color;
-    info.pDepthAttachment = &depth;
-    info.pStencilAttachment = &depth;
+    info.pDepthAttachment = sample_depth ? nullptr : &depth;
+    info.pStencilAttachment = sample_depth ? nullptr : &depth;
 #ifdef __ANDROID__
     g.cmd_begin_rendering(cmd, &info);
 #else
     vkCmdBeginRendering(cmd, &info);
 #endif
     g.rendering = true;
+    g.rendering_samples_depth = sample_depth;
+    g.sampled_depth = sample_depth ? target.depth : nullptr;
 
     VkViewport viewport = {
         0.0f, 0.0f, static_cast<float>(target.color->width), static_cast<float>(target.color->height),
@@ -284,12 +291,37 @@ void UiSideShift(UiSide side, const LogicalMapping &logical, const LogicalMappin
 // Resolves the binding and the state into push constants and binds the pipeline and dynamic
 // state. ui places the draw by the target's UI mapping, moved to the edges side names; the scissor
 // stays where the frame has it unless the side follows it. False when the draw must be dropped.
+// A depth_coverage draw as the pipeline takes it: none of the state it does without.
+DrawState CoverageState(const DrawState &state) {
+    DrawState plain = state;
+    plain.blend = false;
+    plain.premultiplied = false;
+    plain.depth_test = DepthTest::Always;
+    plain.depth_write = false;
+    plain.alpha_test = false;
+    plain.fog = false;
+    plain.stencil_test = false;
+    return plain;
+}
+
 bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureBinding &binding,
-             const DrawState &state, PushConstants &push, bool ui = false, UiSide side = {},
+             const DrawState &given, PushConstants &push, bool ui = false, UiSide side = {},
              std::span<const Vertex2D> vertices = {}) {
     if (!g.in_frame) {
         return false;
     }
+    const bool coverage = given.depth_coverage != 0;
+    if (coverage) {
+        Target    resolved = ResolveTarget(g.target);
+        bool      shares = resolved.color == nullptr || resolved.texture == nullptr || resolved.texture->shares_main_depth;
+        if (!g.depth_sampling || family != kFamily2DTriangles || given.depth_coverage > kCoveragePlanes || !shares) {
+            Error("a depth_coverage draw needs a device that samples depth, 2D triangles, at most %u planes and "
+                  "the main target or one sharing its depth",
+                  kCoveragePlanes);
+            return false;
+        }
+    }
+    const DrawState state = coverage ? CoverageState(given) : given;
     std::memset(&push, 0, sizeof(push));
     push.uv_xform[0] = 1.0f;
     push.uv_xform[1] = 1.0f;
@@ -356,8 +388,13 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
         }
     }
 
+    if (coverage && mode != kTextureRgba) {
+        Error("a depth_coverage draw needs an RGBA texture");
+        return false;
+    }
+
     Target target;
-    EnsureRendering(target);
+    EnsureRendering(target, coverage);
     VkCommandBuffer cmd = DrawCommands();
 
     // The shader writes As as the factor when C is not FIX, which premultiplied takes as its own.
@@ -366,6 +403,9 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     uint32_t     pipeline = !g.dynamic_color_write_mask && state.color_write_mask == 0
                                 ? NoColorPipelineIndex(family, mode, state.alpha_test)
                                 : PipelineIndex(family, blend.slot, mode, state.alpha_test);
+    if (coverage) {
+        pipeline = g.coverage_pipeline;
+    }
     if (g.bound.pipeline != g.pipelines[pipeline]) {
         g.bound.pipeline = g.pipelines[pipeline];
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.bound.pipeline);
@@ -427,6 +467,14 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     constexpr uint32_t kAlphaPass[8] = {0b000, 0b111, 0b001, 0b011, 0b010, 0b110, 0b100, 0b101};
     push.alpha_pass = kAlphaPass[static_cast<uint32_t>(state.alpha_func) & 7];
     push.pad = 0;
+    if (coverage) {
+        push.palette_slot = target.depth == &g.display_depth ? kDisplayDepthSlot : kMainDepthSlot;
+        push.pad = given.depth_coverage;
+        for (uint32_t i = 0; i < 4; i++) {
+            push.fog[i] = i < given.depth_coverage ? given.coverage_depths[i] : -1.0f;
+            push.blend[i] = i + 4 < given.depth_coverage ? given.coverage_depths[i + 4] : -1.0f;
+        }
+    }
     vkCmdPushConstants(cmd, PipelineLayoutOf(family), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(push), &push);
 
@@ -1022,6 +1070,11 @@ void EndRendering() {
         vkCmdEndRendering(DrawCommands());
 #endif
         g.rendering = false;
+    }
+    // Every depth image rests as an attachment between operations.
+    if (g.sampled_depth != nullptr) {
+        ToRest(DrawCommands(), *g.sampled_depth);
+        g.sampled_depth = nullptr;
     }
 }
 

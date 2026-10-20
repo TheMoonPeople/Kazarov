@@ -218,13 +218,16 @@ TEST(GfxMeshDc2, MeshConstantsKeepChroniclesSize) {
 
 TEST(GfxGpuMeshDc2, PipelinesOnlyWhenAsked) {
     uint32_t plain = 0;
+    // The depth_coverage pipeline is one of its own, whatever the families.
+    uint32_t coverage = 0;
     {
         GfxFixture fixture(kWidth, kHeight);
-        plain = gfx::PipelineCount();
+        coverage = gfx::ActiveRendererFeatures().depth_coverage ? 1 : 0;
+        plain = gfx::PipelineCount() - coverage;
     }
     ASSERT_EQ(plain % 3, 0u);
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    EXPECT_EQ(gfx::PipelineCount(), plain / 3 * 5);
+    EXPECT_EQ(gfx::PipelineCount(), plain / 3 * 5 + coverage);
 }
 
 TEST(GfxGpuMeshDc2, PlainMeshesIgnoreTheProg0Pipelines) {
