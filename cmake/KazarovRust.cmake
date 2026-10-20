@@ -51,4 +51,7 @@ elseif(APPLE)
         "-framework AppKit" "-framework Carbon" "-framework CoreFoundation" "-framework CoreGraphics"
         "-framework CoreVideo" "-framework Foundation" "-framework IOKit"
         "-framework OpenGL" "-framework QuartzCore" "-framework UniformTypeIdentifiers" objc)
+    # Corrosion adds the Command Line Tools SDK's usr/lib by a fixed path for Rust's native libraries (System, c, m).
+    # The link's own sysroot supplies them, and a CLT SDK newer than the selected linker is unreadable to it.
+    set_property(TARGET kazarov_core-static PROPERTY INTERFACE_LINK_DIRECTORIES "")
 endif()
