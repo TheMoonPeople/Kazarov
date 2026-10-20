@@ -170,7 +170,11 @@ struct PadSlot {
 // Which device the player touched last (InputActiveGlyphFamily): false until a key or the mouse is
 // used, and the make of the first gamepad once one is open.
 bool             g_last_keyboard = false;
+#ifdef __SWITCH__
+InputGlyphFamily g_pad_family = InputGlyphFamily::Switch;
+#else
 InputGlyphFamily g_pad_family = InputGlyphFamily::Ps4;
+#endif
 
 std::array<std::vector<Source>, kActionCount>            g_bindings;
 bool                                                     g_bindings_ready = false;
@@ -786,6 +790,14 @@ void InputShutdown() {
 }
 
 InputGlyphFamily InputGlyphFamilyForGamepad(int sdl_gamepad_type, unsigned vendor, unsigned product) {
+#ifdef __SWITCH__
+    // Every pad on a Switch is a Nintendo one, and SDL's Horizon joysticks report no type of theirs:
+    // the handheld Joy-Con would otherwise be shown as an Xbox pad.
+    (void) sdl_gamepad_type;
+    (void) vendor;
+    (void) product;
+    return InputGlyphFamily::Switch;
+#endif
     constexpr unsigned kValve = 0x28DE;
     constexpr unsigned kSteamDeck = 0x1205;
     switch (sdl_gamepad_type) {
