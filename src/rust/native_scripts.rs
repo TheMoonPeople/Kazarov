@@ -198,34 +198,84 @@ fn normalize(value: &str) -> String {
         .trim_end_matches(";1")
         .to_owned()
 }
+/// How a bare retail name becomes the name of its converted file.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Rename {
+    /// The converted file keeps the retail stem in the source's directory or PACK; only the extension changes.
+    Extension(String),
+    /// The converted name does not keep the retail stem: a movie's fixed path, or a renamed leaf.
+    Path(String),
+}
 #[derive(Default)]
 struct Inventory {
     paths: BTreeMap<String, String>,
-    leaves: BTreeMap<String, BTreeSet<String>>,
-    target_paths: BTreeMap<String, BTreeSet<String>>,
+    /// Lower-case retail leaf name to the renames of its converted sources.
+    leaves: BTreeMap<String, BTreeSet<Rename>>,
+    /// Lower-case retail leaf name to the published paths of its converted sources.
+    counterparts: BTreeMap<String, BTreeSet<String>>,
     profiles: BTreeMap<String, BTreeSet<String>>,
+}
+/// The rename of one converted source published at `path`. A texture's document may sit at another
+/// physical path, but keeps its logical name: in its PACK's `pack.json`, or below `textures/` in the
+/// same directory for a texture outside any PACK.
+fn rename(alias: &str, extension: &str, path: &str) -> Rename {
+    if extension == "mp4" {
+        return Rename::Path(path.to_owned());
+    }
+    let source = alias.rsplit('/').next().unwrap_or(alias);
+    let source = source.split('#').next().unwrap_or(source);
+    let lower = source.to_ascii_lowercase();
+    let logical = if extension == "json" && (lower.ends_with(".img") || lower.ends_with(".tm2")) {
+        super::textures::legacy_document_path(alias).unwrap_or_else(|_| path.to_owned())
+    } else {
+        path.to_owned()
+    };
+    let leaf = logical.rsplit('/').next().unwrap_or(&logical);
+    let stem = source.rsplit_once('.').map_or(source, |(stem, _)| stem);
+    match leaf.get(..stem.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(stem) => {
+            Rename::Extension(leaf[stem.len()..].to_owned())
+        }
+        _ => Rename::Path(leaf.to_owned()),
+    }
 }
 impl Inventory {
     fn merge(&mut self, other: Inventory) {
         self.paths.extend(other.paths);
         self.profiles.extend(other.profiles);
-        for (leaf, targets) in other.leaves {
-            self.leaves.entry(leaf).or_default().extend(targets);
+        for (leaf, renames) in other.leaves {
+            self.leaves.entry(leaf).or_default().extend(renames);
         }
-        for (target, paths) in other.target_paths {
-            self.target_paths.entry(target).or_default().extend(paths);
+        for (leaf, paths) in other.counterparts {
+            self.counterparts.entry(leaf).or_default().extend(paths);
         }
     }
-    fn target_exists(&self, target: &str, exists: impl Fn(&str) -> bool) -> bool {
-        if exists(target) {
-            return true;
-        }
-        if target.contains('/') {
-            return false;
-        }
-        self.target_paths
-            .get(&normalize(target))
-            .is_some_and(|paths| paths.iter().any(|path| exists(path)))
+    /// Records one converted source and the path its converted file is published at.
+    fn insert(&mut self, alias: &str, extension: &str, path: String) {
+        let leaf = alias
+            .rsplit('/')
+            .next()
+            .unwrap_or(alias)
+            .to_ascii_lowercase();
+        self.leaves
+            .entry(leaf.clone())
+            .or_default()
+            .insert(rename(alias, extension, &path));
+        self.counterparts
+            .entry(leaf)
+            .or_default()
+            .insert(path.clone());
+        self.paths.insert(alias.to_ascii_lowercase(), path);
+    }
+    /// Whether the converted file a migrated name refers to was published: a path directly, and a bare
+    /// name as a converted source of the retail leaf it replaced.
+    fn target_exists(&self, text: &str, target: &str, exists: impl Fn(&str) -> bool) -> bool {
+        exists(target)
+            || (!target.contains('/')
+                && self
+                    .counterparts
+                    .get(&normalize(text))
+                    .is_some_and(|paths| paths.iter().any(|path| exists(path))))
     }
     fn resource(&self, text: &str) -> Option<String> {
         let key = normalize(text);
@@ -244,11 +294,20 @@ impl Inventory {
         if key.contains('/') {
             return None;
         }
-        let candidates = self.leaves.get(&key)?;
-        if candidates.len() != 1 {
+        // The game looks a bare name up in the script's current directory and loaded PACK, which only the
+        // running script decides. Every converted source keeps its stem in that same directory or PACK, so
+        // replacing the extension names the converted file in whichever context the retail name resolved.
+        let renames = self.leaves.get(&key)?;
+        if renames.len() != 1 {
             return None;
         }
-        Some(candidates.first()?.clone())
+        match renames.first()? {
+            Rename::Path(path) => Some(path.clone()),
+            Rename::Extension(extension) => {
+                let stem = text.rsplit_once('.').map_or(text, |(stem, _)| stem);
+                Some(format!("{stem}{extension}"))
+            }
+        }
     }
     fn profile(&self, text: &str, character: Option<&str>) -> Option<String> {
         let key = normalize(text);
@@ -327,23 +386,7 @@ fn planned_lookup(
             .get(alias)
             .cloned()
             .unwrap_or_else(|| super::configs::native_path(alias, extension));
-        lookup.paths.insert(normalized_alias, path.clone());
-        let leaf = alias
-            .rsplit('/')
-            .next()
-            .unwrap_or(alias)
-            .to_ascii_lowercase();
-        let target = if ext == "pss" {
-            path.clone()
-        } else {
-            path.rsplit('/').next().unwrap_or(&path).to_owned()
-        };
-        lookup
-            .target_paths
-            .entry(normalize(&target))
-            .or_default()
-            .insert(path);
-        lookup.leaves.entry(leaf).or_default().insert(target);
+        lookup.insert(alias, extension, path);
     }
     lookup
 }
@@ -426,8 +469,8 @@ pub fn verify_archive(
         let alias = &resource.alias;
         let name = script_output_name(resources, alias);
         let actual = reader.read(&name)?;
-        let (expected, _) = migrate_checked(resource.bytes(), &lookup, |path| {
-            if lookup.target_exists(path, |candidate| reader.contains(candidate)) {
+        let (expected, _) = migrate_checked(resource.bytes(), &lookup, |text, path| {
+            if lookup.target_exists(text, path, |candidate| reader.contains(candidate)) {
                 Ok(())
             } else {
                 Err(fail(format!(
@@ -574,13 +617,13 @@ fn profile_arguments(
     Ok(locations)
 }
 fn migrate(b: &[u8], inventory: &Inventory) -> CoreResult<(Vec<u8>, usize)> {
-    migrate_checked(b, inventory, |_| Ok(()))
+    migrate_checked(b, inventory, |_, _| Ok(()))
 }
 
 fn migrate_checked(
     b: &[u8],
     inventory: &Inventory,
-    mut validate_resource: impl FnMut(&str) -> CoreResult<()>,
+    mut validate_resource: impl FnMut(&str, &str) -> CoreResult<()>,
 ) -> CoreResult<(Vec<u8>, usize)> {
     let (code, functions) = decode(b)?;
     let profile_locations = profile_arguments(b, code, &functions, inventory)?;
@@ -615,7 +658,7 @@ fn migrate_checked(
             };
             if let Some(replacement) = replacement.filter(|v| v.as_bytes() != bytes) {
                 if resource_target {
-                    validate_resource(&replacement)?;
+                    validate_resource(text, &replacement)?;
                 }
                 replacements.insert(insn.at, replacement);
             }
@@ -727,22 +770,7 @@ fn inventory_resource(
     if let Some(extension) = extension {
         let path = super::configs::native_path(alias, extension);
         if assets.join(&path).is_file() || super::configs::is_tracked(alias) {
-            inventory.paths.insert(alias.to_owned(), path.clone());
-            let leaf = Path::new(alias)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            let target = if ext == "pss" {
-                path.clone()
-            } else {
-                Path::new(&path)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            inventory.leaves.entry(leaf).or_default().insert(target);
+            inventory.insert(alias, extension, path);
         }
         if ext == "chr" {
             let sidecar = super::configs::native_path(alias, "game.json");
@@ -1300,18 +1328,108 @@ mod tests {
     #[test]
     fn bare_migrated_targets_resolve_to_published_source_paths() {
         let mut inventory = Inventory::default();
-        inventory.target_paths.insert(
-            "e110_mints.gltf".into(),
-            BTreeSet::from([
-                "event/e100/e110/e110_mints.gltf".into(),
-                "event/e100/e110/_e110_data.pak/e110_mints.gltf".into(),
-            ]),
+        inventory.insert(
+            "event/e100/e110/e110_mints.chr",
+            "gltf",
+            "event/e100/e110/e110_mints.gltf".into(),
+        );
+        inventory.insert(
+            "event/e100/e110/_e110_data.pak/e110_mints.chr",
+            "gltf",
+            "event/e100/e110/_e110_data.pak/e110_mints.gltf".into(),
         );
         let published = BTreeSet::from(["event/e100/e110/e110_mints.gltf".to_owned()]);
-        assert!(inventory.target_exists("e110_mints.gltf", |path| published.contains(path)));
-        assert!(!inventory.target_exists("missing.gltf", |path| published.contains(path)));
-        assert!(
-            !inventory.target_exists("elsewhere/e110_mints.gltf", |path| published.contains(path))
+        let exists = |path: &str| published.contains(path);
+        assert!(inventory.target_exists("e110_mints.chr", "e110_mints.gltf", exists));
+        assert!(!inventory.target_exists("missing.chr", "missing.gltf", exists));
+        assert!(!inventory.target_exists(
+            "elsewhere/e110_mints.chr",
+            "elsewhere/e110_mints.gltf",
+            exists
+        ));
+    }
+
+    #[test]
+    fn bare_names_keep_their_spelling_and_change_only_the_extension() {
+        // Underground Channel's boss scene loads "e110_Halloween.chr" in event/e100/e110/, which holds a
+        // loose e110_halloween.chr and the _e110_data.pak member e110_Halloween.chr.
+        let mut inventory = Inventory::default();
+        for (alias, extension, path) in [
+            (
+                "event/e100/e110/e110_halloween.chr",
+                "gltf",
+                "event/e100/e110/e110_halloween.gltf",
+            ),
+            (
+                "event/e100/e110/_e110_data.pak/e110_Halloween.chr",
+                "gltf",
+                "event/e100/e110/_e110_data.pak/e110_Halloween.gltf",
+            ),
+            // The loose image keeps its name below textures/; the PACK member's document takes a hash
+            // suffix, and its pack.json names it e110telop01.json.
+            (
+                "event/e100/e110/e110telop01.img",
+                "json",
+                "textures/event/e100/e110/e110telop01.json",
+            ),
+            (
+                "event/e100/e110/_e110_data.pak/e110telop01.img",
+                "json",
+                "textures/event/e100/e110/e110telop01-60b3624cea5e-0.json",
+            ),
+            (
+                "dungeon/sphida/sphida_bar_1.img",
+                "json",
+                "textures/dungeon/sphida/sphida_bar_1.json",
+            ),
+            (
+                "snd2/sp/SP_001.snd",
+                "sound.json",
+                "snd2/sp/SP_001.sound.json",
+            ),
+            (
+                "menu/0/inv0_bg.pac/sp_001.snd",
+                "sound.json",
+                "menu/0/inv0_bg.pac/sp_001.sound.json",
+            ),
+            ("movie/OPEN.pss", "mp4", "movie/OPEN.mp4"),
+            ("chara/a.mds", "gltf", "chara/a.gltf"),
+            ("etc/gsys.pak/a.mds", "gltf", "etc/gsys.pak/a.model.gltf"),
+        ] {
+            inventory.insert(alias, extension, path.into());
+        }
+        for (text, converted) in [
+            ("e110_Halloween.chr", Some("e110_Halloween.gltf")),
+            ("E110_HALLOWEEN.CHR", Some("E110_HALLOWEEN.gltf")),
+            ("e110telop01.img", Some("e110telop01.json")),
+            ("sphida_bar_1.img", Some("sphida_bar_1.json")),
+            ("sp_001.snd", Some("sp_001.sound.json")),
+            ("open.pss", Some("movie/OPEN.mp4")),
+            // Sources converted to different extensions stay unconverted.
+            ("a.mds", None),
+            ("missing.chr", None),
+            (
+                "event/e100/e110/e110telop01.img",
+                Some("textures/event/e100/e110/e110telop01.json"),
+            ),
+        ] {
+            assert_eq!(inventory.resource(text).as_deref(), converted, "{text}");
+        }
+        let mut bytes = fixture();
+        bytes.truncate(84);
+        bytes.resize(84 + 2 * 12, 0);
+        let relative = (bytes.len() - 28) as i32;
+        put(&mut bytes, 84, 3);
+        put(&mut bytes, 88, 3);
+        put(&mut bytes, 92, relative);
+        bytes.extend(b"e110_Halloween.chr\0");
+        put(&mut bytes, 84 + 12, 15);
+        let (converted, count) = migrate(&bytes, &inventory).unwrap();
+        assert_eq!(count, 1);
+        let (code, functions) = decode(&converted).unwrap();
+        assert_eq!(
+            literal(&converted, code, &functions[0][0]).unwrap(),
+            b"e110_Halloween.gltf"
         );
     }
 
@@ -1500,7 +1618,7 @@ mod tests {
         Inventory {
             paths: BTreeMap::from([("chara/hero.chr".into(), "chara/hero.gltf".into())]),
             leaves: BTreeMap::new(),
-            target_paths: BTreeMap::new(),
+            counterparts: BTreeMap::new(),
             profiles: BTreeMap::from([("chara/hero.chr".into(), BTreeSet::from(["info".into()]))]),
         }
     }

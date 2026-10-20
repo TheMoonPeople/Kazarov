@@ -427,14 +427,24 @@ impl TextureLayout {
             .iter()
             .map(|source| source["source"].as_str().unwrap())
             .collect();
-        sources.sort_by_key(|alias| {
+        let nested = |alias: &str| {
             let parents = alias.rsplit_once('/').map_or("", |(parents, _)| parents);
-            let nested = parents.split('/').any(|part| part.contains('.')) || alias.contains('#');
-            (nested, *alias)
-        });
+            parents.split('/').any(|part| part.contains('.')) || alias.contains('#')
+        };
+        sources.sort_by_key(|alias| (nested(alias), *alias));
         for alias in sources {
             let candidate = document_path(alias)?;
-            documents.insert(alias.to_owned(), Self::reserve(candidate, alias, &mut used));
+            let document = Self::reserve(candidate, alias, &mut used);
+            // Scripts name a disc file's texture by its retail name in its retail directory, which the game
+            // reads below textures/, so the document can be neither renamed nor moved.
+            if state.loose.contains(alias)
+                && document != format!("textures/{}", legacy_document_path(alias)?)
+            {
+                return Err(fail(format!(
+                    "texture outside any PACK cannot keep its retail name: {alias} -> {document}"
+                )));
+            }
+            documents.insert(alias.to_owned(), document);
         }
         let mut origins = BTreeMap::new();
         for source in &state.sources {
@@ -907,6 +917,8 @@ struct Unit {
     variants: Vec<VariantEmission>,
     record_variants: bool,
     plan_only: bool,
+    /// Disc files, as opposed to PACK members, which the game finds by their retail directory.
+    loose: BTreeSet<String>,
 }
 pub enum TextureEdit {
     Remove,
@@ -931,6 +943,7 @@ impl Unit {
             variants: Vec::new(),
             record_variants: false,
             plan_only: false,
+            loose: BTreeSet::new(),
         }
     }
     fn write_asset(
@@ -1013,6 +1026,9 @@ impl Unit {
     ) -> CoreResult<Option<Vec<u8>>> {
         if depth > 8 {
             return Err(fail(format!("PACK nesting exceeds 8 at {key}")));
+        }
+        if depth == 0 {
+            self.loose.insert(key.to_owned());
         }
         if original.starts_with(b"IMG\0")
             || original.starts_with(b"IM2\0")
@@ -1250,6 +1266,7 @@ pub fn plan_source(inventory: &super::inventory::Inventory) -> CoreResult<Textur
             state.pictures.push(record);
         }
         state.sources.extend(unit.sources);
+        state.loose.extend(unit.loose);
         state.pairs.extend(unit.pairs);
         state.written.extend(unit.written);
         for (document, count) in unit.asset_counts {
@@ -1387,6 +1404,7 @@ fn plan_root_resource(
     if texture_extension && resource.is_empty() {
         unit.sources
             .push(json!({"source":key,"kind":"empty","entries":[]}));
+        unit.loose.insert(key.to_owned());
         unit.edits.insert(key.to_owned(), TextureEdit::Remove);
         return Ok(Some(unit));
     }
@@ -1517,6 +1535,7 @@ fn process_file(
     if texture_extension && len == 0 {
         unit.sources
             .push(json!({"source":key,"kind":"empty","entries":[]}));
+        unit.loose.insert(key.to_owned());
         return Ok(unit);
     }
     if len >= 4 << 20 {
@@ -1868,6 +1887,7 @@ pub fn convert_source_with_progress(
                     record.source_idx += base;
                 }
                 state.sources.extend(unit.sources);
+                state.loose.extend(unit.loose);
                 state.pictures.extend(unit.pictures);
                 state.pairs.extend(unit.pairs);
                 state.written.extend(unit.written);
@@ -2503,7 +2523,9 @@ mod tests {
             "map/two.pac/icon.img",
             "map/THREE.PAC/ICON.IMG",
         ] {
-            state.transform(&noop, &tim2, alias, 0).unwrap();
+            // Only map/icon.img is a disc file; the rest are PACK or character members.
+            let depth = usize::from(alias != "map/icon.img");
+            state.transform(&noop, &tim2, alias, depth).unwrap();
         }
         let layout = TextureLayout::new(&state).unwrap();
         assert_eq!(
@@ -2549,6 +2571,47 @@ mod tests {
         }
         let long = format!("img/{}/hero.chr/texture.img", "x".repeat(170));
         assert!(document_path(&long).unwrap().len() <= 160);
+    }
+    #[test]
+    fn textures_outside_any_pack_keep_their_retail_name_below_textures() {
+        let mut tim2 = vec![0u8; 16];
+        tim2[..4].copy_from_slice(b"TIM2");
+        tim2[6..8].copy_from_slice(&1u16.to_le_bytes());
+        tim2.extend(picture_t8());
+        let noop = |_: &str, _: usize, _: usize, _: &[u8]| Ok(());
+        let mut state = Unit::new();
+        state.plan_only = true;
+        // A PACK member of the same name takes the suffix instead.
+        state
+            .transform(&noop, &tim2, "event/e110/_data.pak/telop.img", 1)
+            .unwrap();
+        state
+            .transform(&noop, &tim2, "event/e110/telop.img", 0)
+            .unwrap();
+        let layout = TextureLayout::new(&state).unwrap();
+        assert_eq!(
+            layout.documents["event/e110/telop.img"],
+            "textures/event/e110/telop.json"
+        );
+        assert_ne!(
+            layout.documents["event/e110/_data.pak/telop.img"],
+            "textures/event/e110/telop.json"
+        );
+        // Two such textures cannot both keep one name.
+        let mut clash = Unit::new();
+        clash.plan_only = true;
+        for alias in ["event/e110/telop.img", "event/e110/telop.tm2"] {
+            clash.transform(&noop, &tim2, alias, 0).unwrap();
+        }
+        assert!(TextureLayout::new(&clash).is_err());
+        // A disc file in a directory whose name has a dot is not in a PACK, but flattening would drop
+        // the directory.
+        let mut dotted = Unit::new();
+        dotted.plan_only = true;
+        dotted
+            .transform(&noop, &tim2, "event/v1.0/foo.img", 0)
+            .unwrap();
+        assert!(TextureLayout::new(&dotted).is_err());
     }
     #[test]
     fn document_paths_handle_markers_and_case() {
