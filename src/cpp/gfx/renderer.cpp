@@ -678,16 +678,23 @@ void CreateFrames() {
 #ifdef KZ_PORT_TRACY
 // Tracy records a calibration submission on the given command buffer and waits for it.
 void CreateGpuProfiler() {
+    // Tracy begins the buffer up to three times, which resets it implicitly, so its pool must allow a reset.
+    VkCommandPoolCreateInfo pool = {};
+    pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool.queueFamilyIndex = g.queue_family;
+    VkCommandPool calibration_pool = VK_NULL_HANDLE;
+    Check(vkCreateCommandPool(g.device, &pool, nullptr, &calibration_pool), "vkCreateCommandPool");
     VkCommandBufferAllocateInfo allocate = {};
     allocate.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocate.commandPool = g_oneshot_pool;
+    allocate.commandPool = calibration_pool;
     allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocate.commandBufferCount = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     Check(vkAllocateCommandBuffers(g.device, &allocate, &cmd), "vkAllocateCommandBuffers");
     g.tracy_vk = TracyVkContext(g.physical_device, g.device, g.queue, cmd);
     TracyVkContextName(g.tracy_vk, "Kazarov", 7);
-    vkFreeCommandBuffers(g.device, g_oneshot_pool, 1, &cmd);
+    vkDestroyCommandPool(g.device, calibration_pool, nullptr);
 }
 #endif
 
