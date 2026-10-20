@@ -319,6 +319,9 @@ bool SupportsDynamicColorWriteMask() {
 
 void CreateDevice() {
     g.depth_format = PickDepthFormat();
+    VkFormatProperties depth_properties;
+    vkGetPhysicalDeviceFormatProperties(g.physical_device, g.depth_format, &depth_properties);
+    g.depth_sampling = (depth_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
     g.dynamic_color_write_mask = g.config.dynamic_color_write_mask && SupportsDynamicColorWriteMask();
 
     float                   priority = 1.0f;
@@ -877,6 +880,12 @@ Image &CurrentMainColor() { return g.main_color[g.main_current]; }
 
 Image &PreviousMainColor() { return g.main_color[g.main_current ^ 1]; }
 
+// The main and display depth buffers; sampled too where depth_coverage draws read them.
+VkImageUsageFlags MainDepthUsage() {
+    return VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+           VK_IMAGE_USAGE_TRANSFER_DST_BIT | (g.depth_sampling ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
+}
+
 void CreateMainTargets() {
     AssertDeviceThread(__func__);
     uint32_t width = g.swapchain.extent.width;
@@ -891,8 +900,7 @@ void CreateMainTargets() {
                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     for (Image *depth : {&g.main_depth, &g.display_depth}) {
         *depth = CreateImage(width, height, 1, g.depth_format,
-                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                             MainDepthUsage());
     }
 
     RunOneShot([](VkCommandBuffer cmd) {
@@ -928,6 +936,7 @@ void CreateMainTargets() {
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     write.pImageInfo = images;
     vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+    WriteDepthDescriptors();
 }
 
 void DestroyMainTargets() {
@@ -1413,7 +1422,7 @@ bool InFrame() { return GameFrameOpen() || RecordingCalls(); }
 
 RendererFeatures ActiveRendererFeatures() {
     return {g.properties.apiVersion, g.offscreen, g.triangle_fans, g.separate_stencil_masks,
-            g.dynamic_color_write_mask, g.portability_subset};
+            g.dynamic_color_write_mask, g.portability_subset, g.depth_sampling};
 }
 
 bool HeadlessSurfaceAvailable() { return InstanceHasExtension(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME); }

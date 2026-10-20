@@ -251,6 +251,29 @@ otherwise a colourless pipeline per family, texture mode and alpha test (18) is 
 partial mask writes every channel. `RendererConfig::dynamic_color_write_mask = false` forces that
 path.
 
+## Depth coverage
+
+A 2D draw with `DrawState::depth_coverage` set to 1 to `kCoveragePlanes` (8) reads the main depth
+buffer instead of testing it. Its colour and alpha, after the texture function, are scaled by the
+fraction of `coverage_depths[0, depth_coverage)` at or nearer than the depth at the pixel (GEqual's
+comparison, 1 near). That is the image a stack of depth-tested draws at those depths makes, each
+adding its share: Chronicle's heat haze accumulates the frame beyond eight planes that way, and on
+the Switch eight blended full-screen draws per image cost 5 to 9 ms where this one costs under 1.
+
+- The draw goes into the main target or a target sharing its depth (anything else is refused with
+  a message), from an RGBA texture, as 2D triangles. It is unblended and has no fog, depth test,
+  depth write, alpha test or stencil test, whatever the state says.
+- The rendering it draws in has no depth attachment: the main or display depth buffer is moved to
+  `DEPTH_STENCIL_READ_ONLY_OPTIMAL` and sampled through a depth-only view at `kMainDepthSlot` or
+  `kDisplayDepthSlot`, the slots after `kPreviousFrame`, and put back to rest as an attachment when
+  that rendering ends. The next draw that needs the attachment begins a rendering of its own.
+- `draw.frag` takes it as a third specialisation constant, `kDepthCoverage`: the depth slot rides
+  in `palette_slot` and the plane count in `fog_color`, since such a draw has no palette or fog, and
+  the depths in `coverage`, eight floats at the end of the push block (104 bytes) that only
+  `draw.frag` declares.
+- It needs a depth format the device can sample (`ActiveRendererFeatures().depth_coverage`);
+  without one there is no pipeline for it and a caller draws the planes one by one.
+
 ## Ordering
 
 Everything happens in the order it was called. An update or copy into a texture or mesh the
@@ -267,7 +290,8 @@ above), all created in `RendererInit` on up to eight threads against the pipelin
 `RendererConfig::prog0_meshes` two more mesh families (Vu_prog0 and Vu_prog0 skinned, one vertex
 specialisation constant apart) give 5 x 28 x 3 x 2 = 840 pipelines (870 without a dynamic colour
 write mask); without it the families stop after the plain mesh family, so a renderer that does not
-ask builds exactly the 504 (522) it always did, at the same indices. Depth
+ask builds exactly the 504 (522) it always did, at the same indices. A device that samples its
+depth format adds the depth coverage pipeline after all of them (above). Depth
 test, depth write, compare op, the whole stencil state, cull mode, front face, viewport, scissor
 and topology within a class are dynamic state, so they add none. The cache file is checked against the device before use and written through a temporary
 file and a rename.

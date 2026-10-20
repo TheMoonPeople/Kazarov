@@ -128,6 +128,8 @@ struct RendererFeatures {
     bool     separate_stencil_masks;
     bool     dynamic_color_write_mask;
     bool     portability_subset;
+    // DrawState::depth_coverage draws: the device can sample its depth format.
+    bool depth_coverage;
 };
 
 // Exits the process with a message, naming what each device lacks, if no Vulkan 1.3 or later device
@@ -443,7 +445,18 @@ struct DrawState {
     bool screen_space = false;
     // Prog0Face bits of a prog0 mesh draw, passed to Vu_prog0 in push constants.
     uint32_t prog0_face = 0;
+    // A 2D draw into the main target, or a target sharing its depth, with depth_coverage planes
+    // (1 to kCoveragePlanes) reads the main depth buffer instead of testing it: its colour and alpha
+    // are scaled by the fraction of coverage_depths[0, depth_coverage) at or nearer than the depth
+    // there (GEqual's comparison, 1 near). One draw where a stack of depth-tested draws at those
+    // depths, each adding its share, would take one per plane. It is drawn unblended, without
+    // fog, the depth test or the stencil test, with an RGBA texture or none, and only where
+    // ActiveRendererFeatures().depth_coverage; elsewhere it is dropped with a message.
+    uint8_t depth_coverage = 0;
+    float   coverage_depths[8] = {};
 };
+
+inline constexpr uint32_t kCoveragePlanes = 8;
 
 // ---- Drawing ---------------------------------------------------------------------------------
 

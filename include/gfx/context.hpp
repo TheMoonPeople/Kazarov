@@ -31,7 +31,10 @@ inline constexpr uint32_t kAnisotropyLevels = 4;
 inline constexpr uint32_t kSamplerCount = kBaseSamplerCount + kAnisotropyLevels * 4;
 inline constexpr uint32_t kMaxMeshes = 65535;
 inline constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
-inline constexpr uint32_t kFirstUserSlot = 3;
+// Slots 3 and 4 hold the main and display depth buffers' depth, for DrawState::depth_coverage.
+inline constexpr uint32_t kMainDepthSlot = 3;
+inline constexpr uint32_t kDisplayDepthSlot = 4;
+inline constexpr uint32_t kFirstUserSlot = 5;
 
 [[noreturn]] void Fatal(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void              Error(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -77,6 +80,8 @@ struct ImageState {
 struct Image {
     VkImage            image = VK_NULL_HANDLE;
     VkImageView        view = VK_NULL_HANDLE;
+    // A sampled depth image's view of its depth alone.
+    VkImageView        depth_view = VK_NULL_HANDLE;
     Allocation         memory;
     VkFormat           format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspect = 0;
@@ -97,6 +102,10 @@ void       Transition(VkCommandBuffer cmd, Image &image, const ImageState &to);
 void       ToRest(VkCommandBuffer cmd, Image &image);
 ImageState TransferSrc();
 ImageState TransferDst();
+// A depth image a depth_coverage draw samples: read-only, by fragment shaders.
+ImageState DepthSampled();
+// The main and display depth buffers' depth views into kMainDepthSlot and kDisplayDepthSlot.
+void WriteDepthDescriptors();
 
 // ---- Resources -------------------------------------------------------------------------------
 
@@ -273,6 +282,8 @@ struct PushConstants {
     uint32_t mesh_index;  // record of the draw's MeshConstants in its chunk's array
     uint32_t prog0_index; // record of the draw's Prog0Constants, prog0 draws only
     uint32_t palette_index; // record of a skinned draw's Prog0Palette, skinned draws only
+    // A depth_coverage draw's planes (DrawState::coverage_depths; draw.frag alone declares them).
+    float coverage[kCoveragePlanes];
 };
 
 enum PushFlags : uint32_t {
@@ -383,6 +394,12 @@ struct Context {
 
     TextureHandle target = kMainTarget;
     bool          rendering = false;
+    // The rendering in progress has no depth attachment: a depth_coverage draw samples it.
+    bool          rendering_samples_depth = false;
+    Image        *sampled_depth = nullptr;
+    // The device samples depth_format, so depth_coverage draws have their pipeline.
+    bool          depth_sampling = false;
+    uint32_t      coverage_pipeline = 0;
     BoundState    bound;
 
     BoundConstants bound_constants;

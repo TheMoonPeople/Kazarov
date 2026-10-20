@@ -259,6 +259,31 @@ ImageState TransferSrc() {
             VK_ACCESS_2_TRANSFER_READ_BIT};
 }
 
+ImageState DepthSampled() {
+    return {VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
+}
+
+void WriteDepthDescriptors() {
+    if (!g.depth_sampling) {
+        return;
+    }
+    VkDescriptorImageInfo images[2] = {
+        {VK_NULL_HANDLE, g.main_depth.depth_view,    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
+        {VK_NULL_HANDLE, g.display_depth.depth_view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
+    };
+    static_assert(kDisplayDepthSlot == kMainDepthSlot + 1);
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = g.texture_set;
+    write.dstBinding = 0;
+    write.dstArrayElement = kMainDepthSlot;
+    write.descriptorCount = 2;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = images;
+    vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+}
+
 ImageState TransferDst() {
     return {VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT};
@@ -302,6 +327,10 @@ Image CreateImage(uint32_t width, uint32_t height, uint32_t mips, VkFormat forma
     view.format = format;
     view.subresourceRange = {image.aspect, 0, mips, 0, 1};
     Check(vkCreateImageView(g.device, &view, nullptr, &image.view), "vkCreateImageView");
+    if (IsDepthFormat(format) && (usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0) {
+        view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        Check(vkCreateImageView(g.device, &view, nullptr, &image.depth_view), "vkCreateImageView");
+    }
     return image;
 }
 
@@ -309,6 +338,9 @@ void DestroyImage(Image &image) {
     AssertDeviceThread(__func__);
     if (image.view != VK_NULL_HANDLE) {
         vkDestroyImageView(g.device, image.view, nullptr);
+    }
+    if (image.depth_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(g.device, image.depth_view, nullptr);
     }
     if (image.image != VK_NULL_HANDLE) {
         vkDestroyImage(g.device, image.image, nullptr);
