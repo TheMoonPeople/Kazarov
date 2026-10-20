@@ -497,6 +497,8 @@ struct Gltf {
     reset_rotation_scale: BTreeSet<usize>,
     /// Nodes whose rotation and scale clips are rebaked from the retail pose at every frame.
     baked: BTreeSet<usize>,
+    /// Authored matrix of each node a clip has split into translation, rotation and scale.
+    authored: BTreeMap<usize, Vec<f32>>,
     /// Transform conventions and boundary keys counted for the conversion report.
     stats: TransformStats,
     /// Animation accessors by their exact contents, so identical key data is stored once.
@@ -681,6 +683,7 @@ impl Gltf {
             rotation_nodes: BTreeMap::new(),
             reset_rotation_scale: BTreeSet::new(),
             baked: BTreeSet::new(),
+            authored: BTreeMap::new(),
             stats: TransformStats::default(),
             shared: BTreeMap::new(),
             animation_bytes: Vec::new(),
@@ -2236,6 +2239,8 @@ fn transform_keys(channels: &[Value]) -> BTreeMap<usize, [Option<&[Value]>; 3]> 
 }
 
 /// Replaces a node's authored matrix by its translation, rotation and scale.
+///
+/// The matrix is kept in `authored`, since every later clip rebakes from it.
 fn decompose_node(gltf: &mut Gltf, node: usize) {
     if let Some(matrix) = gltf.doc["nodes"][node]["matrix"].as_array() {
         let matrix: Vec<f32> = matrix.iter().map(|v| v.as_f64().unwrap() as f32).collect();
@@ -2245,6 +2250,7 @@ fn decompose_node(gltf: &mut Gltf, node: usize) {
         for (key, value) in decomposed.as_object().unwrap() {
             object.insert(key.clone(), value.clone());
         }
+        gltf.authored.insert(node, matrix);
     }
 }
 
@@ -2341,13 +2347,10 @@ fn animation_clip(
         if node >= node_count {
             return Err(fail(format!("motion frame {frame} outside model {name}")));
         }
-        let matrix: Vec<f32> = gltf.doc["nodes"][node]
-            .get("matrix")
-            .and_then(Value::as_array)
-            .map(|m| m.iter().map(|v| v.as_f64().unwrap() as f32).collect())
-            .unwrap_or_else(identity);
         let helper = gltf.rotation_nodes.get(&node).copied();
         decompose_node(gltf, node);
+        // The first clip decomposes the node; a frame without rotation keys keeps this matrix in every clip.
+        let matrix = gltf.authored.get(&node).cloned().unwrap_or_else(identity);
         if let Some(helper) = helper {
             decompose_node(gltf, helper);
         }
@@ -7397,6 +7400,71 @@ mod tests {
             );
             assert!(
                 (gltf.doc["nodes"][0]["scale"][0].as_f64().unwrap() - scale[0] as f64).abs() < 1e-6
+            );
+        }
+    }
+    #[test]
+    fn rebaked_scale_keys_keep_the_authored_rotation_in_every_clip() {
+        let mut gltf = Gltf::new();
+        // Authored a quarter turn about z, as e101a's jnt21_1 is, with the uniform scale and an offset
+        // event/tbox/p00_27a's c20a has.
+        let scale = 1.2802608f32;
+        let mut matrix = identity();
+        matrix[0] = 0.;
+        matrix[1] = scale;
+        matrix[4] = -scale;
+        matrix[5] = 0.;
+        matrix[10] = scale;
+        matrix[12] = 2.;
+        matrix[13] = 3.;
+        matrix[14] = 4.;
+        gltf.doc["nodes"] = json!([{"matrix":matrix}]);
+        gltf.doc["scenes"][0]["nodes"] = json!([0]);
+        // Scale keys only: retail scales the authored matrix in every action.
+        let channels = vec![json!({"frame":0,"type":1,"keys":[
+            {"frame":0,"value":[1,1,1,0]},
+            {"frame":4,"value":[1.35,1.35,1.35,0]},
+            {"frame":8,"value":[1,1,1,0]},
+            {"frame":12,"value":[1.35,1.35,1.35,0]}
+        ]})];
+        prepare_transform_nodes(&mut gltf, &[&channels]).unwrap();
+        assert!(gltf.baked.contains(&0));
+        animation_clip(&mut gltf, "first", &channels, (0, 4), 0, true).unwrap();
+        animation_clip(&mut gltf, "second", &channels, (8, 12), 0, true).unwrap();
+        assert_eq!(gltf.doc["nodes"][0]["translation"], json!([2., 3., 4.]));
+        let animations = gltf.doc["animations"].as_array().unwrap();
+        assert_eq!(animations.len(), 2);
+        let output = |animation: &Value, path: &str| {
+            let channel = animation["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|channel| channel["target"]["path"] == path)
+                .unwrap();
+            let sampler = channel["sampler"].as_u64().unwrap() as usize;
+            test_accessor(
+                &gltf,
+                animation["samplers"][sampler]["output"].as_u64().unwrap() as usize,
+            )
+        };
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        for animation in animations {
+            for q in output(animation, "rotation").chunks(4) {
+                let dot = q[2] * half + q[3] * half;
+                assert!(
+                    (dot.abs() - 1.).abs() < 1e-5,
+                    "{} rotation {q:?}",
+                    animation["name"]
+                );
+            }
+            // The authored scale times the key: 1.2802608 at rest, rising to 1.728352, not 1.35.
+            let scales = output(animation, "scale");
+            let (first, last) = (&scales[..3], &scales[scales.len() - 3..]);
+            assert!(
+                first.iter().all(|value| (value - scale).abs() < 1e-5)
+                    && last.iter().all(|value| (value - 1.728352).abs() < 1e-5),
+                "{} scale {scales:?}",
+                animation["name"]
             );
         }
     }
