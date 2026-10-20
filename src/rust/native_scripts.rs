@@ -1322,6 +1322,9 @@ pub(crate) fn event_script_fixture(calls: &[(i32, &[ScriptArg])]) -> Vec<u8> {
     bytes
 }
 #[cfg(test)]
+#[path = "script_reference_audit.rs"]
+mod reference_audit;
+#[cfg(test)]
 mod tests {
     use super::*;
 
