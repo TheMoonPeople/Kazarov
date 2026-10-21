@@ -80,11 +80,14 @@ TEST(PlatformArenaBlock, OverflowNamesTheArena) {
 }
 
 TEST(PlatformArenaBlock, OverflowOfAnUnnamedArenaGivesItsAddress) {
-    static char key;
-    char address[64];
-    std::snprintf(address, sizeof address, "%p", static_cast<void *>(&key));
+    // A fixed address rather than one of this process's: a death test's child may be a fresh process with its own
+    // layout. ArenaOverflow only prints it.
+    // NOLINTNEXTLINE(performance-no-int-to-ptr): never dereferenced
+    const void *arena = reinterpret_cast<const void *>(std::uintptr_t{0x12345678});
+    char        address[64];
+    std::snprintf(address, sizeof address, "%p", arena);
     const std::string expected = std::string("arena ") + address + ": allocation overflow, 9 of 8 quadwords";
-    EXPECT_DEATH(ArenaOverflow(static_cast<const void *>(&key), 9, 8), expected.c_str());
+    EXPECT_DEATH(ArenaOverflow(arena, 9, 8), expected.c_str());
 }
 
 TEST(PlatformArenaBlock, ContainsOnlyItsBlocks) {
