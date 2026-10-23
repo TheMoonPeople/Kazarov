@@ -35,8 +35,11 @@ public:
 
     void BindBank(int port, std::shared_ptr<const Bank> bank);
 
-    // Bank 0 is the port's bank; 1 to 15 are the extra banks a channel selects with CC 0.
+    // Bank 0 is the port's bank; 1 to kBanks - 1 are the extra banks a channel selects with CC 0.
     void BindBank(int port, int bank_no, std::shared_ptr<const Bank> bank);
+
+    // Every bank CC 0 can select: its whole 7-bit range.
+    static constexpr int kBanks = 128;
 
     void SetSequence(int port, std::shared_ptr<const SqFile> file);
 
@@ -99,7 +102,6 @@ public:
     void Render(float *out, int frames);
 
 private:
-    static constexpr int kBanks = 16;
 
     struct Channel {
         int  program = 0;

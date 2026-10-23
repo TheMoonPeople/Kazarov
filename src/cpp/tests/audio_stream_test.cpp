@@ -251,6 +251,30 @@ TEST(AudioMixerDc2, BankSelectPicksAnExtraBank) {
     EXPECT_NEAR(static_cast<double>(selected_count) / low_count, 0.5, 0.025);
 }
 
+TEST(AudioMixerDc2, BankSelectReachesTheLastBank) {
+    const auto   low = fx::CreateBankFixture(fx::BankSpec{});
+    fx::BankSpec octave_down_spec;
+    octave_down_spec.base_note = 72;
+    const auto octave_down = fx::CreateBankFixture(octave_down_spec);
+    ASSERT_NE(low, nullptr);
+    ASSERT_NE(octave_down, nullptr);
+
+    audio::Mixer reference(48000);
+    Prepare(reference, low);
+    KeyOn(reference, 60);
+    const int low_count = Crossings(reference);
+
+    constexpr int kLast = audio::Mixer::kBanks - 1;
+    audio::Mixer  selected(48000);
+    selected.BindBank(kPort, low);
+    selected.BindBank(kPort, kLast, octave_down);
+    selected.SetVolume(kPort, audio::kFullPortVolume);
+    selected.ShortMessage(kPort, (static_cast<std::uint32_t>(kLast) << 16) | 0xB0);
+    selected.ShortMessage(kPort, 0xC0);
+    KeyOn(selected, 60);
+    EXPECT_NEAR(static_cast<double>(Crossings(selected)) / low_count, 0.5, 0.025);
+}
+
 TEST(AudioMixerDc2, SelectingAnUnboundBankPlaysBankZero) {
     const auto bank = fx::CreateBankFixture(fx::BankSpec{});
     ASSERT_NE(bank, nullptr);
