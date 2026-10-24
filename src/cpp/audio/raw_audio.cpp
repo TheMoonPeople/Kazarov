@@ -33,6 +33,8 @@ bool IsChunk(std::span<const std::uint8_t> data, std::size_t offset,
 
 int DataBytes(std::uint8_t status) {
   switch (status & 0xF0) {
+  // Sony's sequences give a note-off its note number alone, not MIDI's note and velocity.
+  case 0x80:
   case 0xC0:
   case 0xD0:
     return 1;

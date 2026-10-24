@@ -115,8 +115,9 @@ std::vector<std::uint8_t> RawSq(int note, int velocity, int ticks) {
                                    static_cast<std::uint8_t>(note),
                                    static_cast<std::uint8_t>(velocity)};
   AppendVarLen(events, static_cast<std::uint32_t>(ticks));
+  // A retail note-off carries the note alone; the 0x00 after it is the end event's delta.
   events.insert(events.end(), {0x80, static_cast<std::uint8_t>(note), 0x00,
-                               0x00, 0xFF, 0x2F, 0x00});
+                               0xFF, 0x2F, 0x00});
 
   constexpr std::size_t block = 0x14;
   constexpr std::size_t events_at = block + 6;
