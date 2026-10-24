@@ -48,7 +48,7 @@ impl Inventory {
         if self.nodes.insert(alias.clone(), resource.clone()).is_some() {
             return Err(fail(format!("duplicate resource identity: {alias}")));
         }
-        let Some(members) = models::pack(resource.bytes()) else {
+        let Some(members) = models::pack(&resource.bytes()) else {
             self.leaves.push(resource);
             return Ok(());
         };

@@ -154,11 +154,10 @@ impl Archive {
             let end = start
                 .checked_add(size)
                 .ok_or_else(|| error("source range overflow"))?;
-            return Ok(image
-                .bytes()
-                .get(start..end)
-                .ok_or_else(|| error("truncated ISO extent"))?
-                .to_vec());
+            if end > image.len() {
+                return Err(error("truncated ISO extent"));
+            }
+            return Ok(image.slice(start..end)?.to_vec());
         }
         extent.read()
     }
@@ -261,7 +260,7 @@ fn open_image_bytes(image: &Path, bytes: &[u8]) -> CoreResult<Archive> {
 }
 
 fn open_image(image: &Path) -> CoreResult<Archive> {
-    open_image_bytes(image, &fs::read(image)?)
+    open_image_bytes(image, &SourceBytes::open_iso(image)?.bytes()?)
 }
 
 fn directory_file(root: &Path, name: &str) -> CoreResult<Extent> {
@@ -490,9 +489,40 @@ pub struct SourceTree {
 
 /// Bytes owned for the lifetime of all references into one source file.
 #[derive(Clone)]
-pub struct SourceBytes(pub Arc<Vec<u8>>);
+pub struct SourceBytes(Arc<SourceData>);
+
+enum SourceData {
+    Owned(Vec<u8>),
+    /// iOS gives an app about 7 GB of address space: a 4.7 GB disc image, read or mapped whole, leaves the
+    /// converters too little, and an allocation fails. There each resource maps its own range of the image only
+    /// while it is read.
+    Mapped { file: File, length: usize },
+}
+
+/// A source's bytes, borrowed from memory or mapped from the disc image for as long as this lives.
+pub enum SourceSlice<'a> {
+    Borrowed(&'a [u8]),
+    Mapped(memmap2::Mmap),
+    Read(Vec<u8>),
+}
+
+impl std::ops::Deref for SourceSlice<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Mapped(map) => map,
+            Self::Read(bytes) => bytes,
+        }
+    }
+}
 
 impl SourceBytes {
+    pub fn owned(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(SourceData::Owned(bytes)))
+    }
+
     /// Reads an ISO once and shares its immutable buffer with all converters.
     pub fn open_iso(path: &Path) -> CoreResult<Self> {
         Self::open_iso_with_progress(path, &Phase::noop())
@@ -503,6 +533,11 @@ impl SourceBytes {
         let length = usize::try_from(file.metadata()?.len())
             .map_err(|_| error("ISO exceeds addressable memory"))?;
         phase.set_total(length as u64);
+        if cfg!(any(target_os = "ios", kazarov_mapped_source)) {
+            phase.inc(length as u64);
+            phase.add_bytes(length as u64);
+            return Ok(Self(Arc::new(SourceData::Mapped { file, length })));
+        }
         let mut bytes = Vec::with_capacity(length);
         let mut chunk = vec![0u8; CHUNK];
         loop {
@@ -517,12 +552,70 @@ impl SourceBytes {
         if bytes.len() != length {
             return Err(error("ISO changed size while being read"));
         }
-        Ok(Self(Arc::new(bytes)))
+        Ok(Self::owned(bytes))
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        self.0.as_slice()
+    pub fn len(&self) -> usize {
+        match &*self.0 {
+            SourceData::Owned(bytes) => bytes.len(),
+            SourceData::Mapped { length, .. } => *length,
+        }
     }
+
+    /// The bytes in range, which must lie inside the source.
+    pub fn slice(&self, range: Range<usize>) -> CoreResult<SourceSlice<'_>> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(error("source range outside the source"));
+        }
+        match &*self.0 {
+            SourceData::Owned(bytes) => Ok(SourceSlice::Borrowed(&bytes[range])),
+            SourceData::Mapped { file, .. } => {
+                if range.is_empty() {
+                    return Ok(SourceSlice::Borrowed(&[]));
+                }
+                // SAFETY: the mapping is read-only, and the disc image is not changed during extraction.
+                let mapped = unsafe {
+                    memmap2::MmapOptions::new()
+                        .offset(range.start as u64)
+                        .len(range.len())
+                        .map(file)
+                };
+                match mapped {
+                    Ok(map) => Ok(SourceSlice::Mapped(map)),
+                    // Without address space for a mapping there may still be memory for a copy.
+                    Err(_) => {
+                        let mut bytes = vec![0; range.len()];
+                        read_at(file, range.start as u64, &mut bytes)?;
+                        Ok(SourceSlice::Read(bytes))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole source: a mapped image is mapped whole only for as long as the result lives.
+    pub fn bytes(&self) -> CoreResult<SourceSlice<'_>> {
+        self.slice(0..self.len())
+    }
+}
+
+#[cfg(unix)]
+fn read_at(file: &File, offset: u64, bytes: &mut [u8]) -> CoreResult<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, bytes, offset)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> CoreResult<()> {
+    while !bytes.is_empty() {
+        let count = std::os::windows::fs::FileExt::seek_read(file, bytes, offset)?;
+        if count == 0 {
+            return Err(error("disc image ended early"));
+        }
+        offset += count as u64;
+        bytes = &mut bytes[count..];
+    }
+    Ok(())
 }
 
 /// A checked, immutable byte range of a retail resource.
@@ -534,8 +627,12 @@ pub struct ResourceRef {
 }
 
 impl ResourceRef {
-    pub fn bytes(&self) -> &[u8] {
-        &self.source.0[self.range.clone()]
+    /// The resource's bytes. From a mapped disc image they stay mapped only while the result lives, so a
+    /// converter holds them for the one resource it is converting.
+    pub fn bytes(&self) -> SourceSlice<'_> {
+        self.source
+            .slice(self.range.clone())
+            .unwrap_or_else(|failure| panic!("{}: cannot read the source: {failure}", self.alias))
     }
 
     pub fn len(&self) -> usize {
@@ -595,7 +692,7 @@ impl SourceTree {
             .then(|| SourceBytes::open_iso_with_progress(source, phase))
             .transpose()?;
         let mut archive = if let Some(image) = &image {
-            open_image_bytes(source, image.bytes())?
+            open_image_bytes(source, &image.bytes()?)?
         } else {
             open_archive(source)?
         };
@@ -606,7 +703,7 @@ impl SourceTree {
             let source_bytes = if let Some(image) = &image {
                 image.clone()
             } else {
-                SourceBytes(Arc::new(item.extent.read()?))
+                SourceBytes::owned(item.extent.read()?)
             };
             let start =
                 usize::try_from(item.extent.offset).map_err(|_| error("source offset overflow"))?;
@@ -620,7 +717,7 @@ impl SourceTree {
             } else {
                 0..size
             };
-            if range.end > source_bytes.bytes().len() {
+            if range.end > source_bytes.len() {
                 return Err(error(format!("truncated source extent: {}", item.rel)));
             }
             resources.insert(
@@ -678,12 +775,12 @@ impl SourceTree {
         let bytes = entries.values().map(|entry| entry.size).sum();
         let mut resources = BTreeMap::new();
         for (name, extent) in &entries {
-            let bytes = SourceBytes(Arc::new(extent.read()?));
+            let bytes = SourceBytes::owned(extent.read()?);
             resources.insert(
                 name.clone(),
                 ResourceRef {
                     alias: name.clone(),
-                    range: 0..bytes.bytes().len(),
+                    range: 0..bytes.len(),
                     source: bytes,
                 },
             );
@@ -731,8 +828,14 @@ impl SourceTree {
             .ok_or_else(|| error("source is not an ISO"))?;
         let mut hash = Sha256::new();
         hash.update(b"kazarov-source-file-v1\0");
-        hash.update((image.bytes().len() as u64).to_le_bytes());
-        hash.update(image.bytes());
+        hash.update((image.len() as u64).to_le_bytes());
+        // A mapped image is hashed in pieces, so the whole of it is never mapped at once.
+        let mut start = 0;
+        while start < image.len() {
+            let end = image.len().min(start + (64 << 20));
+            hash.update(&*image.slice(start..end)?);
+            start = end;
+        }
         Ok(hash
             .finalize()
             .iter()

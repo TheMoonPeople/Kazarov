@@ -277,6 +277,36 @@ void UiSideShift(UiSide side, const LogicalMapping &logical, const LogicalMappin
     dy = std::round(dy);
 }
 
+// Without the bindless array: pushes the draw's texture, palette and sampler at set 0 unless the
+// last draw pushed the same. Slots no draw has written fall back to the null texture at slot 0.
+void PushTextures(VkCommandBuffer cmd, VkPipelineLayout layout, const PushConstants &push) {
+    VkImageView texture = g.texture_views[push.texture_slot];
+    VkImageView palette = g.texture_views[push.palette_slot];
+    texture = texture != VK_NULL_HANDLE ? texture : g.texture_views[0];
+    palette = palette != VK_NULL_HANDLE ? palette : g.texture_views[0];
+    if (g.bound.texture_view == texture && g.bound.palette_view == palette && g.bound.sampler == push.sampler_slot) {
+        return;
+    }
+    g.bound.texture_view = texture;
+    g.bound.palette_view = palette;
+    g.bound.sampler = push.sampler_slot;
+    VkDescriptorImageInfo images[3] = {
+        {VK_NULL_HANDLE,                texture,        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {VK_NULL_HANDLE,                palette,        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {g.samplers[push.sampler_slot], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED               },
+    };
+    VkWriteDescriptorSet writes[3] = {};
+    for (uint32_t i = 0; i < 3; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[i].pImageInfo = &images[i];
+    }
+    g.cmd_push_descriptor_set(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 3, writes);
+    g.counters.descriptor_binds++;
+}
+
 // Resolves the binding and the state into push constants and binds the pipeline and dynamic
 // state. ui places the draw by the target's UI mapping, moved to the edges side names; the scissor
 // stays where the frame has it unless the side follows it. False when the draw must be dropped.
@@ -400,6 +430,9 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     push.face = state.prog0_face;
     vkCmdPushConstants(cmd, PipelineLayoutOf(family), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(push), &push);
+    if (!g.bindless) {
+        PushTextures(cmd, PipelineLayoutOf(family), push);
+    }
 
     int cull = static_cast<int>(state.cull);
     if (g.bound.cull != cull) {
@@ -1080,9 +1113,11 @@ void ResetDrawState() {
     // A new frame's command buffer has bound nothing, and its transients start over.
     InvalidateBoundConstants();
     VkCommandBuffer cmd = DrawCommands();
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline_layout, 0, 1, &g.texture_set, 0,
-                            nullptr);
-    g.counters.descriptor_binds++;
+    if (g.bindless) {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline_layout, 0, 1, &g.texture_set, 0,
+                                nullptr);
+        g.counters.descriptor_binds++;
+    }
     vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
 }
 

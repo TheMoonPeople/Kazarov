@@ -107,6 +107,11 @@ struct RendererConfig {
     // False sets one stencil reference and compare and write masks for both faces, as on a
     // portability-subset device without separateStencilMaskRef.
     bool separate_stencil_masks = true;
+    // False pushes each draw's texture, palette and sampler, as on a device without the bindless
+    // texture array (Apple A12 and older), so that path can be exercised on any device.
+    // KZ_BINDLESS=0 in the environment sets it false. A portability-subset device (MoltenVK) pushes
+    // them whatever this says, unless KZ_BINDLESS=1.
+    bool bindless_textures = true;
     // Also precompiles the Vu_prog0 pipelines that DrawMeshProg0 needs (Dark Chronicle).
     bool prog0_meshes = false;
     // Lowers the texture and mesh tables for tests; 0 is the build maximum, larger values are clamped to it.
@@ -124,6 +129,7 @@ struct RendererFeatures {
     bool     separate_stencil_masks;
     bool     dynamic_color_write_mask;
     bool     portability_subset;
+    bool     bindless_textures;
 };
 
 // Exits the process with a message, naming what each device lacks, if no Vulkan 1.3 or later device
@@ -160,6 +166,12 @@ void SetRenderIdleHook(RenderIdleHook hook, void *user);
 void WakeRenderThread();
 // The window's pixel size changed; the swapchain and main target follow at the next BeginFrame.
 void RendererResize();
+// For an app sent to the background, where iOS refuses GPU work and ends an app that submits it: on the thread
+// that pumps the window's events, parks the render thread and waits for the GPU to finish everything submitted.
+// Until RendererResume, called on the same thread, nothing else may record or present. Resuming recreates the
+// swapchain at the next BeginFrame. Without a device, or already suspended, nothing happens.
+void RendererSuspend();
+void RendererResume();
 // The swapchain is recreated with the mode at the next BeginFrame or tick render.
 void SetPresentMode(PresentMode mode);
 

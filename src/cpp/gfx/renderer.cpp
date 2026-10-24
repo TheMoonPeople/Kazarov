@@ -6,8 +6,10 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -33,6 +35,8 @@ namespace {
 std::atomic<uint32_t> g_validation_messages{0};
 // The swapchain or surface must be made again before the next frame.
 std::atomic<bool> g_resize_pending{false};
+// KZ_BINDLESS=1: the bindless array even on a portability-subset device (see PickPhysicalDevice).
+bool g_bindless_forced = false;
 // Set by a game frame's OpenFrame, not by the idle hook's frames.
 std::atomic<bool> g_game_frame_open{false};
 
@@ -84,6 +88,109 @@ void Check(VkResult result, const char *call) {
 namespace {
 
 VkCommandPool g_oneshot_pool = VK_NULL_HANDLE;
+
+// With KZ_FRAME_STATS set, what the device thread did with frames, logged every five seconds: a window that stops
+// changing while the game runs shows here as frames that end without a present.
+struct FrameStats {
+    uint64_t opened = 0;
+    uint64_t presented = 0;
+    uint64_t acquire_failed = 0;
+    uint64_t recreated = 0;
+    uint64_t recreate_failed = 0;
+    int      last_present = 0;
+    int      last_acquire = 0;
+    // Where the device thread's time went, in milliseconds: waiting for the GPU to finish an earlier frame, for
+    // a swapchain image and in present. Much of it in the fence wait means the GPU sets the pace; little, the CPU.
+    double   fence_ms = 0;
+    double   acquire_ms = 0;
+    double   present_ms = 0;
+    double   longest_frame_ms = 0;
+    // What the frames drew, summed for the averages: a count that keeps rising while the scene does not change
+    // points at work that piles up.
+    uint64_t mesh_draws = 0;
+    uint64_t draws_2d = 0;
+    uint64_t grab_copies = 0;
+    uint64_t transient_bytes = 0;
+    uint64_t counted_frames = 0;
+    std::chrono::steady_clock::time_point last_open{};
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+FrameStats g_frame_stats;
+
+bool FrameStatsOn() {
+    static const bool on = std::getenv("KZ_FRAME_STATS") != nullptr;
+    return on;
+}
+
+double MillisecondsSince(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+void ReportFrameStats() {
+    if (!FrameStatsOn() || std::chrono::steady_clock::now() - g_frame_stats.since < std::chrono::seconds(5)) {
+        return;
+    }
+    const FrameStats &s = g_frame_stats;
+    const double      frames = s.opened > 0 ? static_cast<double>(s.opened) : 1.0;
+    const double      seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s.since).count();
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "frame stats: {} opened, {} presented (last {}), {} acquires failed (last {}), {} swapchains made, {} "
+             "failed, extent {}x{}",
+             s.opened, s.presented, s.last_present, s.acquire_failed, s.last_acquire, s.recreated,
+             s.recreate_failed, g.swapchain.extent.width, g.swapchain.extent.height);
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "frame times: {:.1f} fps, {:.2f} ms a frame, of which {:.2f} GPU fence, {:.2f} acquire, {:.2f} present; "
+             "longest {:.1f} ms",
+             s.opened / seconds, seconds * 1000.0 / frames, s.fence_ms / frames, s.acquire_ms / frames,
+             s.present_ms / frames, s.longest_frame_ms);
+    uint32_t live_textures = 0;
+    uint32_t live_targets = 0;
+    uint32_t live_meshes = 0;
+    for (const Texture &texture : g.textures) {
+        live_textures += texture.live ? 1 : 0;
+        live_targets += texture.live && texture.render_target ? 1 : 0;
+    }
+    for (const Mesh &mesh : g.meshes) {
+        live_meshes += mesh.live ? 1 : 0;
+    }
+    const double counted = s.counted_frames > 0 ? static_cast<double>(s.counted_frames) : 1.0;
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "frame work: {:.0f} mesh draws, {:.0f} 2D draws, {:.1f} grab copies, {:.2f} MB transient a frame; "
+             "{} textures ({} render targets), {} meshes live",
+             s.mesh_draws / counted, s.draws_2d / counted, s.grab_copies / counted,
+             s.transient_bytes / counted / (1024.0 * 1024.0), live_textures, live_targets, live_meshes);
+    // Each zone's time since the last report, in milliseconds a second: how much of its thread the zone takes.
+    for (profile::ZoneTotals *zone = profile::zone_totals.load(std::memory_order_acquire); zone != nullptr;
+         zone = zone->next) {
+        const uint64_t calls = zone->calls.exchange(0, std::memory_order_relaxed);
+        const uint64_t nanoseconds = zone->nanoseconds.exchange(0, std::memory_order_relaxed);
+        if (calls > 0) {
+            kz::Logf(kz::LogLevel::Info, "gfx", "zone {}: {:.1f} ms a second, {:.0f} calls a second, {:.3f} ms a call",
+                     zone->name, static_cast<double>(nanoseconds) / 1e6 / seconds,
+                     static_cast<double>(calls) / seconds, static_cast<double>(nanoseconds) / 1e6 / calls);
+        }
+    }
+    const auto last_open = s.last_open;
+    g_frame_stats = {};
+    g_frame_stats.last_open = last_open;
+}
+
+// Waits for a fence as long as it takes, saying every few seconds that the GPU has not finished: a frame
+// that never completes otherwise stops the game with nothing in the log.
+void WaitFence(VkFence fence, const char *what) {
+    constexpr uint64_t kReportNanoseconds = 5'000'000'000;
+    for (int waited = 0;; waited += 5) {
+        VkResult result = vkWaitForFences(g.device, 1, &fence, VK_TRUE, kReportNanoseconds);
+        if (result != VK_TIMEOUT) {
+            Check(result, "vkWaitForFences");
+            if (waited > 0) {
+                kz::Logf(kz::LogLevel::Warning, "gfx", "{}: the GPU finished after {}+ s", what, waited);
+            }
+            return;
+        }
+        kz::Logf(kz::LogLevel::Warning, "gfx", "{}: the GPU has not finished after {} s", what, waited + 5);
+    }
+}
 
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
                                              VkDebugUtilsMessageTypeFlagsEXT             types,
@@ -285,6 +392,20 @@ void PickPhysicalDevice() {
     if (std::vector<std::string> workarounds = PortabilityWorkarounds(chosen); !workarounds.empty()) {
         kz::Logf(kz::LogLevel::Info, "Vulkan", "portability subset: {}", Join(workarounds));
     }
+    std::vector<std::string> bindless_missing = MissingBindless(chosen);
+    // MoltenVK keeps the array in a Metal argument buffer, and a GPU drawing the item models of the
+    // quick loadout's icons from it takes an address fault (Apple A18 Pro); a portability-subset
+    // device therefore pushes each draw's textures, as Metal binds them, unless KZ_BINDLESS=1.
+    // Elsewhere turning the array off where it works is only for testing. Both need push descriptors.
+    const bool portability_pushes = chosen.portability_subset && !g_bindless_forced;
+    g.bindless = bindless_missing.empty() && !((!g.config.bindless_textures || portability_pushes) &&
+                                               HasExtension(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME));
+    if (!g.bindless) {
+        kz::Logf(kz::LogLevel::Info, "Vulkan", "each draw pushes its textures: {}",
+                 !bindless_missing.empty()     ? Join(bindless_missing)
+                 : g.config.bindless_textures ? std::string("portability subset")
+                                              : std::string("bindless textures turned off"));
+    }
 }
 
 bool DepthStencilUsable(VkFormat format) {
@@ -352,16 +473,16 @@ void CreateDevice() {
     VkPhysicalDeviceVulkan12Features features12 = {};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     features12.pNext = &features13;
-    features12.descriptorBindingPartiallyBound = VK_TRUE;
-    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
-    features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    features12.descriptorBindingPartiallyBound = g.bindless;
+    features12.descriptorBindingSampledImageUpdateAfterBind = g.bindless;
+    features12.descriptorBindingUpdateUnusedWhilePending = g.bindless;
 
     VkPhysicalDeviceFeatures2 features = {};
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features.pNext = &features12;
     features.features.dualSrcBlend = VK_TRUE;
     features.features.shaderClipDistance = VK_TRUE;
-    features.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    features.features.shaderSampledImageArrayDynamicIndexing = g.bindless;
     VkPhysicalDeviceFeatures supported = {};
     vkGetPhysicalDeviceFeatures(g.physical_device, &supported);
     g.sampler_anisotropy = supported.samplerAnisotropy == VK_TRUE;
@@ -376,6 +497,9 @@ void CreateDevice() {
     }
     if (g.portability_subset) {
         extensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
+    if (!g.bindless) {
+        extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     }
 
     VkDeviceCreateInfo info = {};
@@ -394,6 +518,14 @@ void CreateDevice() {
         g.cmd_set_color_write_mask = reinterpret_cast<PFN_vkCmdSetColorWriteMaskEXT>(
             vkGetDeviceProcAddr(g.device, "vkCmdSetColorWriteMaskEXT"));
         g.dynamic_color_write_mask = g.cmd_set_color_write_mask != nullptr;
+    }
+    if (!g.bindless) {
+        g.cmd_push_descriptor_set = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
+            vkGetDeviceProcAddr(g.device, "vkCmdPushDescriptorSetKHR"));
+        if (g.cmd_push_descriptor_set == nullptr) {
+            Fatal("%s offers %s without vkCmdPushDescriptorSetKHR", g.properties.deviceName,
+                  VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+        }
     }
 }
 
@@ -632,8 +764,10 @@ bool RecreateSwapchain(bool targets = true) {
     vkDeviceWaitIdle(g.device);
     DestroySwapchainResources();
     if (!CreateSwapchain()) {
+        g_frame_stats.recreate_failed++;
         return false;
     }
+    g_frame_stats.recreated++;
     g_resize_pending.store(false);
     if (targets) {
         SyncMainTargets();
@@ -709,7 +843,11 @@ void RunDeletions(Frame &frame) {
 void WaitFrame(Frame &frame) {
     KZ_PROFILE_ZONE("Kazarov WaitFrame");
     if (frame.pending) {
-        Check(vkWaitForFences(g.device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        const auto start = std::chrono::steady_clock::now();
+        WaitFence(frame.fence, "frame");
+        if (FrameStatsOn()) {
+            g_frame_stats.fence_ms += MillisecondsSince(start);
+        }
         frame.pending = false;
         HarvestDepthQueries(frame);
     }
@@ -718,6 +856,7 @@ void WaitFrame(Frame &frame) {
 // Moves recording to the next slot once the GPU is done with what that slot last submitted.
 void AdvanceSlot() {
     AssertDeviceThread(__func__);
+    ReportFrameStats();
     g.frame_slot = (g.frame_slot + 1) % kFramesInFlight;
     Frame &frame = CurrentFrame();
     WaitFrame(frame);
@@ -871,7 +1010,7 @@ void RunOneShot(const std::function<void(VkCommandBuffer)> &record) {
     submit.commandBufferInfoCount = 1;
     submit.pCommandBufferInfos = &command;
     Check(vkQueueSubmit2(g.queue, 1, &submit, fence), "vkQueueSubmit2");
-    Check(vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    WaitFence(fence, "one-shot submission");
     // Synchronous readback completes earlier submissions; publish their depth answers oldest first.
     for (uint32_t frame_offset = 1; frame_offset <= kFramesInFlight; ++frame_offset) {
         WaitFrame(g.frames[(g.frame_slot + frame_offset) % kFramesInFlight]);
@@ -925,6 +1064,10 @@ void CreateMainTargets() {
     VkDescriptorImageInfo images[2];
     for (uint32_t i = 0; i < 2; i++) {
         images[i] = {VK_NULL_HANDLE, g.main_color[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        g.texture_views[kMainTarget + i] = g.main_color[i].view;
+    }
+    if (!g.bindless) {
+        return;
     }
     VkWriteDescriptorSet write = {};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -968,6 +1111,13 @@ float LogicalHeight() { return g.config.logical_height; }
 
 LogicalRect LogicalFrame() { return {0.0f, 0.0f, LogicalWidth(), LogicalHeight()}; }
 
+namespace {
+
+// Held by RendererSuspend's caller while the app is in the background.
+std::optional<RenderLease> g_suspend_lease;
+
+} // namespace
+
 void RendererInit(SDL_Window *window, const RendererConfig &config) {
     static uint64_t instances = 0;
     g_validation_messages.store(0);
@@ -984,11 +1134,19 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
             Error("KZ_RENDER_THREAD=%s is not off, lockstep or async", setting);
         }
     }
+    if (const char *setting = std::getenv("KZ_BINDLESS"); setting != nullptr && std::strcmp(setting, "0") == 0) {
+        g.config.bindless_textures = false;
+    }
+    g_bindless_forced = [] {
+        const char *setting = std::getenv("KZ_BINDLESS");
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+    }();
 #ifdef __ANDROID__
     g.config.render_thread = RenderThreadMode::Off;
 #endif
     g.texture_slot_limit = config.texture_slots == 0 ? kMaxTextures : std::min(config.texture_slots, kMaxTextures);
     g.mesh_slot_limit = config.mesh_slots == 0 ? kMaxMeshes : std::min(config.mesh_slots, kMaxMeshes);
+    g.texture_views.assign(g.texture_slot_limit, VK_NULL_HANDLE);
     g.offscreen = config.offscreen;
     g.layout = config.layout;
     CreateInstance();
@@ -1022,6 +1180,7 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
 }
 
 void RendererShutdown() {
+    g_suspend_lease.reset();
     // No idle hook call may start once shutdown begins.
     SetRenderIdleHook(nullptr, nullptr);
     if (g.device == VK_NULL_HANDLE) {
@@ -1080,6 +1239,24 @@ void RendererShutdown() {
 
 void RendererResize() { g_resize_pending.store(true); }
 
+void RendererSuspend() {
+    if (g.device == VK_NULL_HANDLE || g_suspend_lease) {
+        return;
+    }
+    // The lease waits out queued commands and the idle hook's frame, then keeps both from starting.
+    g_suspend_lease.emplace();
+    vkDeviceWaitIdle(g.device);
+}
+
+void RendererResume() {
+    if (!g_suspend_lease) {
+        return;
+    }
+    // The layer's drawables may have changed size or been released while the app was away.
+    g_resize_pending.store(true);
+    g_suspend_lease.reset();
+}
+
 void SetAnisotropy(int samples) {
     RunOnRenderThread([&] {
         uint32_t level = 0;
@@ -1112,6 +1289,15 @@ bool OpenFrame() {
     }
 #endif
     g.in_frame = true;
+    g_frame_stats.opened++;
+    if (FrameStatsOn()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (g_frame_stats.last_open != std::chrono::steady_clock::time_point{}) {
+            g_frame_stats.longest_frame_ms =
+                std::max(g_frame_stats.longest_frame_ms, MillisecondsSince(g_frame_stats.last_open));
+        }
+        g_frame_stats.last_open = now;
+    }
     if (!tls.in_idle_hook) {
         g_game_frame_open.store(true);
     }
@@ -1130,7 +1316,23 @@ void FinishFrame() {
 }
 
 // A swapchain image for this frame slot, recreating the swapchain when it is out of date.
+bool AcquireImageOnce(bool targets, VkResult &result);
+
 bool AcquireImage(bool targets) {
+    VkResult   result = VK_SUCCESS;
+    const auto start = std::chrono::steady_clock::now();
+    const bool acquired = AcquireImageOnce(targets, result);
+    if (FrameStatsOn()) {
+        g_frame_stats.acquire_ms += MillisecondsSince(start);
+    }
+    if (!acquired) {
+        g_frame_stats.acquire_failed++;
+        g_frame_stats.last_acquire = static_cast<int>(result);
+    }
+    return acquired;
+}
+
+bool AcquireImageOnce(bool targets, VkResult &result) {
     AssertDeviceThread(__func__);
     KZ_PROFILE_ZONE("Kazarov AcquireImage");
     // The idle hook leaves swapchain recreation to the game thread's next recording.
@@ -1141,7 +1343,7 @@ bool AcquireImage(bool targets) {
         SubmitUploadsAndWait();
         return false;
     }
-    VkResult result = vkAcquireNextImageKHR(g.device, g.swapchain.handle, UINT64_MAX,
+    result = vkAcquireNextImageKHR(g.device, g.swapchain.handle, UINT64_MAX,
                                             CurrentFrame().image_available, VK_NULL_HANDLE, &g.image_index);
     if (SwapchainLost(result)) {
         // Recreating may submit pending uploads and move to the next slot.
@@ -1208,7 +1410,13 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     present.swapchainCount = 1;
     present.pSwapchains = &g.swapchain.handle;
     present.pImageIndices = &g.image_index;
-    VkResult result = vkQueuePresentKHR(g.queue, &present);
+    const auto present_start = std::chrono::steady_clock::now();
+    VkResult   result = vkQueuePresentKHR(g.queue, &present);
+    if (FrameStatsOn()) {
+        g_frame_stats.present_ms += MillisecondsSince(present_start);
+    }
+    g_frame_stats.presented++;
+    g_frame_stats.last_present = static_cast<int>(result);
     if (result == VK_SUBOPTIMAL_KHR) {
         if (SuboptimalNeedsRecreate()) {
             g_resize_pending.store(true);
@@ -1221,6 +1429,13 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
 }
 
 void PlotFrameCounters() {
+    if (FrameStatsOn()) {
+        g_frame_stats.mesh_draws += g.counters.mesh_draws;
+        g_frame_stats.draws_2d += g.counters.draws_2d;
+        g_frame_stats.grab_copies += g.counters.grab_copies;
+        g_frame_stats.transient_bytes += g.counters.transient_bytes;
+        ++g_frame_stats.counted_frames;
+    }
     KZ_PROFILE_PLOT("Kazarov mesh draws", g.counters.mesh_draws);
     KZ_PROFILE_PLOT("Kazarov 2D draws", g.counters.draws_2d);
     KZ_PROFILE_PLOT("Kazarov grab copies", g.counters.grab_copies);
@@ -1420,7 +1635,7 @@ bool InFrame() { return GameFrameOpen() || RecordingCalls(); }
 
 RendererFeatures ActiveRendererFeatures() {
     return {g.properties.apiVersion, g.offscreen, g.triangle_fans, g.separate_stencil_masks,
-            g.dynamic_color_write_mask, g.portability_subset};
+            g.dynamic_color_write_mask, g.portability_subset, g.bindless};
 }
 
 bool HeadlessSurfaceAvailable() { return InstanceHasExtension(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME); }

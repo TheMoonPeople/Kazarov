@@ -12,8 +12,8 @@ crate-type = ["staticlib", "rlib"]
 cxx = "=1.0.205"
 crc32fast = "1.5.2"
 encoding_rs = "=0.8.35"
-eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-rfd = "=0.17.2"
+eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
+rfd = { version = "=0.17.2", optional = true }
 gpt_disk_io = { version = "=0.16.2", features = ["std"] }
 iso9660-rs = "=1.0.2"
 memmap2 = "0.9.11"
@@ -23,6 +23,11 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 zstd = { version = "0.14.2", default-features = false }
 libc = "0.2"
+
+[features]
+# The desktop setup window; iOS builds without it.
+default = ["desktop-ui"]
+desktop-ui = ["dep:eframe", "dep:rfd"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

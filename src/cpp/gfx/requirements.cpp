@@ -102,16 +102,10 @@ std::vector<std::string> MissingRequirements(const DeviceCaps &caps, bool offscr
     }
     need(caps.features.dualSrcBlend, "dualSrcBlend");
     need(caps.features.shaderClipDistance, "shaderClipDistance");
-    need(caps.features.shaderSampledImageArrayDynamicIndexing, "shaderSampledImageArrayDynamicIndexing");
-    need(caps.features12.descriptorBindingPartiallyBound, "descriptorBindingPartiallyBound");
-    need(caps.features12.descriptorBindingSampledImageUpdateAfterBind, "descriptorBindingSampledImageUpdateAfterBind");
-    need(caps.features12.descriptorBindingUpdateUnusedWhilePending, "descriptorBindingUpdateUnusedWhilePending");
-    need(caps.properties12.maxPerStageDescriptorUpdateAfterBindSampledImages >= kMaxTextures &&
-             caps.properties12.maxDescriptorSetUpdateAfterBindSampledImages >= kMaxTextures,
-         "8192 update-after-bind sampled images (maxPerStageDescriptorUpdateAfterBindSampledImages, "
-         "maxDescriptorSetUpdateAfterBindSampledImages)");
-    need(caps.properties12.maxPerStageUpdateAfterBindResources >= kMaxTextures + kSamplerCount + 1,
-         "maxPerStageUpdateAfterBindResources for the texture array");
+    if (!MissingBindless(caps).empty()) {
+        need(HasExtension(caps, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
+             "the bindless texture array or " VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    }
     need(caps.features13.dynamicRendering, "dynamicRendering");
     need(caps.features13.synchronization2, "synchronization2");
     need(caps.limits.maxPushConstantsSize >= sizeof(PushConstants), "maxPushConstantsSize");
@@ -123,6 +117,26 @@ std::vector<std::string> MissingRequirements(const DeviceCaps &caps, bool offscr
         need(sizeof(Vertex2D) % alignment == 0 && sizeof(Vertex3D) % alignment == 0,
              "vertex strides of 28 and 36 bytes (minVertexInputBindingStrideAlignment)");
     }
+    return missing;
+}
+
+std::vector<std::string> MissingBindless(const DeviceCaps &caps) {
+    std::vector<std::string> missing;
+    auto                     need = [&](bool present, const char *what) {
+        if (!present) {
+            missing.emplace_back(what);
+        }
+    };
+    need(caps.features.shaderSampledImageArrayDynamicIndexing, "shaderSampledImageArrayDynamicIndexing");
+    need(caps.features12.descriptorBindingPartiallyBound, "descriptorBindingPartiallyBound");
+    need(caps.features12.descriptorBindingSampledImageUpdateAfterBind, "descriptorBindingSampledImageUpdateAfterBind");
+    need(caps.features12.descriptorBindingUpdateUnusedWhilePending, "descriptorBindingUpdateUnusedWhilePending");
+    need(caps.properties12.maxPerStageDescriptorUpdateAfterBindSampledImages >= kMaxTextures &&
+             caps.properties12.maxDescriptorSetUpdateAfterBindSampledImages >= kMaxTextures,
+         "8192 update-after-bind sampled images (maxPerStageDescriptorUpdateAfterBindSampledImages, "
+         "maxDescriptorSetUpdateAfterBindSampledImages)");
+    need(caps.properties12.maxPerStageUpdateAfterBindResources >= kMaxTextures + kSamplerCount + 1,
+         "maxPerStageUpdateAfterBindResources for the texture array");
     return missing;
 }
 

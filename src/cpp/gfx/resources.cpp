@@ -40,6 +40,10 @@ VkFormat VulkanFormat(TextureFormat format) {
 
 void WriteTextureDescriptor(uint32_t slot, VkImageView view) {
     AssertDeviceThread(__func__);
+    g.texture_views[slot] = view;
+    if (!g.bindless) {
+        return;
+    }
     VkDescriptorImageInfo image = {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet  write = {};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

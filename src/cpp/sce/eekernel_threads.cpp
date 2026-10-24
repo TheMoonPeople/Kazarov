@@ -4,8 +4,14 @@
 
 #include <eekernel.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <format>
 #include <iterator>
@@ -28,6 +34,53 @@ void *CreateFiber(std::size_t stack_size, void (*start)(void *), void *parameter
 void  SwitchToFiber(void *fiber);
 void  DeleteFiber(void *fiber);
 }
+#elif defined(__APPLE__) && defined(__aarch64__) && TARGET_OS_IPHONE
+// iOS gets its own switch: <ucontext.h> is deprecated on Apple platforms and its swapcontext did not switch there,
+// so the loading thread of a new game never ran and DeleteNowLoading waited for it forever.
+#define KZ_ARM64_FIBERS 1
+extern "C" void kz_fiber_switch(void **save_sp, void *load_sp);
+extern "C" void kz_fiber_trampoline();
+// Saves the callee-saved registers the AAPCS64 asks a call to keep (x19-x30 and d8-d15) on the current stack,
+// stores that stack in *save_sp, and resumes the stack in load_sp the same way.
+asm(R"(
+    .text
+    .p2align 2
+    .globl _kz_fiber_switch
+_kz_fiber_switch:
+    sub sp, sp, #0xa0
+    stp x19, x20, [sp, #0x00]
+    stp x21, x22, [sp, #0x10]
+    stp x23, x24, [sp, #0x20]
+    stp x25, x26, [sp, #0x30]
+    stp x27, x28, [sp, #0x40]
+    stp x29, x30, [sp, #0x50]
+    stp d8, d9, [sp, #0x60]
+    stp d10, d11, [sp, #0x70]
+    stp d12, d13, [sp, #0x80]
+    stp d14, d15, [sp, #0x90]
+    mov x2, sp
+    str x2, [x0]
+    mov sp, x1
+    ldp x19, x20, [sp, #0x00]
+    ldp x21, x22, [sp, #0x10]
+    ldp x23, x24, [sp, #0x20]
+    ldp x25, x26, [sp, #0x30]
+    ldp x27, x28, [sp, #0x40]
+    ldp x29, x30, [sp, #0x50]
+    ldp d8, d9, [sp, #0x60]
+    ldp d10, d11, [sp, #0x70]
+    ldp d12, d13, [sp, #0x80]
+    ldp d14, d15, [sp, #0x90]
+    add sp, sp, #0xa0
+    ret
+
+    .p2align 2
+    .globl _kz_fiber_trampoline
+_kz_fiber_trampoline:
+    mov x29, xzr
+    bl _kz_fiber_entry
+    brk #0
+)");
 #else
 #include <ucontext.h>
 #endif
@@ -79,6 +132,41 @@ void ContextDestroy(Context &c) {
         DeleteFiber(c.fiber);
         c.fiber = nullptr;
     }
+}
+
+#elif defined(KZ_ARM64_FIBERS)
+
+// A suspended thread is its stack pointer: kz_fiber_switch left the saved registers there.
+struct Context {
+    void *sp = nullptr;
+    void *stack = nullptr;
+};
+
+void ContextInitMain(Context &) {}
+
+void ContextCreate(Context &c) {
+    c.stack = std::malloc(kStackSize);
+    if (c.stack == nullptr) {
+        kz::Abort("eekernel", "out of memory for a thread stack");
+    }
+    // The first switch to the thread restores this frame: zeroed registers, x30 at the trampoline that calls
+    // RunEntry.
+    auto *top = reinterpret_cast<std::uintptr_t *>(
+        (reinterpret_cast<std::uintptr_t>(c.stack) + kStackSize) & ~static_cast<std::uintptr_t>(15));
+    auto *frame = top - 0xa0 / sizeof(std::uintptr_t);
+    std::memset(frame, 0, 0xa0);
+    frame[0x58 / sizeof(std::uintptr_t)] = reinterpret_cast<std::uintptr_t>(&kz_fiber_trampoline);
+    c.sp = frame;
+}
+
+void ContextSwitch(Context &prev, Context &next) {
+    kz_fiber_switch(&prev.sp, next.sp);
+}
+
+void ContextDestroy(Context &c) {
+    std::free(c.stack);
+    c.stack = nullptr;
+    c.sp = nullptr;
 }
 
 #else
@@ -232,6 +320,33 @@ void RunEntry() {
 }
 
 } // namespace
+
+std::size_t KzThreadsSnapshot(KzThreadInfo *out, std::size_t max) {
+    Scheduler  &s = Sched();
+    std::size_t count = 0;
+    for (const auto &[id, thread] : s.threads) {
+        if (count < max) {
+            KzThreadInfo &info = out[count];
+            info = {id, thread->priority, static_cast<int>(thread->state), thread->waiting_on, 0, 0};
+#if defined(KZ_ARM64_FIBERS)
+            // A suspended thread resumes at the x30 kz_fiber_switch saved, with the x29 beside it.
+            if (thread.get() != s.running && thread->context.sp != nullptr) {
+                const auto *saved = static_cast<const std::uintptr_t *>(thread->context.sp);
+                info.fp = saved[0x50 / sizeof(std::uintptr_t)];
+                info.pc = saved[0x58 / sizeof(std::uintptr_t)];
+            }
+#endif
+        }
+        ++count;
+    }
+    return count;
+}
+
+#if defined(KZ_ARM64_FIBERS)
+extern "C" void kz_fiber_entry() {
+    RunEntry();
+}
+#endif
 
 void KzThreadsSetMainPriority(int priority) {
     Scheduler &s = Sched();

@@ -12,6 +12,14 @@
 #include <string_view>
 #include <thread>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
+#endif
+
 #include "gfx/context.hpp"
 #include "gfx/profile.hpp"
 
@@ -47,6 +55,11 @@ bool HookWanted() {
 
 void WorkerMain() {
     KZ_PROFILE_THREAD("Kazarov render");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // A thread std::thread starts gets the default QoS, below the main thread's user-interactive class, which lets
+    // iOS run it on the efficiency cores. It renders and presents the display frames, so it takes the game's class.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     for (;;) {
         std::unique_lock lock(g_mutex);
         g_cv.wait(lock, [] { return g_stop || (!g_queue.empty() && !g_leased) || HookWanted(); });

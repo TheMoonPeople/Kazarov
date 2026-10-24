@@ -165,6 +165,88 @@ struct Resource {
     alias: String,
     data: Vec<u8>,
 }
+
+/// A file's discovered resources. Every analysed file waits with the others until all are analysed, so their
+/// copies are kept zstd-packed meanwhile, as its model artifacts are, and unpacked by the job that publishes it.
+enum ResourceStore {
+    Plain(Vec<Resource>),
+    Packed {
+        first_alias: Option<String>,
+        data_len: usize,
+        decoded_len: usize,
+        bytes: super::spill::SpilledBytes,
+    },
+}
+
+impl ResourceStore {
+    fn pack(&mut self) -> CoreResult<()> {
+        let Self::Plain(resources) = self else {
+            return Ok(());
+        };
+        let mut encoded = Vec::new();
+        for resource in resources.iter() {
+            encoded.extend((resource.alias.len() as u64).to_le_bytes());
+            encoded.extend(resource.alias.as_bytes());
+            encoded.extend((resource.data.len() as u64).to_le_bytes());
+            encoded.extend(&resource.data);
+        }
+        let mut bytes = zstd::bulk::compress(&encoded, 1)?;
+        bytes.shrink_to_fit();
+        *self = Self::Packed {
+            first_alias: resources.first().map(|resource| resource.alias.clone()),
+            data_len: resources.iter().map(|resource| resource.data.len()).sum(),
+            decoded_len: encoded.len(),
+            bytes: super::spill::SpilledBytes::new(bytes)?,
+        };
+        Ok(())
+    }
+
+    fn load(&self) -> CoreResult<std::borrow::Cow<'_, [Resource]>> {
+        let (decoded_len, bytes) = match self {
+            Self::Plain(resources) => return Ok(std::borrow::Cow::Borrowed(resources)),
+            Self::Packed {
+                decoded_len, bytes, ..
+            } => (*decoded_len, bytes),
+        };
+        let decoded = zstd::bulk::decompress(&bytes.read()?, decoded_len)?;
+        fn take<'a>(decoded: &'a [u8], at: &mut usize, count: usize) -> CoreResult<&'a [u8]> {
+            let end = at
+                .checked_add(count)
+                .ok_or_else(|| fail("packed model resources are truncated"))?;
+            let slice = decoded
+                .get(*at..end)
+                .ok_or_else(|| fail("packed model resources are truncated"))?;
+            *at = end;
+            Ok(slice)
+        }
+        let length = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap()) as usize;
+        let mut at = 0;
+        let mut resources = Vec::new();
+        while at < decoded.len() {
+            let alias_len = length(take(&decoded, &mut at, 8)?);
+            let alias = String::from_utf8(take(&decoded, &mut at, alias_len)?.to_vec())
+                .map_err(|_| fail("packed model resource alias is not UTF-8"))?;
+            let data_len = length(take(&decoded, &mut at, 8)?);
+            let data = take(&decoded, &mut at, data_len)?.to_vec();
+            resources.push(Resource { alias, data });
+        }
+        Ok(std::borrow::Cow::Owned(resources))
+    }
+
+    fn first_alias(&self) -> Option<&str> {
+        match self {
+            Self::Plain(resources) => resources.first().map(|resource| resource.alias.as_str()),
+            Self::Packed { first_alias, .. } => first_alias.as_deref(),
+        }
+    }
+
+    fn data_len(&self) -> usize {
+        match self {
+            Self::Plain(resources) => resources.iter().map(|resource| resource.data.len()).sum(),
+            Self::Packed { data_len, .. } => *data_len,
+        }
+    }
+}
 #[derive(Clone)]
 pub(crate) struct Member {
     pub(crate) name: String,
@@ -2520,8 +2602,25 @@ struct NativeArtifact {
     packed: Option<PackedNativeArtifact>,
 }
 
+/// A native artifact ready to merge: as it is, or decoded from its packed form for as long as it is needed.
+enum ExpandedArtifact<'a> {
+    Borrowed(&'a NativeArtifact),
+    Owned(NativeArtifact),
+}
+
+impl std::ops::Deref for ExpandedArtifact<'_> {
+    type Target = NativeArtifact;
+
+    fn deref(&self) -> &NativeArtifact {
+        match self {
+            Self::Borrowed(artifact) => artifact,
+            Self::Owned(artifact) => artifact,
+        }
+    }
+}
+
 struct PackedNativeArtifact {
-    bytes: Vec<u8>,
+    bytes: super::spill::SpilledBytes,
     decoded_len: usize,
 }
 
@@ -2531,12 +2630,15 @@ impl NativeArtifact {
             return Ok(());
         }
         let encoded = serde_json::to_vec(&(&self.gltf, &self.metadata, &self.animations))?;
-        let packed = zstd::bulk::compress(&encoded, 1)?;
+        let mut packed = zstd::bulk::compress(&encoded, 1)?;
+        // compress reserves the worst-case compressed size, about the encoded size; a packed artifact waits
+        // for publication with its file's others, so the spare capacity would be held for every model.
+        packed.shrink_to_fit();
         self.gltf = Value::Null;
         self.metadata = Value::Null;
         self.animations.clear();
         self.packed = Some(PackedNativeArtifact {
-            bytes: packed,
+            bytes: super::spill::SpilledBytes::new(packed)?,
             decoded_len: encoded.len(),
         });
         Ok(())
@@ -2551,7 +2653,7 @@ impl NativeArtifact {
                 packed: None,
             });
         };
-        let decoded = zstd::bulk::decompress(&packed.bytes, packed.decoded_len)?;
+        let decoded = zstd::bulk::decompress(&packed.bytes.read()?, packed.decoded_len)?;
         if decoded.len() != packed.decoded_len {
             return Err(fail("native artifact decompressed length differs"));
         }
@@ -2984,9 +3086,131 @@ pub(crate) struct ExternalMotion {
     /// Index of the referencing animation resource in that sidecar.
     resource: usize,
     /// Retail motion channels.
-    channels: Vec<Value>,
+    channels: PackedChannels,
     /// English action names with their source intervals.
     actions: Vec<(String, u64, u64)>,
+}
+
+/// Motion channels kept compressed while they wait for placement: as JSON values the disc's external motions
+/// take several hundred megabytes, which every model job of the pass would otherwise hold. They are encoded in
+/// binary, not as JSON text: serde_json does not read every float back to the bits it wrote, and the published
+/// keys must not change.
+#[derive(Clone)]
+pub(crate) struct PackedChannels {
+    bytes: Vec<u8>,
+    decoded_len: usize,
+}
+
+impl PackedChannels {
+    fn new(channels: &[Value]) -> CoreResult<Self> {
+        let mut encoded = Vec::new();
+        encode_value_list(channels, &mut encoded);
+        let mut bytes = zstd::bulk::compress(&encoded, 1)?;
+        bytes.shrink_to_fit();
+        Ok(Self {
+            bytes,
+            decoded_len: encoded.len(),
+        })
+    }
+
+    /// The channels as they were packed; they were encoded here, so decoding them cannot fail.
+    fn values(&self) -> Vec<Value> {
+        let decoded = zstd::bulk::decompress(&self.bytes, self.decoded_len)
+            .expect("packed motion channels decompress");
+        let mut at = 0;
+        decode_value_list(&decoded, &mut at)
+    }
+}
+
+fn encode_len(length: usize, out: &mut Vec<u8>) {
+    out.extend((length as u64).to_le_bytes());
+}
+
+fn encode_value_list(values: &[Value], out: &mut Vec<u8>) {
+    encode_len(values.len(), out);
+    for value in values {
+        encode_value(value, out);
+    }
+}
+
+fn encode_value(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Null => out.push(0),
+        Value::Bool(flag) => out.push(if *flag { 2 } else { 1 }),
+        Value::Number(number) => {
+            if let Some(unsigned) = number.as_u64() {
+                out.push(3);
+                out.extend(unsigned.to_le_bytes());
+            } else if let Some(signed) = number.as_i64() {
+                out.push(4);
+                out.extend(signed.to_le_bytes());
+            } else {
+                out.push(5);
+                out.extend(number.as_f64().unwrap_or(0.0).to_bits().to_le_bytes());
+            }
+        }
+        Value::String(text) => {
+            out.push(6);
+            encode_len(text.len(), out);
+            out.extend(text.as_bytes());
+        }
+        Value::Array(values) => {
+            out.push(7);
+            encode_value_list(values, out);
+        }
+        Value::Object(map) => {
+            out.push(8);
+            encode_len(map.len(), out);
+            for (key, value) in map {
+                encode_len(key.len(), out);
+                out.extend(key.as_bytes());
+                encode_value(value, out);
+            }
+        }
+    }
+}
+
+fn decode_u64(bytes: &[u8], at: &mut usize) -> u64 {
+    let value = u64::from_le_bytes(bytes[*at..*at + 8].try_into().unwrap());
+    *at += 8;
+    value
+}
+
+fn decode_text(bytes: &[u8], at: &mut usize) -> String {
+    let length = decode_u64(bytes, at) as usize;
+    let text = std::str::from_utf8(&bytes[*at..*at + length]).unwrap().to_owned();
+    *at += length;
+    text
+}
+
+fn decode_value_list(bytes: &[u8], at: &mut usize) -> Vec<Value> {
+    let count = decode_u64(bytes, at) as usize;
+    (0..count).map(|_| decode_value(bytes, at)).collect()
+}
+
+fn decode_value(bytes: &[u8], at: &mut usize) -> Value {
+    let tag = bytes[*at];
+    *at += 1;
+    match tag {
+        0 => Value::Null,
+        1 => Value::Bool(false),
+        2 => Value::Bool(true),
+        3 => Value::from(decode_u64(bytes, at)),
+        4 => Value::from(decode_u64(bytes, at) as i64),
+        5 => serde_json::Number::from_f64(f64::from_bits(decode_u64(bytes, at)))
+            .map_or(Value::Null, Value::Number),
+        6 => Value::String(decode_text(bytes, at)),
+        7 => Value::Array(decode_value_list(bytes, at)),
+        _ => {
+            let count = decode_u64(bytes, at) as usize;
+            let mut map = serde_json::Map::new();
+            for _ in 0..count {
+                let key = decode_text(bytes, at);
+                map.insert(key, decode_value(bytes, at));
+            }
+            Value::Object(map)
+        }
+    }
 }
 
 /// One published character model that external motions can drive.
@@ -3055,17 +3279,15 @@ fn publish_native_impl(
     report: &mut ConversionReport,
     mut stream: Option<&mut StreamPairs<'_>>,
 ) -> CoreResult<()> {
-    let decoded = if artifacts.values().any(|artifact| artifact.packed.is_some()) {
-        Some(
-            artifacts
-                .iter()
-                .map(|(name, artifact)| Ok((name.clone(), artifact.expanded()?)))
-                .collect::<CoreResult<BTreeMap<_, _>>>()?,
-        )
-    } else {
-        None
-    };
-    let artifacts = decoded.as_ref().unwrap_or(artifacts);
+    // Packed artifacts are expanded where they are merged, one bundle at a time: a file with many models would
+    // otherwise hold every one of them as JSON values at once, over a gigabyte for the largest.
+    fn expand(artifact: &NativeArtifact) -> CoreResult<ExpandedArtifact<'_>> {
+        Ok(if artifact.packed.is_some() {
+            ExpandedArtifact::Owned(artifact.expanded()?)
+        } else {
+            ExpandedArtifact::Borrowed(artifact)
+        })
+    }
     let characters: Vec<_> = resources
         .iter()
         .filter(|r| is_character(&r.alias))
@@ -3079,6 +3301,7 @@ fn publish_native_impl(
         else {
             continue;
         };
+        let artifact = expand(artifact)?;
         let original = resources
             .iter()
             .find(|resource| resource.alias == *source)
@@ -3149,6 +3372,7 @@ fn publish_native_impl(
             .iter()
             .filter(|(source, _)| character_parent(source) == Some(alias.as_str()))
         {
+            let artifact = expand(artifact)?;
             let offsets = merge_gltf(&mut gltf, &artifact.gltf);
             let model_id = if artifact.metadata["frames"]
                 .as_array()
@@ -3306,7 +3530,7 @@ fn publish_native_impl(
                             key: external,
                             sidecar: Some(sidecar.clone()),
                             resource: index,
-                            channels,
+                            channels: PackedChannels::new(&channels)?,
                             actions: named,
                         });
                     } else {
@@ -3465,7 +3689,11 @@ fn publish_native_impl(
             .or_default()
             .push((alias, artifact));
     }
-    for (path, mut entries) in standalone {
+    for (path, entries) in standalone {
+        let mut entries = entries
+            .into_iter()
+            .map(|(alias, artifact)| Ok((alias, expand(artifact)?)))
+            .collect::<CoreResult<Vec<_>>>()?;
         entries.sort_by_key(|(_, a)| a.metadata["frames"].as_array().is_none_or(Vec::is_empty));
         let mut gltf = empty_gltf();
         let mut metadata = entries[0].1.metadata.clone();
@@ -3523,7 +3751,8 @@ fn publish_native_impl(
 ///
 /// Families are models with identical native frame names. Returns the best member score of each.
 fn family_scores(motion: &ExternalMotion, rigs: &[Rig]) -> Vec<(f32, Vec<usize>)> {
-    let keys = transform_keys(&motion.channels);
+    let channels = motion.channels.values();
+    let keys = transform_keys(&channels);
     let needed = keys.keys().max().map_or(0, |frame| frame + 1);
     let translations: Vec<(usize, [f32; 3])> = keys
         .iter()
@@ -3973,6 +4202,7 @@ fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResu
         let mut entries = BTreeMap::<usize, Value>::new();
         for (motion_index, rig_index) in list {
             let motion = &report.externals[motion_index];
+            let channels = motion.channels.values();
             let rig = &report.rigs[rig_index];
             let bundle = motion.key.split('#').next().unwrap_or("");
             let taken: BTreeSet<String> = prefixes.values().cloned().collect();
@@ -3999,8 +4229,7 @@ fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResu
                     .actions
                     .iter()
                     .map(|(name, start, end)| {
-                        let auxiliary: Vec<Value> = motion
-                            .channels
+                        let auxiliary: Vec<Value> = channels
                             .iter()
                             .filter(|c| c["type"].as_i64().is_some_and(|t| t > 2))
                             .map(|c| super::actions::slice_aux(c, *start, *end))
@@ -4022,7 +4251,7 @@ fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResu
                 clips.push(json!(animation_clip(
                     &mut temp,
                     &clip,
-                    &motion.channels,
+                    &channels,
                     (*start, *end),
                     rig.node_offset,
                     false
@@ -4114,6 +4343,7 @@ fn publish_external_memory(
         let mut entries = BTreeMap::<usize, Value>::new();
         for &(motion_index, rig_index) in list {
             let motion = &report.externals[motion_index];
+            let channels = motion.channels.values();
             let rig = &report.rigs[rig_index];
             let bundle = motion.key.split('#').next().unwrap_or("");
             let taken: BTreeSet<String> = prefixes.values().cloned().collect();
@@ -4140,8 +4370,7 @@ fn publish_external_memory(
                     .actions
                     .iter()
                     .map(|(name, start, end)| {
-                        let auxiliary: Vec<Value> = motion
-                            .channels
+                        let auxiliary: Vec<Value> = channels
                             .iter()
                             .filter(|channel| channel["type"].as_i64().is_some_and(|kind| kind > 2))
                             .map(|channel| super::actions::slice_aux(channel, *start, *end))
@@ -4163,7 +4392,7 @@ fn publish_external_memory(
                 clips.push(json!(animation_clip(
                     &mut temp,
                     &clip,
-                    &motion.channels,
+                    &channels,
                     (*start, *end),
                     rig.node_offset,
                     false
@@ -4305,11 +4534,12 @@ struct FileAnalysis {
     models: Vec<ModelOutput>,
     standalone: Vec<(String, Standalone)>,
     used_textures: BTreeSet<String>,
-    resources: Vec<Resource>,
+    resources: ResourceStore,
 }
 
 impl FileAnalysis {
     fn pack_artifacts(&mut self) -> CoreResult<()> {
+        self.resources.pack()?;
         for model in &mut self.models {
             model.artifact.pack()?;
         }
@@ -4683,7 +4913,7 @@ fn analyze_file(
                     sidecar: None,
                     resource: 0,
                     actions: vec![(name, 0, motion_extent(&channels))],
-                    channels,
+                    channels: PackedChannels::new(&channels)?,
                 })
             } else {
                 None
@@ -4737,13 +4967,13 @@ fn analyze_file(
         models,
         standalone,
         used_textures,
-        resources,
+        resources: ResourceStore::Plain(resources),
     }))
 }
 
 /// Native publication of one committed file, with the report entries its commit produced.
 struct NativeJob {
-    resources: Vec<Resource>,
+    resources: ResourceStore,
     artifacts: BTreeMap<String, NativeArtifact>,
     icons: Vec<MemoryCardIcon>,
     files: Vec<String>,
@@ -4752,12 +4982,7 @@ struct NativeJob {
 
 impl NativeJob {
     fn estimated_expanded_bytes(&self) -> usize {
-        let source = self
-            .resources
-            .iter()
-            .map(|resource| resource.data.len())
-            .sum::<usize>()
-            .saturating_mul(4);
+        let source = self.resources.data_len().saturating_mul(4);
         let decoded = self
             .artifacts
             .values()
@@ -4804,14 +5029,13 @@ fn apportion_model_work(weights: &[u128], budget: u64) -> Vec<u64> {
 }
 
 fn external_motion_work(motion: &ExternalMotion) -> u128 {
-    let channels = motion.channels.len() as u128;
-    let keys = motion
-        .channels
+    let values = motion.channels.values();
+    let channels = values.len() as u128;
+    let keys = values
         .iter()
         .map(|channel| channel["keys"].as_array().map_or(0, Vec::len) as u128)
         .sum::<u128>();
-    let scales = motion
-        .channels
+    let scales = values
         .iter()
         .filter(|channel| channel["type"].as_i64() == Some(1))
         .count() as u128;
@@ -4906,7 +5130,7 @@ fn commit_file(
         }
         converted.insert(alias);
     }
-    converted.extend(native_claims(&analysis.resources));
+    converted.extend(native_claims(&analysis.resources.load()?));
     Ok(Some(NativeJob {
         resources: analysis.resources,
         artifacts,
@@ -4930,7 +5154,7 @@ fn publish_jobs(
         let mut local = ConversionReport::default();
         publish_native(
             published,
-            &job.resources,
+            &job.resources.load()?,
             &job.artifacts,
             documents,
             &mut local,
@@ -5047,7 +5271,7 @@ impl ModelPlan {
                         };
                         publish_native_impl(
                             Path::new("published"),
-                            &job.resources,
+                            &job.resources.load()?,
                             &job.artifacts,
                             &documents,
                             &mut local,
@@ -5057,20 +5281,14 @@ impl ModelPlan {
                         if elapsed.as_secs() >= 1
                             && std::env::var_os("DC2DATA_PROFILE_JOBS").is_some()
                         {
-                            let label = job
-                                .resources
-                                .first()
-                                .map_or("model-job", |resource| resource.alias.as_str());
+                            let label = job.resources.first_alias().unwrap_or("model-job");
                             eprintln!("dc2data job preview {label}: {:.3}s", elapsed.as_secs_f64());
                         }
                         Ok((pairs.into_keys().collect(), local, elapsed))
                     })?;
                     let work = preview_work[index];
                     sink.complete(work)?;
-                    let label = job
-                        .resources
-                        .first()
-                        .map_or("", |resource| resource.alias.as_str());
+                    let label = job.resources.first_alias().unwrap_or("");
                     on_preview(work, label);
                     Ok(result)
                 })
@@ -5078,14 +5296,15 @@ impl ModelPlan {
         let mut owners = BTreeMap::<String, usize>::new();
         let mut icon_names = BTreeSet::new();
         let mut preview_nanos = Vec::with_capacity(native_jobs.len());
-        for (index, (job, result)) in native_jobs.iter().zip(previews).enumerate() {
+        for (index, (job, result)) in native_jobs.iter_mut().zip(previews).enumerate() {
             let (names, local, elapsed) = result?;
             preview_nanos.push(elapsed.as_nanos().max(1));
             for name in names {
                 owners.insert(name, index);
             }
             report.rigs.extend(local.rigs);
-            report.externals.extend(job.externals.iter().cloned());
+            // Moved, not copied: the final jobs read external motions from the report alone.
+            report.externals.append(&mut job.externals);
             report.externals.extend(local.externals);
             report.referenced_pngs.extend(local.referenced_pngs);
             report
@@ -5156,10 +5375,10 @@ impl ModelPlan {
             let owners = owners.clone();
             let external_work = external_work.clone();
             let external_targets = external_targets.clone();
-            let label = job.resources.first().map_or_else(
-                || format!("model-job-{index}"),
-                |resource| resource.alias.clone(),
-            );
+            let label = job
+                .resources
+                .first_alias()
+                .map_or_else(|| format!("model-job-{index}"), str::to_owned);
             jobs.push(Job {
                 category: Category::Model,
                 label,
@@ -5176,7 +5395,7 @@ impl ModelPlan {
                     };
                     publish_native_impl(
                         Path::new("published"),
-                        &job.resources,
+                        &job.resources.load()?,
                         &job.artifacts,
                         &documents,
                         &mut local,
@@ -5281,6 +5500,7 @@ fn collect_character_gameplay(
         };
         if !job
             .resources
+            .load()?
             .iter()
             .any(|resource| is_character(&resource.alias))
         {
@@ -5296,7 +5516,7 @@ fn collect_character_gameplay(
         };
         publish_native_impl(
             Path::new("published"),
-            &job.resources,
+            &job.resources.load()?,
             &job.artifacts,
             &documents,
             &mut local,
@@ -6820,7 +7040,7 @@ mod tests {
             key: key.into(),
             sidecar: None,
             resource: 0,
-            channels: Vec::new(),
+            channels: PackedChannels::new(&[]).unwrap(),
             actions: Vec::new(),
         };
         let motions = vec![
@@ -6845,12 +7065,27 @@ mod tests {
     }
 
     #[test]
+    fn packed_channels_keep_every_float_bit() {
+        let channels = vec![json!({
+            "type": 0,
+            "keys": [{"time": 3, "value": [2.3493103981018066, -1.2722920179367065, 0.48843714594841003]}],
+            "name": "frame", "flag": true, "none": null, "offset": -7
+        })];
+        let packed = PackedChannels::new(&channels).unwrap();
+        assert_eq!(packed.values(), channels);
+        assert_eq!(
+            serde_json::to_vec(&packed.values()).unwrap(),
+            serde_json::to_vec(&channels).unwrap()
+        );
+    }
+
+    #[test]
     fn external_motion_cost_moves_heavy_final_jobs_forward_without_changing_work_total() {
         let motion = ExternalMotion {
             key: "motion#0".into(),
             sidecar: None,
             resource: 0,
-            channels: vec![json!({"type":1,"keys":[{}, {}, {}]})],
+            channels: PackedChannels::new(&[json!({"type":1,"keys":[{}, {}, {}]})]).unwrap(),
             actions: vec![("clip".into(), 0, 90)],
         };
         let external = external_motion_work(&motion);

@@ -1,5 +1,5 @@
 //! Bounded in-memory asset submission to one private ZIP writer.
-use super::archive::ResourceRef;
+use super::archive::{ResourceRef, SourceSlice};
 use super::progress::Phase;
 use super::zip_archive::{self, PreparedEntry, StreamWriter, Written};
 use super::{CoreError, CoreResult};
@@ -22,9 +22,9 @@ pub enum ArtifactBytes {
 }
 
 impl ArtifactBytes {
-    pub fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> SourceSlice<'_> {
         match self {
-            Self::Owned(bytes) => bytes,
+            Self::Owned(bytes) => SourceSlice::Borrowed(bytes),
             Self::SourceRange(resource) => resource.bytes(),
         }
     }

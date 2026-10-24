@@ -212,7 +212,7 @@ std::int64_t                                                 g_stick_read_serial
 bool                                                         g_stick_live = false;
 bool                                                         g_gamepad_subsystem = false;
 InputKeyboardMouse                                           g_scripted;
-#ifdef __ANDROID__
+#ifdef KZ_TOUCH_OVERLAY
 // The on-screen gamepad (InputSetTouchOverlay) and whether it is shown.
 InputTouchOverlayState g_touch_overlay;
 bool                   g_touch_overlay_visible = true;
@@ -296,8 +296,8 @@ bool ParseSource(std::string_view name, ActionKind kind, Source &source) {
         std::size_t star = text.find('*');
         if (star != std::string_view::npos) {
             std::string_view factor = Trim(text.substr(star + 1));
-#ifdef __ANDROID__
-            // Android's libc++ has no floating-point from_chars.
+#if defined(__ANDROID__) || defined(SDL_PLATFORM_IOS)
+            // Android's libc++ has no floating-point from_chars, and iOS's has it only from iOS 26.
             std::string factor_text(factor);
             char       *end = nullptr;
             scale = std::strtof(factor_text.c_str(), &end);
@@ -700,7 +700,7 @@ bool GamepadSourceHeld(const Source &source) {
     const bool held = std::ranges::any_of(g_slots, [&](const PadSlot &slot) {
         return slot.gamepad != nullptr && PadSourceHeld(slot.gamepad, source);
     });
-#if defined(__ANDROID__) || defined(KZ_TOUCH_OVERLAY)
+#ifdef KZ_TOUCH_OVERLAY
     // The on-screen gamepad presses the default layout's physical button.
     return held || (g_touch_overlay_visible &&
                     (g_touch_overlay.buttons & PadSourceButton(source, SDL_GAMEPAD_TYPE_STANDARD)) != 0);
@@ -1031,7 +1031,7 @@ static InputGlyphFamily GamepadFamily(SDL_Gamepad *gamepad) {
                                       SDL_GetGamepadProduct(gamepad));
 }
 
-#ifdef __ANDROID__
+#ifdef KZ_TOUCH_OVERLAY
 // The on-screen gamepad stands in for physical devices, so it hides while one is connected or held.
 bool TouchOverlayWanted() {
     if (std::ranges::any_of(g_slots, [](const PadSlot &slot) { return slot.gamepad != nullptr; }) ||
@@ -1058,7 +1058,7 @@ void InputPoll() {
         g_pad_family = GamepadFamily(g_slots[0].gamepad);
         g_pad_type = SDL_GetGamepadType(g_slots[0].gamepad);
     }
-#ifdef __ANDROID__
+#ifdef KZ_TOUCH_OVERLAY
     g_touch_overlay_visible = TouchOverlayWanted();
 #endif
     for (int pad = 0; pad < kInputPadCount; ++pad) {
@@ -1308,7 +1308,7 @@ void InputNoteLeftStickRead() { g_stick_read_serial = g_latch_serial; }
 
 bool InputLeftStickLive() { return g_stick_live; }
 
-#ifdef __ANDROID__
+#ifdef KZ_TOUCH_OVERLAY
 void InputSetTouchOverlay(const InputTouchOverlayState &state) {
     g_touch_overlay = state;
     if (state.buttons != 0 || state.left_x != 0.0f || state.left_y != 0.0f || state.right_x != 0.0f ||
@@ -1326,7 +1326,7 @@ const InputPadState &InputGetPad(int pad) {
         return kAbsent;
     }
     g_view[pad] = g_override[pad] ? *g_override[pad] : g_state[pad];
-#ifdef __ANDROID__
+#ifdef KZ_TOUCH_OVERLAY
     if (pad == 0 && g_touch_overlay_visible && !g_override[pad]) {
         g_view[pad].buttons |= g_touch_overlay.buttons;
         g_view[pad].left_x = InputStickByte(g_touch_overlay.left_x);

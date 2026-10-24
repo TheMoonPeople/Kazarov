@@ -208,6 +208,10 @@ struct BoundState {
     };
     VkBuffer     vertex_buffer = VK_NULL_HANDLE;
     VkDeviceSize vertex_offset = 0;
+    // Without the bindless array: the descriptors last pushed at set 0.
+    VkImageView texture_view = VK_NULL_HANDLE;
+    VkImageView palette_view = VK_NULL_HANDLE;
+    uint32_t    sampler = UINT32_MAX;
 };
 
 // The constant records the draw command buffer has bound at set 1, so an identical next draw skips the upload.
@@ -327,6 +331,10 @@ struct Context {
     bool                          sampler_anisotropy = false;
     uint32_t                      anisotropy_level = 0;
     PFN_vkCmdSetColorWriteMaskEXT cmd_set_color_write_mask = nullptr;
+    // Every texture sits in one update-after-bind array at set 0. Without it (Metal argument
+    // buffers tier 1) each draw pushes its texture, palette and sampler instead.
+    bool                           bindless = true;
+    PFN_vkCmdPushDescriptorSetKHR  cmd_push_descriptor_set = nullptr;
     Swapchain                     swapchain;
 
     std::array<Frame, kFramesInFlight> frames;
@@ -348,7 +356,9 @@ struct Context {
     VkDescriptorSetLayout        constants_set_layout = VK_NULL_HANDLE;
     VkDescriptorPool             texture_pool = VK_NULL_HANDLE;
     VkDescriptorPool             constants_pool = VK_NULL_HANDLE;
-    VkDescriptorSet              texture_set = VK_NULL_HANDLE;
+    VkDescriptorSet              texture_set = VK_NULL_HANDLE; // bindless only
+    // The view at each texture slot, as written to texture_set; what a draw pushes without it.
+    std::vector<VkImageView>     texture_views;
     VkPipelineLayout             pipeline_layout = VK_NULL_HANDLE;
     VkPipelineCache              pipeline_cache = VK_NULL_HANDLE;
     std::vector<VkPipeline>      pipelines;

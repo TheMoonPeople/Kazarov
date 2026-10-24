@@ -1422,14 +1422,14 @@ fn plan_root_resource(
         return Ok(None);
     }
     let no_write = |_: &str, _: usize, _: usize, _: &[u8]| Ok(());
-    let transformed = unit.transform(&no_write, resource.bytes(), key, 0)?;
+    let transformed = unit.transform(&no_write, &resource.bytes(), key, 0)?;
     if transformed.is_some() && texture_extension {
         return Err(fail(format!(
             "unrecognized standalone texture format: {key}"
         )));
     }
     if let Some(next) = transformed {
-        if parse_pack(resource.bytes()).is_none() && next != resource.bytes() {
+        if parse_pack(&resource.bytes()).is_none() && next != *resource.bytes() {
             unit.edits
                 .insert(key.to_owned(), TextureEdit::Replace(next));
         }
@@ -1485,7 +1485,7 @@ fn emit_base_rasters(
             Category::Texture,
         )
     };
-    Unit::new().transform(&write, resource.bytes(), &resource.alias, 0)?;
+    Unit::new().transform(&write, &resource.bytes(), &resource.alias, 0)?;
     Ok(())
 }
 

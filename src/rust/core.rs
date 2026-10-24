@@ -28,6 +28,8 @@ pub mod packs;
 pub mod progress;
 #[path = "publish.rs"]
 pub mod publish;
+#[path = "spill.rs"]
+pub(crate) mod spill;
 #[path = "textures.rs"]
 pub mod textures;
 #[path = "zip_archive.rs"]
@@ -321,7 +323,7 @@ pub fn extract_with_progress_policy(
 const WORKER_STACK: usize = 16 << 20;
 
 #[cfg(windows)]
-fn available_memory() -> Option<u64> {
+fn system_available_memory() -> Option<u64> {
     #[repr(C)]
     struct MemoryStatus {
         length: u32,
@@ -344,15 +346,36 @@ fn available_memory() -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn available_memory() -> Option<u64> {
+fn system_available_memory() -> Option<u64> {
     let pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     (pages > 0 && page_size > 0).then(|| (pages as u64).saturating_mul(page_size as u64))
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
-fn available_memory() -> Option<u64> {
+// What the process may still allocate before iOS ends it, which is less than the device's free memory.
+#[cfg(target_os = "ios")]
+fn system_available_memory() -> Option<u64> {
+    unsafe extern "C" {
+        fn os_proc_available_memory() -> usize;
+    }
+    let available = unsafe { os_proc_available_memory() } as u64;
+    (available > 0).then_some(available)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "ios")))]
+fn system_available_memory() -> Option<u64> {
     None
+}
+
+// DC2DATA_AVAILABLE_MEMORY_MB stands in for the system's figure, to try a smaller device's budget.
+fn available_memory() -> Option<u64> {
+    if let Some(megabytes) = std::env::var("DC2DATA_AVAILABLE_MEMORY_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(megabytes << 20);
+    }
+    system_available_memory()
 }
 
 fn conversion_memory_budget() -> usize {

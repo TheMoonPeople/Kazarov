@@ -352,13 +352,13 @@ fn published_archive_resolves_every_retail_reference() {
     let (mut checked, mut dynamic, mut lost) = (0, 0, Vec::new());
     let mut unresolved = BTreeMap::<String, usize>::new();
     for resource in inventory.leaves() {
-        if !is_valid_script(resource.bytes()) {
+        if !is_valid_script(&resource.bytes()) {
             continue;
         }
         let alias = &resource.alias;
         let name = fold(&script_output_name(&inventory, alias));
         let migrated = archive.read(entries[&name]).unwrap();
-        let operands = operands(resource.bytes(), &migrated);
+        let operands = operands(&resource.bytes(), &migrated);
         // The script's contexts: the root, its own directory, every directory it changes to, and every
         // PACK it names. A character is a PACK on the disc, but its members are read through the
         // character, not by name.

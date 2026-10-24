@@ -1,6 +1,7 @@
 #include "platform/paths.hpp"
 
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <mach-o/dyld.h>
 #elif defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -70,6 +71,13 @@ fs::path Installed(const char *name) {
 #ifdef _WIN32
     if (std::optional<fs::path> local = FromEnvironment("LOCALAPPDATA")) {
         return *local / config.app_dir / name;
+    }
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // iOS: app data lives in the Documents directory inside the app container,
+    // which is backed up and exposed to the Files app.
+    if (std::optional<fs::path> home = FromEnvironment("HOME")) {
+        return *home / "Documents" / config.app_dir / name;
     }
 #endif
     if (std::optional<fs::path> xdg = FromEnvironment("XDG_DATA_HOME"); xdg && xdg->is_absolute()) {

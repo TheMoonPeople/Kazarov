@@ -192,3 +192,14 @@ void AudioOutputStop() {
 bool AudioOutputRunning() {
     return g_stream != nullptr || g_wav.writer.IsOpen();
 }
+
+void AudioOutputPause(bool paused) {
+    if (g_stream == nullptr) {
+        return;
+    }
+    if (paused) {
+        SDL_PauseAudioStreamDevice(g_stream);
+    } else {
+        SDL_ResumeAudioStreamDevice(g_stream);
+    }
+}

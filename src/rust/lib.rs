@@ -1,4 +1,5 @@
 pub mod core;
+#[cfg(feature = "desktop-ui")]
 mod setup;
 
 use core::zip_archive::Archive;
@@ -16,6 +17,12 @@ mod ffi {
         textures: u64,
     }
 
+    /// Where extract_tracked is: a fraction from 0 to 1 and the stage it is in.
+    struct ExtractStatus {
+        fraction: f32,
+        stage: String,
+    }
+
     enum ScriptPublicationPolicy {
         Retain,
         LuauOnly,
@@ -24,6 +31,10 @@ mod ffi {
     extern "Rust" {
         fn bridge_smoke(value: &str) -> Result<String>;
         fn extract(source: &str, data_out: &str, jobs: usize) -> Result<ExtractReport>;
+        /// extract, also publishing its progress for extract_status, for a host that draws its own
+        /// progress while it runs on another thread.
+        fn extract_tracked(source: &str, data_out: &str, jobs: usize) -> Result<ExtractReport>;
+        fn extract_status() -> ExtractStatus;
         fn extract_with_script_policy(
             source: &str,
             data_out: &str,
@@ -83,7 +94,14 @@ mod ffi {
 }
 
 fn setup_data(title: &str, data_root: &str) -> Result<bool, core::CoreError> {
-    setup::run(title, data_root.as_ref())
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        return Ok(false);
+    }
+    #[cfg(feature = "desktop-ui")]
+    {
+        setup::run(title, data_root.as_ref())
+    }
 }
 
 fn setup_data_with_script_policy(
@@ -92,7 +110,15 @@ fn setup_data_with_script_policy(
     policy: ffi::ScriptPublicationPolicy,
 ) -> Result<bool, core::CoreError> {
     let policy = core_script_publication_policy(policy)?;
-    setup::run_with_policy(title, data_root.as_ref(), policy)
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        let _ = (title, data_root, policy);
+        return Ok(false);
+    }
+    #[cfg(feature = "desktop-ui")]
+    {
+        setup::run_with_policy(title, data_root.as_ref(), policy)
+    }
 }
 
 fn bridge_smoke(value: &str) -> Result<String, core::CoreError> {
@@ -100,6 +126,33 @@ fn bridge_smoke(value: &str) -> Result<String, core::CoreError> {
         return Err(core::CoreError("bridge smoke error".into()));
     }
     Ok(value.to_owned())
+}
+
+static EXTRACT_STATUS: std::sync::Mutex<(f32, &'static str)> = std::sync::Mutex::new((0.0, ""));
+
+fn extract_tracked(
+    source: &str,
+    data_out: &str,
+    jobs: usize,
+) -> Result<ffi::ExtractReport, core::CoreError> {
+    *EXTRACT_STATUS.lock().unwrap() = (0.0, "");
+    let report = core::extract_with_progress(source.as_ref(), data_out.as_ref(), jobs, &|fraction, stage| {
+        *EXTRACT_STATUS.lock().unwrap() = (fraction, stage);
+    })?;
+    Ok(ffi::ExtractReport {
+        files: report.files,
+        bytes: report.bytes,
+        texture_sources: report.texture_sources,
+        pngs: report.pngs,
+    })
+}
+
+fn extract_status() -> ffi::ExtractStatus {
+    let (fraction, stage) = *EXTRACT_STATUS.lock().unwrap();
+    ffi::ExtractStatus {
+        fraction,
+        stage: stage.to_owned(),
+    }
 }
 
 fn extract(

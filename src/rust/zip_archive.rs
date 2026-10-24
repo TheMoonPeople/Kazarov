@@ -207,15 +207,24 @@ fn decompress_exact(source: &[u8], out: &mut [u8]) -> CoreResult<()> {
 }
 
 impl Archive {
-    /// Opens and validates an archive's central directory, preferring a memory map.
+    /// Opens and validates an archive's central directory, preferring a memory map. On iOS it is read with
+    /// positioned reads instead: a map of the whole published archive, about 4 GB, takes address space the app
+    /// does not have to spare, so the disc image's mappings during verification or the game's arenas after
+    /// an extraction could no longer be placed.
     pub fn open(path: &Path) -> CoreResult<Archive> {
+        let map = !cfg!(any(target_os = "ios", kazarov_mapped_source));
         let context = |error: CoreError| fail(format!("{}: {error}", path.display()));
         let file = File::open(path).map_err(|e| context(e.into()))?;
         let length = file.metadata().map_err(|e| context(e.into()))?.len();
         // SAFETY: archives are treated as immutable while open; concurrent truncation
         // by another process is outside the supported contract.
-        let backing = match unsafe { memmap2::Mmap::map(&file) } {
-            Ok(map) if map.len() as u64 == length => Backing::Mapped(map),
+        let mapped = if map {
+            unsafe { memmap2::Mmap::map(&file) }.ok()
+        } else {
+            None
+        };
+        let backing = match mapped {
+            Some(map) if map.len() as u64 == length => Backing::Mapped(map),
             _ => Backing::File(file),
         };
         let mut archive = Archive {
@@ -471,10 +480,13 @@ impl Archive {
                 entry.name
             )));
         }
-        let source = self.bytes(entry.data, entry.compressed)?;
-        if entry.method == METHOD_STORED {
-            out.copy_from_slice(&source);
+        if let (Backing::File(file), METHOD_STORED) = (&self.backing, entry.method) {
+            // Straight into the caller's buffer, without a copy of the whole entry in between.
+            read_exact_at(file, out, entry.data)?;
+        } else if entry.method == METHOD_STORED {
+            out.copy_from_slice(&self.bytes(entry.data, entry.compressed)?);
         } else {
+            let source = self.bytes(entry.data, entry.compressed)?;
             decompress_exact(&source, out)
                 .map_err(|e| fail(format!("{}: {}: {e}", self.path.display(), entry.name)))?;
         }
@@ -592,16 +604,27 @@ enum PreparedPayload {
 
 pub(crate) fn prepare_artifact(name: String, bytes: ArtifactBytes) -> CoreResult<PreparedEntry> {
     validate_name(&name)?;
-    let source = bytes.as_slice();
-    let size = source.len() as u64;
-    let crc = crc32fast::hash(source);
-    let sha256 = Sha256::digest(source).into();
-    let (method, payload) = if stored_by_name(&name) {
-        (METHOD_STORED, PreparedPayload::Stored(bytes))
-    } else {
-        let compressed = zstd::bulk::compress(source, ZSTD_LEVEL)
-            .map_err(|error| fail(format!("{name}: {error}")))?;
-        (METHOD_ZSTD, PreparedPayload::Compressed(compressed))
+    // A source range is read only within this scope; a stored one is read again when it is written.
+    let (size, crc, sha256, compressed) = {
+        let source = bytes.as_slice();
+        let compressed = if stored_by_name(&name) {
+            None
+        } else {
+            Some(
+                zstd::bulk::compress(&source, ZSTD_LEVEL)
+                    .map_err(|error| fail(format!("{name}: {error}")))?,
+            )
+        };
+        (
+            source.len() as u64,
+            crc32fast::hash(&source),
+            Sha256::digest(&*source).into(),
+            compressed,
+        )
+    };
+    let (method, payload) = match compressed {
+        None => (METHOD_STORED, PreparedPayload::Stored(bytes)),
+        Some(compressed) => (METHOD_ZSTD, PreparedPayload::Compressed(compressed)),
     };
     Ok(PreparedEntry {
         name,
@@ -642,7 +665,7 @@ impl StreamWriter {
             local,
         ))?;
         match &entry.payload {
-            PreparedPayload::Stored(bytes) => self.0.out.put(bytes.as_slice())?,
+            PreparedPayload::Stored(bytes) => self.0.out.put(&bytes.as_slice())?,
             PreparedPayload::Compressed(bytes) => self.0.out.put(bytes)?,
         }
         self.0.central.push(CentralEntry {

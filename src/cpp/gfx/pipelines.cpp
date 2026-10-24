@@ -16,6 +16,7 @@
 #include "platform/files.hpp"
 #include "platform/paths.hpp"
 #include "shaders/draw.frag.spv.hpp"
+#include "shaders/draw_bound.frag.spv.hpp"
 #include "shaders/draw2d.vert.spv.hpp"
 #include "shaders/mesh.vert.spv.hpp"
 #include "shaders/mesh_prog0.vert.spv.hpp"
@@ -222,29 +223,8 @@ struct PipelineDesc {
 // their indices are the ones it always had.
 uint32_t FamilyCount() { return g.config.prog0_meshes ? kFamilyCount : kFamilyMesh + 1; }
 
-} // namespace
-
-void CreatePipelineLayout() {
-    for (uint32_t i = 0; i < kSamplerCount; i++) {
-        bool                anisotropic = i >= kBaseSamplerCount;
-        bool                linear = anisotropic || (i & 4);
-        VkSamplerCreateInfo info = {};
-        info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        info.magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        info.minFilter = info.magFilter;
-        info.mipmapMode = linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        info.addressModeU = (i & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        info.addressModeV = (i & 1) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        if (anisotropic && g.sampler_anisotropy) {
-            float samples = static_cast<float>(2u << ((i - kBaseSamplerCount) / 4));
-            info.anisotropyEnable = VK_TRUE;
-            info.maxAnisotropy = std::min(samples, g.properties.limits.maxSamplerAnisotropy);
-        }
-        info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        info.maxLod = VK_LOD_CLAMP_NONE;
-        Check(vkCreateSampler(g.device, &info, nullptr, &g.samplers[i]), "vkCreateSampler");
-    }
-
+// Set 0 of the bindless path: every texture slot in one update-after-bind array, and the samplers.
+void CreateBindlessTextureSet() {
     VkDescriptorSetLayoutBinding texture_bindings[2] = {};
     texture_bindings[0].binding = 0;
     texture_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -275,22 +255,6 @@ void CreatePipelineLayout() {
     Check(vkCreateDescriptorSetLayout(g.device, &texture_layout, nullptr, &g.texture_set_layout),
           "vkCreateDescriptorSetLayout");
 
-    // Set 1: the chunk's MeshConstants records at binding 0, Prog0Constants records at binding 1 and
-    // Prog0Palette records at binding 2.
-    VkDescriptorSetLayoutBinding constants_bindings[3] = {};
-    for (uint32_t binding = 0; binding < 3; binding++) {
-        constants_bindings[binding].binding = binding;
-        constants_bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        constants_bindings[binding].descriptorCount = 1;
-        constants_bindings[binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo constants_layout = {};
-    constants_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    constants_layout.bindingCount = 3;
-    constants_layout.pBindings = constants_bindings;
-    Check(vkCreateDescriptorSetLayout(g.device, &constants_layout, nullptr, &g.constants_set_layout),
-          "vkCreateDescriptorSetLayout");
-
     VkDescriptorPoolSize texture_sizes[2] = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxTextures },
         {VK_DESCRIPTOR_TYPE_SAMPLER,       kSamplerCount}
@@ -310,6 +274,74 @@ void CreatePipelineLayout() {
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &g.texture_set_layout;
     Check(vkAllocateDescriptorSets(g.device, &allocate, &g.texture_set), "vkAllocateDescriptorSets");
+}
+
+// Set 0 without the bindless array, pushed by each draw: its texture, its palette, its sampler and
+// the palette's sampler, which never changes.
+void CreatePushedTextureLayout() {
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (uint32_t binding = 0; binding < 4; binding++) {
+        bindings[binding].binding = binding;
+        bindings[binding].descriptorType = binding < 2 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
+        bindings[binding].descriptorCount = 1;
+        bindings[binding].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    bindings[3].pImmutableSamplers = &g.samplers[0];
+
+    VkDescriptorSetLayoutCreateInfo layout = {};
+    layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layout.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    layout.bindingCount = 4;
+    layout.pBindings = bindings;
+    Check(vkCreateDescriptorSetLayout(g.device, &layout, nullptr, &g.texture_set_layout),
+          "vkCreateDescriptorSetLayout");
+}
+
+} // namespace
+
+void CreatePipelineLayout() {
+    for (uint32_t i = 0; i < kSamplerCount; i++) {
+        bool                anisotropic = i >= kBaseSamplerCount;
+        bool                linear = anisotropic || (i & 4);
+        VkSamplerCreateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        info.magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        info.minFilter = info.magFilter;
+        info.mipmapMode = linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        info.addressModeU = (i & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        info.addressModeV = (i & 1) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (anisotropic && g.sampler_anisotropy) {
+            float samples = static_cast<float>(2u << ((i - kBaseSamplerCount) / 4));
+            info.anisotropyEnable = VK_TRUE;
+            info.maxAnisotropy = std::min(samples, g.properties.limits.maxSamplerAnisotropy);
+        }
+        info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        info.maxLod = VK_LOD_CLAMP_NONE;
+        Check(vkCreateSampler(g.device, &info, nullptr, &g.samplers[i]), "vkCreateSampler");
+    }
+
+    if (g.bindless) {
+        CreateBindlessTextureSet();
+    } else {
+        CreatePushedTextureLayout();
+    }
+
+    // Set 1: the chunk's MeshConstants records at binding 0, Prog0Constants records at binding 1 and
+    // Prog0Palette records at binding 2.
+    VkDescriptorSetLayoutBinding constants_bindings[3] = {};
+    for (uint32_t binding = 0; binding < 3; binding++) {
+        constants_bindings[binding].binding = binding;
+        constants_bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        constants_bindings[binding].descriptorCount = 1;
+        constants_bindings[binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo constants_layout = {};
+    constants_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    constants_layout.bindingCount = 3;
+    constants_layout.pBindings = constants_bindings;
+    Check(vkCreateDescriptorSetLayout(g.device, &constants_layout, nullptr, &g.constants_set_layout),
+          "vkCreateDescriptorSetLayout");
+
 
     constexpr uint32_t         kConstantSets = 256;
     VkDescriptorPoolSize       constants_size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kConstantSets};
@@ -387,7 +419,8 @@ void CreatePipelines() {
 
     VkShaderModule draw2d_module = CreateShader(draw2d_vert, sizeof(draw2d_vert));
     VkShaderModule mesh_module = CreateShader(mesh_vert, sizeof(mesh_vert));
-    VkShaderModule frag_module = CreateShader(draw_frag, sizeof(draw_frag));
+    VkShaderModule frag_module = g.bindless ? CreateShader(draw_frag, sizeof(draw_frag))
+                                            : CreateShader(draw_bound_frag, sizeof(draw_bound_frag));
     VkShaderModule prog0_module =
         g.config.prog0_meshes ? CreateShader(mesh_prog0_vert, sizeof(mesh_prog0_vert)) : VK_NULL_HANDLE;
 

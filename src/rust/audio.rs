@@ -700,12 +700,12 @@ pub fn gameplay_documents(
     let inventory = super::inventory::Inventory::build(source)?;
     let mut documents = BTreeMap::new();
     if let Some(resource) = inventory.get("snd2/rev.bin") {
-        documents.insert("snd2/rev.json".to_owned(), scene_reverb(resource.bytes())?);
+        documents.insert("snd2/rev.json".to_owned(), scene_reverb(&resource.bytes())?);
     }
     if let Some(resource) = inventory.get("snd2/map_index.txt") {
         documents.insert(
             "snd2/map_index.json".to_owned(),
-            scene_sound_routes(resource.bytes())?,
+            scene_sound_routes(&resource.bytes())?,
         );
     }
     let mut sequence_names = BTreeMap::<String, BTreeMap<String, String>>::new();
@@ -728,7 +728,7 @@ pub fn gameplay_documents(
             continue;
         }
         let volume = key.ends_with(".vol");
-        let mut document = sound_metadata_document(resource.bytes(), volume)?;
+        let mut document = sound_metadata_document(&resource.bytes(), volume)?;
         if !volume {
             let (group, _) = key
                 .split_once(".snd/")
@@ -1168,7 +1168,7 @@ pub fn plan_stream(inventory: &Inventory) -> CoreResult<AudioPlan> {
                 work: (hd.len() + bd.len()) as u64,
                 estimated_bytes: bd.len().saturating_mul(4).saturating_add(hd.len()),
                 run: Box::new(move |sink| {
-                    bank_with(&key, hd.bytes(), bd.bytes(), &mut |name, bytes| {
+                    bank_with(&key, &hd.bytes(), &bd.bytes(), &mut |name, bytes| {
                         sink.submit(
                             name.to_owned(),
                             ArtifactBytes::Owned(bytes),
@@ -1195,9 +1195,9 @@ pub fn plan_stream(inventory: &Inventory) -> CoreResult<AudioPlan> {
                         )
                     };
                     if key.ends_with(".sq") {
-                        sequence_with(&key, input.bytes(), &mut emit)?;
+                        sequence_with(&key, &input.bytes(), &mut emit)?;
                     } else {
-                        smf_with(&key, input.bytes(), &mut emit)?;
+                        smf_with(&key, &input.bytes(), &mut emit)?;
                     }
                     Ok(())
                 }),
@@ -1211,7 +1211,7 @@ pub fn plan_stream(inventory: &Inventory) -> CoreResult<AudioPlan> {
                 work: input.len() as u64,
                 estimated_bytes: input.len().saturating_mul(3),
                 run: Box::new(move |sink| {
-                    let mp4 = movie_mp4_memory(input.bytes())?;
+                    let mp4 = movie_mp4_memory(&input.bytes())?;
                     sink.submit(
                         movie_target(&key),
                         ArtifactBytes::Owned(mp4),
@@ -1235,7 +1235,7 @@ pub fn plan_stream(inventory: &Inventory) -> CoreResult<AudioPlan> {
                     sink.submit(
                         format!("{}.wav", key.trim_end_matches(".wav")),
                         ArtifactBytes::Owned(
-                            stream(input.bytes())
+                            stream(&input.bytes())
                                 .map_err(|error| fail(format!("{key}: {error}")))?,
                         ),
                         Category::Audio,

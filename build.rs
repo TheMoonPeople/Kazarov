@@ -96,6 +96,8 @@ fn collect(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) {
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(kazarov_ffmpeg)");
+    // Maps the disc image a resource at a time, as on iOS, for testing that path on other hosts.
+    println!("cargo:rustc-check-cfg=cfg(kazarov_mapped_source)");
     println!("cargo:rerun-if-env-changed=KAZAROV_FFMPEG_INCLUDE");
     println!("cargo:rerun-if-env-changed=KAZAROV_FFMPEG_LIB");
     println!("cargo:rerun-if-changed=src/c/movie_mux.c");

@@ -46,6 +46,10 @@ bool ClockUnbounded();
 // Re-anchors the clock at the current time with a count of zero.
 void ClockReset();
 
+// Re-anchors the clock at the current time without moving the count, so time the app spent in the
+// background is not run as ticks.
+void ClockReanchor();
+
 std::int64_t ClockTickCount();
 
 void ClockSetTickCallback(ClockTickCallback callback);

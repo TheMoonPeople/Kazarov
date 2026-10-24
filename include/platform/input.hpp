@@ -6,6 +6,15 @@
 #include <string_view>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+// Touch screens get an on-screen gamepad: Android's and iOS's ports draw it over the game.
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#define KZ_TOUCH_OVERLAY 1
+#endif
+
 struct HostSettings;
 union SDL_Event;
 
@@ -216,7 +225,7 @@ InputMenuMouse InputTakeMenuMouse();
 // Does not drain motion, wheel, buttons or tap edges.
 void InputPeekMenuMouseMotion(float &dx, float &dy);
 
-#ifdef __ANDROID__
+#ifdef KZ_TOUCH_OVERLAY
 // The on-screen gamepad of a touch screen: an active-high button word and stick deflections from -1
 // to 1.
 struct InputTouchOverlayState {

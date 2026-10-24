@@ -1,5 +1,12 @@
 #include "platform/input_script.hpp"
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#define KZ_IOS 1
+#endif
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -48,8 +55,8 @@ InputPadState Released() {
     return state;
 }
 
-// Android's libc++ has no floating-point std::from_chars.
-#ifdef __ANDROID__
+// Android's libc++ has no floating-point std::from_chars, and iOS's has it only from iOS 26.
+#if defined(__ANDROID__) || defined(KZ_IOS)
 constexpr bool kFloatFromChars = false;
 #else
 constexpr bool kFloatFromChars = true;

@@ -488,9 +488,9 @@ Nothing the renderer calls was introduced by Vulkan 1.4, so 1.3 is the floor:
 
 | Requirement | Introduced by |
 |---|---|
-| `dualSrcBlend`, `shaderClipDistance`, `shaderSampledImageArrayDynamicIndexing` | 1.0 features |
+| `dualSrcBlend`, `shaderClipDistance` | 1.0 features |
 | `vkGetPhysicalDeviceFeatures2`, `vkGetPhysicalDeviceProperties2` | 1.1 |
-| `descriptorBindingPartiallyBound`, `descriptorBindingSampledImageUpdateAfterBind`, `descriptorBindingUpdateUnusedWhilePending`; 8192 update-after-bind sampled images per stage and per set, and that many update-after-bind resources per stage | 1.2 (descriptor indexing) |
+| The bindless texture array (below), or `VK_KHR_push_descriptor` | 1.2 (descriptor indexing), or extension |
 | `dynamicRendering` (`vkCmdBeginRendering`, `VkPipelineRenderingCreateInfo`) | 1.3 feature |
 | `synchronization2` (`vkCmdPipelineBarrier2`, `vkQueueSubmit2`, the `*_2` stages and accesses) | 1.3 feature |
 | Cull mode, front face, topology, depth test/write/compare, stencil test and ops as dynamic state | 1.3 core (no feature bit) |
@@ -498,6 +498,18 @@ Nothing the renderer calls was introduced by Vulkan 1.4, so 1.3 is the floor:
 | `maxPushConstantsSize` of 72 bytes | 1.0 limit (128 guaranteed) |
 | `maxStorageBufferRange` of 8 MiB and `maxPerStageDescriptorStorageBuffers` of 3 | 1.0 limits (128 MiB and 4 guaranteed) |
 | `VK_KHR_swapchain` and a graphics queue that presents to the window | not when offscreen |
+
+The bindless texture array holds every texture slot at set 0, indexed by the push constants. It
+needs `shaderSampledImageArrayDynamicIndexing`, `descriptorBindingPartiallyBound`,
+`descriptorBindingSampledImageUpdateAfterBind`, `descriptorBindingUpdateUnusedWhilePending`, 8192
+update-after-bind sampled images per stage and per set, and that many update-after-bind resources
+per stage. GPUs with Metal argument buffers tier 1 (Apple A12 and older) have about a hundred, so
+there `draw_bound.frag` takes set 0 as one texture, palette and sampler that each draw pushes with
+`vkCmdPushDescriptorSetKHR`, skipped when the previous draw pushed the same. `MissingBindless` makes
+the choice; `RendererConfig::bindless_textures = false` or `KZ_BINDLESS=0` takes the pushed path
+on any device. A portability-subset device (MoltenVK) takes it too even where the array fits: there
+the array is a Metal argument buffer, and drawing the quick loadout's item icons from it faults on
+the GPU (Apple A18 Pro). `KZ_BINDLESS=1` keeps the array on such a device.
 
 Optional, used when present:
 

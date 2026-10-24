@@ -101,6 +101,10 @@ void ClockReset() {
     Anchor(SteadyClock::now());
 }
 
+void ClockReanchor() {
+    Anchor(SteadyClock::now());
+}
+
 std::int64_t ClockTickCount() {
     return g_clock.count;
 }

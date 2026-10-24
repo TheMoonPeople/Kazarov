@@ -69,7 +69,7 @@ pub fn assemble_retained(
             .get(alias)
             .ok_or_else(|| fail(format!("missing retail resource: {alias}")))?;
         let members = inventory.members(alias);
-        if members.is_some() || empty_archive(resource.bytes(), alias) {
+        if members.is_some() || empty_archive(&resource.bytes(), alias) {
             if consumed_container(alias) {
                 return Ok(());
             }
@@ -90,7 +90,7 @@ pub fn assemble_retained(
             if let Some(members) = members {
                 for member in members {
                     if member.resource.is_empty()
-                        && !empty_archive(member.resource.bytes(), &member.alias)
+                        && !empty_archive(&member.resource.bytes(), &member.alias)
                     {
                         continue;
                     }
@@ -142,7 +142,7 @@ pub fn plan_jobs(
             .get(alias)
             .ok_or_else(|| fail(format!("missing retail resource: {alias}")))?;
         let members = inventory.members(alias);
-        if members.is_some() || empty_archive(resource.bytes(), alias) {
+        if members.is_some() || empty_archive(&resource.bytes(), alias) {
             if consumed_container(alias) {
                 return Ok(());
             }
@@ -164,7 +164,7 @@ pub fn plan_jobs(
             if let Some(members) = members {
                 for member in members {
                     if member.resource.is_empty()
-                        && !empty_archive(member.resource.bytes(), &member.alias)
+                        && !empty_archive(&member.resource.bytes(), &member.alias)
                     {
                         continue;
                     }

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Build a minimal LGPL-only FFmpeg into DIR and stamp it.
 
-    kz-ffmpeg --out DIR [--tarball FILE] [--sha256 HEX] [--jobs N] [--check] [--print-configure]
+    kz-ffmpeg --out DIR [--target ios-arm64] [--tarball FILE] [--sha256 HEX] [--jobs N] [--check] [--print-configure]
 
 The build provides lossless MPEG-2/ALAC MP4 extraction and MP4 playback through
 static codec, format, resampling and scaling libraries plus the FFmpeg command.
 The Linux image and macOS hosts use it; Windows takes BtbN's LGPL-shared bundle.
+--target ios-arm64 cross-compiles the libraries for iOS on a macOS host, without the command.
 scripts/build/kz-ffmpeg launches this shared FFmpeg tool; the image uses it directly.
 """
 
@@ -27,8 +28,9 @@ URL = f'https://ffmpeg.org/releases/ffmpeg-{VERSION}.tar.xz'
 SHA256 = '8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e'
 LICENSE_LINE = 'License: LGPL version 2.1 or later'
 STAMP = 'kz-ffmpeg.json'
-PRODUCTS = ('lib/libavcodec.a', 'lib/libavformat.a', 'lib/libavutil.a',
-            'lib/libswresample.a', 'lib/libswscale.a', 'include/libavcodec/avcodec.h', 'bin/ffmpeg')
+LIBRARIES = ('lib/libavcodec.a', 'lib/libavformat.a', 'lib/libavutil.a',
+             'lib/libswresample.a', 'lib/libswscale.a', 'include/libavcodec/avcodec.h')
+IOS_MIN_VERSION = '16.0'
 CONFIGURE_FLAGS = [
     '--disable-everything',
     '--disable-programs',
@@ -55,10 +57,29 @@ CONFIGURE_FLAGS = [
 GPL_FLAGS = ('--enable-gpl', '--enable-nonfree', '--enable-version3')
 
 
-def configure_flags():
+def products(target):
+    return LIBRARIES if target == 'ios-arm64' else LIBRARIES + ('bin/ffmpeg',)
+
+
+def ios_flags():
+    # An iOS app cannot start processes, so only the libraries are built.
+    sysroot = subprocess.run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], capture_output=True, text=True,
+                             check=True).stdout.strip()
+    target = f'-arch arm64 -mios-version-min={IOS_MIN_VERSION}'
+    # The program stream demuxer names a movie's video codec by probing it with the raw MPEG video demuxer; without
+    # it the in-process muxer finds no codec ("probed stream 0 failed") and cannot write the MP4.
+    return ['--enable-cross-compile', '--target-os=darwin', '--arch=aarch64', '--cc=xcrun -sdk iphoneos clang',
+            f'--sysroot={sysroot}', f'--extra-cflags={target}', f'--extra-ldflags={target}',
+            '--enable-demuxer=mpegvideo']
+
+
+def configure_flags(target=None):
     flags = list(CONFIGURE_FLAGS)
+    if target == 'ios-arm64':
+        flags.remove('--enable-ffmpeg')
+        flags += ios_flags()
     # configure aborts without nasm unless x86 assembly is disabled explicitly.
-    if shutil.which('nasm') is None:
+    elif shutil.which('nasm') is None:
         flags.append('--disable-x86asm')
     return flags
 
@@ -69,23 +90,23 @@ if _leaked:
     raise SystemExit(f"kz-ffmpeg: refusing to configure with {' '.join(_leaked)}")
 
 
-def expected_stamp(sha):
-    return {'version': VERSION, 'sha256': sha, 'configure': configure_flags(), 'license': LICENSE_LINE}
+def expected_stamp(sha, target):
+    return {'version': VERSION, 'sha256': sha, 'configure': configure_flags(target), 'license': LICENSE_LINE}
 
 
-def current(out, sha):
+def current(out, sha, target):
     try:
         with open(out / STAMP) as f:
             stamp = json.load(f)
     except (OSError, ValueError):
         return False
-    return stamp == expected_stamp(sha) and all((out / p).exists() for p in PRODUCTS)
+    return stamp == expected_stamp(sha, target) and all((out / p).exists() for p in products(target))
 
 
-def write_stamp(out, sha):
+def write_stamp(out, sha, target):
     tmp = out / (STAMP + '.kz-tmp')
     with open(tmp, 'w') as f:
-        json.dump(expected_stamp(sha), f, indent=1, sort_keys=True)
+        json.dump(expected_stamp(sha, target), f, indent=1, sort_keys=True)
         f.write('\n')
     os.replace(tmp, out / STAMP)
 
@@ -119,10 +140,10 @@ def extract(tarball, into):
     return src
 
 
-def configure_and_build(src, out, jobs):
+def configure_and_build(src, out, jobs, target):
     out.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        ['./configure', f'--prefix={out}', *configure_flags()],
+        ['./configure', f'--prefix={out}', *configure_flags(target)],
         cwd=src, capture_output=True, text=True, encoding='utf-8', errors='replace',
     )
     log = result.stdout + result.stderr
@@ -141,6 +162,7 @@ def configure_and_build(src, out, jobs):
 def main():
     parser = argparse.ArgumentParser(description=f'Build a minimal LGPL-only FFmpeg {VERSION} for the Kazarov image.')
     parser.add_argument('--out', metavar='DIR')
+    parser.add_argument('--target', choices=['ios-arm64'], help='cross-compile the libraries for this target')
     parser.add_argument('--tarball', metavar='FILE')
     parser.add_argument('--sha256', metavar='HEX')
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 1, metavar='N')
@@ -149,7 +171,7 @@ def main():
     args = parser.parse_args()
 
     if args.print_configure:
-        print('configure ' + shlex.join(configure_flags()))
+        print('configure ' + shlex.join(configure_flags(args.target)))
         return
     if args.out is None:
         parser.error('--out DIR is required')
@@ -157,10 +179,10 @@ def main():
     out = Path(args.out).resolve()
     sha = (args.sha256 or SHA256).lower()
     if args.check:
-        if not current(out, sha):
+        if not current(out, sha, args.target):
             sys.exit(f'kz-ffmpeg: {out} does not hold a current build')
         return
-    if current(out, sha):
+    if current(out, sha, args.target):
         print(f'kz-ffmpeg: {out} is up to date')
         return
     (out / STAMP).unlink(missing_ok=True)
@@ -176,9 +198,9 @@ def main():
         if got != sha:
             sys.exit(f'kz-ffmpeg: {tarball} sha256 mismatch: expected {sha}, got {got}')
         src = extract(tarball, tmp)
-        configure_and_build(src, out, args.jobs)
+        configure_and_build(src, out, args.jobs, args.target)
 
-    write_stamp(out, sha)
+    write_stamp(out, sha, args.target)
     print(f'kz-ffmpeg: built FFmpeg {VERSION} into {out}')
 
 
