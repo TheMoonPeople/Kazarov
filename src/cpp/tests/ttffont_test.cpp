@@ -136,3 +136,16 @@ TEST(TtfFont, SeparateScalesStretchTheGlyphAndShiftsMoveIt) {
     EXPECT_FALSE(ttffont::RenderGlyph(U'H', 40.0f, 40.0f, 1.0f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
     EXPECT_FALSE(ttffont::RenderGlyph(U'H', 3.0f, 40.0f, 0.0f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
 }
+
+TEST(TtfFont, AdvancesAreTheFontsOwnInEms) {
+    if (!LoadTestFont()) {
+        GTEST_SKIP() << "TEST_FONT is not set";
+    }
+    float i = 0, m = 0, missing = 0;
+    ASSERT_TRUE(ttffont::GetAdvance(U'i', i));
+    ASSERT_TRUE(ttffont::GetAdvance(U'm', m));
+    EXPECT_GT(i, 0.0f);
+    EXPECT_LE(i, m);
+    EXPECT_LT(m, 2.0f);
+    EXPECT_FALSE(ttffont::GetAdvance(char32_t{0x10FFFD}, missing));
+}

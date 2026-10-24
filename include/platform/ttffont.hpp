@@ -40,6 +40,10 @@ bool RenderGlyph(char32_t ch, int em_px, std::vector<unsigned char> &alpha, int 
 bool RenderGlyph(char32_t ch, float em_x, float em_y, float shift_x, float shift_y, std::vector<unsigned char> &alpha,
                  int &w, int &h, int &x0, int &y0);
 
+// How far ch moves the pen, in ems (its advance width over the font's units per em); false where the
+// font has no glyph for it.
+bool GetAdvance(char32_t ch, float &em);
+
 // The atlas, to draw GetGlyph's coordinates from.
 gfx::TextureBinding Binding();
 

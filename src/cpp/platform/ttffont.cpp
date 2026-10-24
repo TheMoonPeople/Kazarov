@@ -426,6 +426,20 @@ bool RenderGlyph(char32_t ch, float em_x, float em_y, float shift_x, float shift
     return true;
 }
 
+bool GetAdvance(char32_t ch, float &em) {
+    if (!g_font.loaded) {
+        return false;
+    }
+    const int index = stbtt_FindGlyphIndex(&g_font.info, static_cast<int>(ch));
+    if (index == 0) {
+        return false;
+    }
+    int advance, bearing;
+    stbtt_GetGlyphHMetrics(&g_font.info, index, &advance, &bearing);
+    em = static_cast<float>(advance) * stbtt_ScaleForMappingEmToPixels(&g_font.info, 1.0f);
+    return true;
+}
+
 gfx::TextureBinding Binding() {
     gfx::TextureBinding binding;
     binding.texture = g_atlas.texture;
