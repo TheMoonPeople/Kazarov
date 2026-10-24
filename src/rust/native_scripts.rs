@@ -405,12 +405,18 @@ fn script_output_name(resources: &ResourceInventory, alias: &str) -> String {
     }
 }
 
+fn is_script_resource_name(alias: &str) -> bool {
+    let lower_alias = alias.to_ascii_lowercase();
+    lower_alias.ends_with(".stb") || lower_alias.ends_with(".stb_")
+}
+
 /// Plans final compiled-script bytes from immutable retail references and native asset names.
 pub fn plan_jobs(
     resources: &ResourceInventory,
     converted_aliases: &HashSet<String>,
     profiles: &BTreeMap<String, BTreeSet<String>>,
     texture_paths: &BTreeMap<String, String>,
+    publish_scripts: bool,
 ) -> CoreResult<(HashSet<String>, Vec<Job>)> {
     let lookup = Arc::new(planned_lookup(
         resources,
@@ -421,10 +427,24 @@ pub fn plan_jobs(
     let mut consumed = HashSet::new();
     let mut jobs = Vec::new();
     for resource in resources.leaves() {
-        if !is_valid_script(resource.bytes()) {
+        let alias = resource.alias.clone();
+        let valid_script = is_valid_script(resource.bytes());
+        if !publish_scripts && valid_script {
+            if !is_script_resource_name(&alias) {
+                return Err(CoreError(format!(
+                    "compiled script resource has an unsupported alias: {alias}"
+                )));
+            }
+            consumed.insert(alias);
             continue;
         }
-        let alias = resource.alias.clone();
+        if !publish_scripts && is_script_resource_name(&alias) {
+            consumed.insert(alias);
+            continue;
+        }
+        if !valid_script {
+            continue;
+        }
         let name = script_output_name(resources, &alias);
         consumed.insert(alias.clone());
         let resource = resource.clone();
@@ -443,7 +463,10 @@ pub fn plan_jobs(
     Ok((consumed, jobs))
 }
 
-pub fn verify_archive_work(resources: &ResourceInventory) -> u64 {
+pub fn verify_archive_work(resources: &ResourceInventory, publish_scripts: bool) -> u64 {
+    if !publish_scripts {
+        return 0;
+    }
     resources
         .leaves()
         .iter()
@@ -459,11 +482,12 @@ pub fn verify_archive(
     texture_paths: &BTreeMap<String, String>,
     reader: &dyn super::publish::ArchiveReader,
     phase: &Phase,
+    publish_scripts: bool,
 ) -> CoreResult<()> {
     let lookup = planned_lookup(resources, converted_aliases, profiles, texture_paths);
     let mut character_scripts = BTreeMap::<String, BTreeSet<String>>::new();
     for resource in resources.leaves() {
-        if !is_valid_script(resource.bytes()) {
+        if !publish_scripts || !is_valid_script(resource.bytes()) {
             continue;
         }
         let alias = &resource.alias;
@@ -1327,6 +1351,81 @@ mod reference_audit;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn luau_only_rejects_valid_scripts_with_unmapped_aliases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("valid-script.bin"), ambiguous_script_fixture()).unwrap();
+        let source = super::super::archive::SourceTree::directory(&raw).unwrap();
+        let resources = ResourceInventory::build(&source).unwrap();
+        let error = match plan_jobs(
+            &resources,
+            &HashSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        ) {
+            Ok(_) => panic!("valid script with an unmapped alias was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported alias"));
+    }
+
+    #[test]
+    fn luau_only_consumes_nested_pack_scripts_and_keeps_neighbor_resources() {
+        fn pack(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut output = Vec::new();
+            for (name, payload) in entries {
+                let mut header = vec![0; 80];
+                header[..name.len()].copy_from_slice(name.as_bytes());
+                for (at, value) in [
+                    (64, 80),
+                    (68, payload.len() as u32),
+                    (72, 80 + payload.len() as u32),
+                ] {
+                    header[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                output.extend(header);
+                output.extend_from_slice(payload);
+            }
+            output.extend([0; 80]);
+            output
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        let script = ambiguous_script_fixture();
+        let nested = pack(&[("c02.stb_", &script), ("palette.bin", b"keep")]);
+        fs::write(raw.join("scripts.pak"), pack(&[("nested.pak", &nested)])).unwrap();
+        fs::write(raw.join("loose.stb"), &script).unwrap();
+        let source = super::super::archive::SourceTree::directory(&raw).unwrap();
+        let resources = ResourceInventory::build(&source).unwrap();
+        let (consumed, jobs) = plan_jobs(
+            &resources,
+            &HashSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        assert!(jobs.is_empty());
+        assert!(consumed.contains("loose.stb"));
+        assert!(consumed.contains("scripts.pak/nested.pak/c02.stb_"));
+        assert!(!consumed.contains("scripts.pak/nested.pak/palette.bin"));
+        assert_eq!(resources.leaves().len(), 3);
+    }
+
+    #[test]
+    fn script_publication_recognizes_loose_and_trailing_underscore_aliases() {
+        for alias in ["map/evt.stb", "mainchr/c02.stb_", "PACK.PAK/script.STB"] {
+            assert!(is_script_resource_name(alias));
+        }
+        for alias in ["map/evt.stb.bak", "map/evt.stb1", "map/evt"] {
+            assert!(!is_script_resource_name(alias));
+        }
+    }
 
     #[test]
     fn bare_migrated_targets_resolve_to_published_source_paths() {

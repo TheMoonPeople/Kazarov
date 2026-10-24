@@ -1,6 +1,6 @@
 //! First-run desktop setup, invoked before the host game creates its window.
 
-use crate::core::{self, CoreError, CoreResult};
+use crate::core::{self, CoreError, CoreResult, ScriptPublicationPolicy};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,7 @@ impl Progress {
 struct Setup {
     source: String,
     output: PathBuf,
+    script_policy: ScriptPublicationPolicy,
     progress: Arc<Mutex<Progress>>,
     worker: Option<JoinHandle<CoreResult<core::ExtractReport>>>,
     error: Option<String>,
@@ -51,14 +52,21 @@ impl Setup {
         *self.progress.lock().unwrap() = Progress::default();
         let progress = self.progress.clone();
         let output = self.output.clone();
+        let script_policy = self.script_policy;
         let jobs = std::thread::available_parallelism().map_or(1, usize::from);
         match std::thread::Builder::new()
             .name("game-data-extraction".into())
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
-                core::extract_with_progress(&source, &output, jobs, &|fraction, message| {
-                    progress.lock().unwrap().advance(fraction, message);
-                })
+                core::extract_with_progress_policy(
+                    &source,
+                    &output,
+                    jobs,
+                    &|fraction, message| {
+                        progress.lock().unwrap().advance(fraction, message);
+                    },
+                    script_policy,
+                )
             }) {
             Ok(worker) => self.worker = Some(worker),
             Err(error) => self.error = Some(format!("Could not start extraction: {error}")),
@@ -226,10 +234,20 @@ fn icon() -> Option<egui::IconData> {
 
 /// Runs on the main thread and returns only after setup closes or succeeds.
 pub fn run(title: &str, output: &Path) -> CoreResult<bool> {
+    run_with_policy(title, output, ScriptPublicationPolicy::Retain)
+}
+
+/// Runs first-run setup with an explicit compiled-script publication policy.
+pub fn run_with_policy(
+    title: &str,
+    output: &Path,
+    script_policy: ScriptPublicationPolicy,
+) -> CoreResult<bool> {
     let succeeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let app = Setup {
         source: String::new(),
         output: output.into(),
+        script_policy,
         progress: Arc::new(Mutex::new(Progress::default())),
         worker: None,
         error: None,
@@ -261,10 +279,11 @@ mod tests {
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
 
-    fn test_setup() -> Setup {
+    fn test_setup(script_policy: ScriptPublicationPolicy) -> Setup {
         Setup {
             source: String::new(),
             output: PathBuf::from("unused/data"),
+            script_policy,
             progress: Arc::new(Mutex::new(Progress::default())),
             worker: None,
             error: None,
@@ -275,7 +294,7 @@ mod tests {
 
     #[test]
     fn invalid_path_stays_open_for_correction() {
-        let mut app = test_setup();
+        let mut app = test_setup(ScriptPublicationPolicy::Retain);
         app.start();
         assert!(app.worker.is_none());
         assert!(app.error.is_some());
@@ -298,7 +317,7 @@ mod tests {
 
     #[test]
     fn worker_failure_does_not_launch_game_and_success_does() {
-        let mut app = test_setup();
+        let mut app = test_setup(ScriptPublicationPolicy::Retain);
         app.worker = Some(std::thread::spawn(|| Err(CoreError("invalid disc".into()))));
         while app.worker.is_some() {
             app.poll();
@@ -315,6 +334,83 @@ mod tests {
         }
         assert!(app.completed_at.is_some());
         assert!(app.succeeded.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn setup_worker_publishes_using_the_selected_script_policy() {
+        let temp = tempfile::tempdir().expect("temporary folder");
+        let source = temp.path().join("disc");
+        std::fs::create_dir_all(source.join("MOVIE")).expect("disc folder");
+
+        let mut hd4 = vec![0u8; 54];
+        hd4[0..4].copy_from_slice(&36u32.to_le_bytes());
+        hd4[4..8].copy_from_slice(&4u32.to_le_bytes());
+        hd4[12..16].copy_from_slice(&44u32.to_le_bytes());
+        hd4[16..20].copy_from_slice(&4u32.to_le_bytes());
+        hd4[20..24].copy_from_slice(&1u32.to_le_bytes());
+        hd4[24..28].copy_from_slice(&53u32.to_le_bytes());
+        hd4[36..44].copy_from_slice(b"FOO.STB\0");
+        hd4[44..53].copy_from_slice(b"BAR.STB_\0");
+        std::fs::write(source.join("DATA.HD4"), hd4).expect("data index");
+        let mut data = vec![0u8; 2052];
+        data[..4].copy_from_slice(b"DATA");
+        data[2048..].copy_from_slice(b"MORE");
+        std::fs::write(source.join("DATA.DAT"), data).expect("data archive");
+        let mut hd3 = vec![0u8; 42];
+        hd3[0..4].copy_from_slice(&32u32.to_le_bytes());
+        hd3[4..8].copy_from_slice(&3u32.to_le_bytes());
+        hd3[12..16].copy_from_slice(&1u32.to_le_bytes());
+        hd3[32..42].copy_from_slice(b"BGM_A.STR\0");
+        std::fs::write(source.join("SOUND.HD3"), hd3).expect("sound index");
+        std::fs::write(source.join("SOUND.DAT"), b"SND").expect("sound archive");
+        let source = std::fs::canonicalize(source).expect("canonical disc path");
+
+        for (name, policy) in [
+            ("retain", ScriptPublicationPolicy::Retain),
+            ("luau-only", ScriptPublicationPolicy::LuauOnly),
+        ] {
+            let output_root = temp.path().join(name);
+            let mut app = test_setup(policy);
+            app.source = source.to_string_lossy().into_owned();
+            app.output = output_root.join("data");
+            app.start();
+            assert!(app.error.is_none(), "worker starts: {:?}", app.error);
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.worker.is_some() && Instant::now() < deadline {
+                app.poll();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(app.worker.is_none(), "extraction worker finishes");
+            assert!(app.error.is_none(), "extraction succeeds: {:?}", app.error);
+            assert!(app.succeeded.load(std::sync::atomic::Ordering::Acquire));
+
+            let archive =
+                core::zip_archive::Archive::open(&output_root.join(core::publish::ARCHIVE))
+                    .expect("published archive");
+            let names: Vec<_> = (0..archive.len())
+                .map(|index| archive.name(index))
+                .collect();
+            match policy {
+                ScriptPublicationPolicy::Retain => {
+                    assert!(names.contains(&"foo.stb"));
+                    assert!(names.contains(&"bar.stb_"));
+                }
+                ScriptPublicationPolicy::LuauOnly => assert!(names.iter().all(|name| {
+                    let name = name.to_ascii_lowercase();
+                    !name.ends_with(".stb") && !name.ends_with(".stb_")
+                })),
+            }
+            let marker: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(output_root.join(core::publish::MARKER)).expect("policy marker"),
+            )
+            .expect("valid policy marker");
+            let marker_policy = match policy {
+                ScriptPublicationPolicy::Retain => "Retain",
+                ScriptPublicationPolicy::LuauOnly => "LuauOnly",
+            };
+            assert_eq!(marker["script_publication_policy"], marker_policy);
+        }
     }
 
     #[test]

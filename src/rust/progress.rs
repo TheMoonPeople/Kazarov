@@ -1286,7 +1286,6 @@ mod terminal {
     unsafe extern "C" {
         fn signal(signum: i32, handler: usize) -> usize;
         fn raise(signum: i32) -> i32;
-        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     }
 
     pub fn enable_vt() -> bool {
@@ -1308,7 +1307,7 @@ mod terminal {
     extern "C" fn interrupted(signum: i32) {
         let show = b"\x1b[?25h\n";
         unsafe {
-            write(2, show.as_ptr(), show.len());
+            libc::write(2, show.as_ptr().cast(), show.len());
             signal(signum, 0);
             raise(signum);
         }

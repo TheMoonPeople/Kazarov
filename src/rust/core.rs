@@ -80,6 +80,16 @@ pub struct CheckReport {
     pub textures: u64,
 }
 
+/// Controls whether converted retail script files remain in the published archive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScriptPublicationPolicy {
+    /// Preserve compiled script bytes for compatibility with existing callers.
+    #[default]
+    Retain,
+    /// Omit compiled script resources while retaining logical references for loose Luau modules.
+    LuauOnly,
+}
+
 fn source_fingerprint(source: &Path, phase: &Phase) -> CoreResult<String> {
     fn hash_file(path: &Path, hash: &mut Sha256, phase: &Phase) -> CoreResult<()> {
         const CHUNK: usize = 4 << 20;
@@ -249,9 +259,19 @@ fn source_state(source: &Path) -> CoreResult<serde_json::Value> {
 }
 
 pub fn extract(source: &Path, data_out: &Path, jobs: usize) -> CoreResult<ExtractReport> {
+    extract_with_policy(source, data_out, jobs, ScriptPublicationPolicy::Retain)
+}
+
+/// Extracts data using an explicit compiled-script publication policy.
+pub fn extract_with_policy(
+    source: &Path,
+    data_out: &Path,
+    jobs: usize,
+    script_policy: ScriptPublicationPolicy,
+) -> CoreResult<ExtractReport> {
     Reporter::new(&|_, _| {})
         .with_console()
-        .run(|reporter| extract_stages(source, data_out, jobs, reporter))
+        .run(|reporter| extract_stages(source, data_out, jobs, reporter, script_policy))
 }
 
 /// Recognizes a complete, verified archive staged for the unchanged source.
@@ -277,7 +297,25 @@ pub fn extract_with_progress(
     jobs: usize,
     progress: &(dyn Fn(f32, &'static str) + Sync),
 ) -> CoreResult<ExtractReport> {
-    Reporter::new(progress).run(|reporter| extract_stages(source, data_out, jobs, reporter))
+    extract_with_progress_policy(
+        source,
+        data_out,
+        jobs,
+        progress,
+        ScriptPublicationPolicy::Retain,
+    )
+}
+
+/// Extracts and publishes data under an explicit compiled-script publication policy.
+pub fn extract_with_progress_policy(
+    source: &Path,
+    data_out: &Path,
+    jobs: usize,
+    progress: &(dyn Fn(f32, &'static str) + Sync),
+    script_policy: ScriptPublicationPolicy,
+) -> CoreResult<ExtractReport> {
+    Reporter::new(progress)
+        .run(|reporter| extract_stages(source, data_out, jobs, reporter, script_policy))
 }
 
 const WORKER_STACK: usize = 16 << 20;
@@ -450,6 +488,7 @@ fn extract_stages(
     data_out: &Path,
     jobs: usize,
     reporter: &Reporter<'_>,
+    script_policy: ScriptPublicationPolicy,
 ) -> CoreResult<ExtractReport> {
     use std::collections::HashSet;
     use std::sync::{Arc, atomic::AtomicU64};
@@ -496,7 +535,7 @@ fn extract_stages(
     let gameplay_source_fingerprint = configs::source_fingerprint();
     let metadata = serde_json::json!({
         "schema_version":1,"data_version":data_version(),"source":source.to_string_lossy(),
-        "source_sha256":source_sha256,"gameplay_plan_sha256":gameplay_plan_sha256,
+        "source_sha256":source_sha256,"script_publication_policy":format!("{script_policy:?}"),"gameplay_plan_sha256":gameplay_plan_sha256,
         "gameplay_source_fingerprint":gameplay_source_fingerprint,"jobs":jobs,
     });
     let stage = publish::acquire_stage(root, &metadata)?;
@@ -540,8 +579,13 @@ fn extract_stages(
     consumed.extend(model_plan.consumed.iter().cloned());
     consumed.extend(configs::gameplay_source_aliases(&inventory));
     let converted_aliases = consumed.clone();
-    let (script_consumed, script_jobs) =
-        native_scripts::plan_jobs(&inventory, &converted_aliases, &profiles, &texture_paths)?;
+    let (script_consumed, script_jobs) = native_scripts::plan_jobs(
+        &inventory,
+        &converted_aliases,
+        &profiles,
+        &texture_paths,
+        script_policy == ScriptPublicationPolicy::Retain,
+    )?;
     consumed.extend(script_consumed);
     let texture_members = texture_plan
         .documents
@@ -652,6 +696,7 @@ fn extract_stages(
         "schema_version":1,"data_version":data_version(),"source_state":initial_state,
         "source_sha256":source_sha256,"gameplay_plan_sha256":gameplay_plan_sha256,
         "gameplay_source_fingerprint":gameplay_source_fingerprint,
+        "script_publication_policy":format!("{script_policy:?}"),
         "texture_sources":texture_sources,
     });
     publish::seal_stream(sink, &published, marker)?;
@@ -666,6 +711,7 @@ fn extract_stages(
             &profiles,
             &texture_paths,
             &phase,
+            script_policy == ScriptPublicationPolicy::Retain,
         )
     })?;
     if source_state(&source)? != initial_state {
@@ -710,6 +756,15 @@ pub fn check(data_root: &Path) -> CoreResult<CheckReport> {
 }
 
 pub fn current(source: &Path, data_root: &Path) -> CoreResult<bool> {
+    current_with_policy(source, data_root, ScriptPublicationPolicy::Retain)
+}
+
+/// Checks whether the published archive matches a specific script policy.
+pub fn current_with_policy(
+    source: &Path,
+    data_root: &Path,
+    script_policy: ScriptPublicationPolicy,
+) -> CoreResult<bool> {
     if data_root.file_name().is_none_or(|name| name != "data") {
         return Err(CoreError("current path must be <game-root>/data".into()));
     }
@@ -726,6 +781,17 @@ pub fn current(source: &Path, data_root: &Path) -> CoreResult<bool> {
         Ok(state) => state,
         Err(_) => return Ok(false),
     };
+    let marker_policy = match marker.get("script_publication_policy") {
+        None => ScriptPublicationPolicy::Retain,
+        Some(value) => match value.as_str() {
+            Some("Retain") => ScriptPublicationPolicy::Retain,
+            Some("LuauOnly") => ScriptPublicationPolicy::LuauOnly,
+            _ => return Ok(false),
+        },
+    };
+    if marker_policy != script_policy {
+        return Ok(false);
+    }
     Ok(marker["source_state"] == state
         && marker["source_sha256"].as_str().is_some()
         && marker["gameplay_plan_sha256"].as_str()
@@ -824,6 +890,63 @@ mod tests {
         assert_eq!(left, ["data.json", "data.zip"]);
     }
 
+    #[test]
+    fn luau_only_policy_omits_loose_stb_and_stb_while_default_retains_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("disc");
+        std::fs::create_dir_all(source.join("MOVIE")).unwrap();
+        let mut hd4 = vec![0u8; 54];
+        hd4[0..4].copy_from_slice(&36u32.to_le_bytes());
+        hd4[4..8].copy_from_slice(&4u32.to_le_bytes());
+        hd4[8..12].copy_from_slice(&0u32.to_le_bytes());
+        hd4[12..16].copy_from_slice(&44u32.to_le_bytes());
+        hd4[16..20].copy_from_slice(&4u32.to_le_bytes());
+        hd4[20..24].copy_from_slice(&1u32.to_le_bytes());
+        hd4[24..28].copy_from_slice(&53u32.to_le_bytes());
+        hd4[36..44].copy_from_slice(b"FOO.STB\0");
+        hd4[44..53].copy_from_slice(b"BAR.STB_\0");
+        std::fs::write(source.join("DATA.HD4"), hd4).unwrap();
+        let mut data = vec![0u8; 2052];
+        data[..4].copy_from_slice(b"DATA");
+        data[2048..].copy_from_slice(b"MORE");
+        std::fs::write(source.join("DATA.DAT"), data).unwrap();
+        let mut hd3 = vec![0u8; 42];
+        hd3[0..4].copy_from_slice(&32u32.to_le_bytes());
+        hd3[4..8].copy_from_slice(&3u32.to_le_bytes());
+        hd3[8..12].copy_from_slice(&0u32.to_le_bytes());
+        hd3[12..16].copy_from_slice(&1u32.to_le_bytes());
+        hd3[32..42].copy_from_slice(b"BGM_A.STR\0");
+        std::fs::write(source.join("SOUND.HD3"), hd3).unwrap();
+        std::fs::write(source.join("SOUND.DAT"), b"SND").unwrap();
+
+        let source = std::fs::canonicalize(source).unwrap();
+        let retain_root = temp.path().join("retain");
+        extract(&source, &retain_root.join("data"), 2).unwrap();
+        let retained = Archive::open(&retain_root.join(publish::ARCHIVE)).unwrap();
+        let retained_names: Vec<_> = (0..retained.len()).map(|i| retained.name(i)).collect();
+        assert!(retained_names.contains(&"foo.stb"));
+        assert!(retained_names.contains(&"bar.stb_"));
+
+        let luau_root = temp.path().join("luau-only");
+        extract_with_progress_policy(
+            &source,
+            &luau_root.join("data"),
+            2,
+            &|_, _| {},
+            ScriptPublicationPolicy::LuauOnly,
+        )
+        .unwrap();
+        let published = Archive::open(&luau_root.join(publish::ARCHIVE)).unwrap();
+        assert!((0..published.len()).all(|i| {
+            let name = published.name(i).to_ascii_lowercase();
+            !name.ends_with(".stb") && !name.ends_with(".stb_")
+        }));
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(luau_root.join(publish::MARKER)).unwrap())
+                .unwrap();
+        assert_eq!(marker["script_publication_policy"], "LuauOnly");
+    }
+
     fn sealed_stage(published: &Path, state: &serde_json::Value) {
         std::fs::create_dir_all(published.join("data")).unwrap();
         std::fs::write(published.join("data/example.bin"), b"payload").unwrap();
@@ -909,6 +1032,67 @@ mod tests {
     }
 
     #[test]
+    fn current_requires_the_requested_script_publication_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("item.bin"), b"one").unwrap();
+        let root = temp.path().join("run");
+        let state = source_state(&source).unwrap();
+        sealed_stage(&root, &state);
+
+        assert!(current(&source, &root.join("data")).unwrap());
+        assert!(
+            current_with_policy(&source, &root.join("data"), ScriptPublicationPolicy::Retain)
+                .unwrap()
+        );
+        assert!(
+            !current_with_policy(
+                &source,
+                &root.join("data"),
+                ScriptPublicationPolicy::LuauOnly
+            )
+            .unwrap()
+        );
+
+        let marker_path = root.join(publish::MARKER);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker["script_publication_policy"] = serde_json::json!("LuauOnly");
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        assert!(!current(&source, &root.join("data")).unwrap());
+        assert!(
+            !current_with_policy(&source, &root.join("data"), ScriptPublicationPolicy::Retain)
+                .unwrap()
+        );
+        assert!(
+            current_with_policy(
+                &source,
+                &root.join("data"),
+                ScriptPublicationPolicy::LuauOnly
+            )
+            .unwrap()
+        );
+
+        marker["script_publication_policy"] = serde_json::json!(17);
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        assert!(!current(&source, &root.join("data")).unwrap());
+        assert!(
+            !current_with_policy(&source, &root.join("data"), ScriptPublicationPolicy::Retain)
+                .unwrap()
+        );
+        assert!(
+            !current_with_policy(
+                &source,
+                &root.join("data"),
+                ScriptPublicationPolicy::LuauOnly
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn current_rejects_directory_layout_and_truncated_archive() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
@@ -934,5 +1118,18 @@ mod tests {
         )
         .unwrap();
         assert!(!current(&source, &root.join("data")).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod script_policy_tests {
+    use super::ScriptPublicationPolicy;
+
+    #[test]
+    fn script_publication_defaults_to_retain() {
+        assert_eq!(
+            ScriptPublicationPolicy::default(),
+            ScriptPublicationPolicy::Retain
+        );
     }
 }

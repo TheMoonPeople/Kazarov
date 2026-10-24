@@ -83,6 +83,19 @@ fn save(path: &Path, document: &Value) -> CoreResult<()> {
     fs::write(path, serde_json::to_vec(document)?)?;
     Ok(())
 }
+fn is_compiled_script_path(path: &str) -> bool {
+    !path.contains([':', '\0', '\\'])
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && (path.to_ascii_lowercase().ends_with(".stb")
+            || path.to_ascii_lowercase().ends_with(".stb_"))
+}
+
+fn may_omit_character_resource(key: &str, path: &str, publish_scripts: bool) -> bool {
+    key == "scripts" && !publish_scripts && is_compiled_script_path(path)
+}
+
 fn extension(alias: &str) -> &str {
     alias
         .split("#entry:")
@@ -1373,6 +1386,7 @@ fn prune_metadata(value: &mut Value) {
         _ => {}
     }
 }
+#[cfg(test)]
 fn publish_pair(
     published: &Path,
     path: &str,
@@ -1420,25 +1434,25 @@ fn publish_pair_impl(
     report: &mut ConversionReport,
     mut stream: Option<&mut StreamPairs<'_>>,
 ) -> CoreResult<()> {
-    if let Some(output) = stream.as_mut() {
-        if output.preview {
-            let document = path.replace('\\', "/");
-            if output
-                .pairs
-                .insert(
-                    document.clone(),
-                    StreamPair {
-                        gltf: Value::Null,
-                        metadata: Value::Null,
-                        buffer: None,
-                    },
-                )
-                .is_some()
-            {
-                return Err(fail(format!("duplicate model output: {document}")));
-            }
-            return Ok(());
+    if let Some(output) = stream.as_mut()
+        && output.preview
+    {
+        let document = path.replace('\\', "/");
+        if output
+            .pairs
+            .insert(
+                document.clone(),
+                StreamPair {
+                    gltf: Value::Null,
+                    metadata: Value::Null,
+                    buffer: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(fail(format!("duplicate model output: {document}")));
         }
+        return Ok(());
     }
     if metadata["kind"] == "character" {
         for model in metadata["models"].as_array_mut().unwrap() {
@@ -4202,7 +4216,7 @@ fn publish_external_memory(
                 .push(entry);
         }
         pair.buffer =
-            externalize_buffers_memory_with_existing(&path, &mut doc, pair.buffer.as_deref())?;
+            externalize_buffers_memory_with_existing(path, &mut doc, pair.buffer.as_deref())?;
         pair.gltf = serde_json::to_vec(&doc)?;
         pair.metadata = serde_json::to_vec(&sidecar)?;
     }
@@ -4256,13 +4270,6 @@ fn collect(dir: &Path, files: &mut Vec<PathBuf>) -> CoreResult<()> {
         }
     }
     Ok(())
-}
-
-fn source_alias(raw: &Path, path: &Path) -> String {
-    path.strip_prefix(raw)
-        .unwrap()
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 struct MemoryCardIcon {
@@ -4374,7 +4381,7 @@ fn analyze_file(
             png,
         });
     }
-    if matches!(extension(&alias), "mds" | "mdt") {
+    if matches!(extension(alias), "mds" | "mdt") {
         for ext in ["mot", "wgt", "bbp"] {
             let sibling_alias = Path::new(alias)
                 .with_extension(ext)
@@ -4821,11 +4828,11 @@ fn final_model_weights(preview_nanos: &[u128], external_ops: &[u128]) -> Vec<u12
         .iter()
         .zip(external_ops)
         .map(|(&preview, &external)| {
-            let external_weight = if external_total == 0 {
-                0
-            } else {
-                external.saturating_mul(preview_total).saturating_mul(2) / external_total
-            };
+            let external_weight = external
+                .saturating_mul(preview_total)
+                .saturating_mul(2)
+                .checked_div(external_total)
+                .unwrap_or(0);
             preview.saturating_add(external_weight).max(1)
         })
         .collect()
@@ -4994,8 +5001,8 @@ impl ModelPlan {
             .map_err(|_| fail("model analysis lock poisoned"))?;
         for analysis in analyses {
             let analysis = analysis.ok_or_else(|| fail("model analysis job did not complete"))?;
-            if let Some(analysis) = analysis {
-                if let Some(job) = commit_file(
+            if let Some(analysis) = analysis
+                && let Some(job) = commit_file(
                     Path::new("published"),
                     analysis,
                     &mut converted,
@@ -5003,9 +5010,9 @@ impl ModelPlan {
                     &mut used_textures,
                     &mut report,
                     true,
-                )? {
-                    native_jobs.push(job);
-                }
+                )?
+            {
+                native_jobs.push(job);
             }
         }
         let documents = self.documents;
@@ -5658,7 +5665,7 @@ pub fn strip_source(
                 }
             } else if dest.is_file() && fs::metadata(&dest)?.len() <= 128 << 20 {
                 let mut b = fs::read(&dest)?;
-                if scrub(&mut b, &alias, converted, 0)? {
+                if scrub(&mut b, alias, converted, 0)? {
                     fs::write(dest, b)?
                 }
             }
@@ -5860,24 +5867,6 @@ fn verify_images(
         }
     }
     Ok(())
-}
-fn reference(root: &Path, value: &Value, key: &str) -> CoreResult<PathBuf> {
-    let s = value[key]
-        .as_str()
-        .ok_or_else(|| fail(format!("missing model {key}")))?;
-    if s.is_empty()
-        || s.contains(['\\', ':', '\0'])
-        || Path::new(s)
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return Err(fail("unsafe model reference"));
-    }
-    let path = root.join(s);
-    if !path.is_file() {
-        return Err(fail(format!("missing model asset {s}")));
-    }
-    Ok(path)
 }
 fn index(value: &Value, limit: usize, what: &str) -> CoreResult<usize> {
     let i = value
@@ -6364,6 +6353,16 @@ pub fn verify_work(names: &BTreeSet<String>) -> u64 {
 
 /// Verifies models against a previously collected data-tree inventory.
 pub fn verify_files(root: &Path, names: &BTreeSet<String>, phase: &Phase) -> CoreResult<()> {
+    verify_files_with_script_policy(root, names, phase, true)
+}
+
+/// Verifies models while allowing omitted compiled script paths only under Luau-only publication.
+pub fn verify_files_with_script_policy(
+    root: &Path,
+    names: &BTreeSet<String>,
+    phase: &Phase,
+    publish_scripts: bool,
+) -> CoreResult<()> {
     let port = root.join("data");
     let documents: Vec<PathBuf> = names
         .iter()
@@ -6431,7 +6430,7 @@ pub fn verify_files(root: &Path, names: &BTreeSet<String>, phase: &Phase) -> Cor
                         )));
                     }
                 }
-                verify_images(&port, &document, &doc, &metadata, &names, &mut checked_pngs)?;
+                verify_images(&port, &document, &doc, &metadata, names, &mut checked_pngs)?;
                 if metadata["kind"] == "character" {
                     for model in metadata["models"]
                         .as_array()
@@ -6450,7 +6449,16 @@ pub fn verify_files(root: &Path, names: &BTreeSet<String>, phase: &Phase) -> Cor
                             .as_array()
                             .ok_or_else(|| fail("character resource array missing"))?
                         {
-                            reference(&port, resource, "path")?;
+                            let resource_path = resource["path"]
+                                .as_str()
+                                .ok_or_else(|| fail("character resource path missing"))?;
+                            if !names.contains(resource_path)
+                                && !may_omit_character_resource(key, resource_path, publish_scripts)
+                            {
+                                return Err(fail(format!(
+                                    "missing character resource: {resource_path}"
+                                )));
+                            }
                         }
                     }
                     for animation in resources["animations"]
@@ -6600,6 +6608,14 @@ pub fn verify_archive_work(names: &[String]) -> u64 {
 
 /// Validates model structure and cross-asset references directly from the final ZIP.
 pub fn verify_archive(reader: &dyn super::publish::ArchiveReader, phase: &Phase) -> CoreResult<()> {
+    verify_archive_with_script_policy(reader, phase, true)
+}
+
+pub fn verify_archive_with_script_policy(
+    reader: &dyn super::publish::ArchiveReader,
+    phase: &Phase,
+    publish_scripts: bool,
+) -> CoreResult<()> {
     let names: BTreeSet<String> = reader.names().into_iter().collect();
     let documents: Vec<String> = names
         .iter()
@@ -6691,7 +6707,9 @@ pub fn verify_archive(reader: &dyn super::publish::ArchiveReader, phase: &Phase)
                             let path = resource["path"]
                                 .as_str()
                                 .ok_or_else(|| fail("character resource path missing"))?;
-                            if !reader.contains(path) {
+                            if !reader.contains(path)
+                                && !may_omit_character_resource(key, path, publish_scripts)
+                            {
                                 return Err(fail(format!("missing character resource: {path}")));
                             }
                         }
@@ -6755,6 +6773,45 @@ pub fn audit_payload(alias: &str, bytes: &[u8]) -> CoreResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn luau_only_allows_missing_script_paths_but_not_other_character_resources() {
+        assert!(is_compiled_script_path("event/map/test.stb"));
+        assert!(is_compiled_script_path("mainchr/c02.stb_"));
+        assert!(!is_compiled_script_path("character/model.gltf"));
+        assert!(!is_compiled_script_path("../outside.stb"));
+        assert!(!is_compiled_script_path("event\\map\\test.stb"));
+        assert!(may_omit_character_resource(
+            "scripts",
+            "event/map/test.stb",
+            false
+        ));
+        assert!(may_omit_character_resource(
+            "scripts",
+            "mainchr/c02.stb_",
+            false
+        ));
+        assert!(!may_omit_character_resource(
+            "scripts",
+            "character/model.gltf",
+            false
+        ));
+        assert!(!may_omit_character_resource(
+            "children",
+            "event/map/test.stb",
+            false
+        ));
+        assert!(!may_omit_character_resource(
+            "scripts",
+            "event/map/test.stb",
+            true
+        ));
+        for index in 0..33 {
+            let path = format!("event/e{index:03}/e{index:03}.stb");
+            assert!(may_omit_character_resource("scripts", &path, false));
+            assert!(!may_omit_character_resource("children", &path, false));
+        }
+    }
+
     use super::*;
 
     #[test]

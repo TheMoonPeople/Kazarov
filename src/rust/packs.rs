@@ -554,11 +554,11 @@ pub fn convert_source(
         .par_iter()
         .map(|alias| -> CoreResult<Option<(String, String)>> {
             let bytes = source_tree.read(alias)?;
-            if models::pack(&bytes).is_none() && !empty_archive(&bytes, &alias) {
+            if models::pack(&bytes).is_none() && !empty_archive(&bytes, alias) {
                 phase.inc(1);
                 return Ok(None);
             }
-            let folder = folder_path(&alias)
+            let folder = folder_path(alias)
                 .to_string_lossy()
                 .replace('\\', "/")
                 .to_lowercase();

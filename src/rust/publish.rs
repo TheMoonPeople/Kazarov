@@ -174,6 +174,7 @@ fn check_asset(
     }
     Ok(())
 }
+#[cfg(test)]
 fn verify_catalog(port: &Path, catalog: &Value, expected: &BTreeSet<String>) -> CoreResult<()> {
     verify_catalog_with_document(
         &|name| Ok(fs::read(port.join(name))?),
@@ -534,6 +535,30 @@ fn lock_stage(path: &Path) -> CoreResult<StageGuard> {
     })
 }
 
+fn stage_metadata_matches(prior: &Value, current: &Value) -> bool {
+    if prior == current {
+        return true;
+    }
+    let Some(current_policy) = current
+        .get("script_publication_policy")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    if current_policy != "Retain" || prior.get("script_publication_policy").is_some() {
+        return false;
+    }
+    let Some(prior_object) = prior.as_object() else {
+        return false;
+    };
+    let mut normalized = prior_object.clone();
+    normalized.insert(
+        "script_publication_policy".into(),
+        Value::String("Retain".into()),
+    );
+    Value::Object(normalized) == *current
+}
+
 pub fn acquire_stage(root: &Path, metadata: &Value) -> CoreResult<StageGuard> {
     fs::create_dir_all(root)?;
     // Directory order is unspecified (APFS differs from ext4 and NTFS); try
@@ -557,7 +582,7 @@ pub fn acquire_stage(root: &Path, metadata: &Value) -> CoreResult<StageGuard> {
             Some(prior) => prior,
             None => continue,
         };
-        if &prior != metadata {
+        if !stage_metadata_matches(&prior, metadata) {
             continue;
         }
         if let Ok(stage) = lock_stage(&path) {
@@ -1003,7 +1028,7 @@ fn verify_pack_textures(
 }
 
 fn verify_open_archive(archive: &Archive, marker: &Value, phase: &Phase) -> CoreResult<u64> {
-    let view = ArchiveView::new(&archive);
+    let view = ArchiveView::new(archive);
     let names: BTreeSet<String> = view.names().into_iter().collect();
     for &(name, _) in super::configs::gameplay_manifest() {
         if !names.contains(name) {
@@ -1049,6 +1074,7 @@ pub fn verify_stream_with_progress(
     profiles: &BTreeMap<String, BTreeSet<String>>,
     texture_paths: &BTreeMap<String, String>,
     phase: &Phase,
+    publish_scripts: bool,
 ) -> CoreResult<u64> {
     let marker = read_marker(root)?;
     if !archive_present(root, &marker) {
@@ -1064,14 +1090,14 @@ pub fn verify_stream_with_progress(
         archive.len() as u64
             + super::models::verify_archive_work(&archive_names)
             + super::audio::verify_work(&names)
-            + super::native_scripts::verify_archive_work(resources)
+            + super::native_scripts::verify_archive_work(resources, publish_scripts)
             + 1,
     );
     let pngs = verify_open_archive(&archive, &marker, phase)?;
     let ((models, audio), scripts) = rayon::join(
         || {
             rayon::join(
-                || super::models::verify_archive(&view, phase),
+                || super::models::verify_archive_with_script_policy(&view, phase, publish_scripts),
                 || super::audio::verify_archive(&view, phase),
             )
         },
@@ -1083,6 +1109,7 @@ pub fn verify_stream_with_progress(
                 texture_paths,
                 &view,
                 phase,
+                publish_scripts,
             )
         },
     );
@@ -1165,6 +1192,22 @@ pub fn publish_verified(staged: &Path, root: &Path) -> CoreResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_stage_metadata_defaults_to_retain_but_not_luau_only() {
+        let old = serde_json::json!({"schema_version": 1, "jobs": 2});
+        let retain = serde_json::json!({
+            "schema_version": 1,
+            "jobs": 2,
+            "script_publication_policy": "Retain"
+        });
+        let luau_only = serde_json::json!({
+            "schema_version": 1,
+            "jobs": 2,
+            "script_publication_policy": "LuauOnly"
+        });
+        assert!(super::stage_metadata_matches(&old, &retain));
+        assert!(!super::stage_metadata_matches(&old, &luau_only));
+    }
     use super::*;
 
     #[test]

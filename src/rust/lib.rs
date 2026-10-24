@@ -16,9 +16,20 @@ mod ffi {
         textures: u64,
     }
 
+    enum ScriptPublicationPolicy {
+        Retain,
+        LuauOnly,
+    }
+
     extern "Rust" {
         fn bridge_smoke(value: &str) -> Result<String>;
         fn extract(source: &str, data_out: &str, jobs: usize) -> Result<ExtractReport>;
+        fn extract_with_script_policy(
+            source: &str,
+            data_out: &str,
+            jobs: usize,
+            policy: ScriptPublicationPolicy,
+        ) -> Result<ExtractReport>;
         fn list(source: &str) -> Result<String>;
         fn sound(source: &str) -> Result<String>;
         fn refresh_configs(source: &str, config_dir: &str) -> Result<usize>;
@@ -32,8 +43,19 @@ mod ffi {
         ) -> Result<usize>;
         fn check(data_root: &str) -> Result<CheckReport>;
         fn current(source: &str, data_root: &str) -> Result<bool>;
+        fn current_with_script_policy(
+            source: &str,
+            data_root: &str,
+            policy: ScriptPublicationPolicy,
+        ) -> Result<bool>;
         /// Runs first-run setup on the main thread; false means the user closed it.
         fn setup_data(title: &str, data_root: &str) -> Result<bool>;
+        /// Runs first-run setup under an explicit compiled-script publication policy.
+        fn setup_data_with_script_policy(
+            title: &str,
+            data_root: &str,
+            policy: ScriptPublicationPolicy,
+        ) -> Result<bool>;
 
         /// Immutable, thread-safe view of a ZIP asset archive.
         type Archive;
@@ -64,6 +86,15 @@ fn setup_data(title: &str, data_root: &str) -> Result<bool, core::CoreError> {
     setup::run(title, data_root.as_ref())
 }
 
+fn setup_data_with_script_policy(
+    title: &str,
+    data_root: &str,
+    policy: ffi::ScriptPublicationPolicy,
+) -> Result<bool, core::CoreError> {
+    let policy = core_script_publication_policy(policy)?;
+    setup::run_with_policy(title, data_root.as_ref(), policy)
+}
+
 fn bridge_smoke(value: &str) -> Result<String, core::CoreError> {
     if value == "error" {
         return Err(core::CoreError("bridge smoke error".into()));
@@ -83,6 +114,68 @@ fn extract(
         texture_sources: report.texture_sources,
         pngs: report.pngs,
     })
+}
+
+fn extract_with_script_policy(
+    source: &str,
+    data_out: &str,
+    jobs: usize,
+    policy: ffi::ScriptPublicationPolicy,
+) -> Result<ffi::ExtractReport, core::CoreError> {
+    let policy = core_script_publication_policy(policy)?;
+    let report = core::extract_with_policy(source.as_ref(), data_out.as_ref(), jobs, policy)?;
+    Ok(ffi::ExtractReport {
+        files: report.files,
+        bytes: report.bytes,
+        texture_sources: report.texture_sources,
+        pngs: report.pngs,
+    })
+}
+
+#[cfg(test)]
+fn script_publication_policy_from_repr(
+    value: u8,
+) -> Result<core::ScriptPublicationPolicy, core::CoreError> {
+    match value {
+        0 => Ok(core::ScriptPublicationPolicy::Retain),
+        1 => Ok(core::ScriptPublicationPolicy::LuauOnly),
+        _ => Err(core::CoreError(format!(
+            "invalid script publication policy value: {value}"
+        ))),
+    }
+}
+
+fn core_script_publication_policy(
+    policy: ffi::ScriptPublicationPolicy,
+) -> Result<core::ScriptPublicationPolicy, core::CoreError> {
+    match policy {
+        ffi::ScriptPublicationPolicy::Retain => Ok(core::ScriptPublicationPolicy::Retain),
+        ffi::ScriptPublicationPolicy::LuauOnly => Ok(core::ScriptPublicationPolicy::LuauOnly),
+        _ => Err(core::CoreError("invalid script publication policy".into())),
+    }
+}
+
+#[cfg(test)]
+mod script_publication_policy_tests {
+    use super::*;
+
+    #[test]
+    fn maps_both_publication_policies() {
+        assert_eq!(
+            core_script_publication_policy(ffi::ScriptPublicationPolicy::Retain).unwrap(),
+            core::ScriptPublicationPolicy::Retain
+        );
+        assert_eq!(
+            core_script_publication_policy(ffi::ScriptPublicationPolicy::LuauOnly).unwrap(),
+            core::ScriptPublicationPolicy::LuauOnly
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_policy_values() {
+        assert!(script_publication_policy_from_repr(2).is_err());
+        assert!(script_publication_policy_from_repr(u8::MAX).is_err());
+    }
 }
 
 fn list(source: &str) -> Result<String, core::CoreError> {
@@ -320,27 +413,27 @@ fn refresh_configs(source: &str, config_dir: &str) -> Result<usize, core::CoreEr
         let characters = core::models::export_character_gameplay(&indexed, &staging)
             .map_err(|error| core::CoreError(format!("character gameplay export: {error}")))?;
         ready_to_install = true;
-        if destination.exists() {
-            if let Err(error) = std::fs::rename(destination, &backup) {
-                if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    install_filewise(&staging, destination, &backup).map_err(|install_error| core::CoreError(format!(
+        if destination.exists()
+            && let Err(error) = std::fs::rename(destination, &backup)
+        {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                install_filewise(&staging, destination, &backup).map_err(|install_error| core::CoreError(format!(
                         "directory swap denied ({error}); filewise gameplay install failed: {install_error}; complete refresh retained at {}", staging.display()
                     )))?;
-                    if let Err(cleanup_error) = std::fs::remove_dir_all(&staging) {
-                        eprintln!(
-                            "gameplay refresh retained completed staging {}: {cleanup_error}",
-                            staging.display()
-                        );
-                    }
-                    return Ok(configs + audio + characters + 1);
+                if let Err(cleanup_error) = std::fs::remove_dir_all(&staging) {
+                    eprintln!(
+                        "gameplay refresh retained completed staging {}: {cleanup_error}",
+                        staging.display()
+                    );
                 }
-                return Err(core::CoreError(format!(
-                    "move existing gameplay directory {} to {}: {error}; complete refresh retained at {}",
-                    destination.display(),
-                    backup.display(),
-                    staging.display()
-                )));
+                return Ok(configs + audio + characters + 1);
             }
+            return Err(core::CoreError(format!(
+                "move existing gameplay directory {} to {}: {error}; complete refresh retained at {}",
+                destination.display(),
+                backup.display(),
+                staging.display()
+            )));
         }
         if let Err(error) = std::fs::rename(&staging, destination) {
             if backup.exists() {
@@ -352,13 +445,13 @@ fn refresh_configs(source: &str, config_dir: &str) -> Result<usize, core::CoreEr
                 staging.display()
             )));
         }
-        if backup.exists() {
-            if let Err(error) = std::fs::remove_dir_all(&backup) {
-                eprintln!(
-                    "gameplay refresh retained previous directory {}: {error}",
-                    backup.display()
-                );
-            }
+        if backup.exists()
+            && let Err(error) = std::fs::remove_dir_all(&backup)
+        {
+            eprintln!(
+                "gameplay refresh retained previous directory {}: {error}",
+                backup.display()
+            );
         }
         Ok(configs + audio + characters + 1)
     })();
@@ -463,6 +556,15 @@ fn check(data_root: &str) -> Result<ffi::CheckReport, core::CoreError> {
 
 fn current(source: &str, data_root: &str) -> Result<bool, core::CoreError> {
     core::current(source.as_ref(), data_root.as_ref())
+}
+
+fn current_with_script_policy(
+    source: &str,
+    data_root: &str,
+    policy: ffi::ScriptPublicationPolicy,
+) -> Result<bool, core::CoreError> {
+    let policy = core_script_publication_policy(policy)?;
+    core::current_with_policy(source.as_ref(), data_root.as_ref(), policy)
 }
 
 fn open_archive(path: &str) -> Result<Box<Archive>, core::CoreError> {

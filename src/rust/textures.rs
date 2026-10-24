@@ -177,9 +177,6 @@ fn decode_palette(raw: &[u8], image_type: u8, clut_type: u8) -> CoreResult<Vec<u
     }
     Ok(out)
 }
-fn parse_picture(b: &[u8], offset: usize, swizzled: bool, no_image: bool) -> CoreResult<Picture> {
-    parse_picture_mode(b, offset, swizzled, no_image, true)
-}
 fn parse_picture_mode(
     b: &[u8],
     offset: usize,
@@ -1539,13 +1536,13 @@ fn process_file(
         return Ok(unit);
     }
     if len >= 4 << 20 {
-        phase.item(&key);
+        phase.item(key);
     }
     if super::audio::owns_source(source, key)? {
         return Ok(unit);
     }
     let target = output.join("data").join(relative);
-    if possible_texture(len, &key)? {
+    if possible_texture(len, key)? {
         let original = source.read(key)?;
         let is_pack = parse_pack(&original).is_some();
         let transformed = unit.transform(&write, &original, key, 0)?;

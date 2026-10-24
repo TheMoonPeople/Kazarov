@@ -1063,12 +1063,12 @@ fn source_alias_catalog(
             }
             consumed.insert(alias.clone());
             let path = output_path(&alias);
-            if !super::configs_native::unused(&alias) {
-                if let Some(other) = catalog.insert(path.clone(), alias.clone()) {
-                    return Err(fail(format!(
-                        "native CFG output collision: {other} and {alias} -> {path}"
-                    )));
-                }
+            if !super::configs_native::unused(&alias)
+                && let Some(other) = catalog.insert(path.clone(), alias.clone())
+            {
+                return Err(fail(format!(
+                    "native CFG output collision: {other} and {alias} -> {path}"
+                )));
             }
         }
     }

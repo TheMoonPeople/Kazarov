@@ -42,13 +42,15 @@ pub enum Category {
     Gameplay,
 }
 
+type JobRunner = Box<dyn FnOnce(&AssetSink) -> CoreResult<()> + Send>;
+
 /// A conversion task admitted by byte estimate before its closure runs.
 pub struct Job {
     pub category: Category,
     pub label: String,
     pub work: u64,
     pub estimated_bytes: usize,
-    pub run: Box<dyn FnOnce(&AssetSink) -> CoreResult<()> + Send>,
+    pub run: JobRunner,
 }
 
 impl Job {

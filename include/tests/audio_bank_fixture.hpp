@@ -13,6 +13,7 @@
 #include "audio/hdbank.hpp"
 #include "audio/mixer.hpp"
 #include "audio/vag.hpp"
+#include "tests/platform_fixture.hpp"
 
 namespace dc::test {
 
@@ -26,8 +27,11 @@ struct BankSpec {
     std::uint16_t adsr2 = 0x5FC0;
 };
 
+/**
+ * Writes a per-process square-wave sample for a bank fixture.
+ */
 inline std::filesystem::path SampleFile(int rate) {
-    const auto    path = std::filesystem::temp_directory_path() / ("dc2_audio_square_" + std::to_string(rate) + ".wav");
+    const auto    path = std::filesystem::temp_directory_path() / ("dc2_audio_square_" + std::to_string(ProcessId()) + "_" + std::to_string(rate) + ".wav");
     std::ofstream out(path, std::ios::binary);
     auto          put16 = [&](std::uint16_t v) {out.put(v&255);out.put(v>>8); };
     auto          put32 = [&](std::uint32_t v) {put16(v&65535);put16(v>>16); };
