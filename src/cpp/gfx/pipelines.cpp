@@ -3,18 +3,17 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <iterator>
 #include <mutex>
-#include <random>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <vector>
 
 #include "gfx/context.hpp"
+#include "kazarov/log.hpp"
+#include "platform/files.hpp"
 #include "platform/paths.hpp"
 #include "shaders/draw.frag.spv.hpp"
 #include "shaders/draw2d.vert.spv.hpp"
@@ -161,6 +160,9 @@ void BuildBlendTable() {
             }
         }
     }
+    g_equations.push_back(
+        Equation{VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_OP_ADD, kSourceColor});
+    g.premultiplied_slot = static_cast<uint16_t>(g_equations.size() - 1);
     g.blend_slot_count = static_cast<uint32_t>(g_equations.size());
 }
 
@@ -207,21 +209,8 @@ void SaveCache(const std::filesystem::path &path) {
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), error);
     }
-    // Written aside and renamed so a concurrent reader never sees half a file.
-    std::filesystem::path temporary = path;
-    temporary += ".tmp" + std::to_string(std::random_device{}());
-    {
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        if (!file ||
-            !file.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(size))) {
-            Error("cannot write the pipeline cache to %s", PathsDisplay(temporary).c_str());
-            return;
-        }
-    }
-    std::filesystem::rename(temporary, path, error);
-    if (error) {
-        Error("cannot write the pipeline cache to %s: %s", PathsDisplay(path).c_str(), error.message().c_str());
-        std::filesystem::remove(temporary, error);
+    if (FilesWrite(path, data.data(), size, true) != FilesResult::kWritten) {
+        Error("cannot write the pipeline cache to %s", PathsDisplay(path).c_str());
     }
 }
 
@@ -289,15 +278,19 @@ void CreatePipelineLayout() {
     Check(vkCreateDescriptorSetLayout(g.device, &texture_layout, nullptr, &g.texture_set_layout),
           "vkCreateDescriptorSetLayout");
 
-    VkDescriptorSetLayoutBinding constants_binding = {};
-    constants_binding.binding = 0;
-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    constants_binding.descriptorCount = 1;
-    constants_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    // Set 1: the chunk's MeshConstants records at binding 0, Prog0Constants records at binding 1 and
+    // Prog0Palette records at binding 2.
+    VkDescriptorSetLayoutBinding constants_bindings[3] = {};
+    for (uint32_t binding = 0; binding < 3; binding++) {
+        constants_bindings[binding].binding = binding;
+        constants_bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        constants_bindings[binding].descriptorCount = 1;
+        constants_bindings[binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo constants_layout = {};
     constants_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    constants_layout.bindingCount = 1;
-    constants_layout.pBindings = &constants_binding;
+    constants_layout.bindingCount = 3;
+    constants_layout.pBindings = constants_bindings;
     Check(vkCreateDescriptorSetLayout(g.device, &constants_layout, nullptr, &g.constants_set_layout),
           "vkCreateDescriptorSetLayout");
 
@@ -322,7 +315,7 @@ void CreatePipelineLayout() {
     Check(vkAllocateDescriptorSets(g.device, &allocate, &g.texture_set), "vkAllocateDescriptorSets");
 
     constexpr uint32_t         kConstantSets = 256;
-    VkDescriptorPoolSize       constants_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kConstantSets};
+    VkDescriptorPoolSize       constants_size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kConstantSets};
     VkDescriptorPoolCreateInfo constants_pool = {};
     constants_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     constants_pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -342,39 +335,6 @@ void CreatePipelineLayout() {
     info.pushConstantRangeCount = 1;
     info.pPushConstantRanges = &push;
     Check(vkCreatePipelineLayout(g.device, &info, nullptr, &g.pipeline_layout), "vkCreatePipelineLayout");
-
-    if (!g.config.prog0_meshes) {
-        return;
-    }
-
-    VkDescriptorSetLayoutBinding prog0_binding = {};
-    prog0_binding.binding = 0;
-    prog0_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    prog0_binding.descriptorCount = 1;
-    prog0_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    VkDescriptorSetLayoutCreateInfo prog0_layout = {};
-    prog0_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    prog0_layout.bindingCount = 1;
-    prog0_layout.pBindings = &prog0_binding;
-    Check(vkCreateDescriptorSetLayout(g.device, &prog0_layout, nullptr, &g.prog0_set_layout),
-          "vkCreateDescriptorSetLayout");
-
-    VkDescriptorPoolSize       prog0_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kConstantSets};
-    VkDescriptorPoolCreateInfo prog0_pool = {};
-    prog0_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    prog0_pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    prog0_pool.maxSets = kConstantSets;
-    prog0_pool.poolSizeCount = 1;
-    prog0_pool.pPoolSizes = &prog0_size;
-    Check(vkCreateDescriptorPool(g.device, &prog0_pool, nullptr, &g.prog0_descriptor_pool),
-          "vkCreateDescriptorPool");
-
-    // Same push constant range as the plain layout, so pushes made through either stay valid for both.
-    VkDescriptorSetLayout prog0_layouts[3] = {g.texture_set_layout, g.constants_set_layout, g.prog0_set_layout};
-    info.setLayoutCount = 3;
-    info.pSetLayouts = prog0_layouts;
-    Check(vkCreatePipelineLayout(g.device, &info, nullptr, &g.prog0_pipeline_layout),
-          "vkCreatePipelineLayout");
 }
 
 uint32_t PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, bool alpha_test) {
@@ -402,9 +362,8 @@ PipelineFamily MeshFamily(const Prog0Constants *prog0) {
     return (prog0->flags & kProg0Skinned) != 0 ? kFamilyMeshProg0Skinned : kFamilyMeshProg0;
 }
 
-VkPipelineLayout PipelineLayoutOf(PipelineFamily family) {
-    return family > kFamilyMesh ? g.prog0_pipeline_layout : g.pipeline_layout;
-}
+// Every family shares one layout: the chunk's records at set 1 serve plain and prog0 draws alike.
+VkPipelineLayout PipelineLayoutOf(PipelineFamily) { return g.pipeline_layout; }
 
 BlendMapping MapBlend(const GsBlend &blend, bool enable) {
     if (!enable) {
@@ -462,14 +421,20 @@ void CreatePipelines() {
     // mesh_prog0.vert always reads the skin at locations 4 and 5. Unskinned, they alias bytes of the
     // vertex itself, which the shader then never uses.
     VkVertexInputAttributeDescription attributes_prog0[6] = {
-        attributes_mesh[0], attributes_mesh[1], attributes_mesh[2], attributes_mesh[3],
+        attributes_mesh[0],
+        attributes_mesh[1],
+        attributes_mesh[2],
+        attributes_mesh[3],
         {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex3D, position)},
         {5, 0, VK_FORMAT_R8G8B8A8_UINT,       offsetof(Vertex3D, color)   },
     };
     VkVertexInputBindingDescription   binding_skinned = {0, 2 * sizeof(Vertex3D),
                                                          VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes_skinned[6] = {
-        attributes_mesh[0], attributes_mesh[1], attributes_mesh[2], attributes_mesh[3],
+        attributes_mesh[0],
+        attributes_mesh[1],
+        attributes_mesh[2],
+        attributes_mesh[3],
         {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, sizeof(Vertex3D) + offsetof(Prog0Skin, weight)},
         {5, 0, VK_FORMAT_R8G8B8A8_UINT,       sizeof(Vertex3D) + offsetof(Prog0Skin, bone)  },
     };
@@ -597,9 +562,13 @@ void CreatePipelines() {
     uint32_t families = family_count;
     uint32_t modes = kTextureModeCount;
     uint32_t total = blended + (g.dynamic_color_write_mask ? 0 : families * modes * 2);
+    // DrawState::depth_coverage's one pipeline last: 2D triangles from an RGBA texture, unblended,
+    // into a rendering without the depth attachment it samples.
+    g.coverage_pipeline = total;
+    uint32_t pipeline_count = total + (g.depth_sampling ? 1 : 0);
 
-    std::vector<VkPipelineShaderStageCreateInfo> stages(total * 2);
-    std::vector<VkGraphicsPipelineCreateInfo>    infos(total);
+    std::vector<VkPipelineShaderStageCreateInfo> stages(pipeline_count * 2);
+    std::vector<VkGraphicsPipelineCreateInfo>    infos(pipeline_count);
     uint32_t                                     blend_variants = g.blend_slot_count + (g.dynamic_color_write_mask ? 0 : 1);
     for (uint32_t family = 0; family < family_count; family++) {
         for (uint32_t blend = 0; blend < blend_variants; blend++) {
@@ -616,7 +585,7 @@ void CreatePipelines() {
                     stage[0] = {};
                     stage[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
                     stage[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-                    stage[0].module = family == kFamilyMesh ? mesh_module
+                    stage[0].module = family == kFamilyMesh  ? mesh_module
                                       : family > kFamilyMesh ? prog0_module
                                                              : draw2d_module;
                     stage[0].pSpecializationInfo =
@@ -636,7 +605,7 @@ void CreatePipelines() {
                     info.pVertexInputState = family == kFamilyMesh               ? &vertex_mesh
                                              : family == kFamilyMeshProg0        ? &vertex_prog0
                                              : family == kFamilyMeshProg0Skinned ? &vertex_skinned
-                                             : &vertex_2d;
+                                                                                 : &vertex_2d;
                     info.pInputAssemblyState = family == kFamily2DLines ? &lines : &triangles;
                     info.pViewportState = &viewport;
                     info.pRasterizationState = &raster;
@@ -649,6 +618,33 @@ void CreatePipelines() {
             }
         }
     }
+
+    struct CoverageSpecialization {
+        int32_t  mode;
+        VkBool32 alpha_test;
+        VkBool32 coverage;
+    };
+    CoverageSpecialization   coverage_data = {kTextureRgba, VK_FALSE, VK_TRUE};
+    VkSpecializationMapEntry coverage_entries[3] = {
+        {0, offsetof(CoverageSpecialization, mode),       sizeof(int32_t) },
+        {1, offsetof(CoverageSpecialization, alpha_test), sizeof(VkBool32)},
+        {2, offsetof(CoverageSpecialization, coverage),   sizeof(VkBool32)},
+    };
+    VkSpecializationInfo          coverage_info = {3, coverage_entries, sizeof(coverage_data), &coverage_data};
+    VkPipelineRenderingCreateInfo color_only = rendering;
+    color_only.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+    color_only.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+    if (g.depth_sampling) {
+        VkPipelineShaderStageCreateInfo *stage = &stages[total * 2];
+        stage[0] = stages[PipelineIndex(kFamily2DTriangles, 0, kTextureRgba, false) * 2];
+        stage[1] = stages[PipelineIndex(kFamily2DTriangles, 0, kTextureRgba, false) * 2 + 1];
+        stage[1].pSpecializationInfo = &coverage_info;
+        infos[total] = infos[PipelineIndex(kFamily2DTriangles, 0, kTextureRgba, false)];
+        infos[total].pNext = &color_only;
+        infos[total].pStages = stage;
+        infos[total].pColorBlendState = &blends[0];
+    }
+    total = pipeline_count;
 
     // Pipeline creation is thread-safe against one cache, and on a cold cache it is the whole
     // cost of starting up, so it is spread over the cores while the caller reports progress.
@@ -705,7 +701,7 @@ void CreatePipelines() {
     }
     SaveCache(g.config.pipeline_cache);
     g.pipeline_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    std::fprintf(stderr, "gfx: %u pipelines ready in %.2f s\n", total, g.pipeline_seconds);
+    kz::Logf(kz::LogLevel::Info, "gfx", "{} pipelines ready in {:.2f} s", total, g.pipeline_seconds);
 }
 
 void DestroyPipelines() {

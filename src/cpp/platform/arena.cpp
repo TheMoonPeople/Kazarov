@@ -1,9 +1,10 @@
 #include "platform/arena.hpp"
 
 #include <cstdio>
-#include <cstdlib>
+#include <format>
 #include <vector>
 
+#include "kazarov/log.hpp"
 #include "platform/memory.hpp"
 
 namespace {
@@ -84,8 +85,7 @@ void ArenaRequireOneAbove4GiB(const void *const *bases, std::size_t count) {
             return;
         }
     }
-    std::fprintf(stderr, "arena: none lies above 4 GiB, where a truncated pointer would show\n");
-    std::abort();
+    kz::Abort("arena", "none lies above 4 GiB, where a truncated pointer would show");
 #endif
 }
 
@@ -98,11 +98,12 @@ void *PortImagePointer(std::int32_t truncated) {
 }
 
 void ArenaOverflow(const void *arena, int used, int limit) {
-    std::fprintf(stderr, "arena %p: allocation overflow, %d of %d quadwords\n", arena, used, limit);
-    std::abort();
+    // %p, not std::format's {}, so the address reads as the platform's printf spells it.
+    char address[32];
+    std::snprintf(address, sizeof(address), "%p", arena);
+    kz::Abort(std::format("arena {}", address), std::format("allocation overflow, {} of {} quadwords", used, limit));
 }
 
 void ArenaOverflow(const char *name, int used, int limit) {
-    std::fprintf(stderr, "arena %s: allocation overflow, %d of %d quadwords\n", name, used, limit);
-    std::abort();
+    kz::Abort(std::format("arena {}", name), std::format("allocation overflow, {} of {} quadwords", used, limit));
 }

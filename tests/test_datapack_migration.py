@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -8,9 +9,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from migrate_texture_datapacks import (MigrationError, build_mapping, load_mapping,
                                        migrate, plan, save_mapping)
+from kazarov_textures import document_path
 
 
 class DatapackMigrationTests(unittest.TestCase):
+    def test_native_document_namespace(self):
+        self.assertEqual(document_path("img/upper.IMG"), "textures/img/upper.json")
+        self.assertEqual(document_path("menu/a.pac/sub/icon.img"), "textures/menu/sub/icon.json")
+        self.assertEqual(document_path("chara/hero.chr/body.img"), "textures/chara/hero-body.json")
+        self.assertEqual(document_path("model.chr#offset:80"), "textures/model-embedded-offset-80.json")
+        self.assertEqual(document_path("menu-img/icon.img"), "textures/menu-img/icon.json")
+        path = document_path("a" * 80 + "/" + "b" * 80 + "/one.img")
+        self.assertTrue(path.startswith("textures/long-path-"))
+        self.assertLessEqual(len(path), 160)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.addCleanup(self.temp.cleanup)
@@ -62,6 +74,45 @@ class DatapackMigrationTests(unittest.TestCase):
         (self.new / "textures/hero.json").unlink()
         with self.assertRaisesRegex(MigrationError, "missing native texture document"):
             build_mapping(self.old / "catalog.json", self.new)
+
+    def test_direct_document_root_finds_new_texture_namespace(self):
+        (self.new / "catalog.json").unlink()
+        target = self.new / "textures/textures/hero.json"
+        target.parent.mkdir()
+        (self.new / "textures/hero.json").rename(target)
+        mapping = build_mapping(self.old / "catalog.json", self.new)
+        self.assertEqual(mapping, {"textures/hero.img/face-entry-0-picture-0.png":
+                                   "textures/textures/hero_0.png"})
+
+    def test_character_renamed_pngs_are_found_in_embedded_sidecar(self):
+        alias = "chara/hero.chr#offset:80"
+        old_png = "chara/hero.chr/face-entry-0-picture-0.png"
+        target = "textures/chara/hero_0.png"
+        self.embedded_source(alias, old_png)
+        sidecar = {"schema_version": 1, "kind": "character", "images": [{"image": 0, "png": target}],
+                   "resources": {"texture_sets": [{"document": {
+                       "schema_version": 3, "groups": [2], "entries": [{"name": "face", "block": 2,
+                       "pictures": [{"levels": ["#/images/0"]}]}]}}]}}
+        (self.new / "chara").mkdir()
+        (self.new / "chara/hero.game.json").write_text(json.dumps(sidecar))
+        self.assertEqual(build_mapping(self.old / "catalog.json", self.new), {old_png: target})
+
+    def test_collision_document_uses_source_hash_instead_of_other_container(self):
+        (self.new / "catalog.json").unlink()
+        alias = "textures/other.pac/hero.img"
+        old = json.loads((self.old / "catalog.json").read_text())
+        old["sources"][0]["source"] = alias
+        (self.old / "catalog.json").write_text(json.dumps(old))
+        suffix = hashlib.sha256(alias.encode()).hexdigest()[:12]
+        directory = self.new / "textures/textures"
+        directory.mkdir()
+        document = json.loads((self.new / "textures/hero.json").read_text())
+        (directory / "hero.json").write_text(json.dumps(document))
+        document["entries"][0]["pictures"][0]["levels"] = ["hero_collision_0.png"]
+        (directory / f"hero-{suffix}-0.json").write_text(json.dumps(document))
+        mapping = build_mapping(self.old / "catalog.json", self.new)
+        self.assertEqual(mapping, {"textures/hero.img/face-entry-0-picture-0.png":
+                                   "textures/textures/hero_collision_0.png"})
 
     def embedded_source(self, alias, old_png):
         old = json.loads((self.old / "catalog.json").read_text())

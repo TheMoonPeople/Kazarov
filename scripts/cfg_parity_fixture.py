@@ -50,7 +50,7 @@ def members(data):
     return None
 
 
-def prepare(raw, port_data, destination, texture_oracle=None):
+def prepare(raw, data_root, destination, texture_oracle=None):
     found = {}
     identities=set()
     ordered=[]
@@ -74,11 +74,11 @@ def prepare(raw, port_data, destination, texture_oracle=None):
                 entry["gltf"]=native_path(parent,"gltf")
                 entry["game"]=native_path(parent,"game.json")
                 entry["profile"]=Path(alias).stem
-                document=json.loads((port_data/entry["game"]).read_bytes())
+                document=json.loads((data_root/entry["game"]).read_bytes())
                 if entry["profile"] not in document.get("profiles",{}):raise ValueError(f"missing profile {alias}: {entry['game']} kind={document.get('kind')} keys={list(document)}")
             else:
                 entry["json"]=native_path(alias,"json")
-                if not (port_data/entry["json"]).is_file():raise ValueError(f"missing native CFG {alias}: {entry['json']}")
+                if not (data_root/entry["json"]).is_file():raise ValueError(f"missing native CFG {alias}: {entry['json']}")
             found[alias] = entry
             return
         children = members(data)
@@ -106,7 +106,7 @@ def prepare(raw, port_data, destination, texture_oracle=None):
             if path.stat().st_size <= 128 << 20:
                 visit(path.read_bytes(), alias)
     manifest = {
-        "port_data": str(port_data.resolve()),
+        "data": str(data_root.resolve()),
         "sources": [found[alias] for alias in sorted(found)],
         "identities": sorted(identities),
         "character_resources": character_resources,
@@ -175,12 +175,12 @@ def texture_document_path(alias):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("raw", type=Path)
-    parser.add_argument("port_data", type=Path)
+    parser.add_argument("data", type=Path)
     parser.add_argument("destination", type=Path)
     parser.add_argument("--texture-oracle", type=Path,
-                        help="Private port_data directory decoded from original IMG/TIM2 resources")
+                        help="Private data directory decoded from original IMG/TIM2 resources")
     args = parser.parse_args()
-    prepare(args.raw, args.port_data, args.destination, args.texture_oracle)
+    prepare(args.raw, args.data, args.destination, args.texture_oracle)
 
 
 if __name__ == "__main__":

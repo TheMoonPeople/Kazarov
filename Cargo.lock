@@ -1269,12 +1269,14 @@ dependencies = [
 name = "kazarov_core"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "crc32fast",
  "cxx",
  "eframe",
  "encoding_rs",
  "gpt_disk_io",
  "iso9660-rs",
+ "libc",
  "memmap2",
  "png",
  "rayon",

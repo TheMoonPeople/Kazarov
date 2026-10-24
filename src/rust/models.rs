@@ -1,5 +1,6 @@
 //! Converts retail scene, mesh, skeleton and animation records into glTF and typed JSON.
 use super::actions::{KeyAction, NameBook};
+use super::artifacts::{ArtifactBytes, AssetSink, Category, Job};
 use super::progress::Phase;
 use super::{CoreError, CoreResult};
 use rayon::prelude::*;
@@ -7,6 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 fn fail(s: impl Into<String>) -> CoreError {
     CoreError(s.into())
@@ -75,17 +77,25 @@ fn base64(b: &[u8]) -> String {
     }
     out
 }
+/// Writes a generated model JSON asset without indentation.
 fn save(path: &Path, document: &Value) -> CoreResult<()> {
-    fs::create_dir_all(path.parent().ok_or_else(|| fail("missing model parent"))?)?;
-    fs::write(path, serde_json::to_vec_pretty(document)?)?;
-    Ok(())
-}
-/// Writes a glTF without indentation; its accessor and animation tables are long.
-fn save_compact(path: &Path, document: &Value) -> CoreResult<()> {
     fs::create_dir_all(path.parent().ok_or_else(|| fail("missing model parent"))?)?;
     fs::write(path, serde_json::to_vec(document)?)?;
     Ok(())
 }
+fn is_compiled_script_path(path: &str) -> bool {
+    !path.contains([':', '\0', '\\'])
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && (path.to_ascii_lowercase().ends_with(".stb")
+            || path.to_ascii_lowercase().ends_with(".stb_"))
+}
+
+fn may_omit_character_resource(key: &str, path: &str, publish_scripts: bool) -> bool {
+    key == "scripts" && !publish_scripts && is_compiled_script_path(path)
+}
+
 fn extension(alias: &str) -> &str {
     alias
         .split("#entry:")
@@ -102,6 +112,36 @@ fn is_character(alias: &str) -> bool {
     extension(alias)
         .trim_end_matches('_')
         .eq_ignore_ascii_case("chr")
+}
+
+/// Native profile names available to script migration before graphics jobs run.
+pub(crate) fn planned_profile_names(
+    inventory: &super::inventory::Inventory,
+) -> CoreResult<BTreeMap<String, BTreeSet<String>>> {
+    let mut names = BTreeMap::new();
+    let profiled: BTreeSet<&str> = inventory
+        .names()
+        .filter(|resource| extension(resource).eq_ignore_ascii_case("cfg"))
+        .filter_map(character_parent)
+        .collect();
+    for alias in inventory.names() {
+        if !is_character(alias) {
+            continue;
+        }
+        if let Some(plan) = super::configs::profile_actions_for(alias)? {
+            names.insert(
+                alias.to_owned(),
+                plan.profiles.iter().map(|alias| leaf_stem(alias)).collect(),
+            );
+        } else if profiled.contains(alias) {
+            return Err(fail(format!(
+                "missing checked-in gameplay clip plan for {alias}"
+            )));
+        } else {
+            names.insert(alias.to_owned(), BTreeSet::new());
+        }
+    }
+    Ok(names)
 }
 fn parent(alias: &str) -> &str {
     alias.rsplit_once('/').map_or("", |p| p.0)
@@ -470,6 +510,8 @@ struct Gltf {
     reset_rotation_scale: BTreeSet<usize>,
     /// Nodes whose rotation and scale clips are rebaked from the retail pose at every frame.
     baked: BTreeSet<usize>,
+    /// Authored matrix of each node a clip has split into translation, rotation and scale.
+    authored: BTreeMap<usize, Vec<f32>>,
     /// Transform conventions and boundary keys counted for the conversion report.
     stats: TransformStats,
     /// Animation accessors by their exact contents, so identical key data is stored once.
@@ -654,6 +696,7 @@ impl Gltf {
             rotation_nodes: BTreeMap::new(),
             reset_rotation_scale: BTreeSet::new(),
             baked: BTreeSet::new(),
+            authored: BTreeMap::new(),
             stats: TransformStats::default(),
             shared: BTreeMap::new(),
             animation_bytes: Vec::new(),
@@ -885,7 +928,7 @@ fn textures(
                             json!([{"levels":entry["variants"][0]["levels"]}])
                         },
                         directory: published
-                            .join("port_data")
+                            .join("data")
                             .join(Path::new(&document).parent().unwrap()),
                     }),
                 });
@@ -1066,7 +1109,7 @@ fn encode_uri_segment(segment: &str) -> String {
     }
     out
 }
-/// Builds the relative URI from a port_data document to another port_data file.
+/// Builds the relative URI from a data document to another data file.
 fn relative_uri(document: &str, target: &str) -> String {
     let mut base: Vec<&str> = document.split('/').collect();
     base.pop();
@@ -1084,7 +1127,7 @@ fn relative_uri(document: &str, target: &str) -> String {
 fn buffer_path(document: &str) -> String {
     format!("{document}.bin")
 }
-/// Reads every buffer of a published glTF, embedded or stored in a port_data file.
+/// Reads every buffer of a published glTF, embedded or stored in a data file.
 fn load_buffers(port: &Path, document: &str, doc: &Value) -> CoreResult<Vec<Vec<u8>>> {
     let mut buffers = Vec::new();
     for buffer in doc["buffers"].as_array().into_iter().flatten() {
@@ -1103,7 +1146,7 @@ fn load_buffers(port: &Path, document: &str, doc: &Value) -> CoreResult<Vec<Vec<
 /// Stores a glTF's buffers as one `<document>.bin` file beside it and points the document at it.
 ///
 /// Every buffer view keeps its bytes; views are rebased onto the merged, 4-byte aligned buffer.
-/// Returns the port_data path of the buffer file, or `None` when the document has no buffers.
+/// Returns the data path of the buffer file, or `None` when the document has no buffers.
 fn externalize_buffers(
     port: &Path,
     document: &str,
@@ -1143,14 +1186,69 @@ fn externalize_buffers(
     gltf["buffers"] = json!([{"byteLength":merged.len(),"uri":relative_uri(document, &path)}]);
     Ok(Some(path))
 }
+
+/// Externalizes generated buffers without reading or writing staged asset files.
+fn externalize_buffers_memory(document: &str, gltf: &mut Value) -> CoreResult<Option<Vec<u8>>> {
+    externalize_buffers_memory_with_existing(document, gltf, None)
+}
+
+fn externalize_buffers_memory_with_existing(
+    document: &str,
+    gltf: &mut Value,
+    existing: Option<&[u8]>,
+) -> CoreResult<Option<Vec<u8>>> {
+    let mut buffers = Vec::new();
+    for entry in gltf["buffers"].as_array().into_iter().flatten() {
+        let uri = entry["uri"]
+            .as_str()
+            .ok_or_else(|| fail("generated glTF buffer URI missing"))?;
+        if uri.starts_with("data:") {
+            buffers.push(decode_uri(uri, "data:application/octet-stream;base64,")?);
+        } else if uri == relative_uri(document, &buffer_path(document)) {
+            buffers.push(
+                existing
+                    .ok_or_else(|| fail(format!("missing model buffer for {document}")))?
+                    .to_vec(),
+            );
+        } else {
+            return Err(fail(format!("unexpected generated glTF buffer URI: {uri}")));
+        }
+    }
+    if buffers.is_empty() {
+        return Ok(None);
+    }
+    let mut merged = Vec::new();
+    let mut starts = Vec::with_capacity(buffers.len());
+    for buffer in buffers {
+        while !merged.len().is_multiple_of(4) {
+            merged.push(0);
+        }
+        starts.push(merged.len());
+        merged.extend_from_slice(&buffer);
+    }
+    for view in gltf["bufferViews"].as_array_mut().into_iter().flatten() {
+        let buffer = index(&view["buffer"], starts.len(), "buffer")?;
+        let offset = view["byteOffset"].as_u64().unwrap_or(0) as usize + starts[buffer];
+        view["buffer"] = json!(0);
+        if offset == 0 {
+            view.as_object_mut().unwrap().remove("byteOffset");
+        } else {
+            view["byteOffset"] = json!(offset);
+        }
+    }
+    gltf["buffers"] =
+        json!([{"byteLength":merged.len(),"uri":relative_uri(document, &buffer_path(document))}]);
+    Ok(Some(merged))
+}
 /// Points every glTF image at its standalone PNG relative to the glTF file.
 fn link_images(
     published: &Path,
     path: &str,
     gltf: &mut Value,
     report: &mut ConversionReport,
+    planned_pngs: Option<&BTreeSet<String>>,
 ) -> CoreResult<()> {
-    let port = published.join("port_data");
+    let port = published.join("data");
     let document = path.replace('\\', "/");
     for image in gltf
         .get_mut("images")
@@ -1162,7 +1260,7 @@ fn link_images(
             .as_str()
             .ok_or_else(|| fail(format!("model image has no standalone PNG: {document}")))?
             .to_owned();
-        if !port.join(&png).is_file() {
+        if !planned_pngs.map_or_else(|| port.join(&png).is_file(), |names| names.contains(&png)) {
             return Err(fail(format!("missing model image {png}: {document}")));
         }
         image["uri"] = json!(relative_uri(&document, &png));
@@ -1173,7 +1271,7 @@ fn link_images(
 fn png_identity(path: &Path) -> String {
     let normalized = path.to_string_lossy().replace('\\', "/");
     let relative = normalized
-        .rsplit_once("/port_data/")
+        .rsplit_once("/data/")
         .map_or(normalized.clone(), |(_, relative)| relative.to_owned());
     let mut parts = Vec::new();
     for part in relative.split('/') {
@@ -1288,6 +1386,7 @@ fn prune_metadata(value: &mut Value) {
         _ => {}
     }
 }
+#[cfg(test)]
 fn publish_pair(
     published: &Path,
     path: &str,
@@ -1295,6 +1394,66 @@ fn publish_pair(
     metadata: &mut Value,
     report: &mut ConversionReport,
 ) -> CoreResult<()> {
+    publish_pair_impl(published, path, gltf, metadata, report, None)
+}
+
+struct StreamPair {
+    gltf: Value,
+    metadata: Value,
+    buffer: Option<Vec<u8>>,
+}
+
+struct PackedPair {
+    gltf: Vec<u8>,
+    metadata: Vec<u8>,
+    buffer: Option<Vec<u8>>,
+}
+
+impl StreamPair {
+    fn compact(self) -> CoreResult<PackedPair> {
+        Ok(PackedPair {
+            gltf: serde_json::to_vec(&self.gltf)?,
+            metadata: serde_json::to_vec(&self.metadata)?,
+            buffer: self.buffer,
+        })
+    }
+}
+
+struct StreamPairs<'a> {
+    pairs: &'a mut BTreeMap<String, StreamPair>,
+    png_names: &'a BTreeSet<String>,
+    gameplay: Option<&'a mut BTreeMap<String, Value>>,
+    preview: bool,
+}
+
+fn publish_pair_impl(
+    published: &Path,
+    path: &str,
+    gltf: &mut Value,
+    metadata: &mut Value,
+    report: &mut ConversionReport,
+    mut stream: Option<&mut StreamPairs<'_>>,
+) -> CoreResult<()> {
+    if let Some(output) = stream.as_mut()
+        && output.preview
+    {
+        let document = path.replace('\\', "/");
+        if output
+            .pairs
+            .insert(
+                document.clone(),
+                StreamPair {
+                    gltf: Value::Null,
+                    metadata: Value::Null,
+                    buffer: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(fail(format!("duplicate model output: {document}")));
+        }
+        return Ok(());
+    }
     if metadata["kind"] == "character" {
         for model in metadata["models"].as_array_mut().unwrap() {
             model.as_object_mut().unwrap().remove("name");
@@ -1333,7 +1492,13 @@ fn publish_pair(
     } else {
         minimal_model(metadata);
     }
-    link_images(published, path, gltf, report)?;
+    link_images(
+        published,
+        path,
+        gltf,
+        report,
+        stream.as_ref().map(|output| output.png_names),
+    )?;
     let mut images = Vec::new();
     if let Some(values) = gltf.get_mut("images").and_then(Value::as_array_mut) {
         for (image, value) in values.iter_mut().enumerate() {
@@ -1354,12 +1519,75 @@ fn publish_pair(
     gltf.as_object_mut().unwrap().remove("extras");
     prune_metadata(metadata);
     let document = path.replace('\\', "/");
-    if let Some(buffer) = externalize_buffers(&published.join("port_data"), &document, gltf)? {
+    if let Some(output) = stream.as_mut() {
+        if metadata["kind"] == "character" {
+            if let Some(gameplay) = output.gameplay.as_deref_mut() {
+                let mut external = json!({"schema_version":1,"kind":"character_gameplay",
+                    "profiles":metadata["profiles"],"game_names":metadata["game_names"]});
+                if !metadata["default_profile"].is_null() {
+                    external["default_profile"] = metadata["default_profile"].clone();
+                }
+                let cloth: Vec<Value> = metadata["resources"]["cloths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .filter_map(|(index, row)| {
+                        row.get("commands")
+                            .map(|commands| json!({"index":index,"commands":commands}))
+                    })
+                    .collect();
+                if !cloth.is_empty() {
+                    external["cloth_commands"] = json!(cloth);
+                }
+                let path = Path::new(path)
+                    .with_extension("character.json")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if gameplay.insert(path.clone(), external).is_some() {
+                    return Err(fail(format!("duplicate gameplay document: {path}")));
+                }
+            }
+            metadata.as_object_mut().unwrap().remove("profiles");
+            metadata.as_object_mut().unwrap().remove("game_names");
+            metadata.as_object_mut().unwrap().remove("default_profile");
+            for cloth in metadata["resources"]["cloths"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                cloth.as_object_mut().unwrap().remove("commands");
+            }
+        }
+        let buffer = externalize_buffers_memory(&document, gltf)?;
+        let sidecar = Path::new(path)
+            .with_extension("game.json")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if output
+            .pairs
+            .insert(
+                document.clone(),
+                StreamPair {
+                    gltf: gltf.clone(),
+                    metadata: metadata.clone(),
+                    buffer,
+                },
+            )
+            .is_some()
+        {
+            return Err(fail(format!("duplicate model output: {document}")));
+        }
+        report.files.push(document);
+        report.files.push(sidecar);
+        return Ok(());
+    }
+    if let Some(buffer) = externalize_buffers(&published.join("data"), &document, gltf)? {
         report.files.push(buffer);
     }
-    save_compact(&published.join("port_data").join(path), gltf)?;
+    save(&published.join("data").join(path), gltf)?;
     let sidecar = Path::new(path).with_extension("game.json");
-    save(&published.join("port_data").join(&sidecar), metadata)?;
+    save(&published.join("data").join(&sidecar), metadata)?;
     report.files.push(path.into());
     report
         .files
@@ -2025,6 +2253,8 @@ fn transform_keys(channels: &[Value]) -> BTreeMap<usize, [Option<&[Value]>; 3]> 
 }
 
 /// Replaces a node's authored matrix by its translation, rotation and scale.
+///
+/// The matrix is kept in `authored`, since every later clip rebakes from it.
 fn decompose_node(gltf: &mut Gltf, node: usize) {
     if let Some(matrix) = gltf.doc["nodes"][node]["matrix"].as_array() {
         let matrix: Vec<f32> = matrix.iter().map(|v| v.as_f64().unwrap() as f32).collect();
@@ -2034,6 +2264,7 @@ fn decompose_node(gltf: &mut Gltf, node: usize) {
         for (key, value) in decomposed.as_object().unwrap() {
             object.insert(key.clone(), value.clone());
         }
+        gltf.authored.insert(node, matrix);
     }
 }
 
@@ -2130,13 +2361,10 @@ fn animation_clip(
         if node >= node_count {
             return Err(fail(format!("motion frame {frame} outside model {name}")));
         }
-        let matrix: Vec<f32> = gltf.doc["nodes"][node]
-            .get("matrix")
-            .and_then(Value::as_array)
-            .map(|m| m.iter().map(|v| v.as_f64().unwrap() as f32).collect())
-            .unwrap_or_else(identity);
         let helper = gltf.rotation_nodes.get(&node).copied();
         decompose_node(gltf, node);
+        // The first clip decomposes the node; a frame without rotation keys keeps this matrix in every clip.
+        let matrix = gltf.authored.get(&node).cloned().unwrap_or_else(identity);
         if let Some(helper) = helper {
             decompose_node(gltf, helper);
         }
@@ -2289,6 +2517,52 @@ struct NativeArtifact {
     gltf: Value,
     metadata: Value,
     animations: Vec<Value>,
+    packed: Option<PackedNativeArtifact>,
+}
+
+struct PackedNativeArtifact {
+    bytes: Vec<u8>,
+    decoded_len: usize,
+}
+
+impl NativeArtifact {
+    fn pack(&mut self) -> CoreResult<()> {
+        if self.packed.is_some() {
+            return Ok(());
+        }
+        let encoded = serde_json::to_vec(&(&self.gltf, &self.metadata, &self.animations))?;
+        let packed = zstd::bulk::compress(&encoded, 1)?;
+        self.gltf = Value::Null;
+        self.metadata = Value::Null;
+        self.animations.clear();
+        self.packed = Some(PackedNativeArtifact {
+            bytes: packed,
+            decoded_len: encoded.len(),
+        });
+        Ok(())
+    }
+
+    fn expanded(&self) -> CoreResult<Self> {
+        let Some(packed) = &self.packed else {
+            return Ok(Self {
+                gltf: self.gltf.clone(),
+                metadata: self.metadata.clone(),
+                animations: self.animations.clone(),
+                packed: None,
+            });
+        };
+        let decoded = zstd::bulk::decompress(&packed.bytes, packed.decoded_len)?;
+        if decoded.len() != packed.decoded_len {
+            return Err(fail("native artifact decompressed length differs"));
+        }
+        let (gltf, metadata, animations) = serde_json::from_slice(&decoded)?;
+        Ok(Self {
+            gltf,
+            metadata,
+            animations,
+            packed: None,
+        })
+    }
 }
 
 /// Describes native assets and texture containers consumed by model publication.
@@ -2496,7 +2770,7 @@ fn embed_texture_set(
 ) -> CoreResult<Value> {
     let mut doc = source.document.clone();
     let directory = published
-        .join("port_data")
+        .join("data")
         .join(Path::new(&source.document_path).parent().unwrap());
     fn levels(gltf: &mut Value, directory: &Path, value: &mut Value) -> CoreResult<()> {
         if let Some(levels) = value.as_array_mut() {
@@ -2701,6 +2975,7 @@ fn rewrite_profile(
 }
 
 /// A motion whose skeleton is another bundle's model; its actions are published into those models.
+#[derive(Clone)]
 pub(crate) struct ExternalMotion {
     /// Identity shared by the referencing resource and the entries published into target models.
     key: String,
@@ -2769,6 +3044,28 @@ fn publish_native(
     documents: &[super::textures::ConvertedTextureDocument],
     report: &mut ConversionReport,
 ) -> CoreResult<()> {
+    publish_native_impl(published, resources, artifacts, documents, report, None)
+}
+
+fn publish_native_impl(
+    published: &Path,
+    resources: &[Resource],
+    artifacts: &BTreeMap<String, NativeArtifact>,
+    documents: &[super::textures::ConvertedTextureDocument],
+    report: &mut ConversionReport,
+    mut stream: Option<&mut StreamPairs<'_>>,
+) -> CoreResult<()> {
+    let decoded = if artifacts.values().any(|artifact| artifact.packed.is_some()) {
+        Some(
+            artifacts
+                .iter()
+                .map(|(name, artifact)| Ok((name.clone(), artifact.expanded()?)))
+                .collect::<CoreResult<BTreeMap<_, _>>>()?,
+        )
+    } else {
+        None
+    };
+    let artifacts = decoded.as_ref().unwrap_or(artifacts);
     let characters: Vec<_> = resources
         .iter()
         .filter(|r| is_character(&r.alias))
@@ -2815,12 +3112,30 @@ fn publish_native(
             .to_string_lossy()
             .replace('\\', "/");
         let mut profiles = Vec::new();
-        for profile in resources.iter().filter(|r| {
-            extension(&r.alias) == "cfg" && character_parent(&r.alias) == Some(alias.as_str())
-        }) {
-            profiles.push((profile.alias.clone(), super::configs::parse(&profile.data)?));
-        }
-        let keyed = super::actions::key_actions(&profiles)?;
+        let keyed = if stream
+            .as_ref()
+            .is_some_and(|output| output.gameplay.is_none())
+        {
+            if let Some(plan) = super::configs::profile_actions_for(alias)? {
+                plan.actions.clone()
+            } else if resources.iter().any(|resource| {
+                extension(&resource.alias).eq_ignore_ascii_case("cfg")
+                    && character_parent(&resource.alias) == Some(alias)
+            }) {
+                return Err(fail(format!(
+                    "missing checked-in gameplay clip plan for {alias}"
+                )));
+            } else {
+                super::actions::ProfileActions::default()
+            }
+        } else {
+            for profile in resources.iter().filter(|r| {
+                extension(&r.alias) == "cfg" && character_parent(&r.alias) == Some(alias.as_str())
+            }) {
+                profiles.push((profile.alias.clone(), super::configs::parse(&profile.data)?));
+            }
+            super::actions::key_actions(&profiles)?
+        };
         let mut book = NameBook::default();
         for (motion, action) in &keyed.order {
             book.action(motion, action, "")?;
@@ -3001,13 +3316,22 @@ fn publish_native(
                 "bind_pose" => value["matrices"] = bind_pose(resource)?["matrices"].clone(),
                 "weights" => value["channels"] = json!(channels(resource)?),
                 "cloth" => {
-                    value["commands"] = super::configs::parse(&resource.data)?["commands"].clone()
+                    if stream.is_none()
+                        || stream
+                            .as_ref()
+                            .is_some_and(|output| output.gameplay.is_some())
+                    {
+                        value["commands"] =
+                            super::configs::parse(&resource.data)?["commands"].clone();
+                    }
                 }
                 "script" => {
                     let path = super::configs::native_path(&resource.alias, "stb");
-                    let dest = published.join("port_data").join(&path);
-                    fs::create_dir_all(dest.parent().unwrap())?;
-                    fs::write(dest, &resource.data)?;
+                    let dest = published.join("data").join(&path);
+                    if stream.is_none() {
+                        fs::create_dir_all(dest.parent().unwrap())?;
+                        fs::write(dest, &resource.data)?;
+                    }
                     value["path"] = json!(path.clone());
                     value["texture_sets"] = json!([]);
                     report.files.push(path);
@@ -3099,24 +3423,37 @@ fn publish_native(
                 index
             });
         }
-        for (profile, document) in profiles {
-            let name = leaf_stem(&profile);
-            if native.get("default_profile").is_none() {
-                native["default_profile"] = json!(name);
+        if stream.is_none()
+            || stream
+                .as_ref()
+                .is_some_and(|output| output.gameplay.is_some())
+        {
+            for (profile, document) in profiles {
+                let name = leaf_stem(&profile);
+                if native.get("default_profile").is_none() {
+                    native["default_profile"] = json!(name);
+                }
+                native["profiles"][&name] =
+                    rewrite_profile(document, &profile, alias, &references, &mut book, &unbound)?;
             }
-            native["profiles"][&name] =
-                rewrite_profile(document, &profile, alias, &references, &mut book, &unbound)?;
+            let names: serde_json::Map<String, Value> = book
+                .names
+                .iter()
+                .filter(|(_, game)| !game.is_null())
+                .map(|(name, game)| (name.clone(), game.clone()))
+                .collect();
+            if !names.is_empty() {
+                native["game_names"] = Value::Object(names);
+            }
         }
-        let names: serde_json::Map<String, Value> = book
-            .names
-            .iter()
-            .filter(|(_, game)| !game.is_null())
-            .map(|(name, game)| (name.clone(), game.clone()))
-            .collect();
-        if !names.is_empty() {
-            native["game_names"] = Value::Object(names);
-        }
-        publish_pair(published, &path, &mut gltf, &mut native, report)?;
+        publish_pair_impl(
+            published,
+            &path,
+            &mut gltf,
+            &mut native,
+            report,
+            stream.as_deref_mut(),
+        )?;
     }
     let mut standalone = BTreeMap::<String, Vec<(&String, &NativeArtifact)>>::new();
     for (alias, artifact) in artifacts
@@ -3170,7 +3507,14 @@ fn publish_native(
             }
             metadata["texture_sets"] = json!(sets);
         }
-        publish_pair(published, &path, &mut gltf, &mut metadata, report)?;
+        publish_pair_impl(
+            published,
+            &path,
+            &mut gltf,
+            &mut metadata,
+            report,
+            stream.as_deref_mut(),
+        )?;
     }
     Ok(())
 }
@@ -3304,6 +3648,34 @@ fn fitting_rigs(
         .flat_map(|(_, members)| members.iter().map(|&m| index[m]))
         .collect()
 }
+
+fn linked_copy_candidates(
+    externals: &[ExternalMotion],
+    placements: &[Value],
+    selected: &[BTreeSet<usize>],
+    bundle: &str,
+) -> (BTreeSet<usize>, Vec<String>) {
+    let leaf = bundle.rsplit('/').next().unwrap_or(bundle);
+    let mut copies = BTreeSet::new();
+    let mut names = Vec::new();
+    for (copy, other) in externals.iter().enumerate() {
+        let path = other
+            .key
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if path != bundle
+            && path.ends_with(&format!("/{leaf}"))
+            && placements[copy]["method"] == "linked"
+        {
+            names.push(other.key.clone());
+            copies.extend(selected[copy].iter().copied());
+        }
+    }
+    (copies, names)
+}
+
 /// Chooses the models each external motion is published into from the game's own loads.
 ///
 /// Event scripts bind a motion pack to an actor with `_LOAD_MOTION`; actor 0 is the scene's player
@@ -3357,6 +3729,7 @@ fn place_externals(report: &mut ConversionReport) -> Vec<BTreeSet<usize>> {
     }
     let mut placements = Vec::new();
     let mut unresolved = Vec::new();
+    let mut orphans = Vec::new();
     let mut out = Vec::new();
     for motion in &report.externals {
         let bundle = motion
@@ -3459,6 +3832,7 @@ fn place_externals(report: &mut ConversionReport) -> Vec<BTreeSet<usize>> {
             .difference(&fitting)
             .map(|&rig| format!("{} model {}", report.rigs[rig].path, report.rigs[rig].model))
             .collect();
+        let mut reason = String::new();
         let (rigs, method) = if !fitting.is_empty() {
             (fitting, "linked")
         } else {
@@ -3475,9 +3849,9 @@ fn place_externals(report: &mut ConversionReport) -> Vec<BTreeSet<usize>> {
                 })
                 .map(|(script, _)| script)
                 .collect();
-            // Only a motion some script names, through arguments this scan cannot follow, is
-            // published by skeleton match; a motion nothing loads is not published.
+            // A motion nothing loads is placed after every other motion, from its loaded copies.
             let rigs = if mentions.is_empty() && linked.is_empty() {
+                orphans.push(out.len());
                 BTreeSet::new()
             } else {
                 let all: BTreeSet<usize> = (0..report.rigs.len()).collect();
@@ -3494,20 +3868,20 @@ fn place_externals(report: &mut ConversionReport) -> Vec<BTreeSet<usize>> {
                     mentions[0]
                 )
             };
-            unresolved.push(format!(
-                "{}: {evidence}; {}",
-                motion.key,
-                if rigs.is_empty() {
-                    "not published into any model".to_owned()
-                } else {
-                    format!("placed by skeleton match into {} models", rigs.len())
-                }
-            ));
-            (rigs, "skeleton")
+            if !rigs.is_empty() {
+                unresolved.push(format!(
+                    "{}: {evidence}; placed by skeleton match into {} models",
+                    motion.key,
+                    rigs.len()
+                ));
+            }
+            reason = evidence;
+            (rigs, "heuristic")
         };
         placements.push(json!({
             "motion": motion.key,
             "method": method,
+            "reason": reason,
             "targets": rigs.iter().map(|&r| json!({
                 "model": report.rigs[r].path,
                 "index": report.rigs[r].model,
@@ -3517,6 +3891,59 @@ fn place_externals(report: &mut ConversionReport) -> Vec<BTreeSet<usize>> {
         }));
         out.push(rigs);
     }
+    // A motion nothing loads goes where the game loads a copy of it (a pack with the same name),
+    // when that copy's models fit; otherwise into the single model its skeleton fits best.
+    for index in orphans {
+        let motion = &report.externals[index];
+        let bundle = motion
+            .key
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let (copies, copy_names) =
+            linked_copy_candidates(&report.externals, &placements, &out, &bundle);
+        let mut rigs = fitting_rigs(motion, &report.rigs, &copies);
+        let reason = if !rigs.is_empty() {
+            format!(
+                "no script or game code loads it; published where the game loads its copy {}",
+                copy_names.join(", ")
+            )
+        } else {
+            let all: BTreeSet<usize> = (0..report.rigs.len()).collect();
+            let fitting = fitting_rigs(motion, &report.rigs, &all);
+            let best = family_scores(motion, &report.rigs)
+                .into_iter()
+                .flat_map(|(score, members)| members.into_iter().map(move |m| (score, m)))
+                .filter(|(_, m)| fitting.contains(m))
+                .max_by(|a, b| {
+                    (a.0, main_unit.contains(&a.1), std::cmp::Reverse(a.1))
+                        .partial_cmp(&(b.0, main_unit.contains(&b.1), std::cmp::Reverse(b.1)))
+                        .unwrap()
+                });
+            rigs = best
+                .map(|(_, rig)| BTreeSet::from([rig]))
+                .unwrap_or_default();
+            "no script or game code loads it; published into the model its skeleton fits best"
+                .to_owned()
+        };
+        unresolved.push(format!(
+            "{}: {reason}; {}",
+            motion.key,
+            if rigs.is_empty() {
+                "fits no model, not published".to_owned()
+            } else {
+                format!("placed by skeleton match into {} models", rigs.len())
+            }
+        ));
+        placements[index]["reason"] = json!(reason);
+        placements[index]["targets"] = json!(
+            rigs.iter()
+                .map(|&r| json!({"model": report.rigs[r].path, "index": report.rigs[r].model, "evidence": []}))
+                .collect::<Vec<_>>()
+        );
+        out[index] = rigs;
+    }
     report.placements = placements;
     report.unresolved.extend(unresolved);
     out
@@ -3524,7 +3951,7 @@ fn place_externals(report: &mut ConversionReport) -> Vec<BTreeSet<usize>> {
 
 /// Publishes every external motion's actions into the models `place_externals` chooses.
 fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResult<()> {
-    let port = published.join("port_data");
+    let port = published.join("data");
     let mut work = BTreeMap::<String, Vec<(usize, usize)>>::new();
     let mut targets = vec![BTreeSet::<String>::new(); report.externals.len()];
     for (index, rigs) in place_externals(report).into_iter().enumerate() {
@@ -3654,7 +4081,7 @@ fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResu
         {
             report.files.push(buffer);
         }
-        save_compact(&gltf_path, &doc)?;
+        save(&gltf_path, &doc)?;
         save(&sidecar_path, &sidecar)?;
     }
     for (motion, targets) in report.externals.iter().zip(targets) {
@@ -3669,6 +4096,170 @@ fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResu
     Ok(())
 }
 
+fn publish_external_memory(
+    pairs: &mut BTreeMap<String, PackedPair>,
+    report: &ConversionReport,
+    work: &BTreeMap<String, Vec<(usize, usize)>>,
+    targets: &[BTreeSet<String>],
+) -> CoreResult<()> {
+    for (path, list) in work {
+        let Some(pair) = pairs.get_mut(path) else {
+            continue;
+        };
+        let mut doc: Value = serde_json::from_slice(&pair.gltf)?;
+        let mut sidecar: Value = serde_json::from_slice(&pair.metadata)?;
+        let mut temp = Gltf::new();
+        temp.doc["nodes"] = doc["nodes"].clone();
+        let mut prefixes = BTreeMap::<String, String>::new();
+        let mut entries = BTreeMap::<usize, Value>::new();
+        for &(motion_index, rig_index) in list {
+            let motion = &report.externals[motion_index];
+            let rig = &report.rigs[rig_index];
+            let bundle = motion.key.split('#').next().unwrap_or("");
+            let taken: BTreeSet<String> = prefixes.values().cloned().collect();
+            let prefix = prefixes
+                .entry(bundle.to_owned())
+                .or_insert_with(|| {
+                    let base = leaf_stem(bundle);
+                    let mut name = base.clone();
+                    let mut suffix = 2;
+                    while taken.contains(&name) {
+                        name = format!("{base}_{suffix}");
+                        suffix += 1;
+                    }
+                    name
+                })
+                .clone();
+            temp.rotation_nodes = rig
+                .helpers
+                .iter()
+                .map(|(&frame, &helper)| (rig.node_offset + frame, helper))
+                .collect();
+            let entry = entries.entry(motion_index).or_insert_with(|| {
+                let actions: Vec<Value> = motion
+                    .actions
+                    .iter()
+                    .map(|(name, start, end)| {
+                        let auxiliary: Vec<Value> = motion
+                            .channels
+                            .iter()
+                            .filter(|channel| channel["type"].as_i64().is_some_and(|kind| kind > 2))
+                            .map(|channel| super::actions::slice_aux(channel, *start, *end))
+                            .collect();
+                        json!({"name":name,"duration":end-start,"channels":auxiliary})
+                    })
+                    .collect();
+                json!({"external":motion.key,"actions":actions,"variants":[]})
+            });
+            let previous = entry["variants"].as_array().unwrap().len();
+            let scene = doc["scenes"]
+                [sidecar["models"][rig.model]["scene"].as_u64().unwrap_or(0) as usize]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            let mut clips = Vec::new();
+            for (name, start, end) in &motion.actions {
+                let clip = clip_name(&format!("{prefix}/{name}"), previous, &scene);
+                clips.push(json!(animation_clip(
+                    &mut temp,
+                    &clip,
+                    &motion.channels,
+                    (*start, *end),
+                    rig.node_offset,
+                    false
+                )?));
+            }
+            entry["variants"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"model":rig.model,"node_offset":rig.node_offset,"animations":clips}));
+        }
+        doc["nodes"] = temp.doc["nodes"].clone();
+        let added = temp.finish();
+        let offsets: BTreeMap<&str, usize> = ["buffers", "bufferViews", "accessors", "animations"]
+            .into_iter()
+            .map(|key| (key, doc[key].as_array().map_or(0, Vec::len)))
+            .collect();
+        for key in ["buffers", "bufferViews", "accessors", "animations"] {
+            for item in added[key].as_array().into_iter().flatten() {
+                let mut value = item.clone();
+                match key {
+                    "bufferViews" => shift_field(&mut value, "buffer", offsets["buffers"]),
+                    "accessors" => shift_field(&mut value, "bufferView", offsets["bufferViews"]),
+                    "animations" => {
+                        for sampler in value["samplers"].as_array_mut().unwrap() {
+                            shift(&mut sampler["input"], offsets["accessors"]);
+                            shift(&mut sampler["output"], offsets["accessors"]);
+                        }
+                    }
+                    _ => {}
+                }
+                doc.as_object_mut()
+                    .unwrap()
+                    .entry(key)
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .unwrap()
+                    .push(value);
+            }
+        }
+        for mut entry in entries.into_values() {
+            for variant in entry["variants"].as_array_mut().unwrap() {
+                for clip in variant["animations"].as_array_mut().unwrap() {
+                    shift(clip, offsets["animations"]);
+                }
+            }
+            prune_metadata(&mut entry);
+            sidecar["resources"]["animations"]
+                .as_array_mut()
+                .ok_or_else(|| fail(format!("external motion target is not a character: {path}")))?
+                .push(entry);
+        }
+        pair.buffer =
+            externalize_buffers_memory_with_existing(path, &mut doc, pair.buffer.as_deref())?;
+        pair.gltf = serde_json::to_vec(&doc)?;
+        pair.metadata = serde_json::to_vec(&sidecar)?;
+    }
+    for (motion, targets) in report.externals.iter().zip(targets) {
+        let Some(sidecar) = &motion.sidecar else {
+            continue;
+        };
+        let path = format!(
+            "{}.gltf",
+            sidecar
+                .strip_suffix(".game.json")
+                .ok_or_else(|| fail(format!("invalid external sidecar path: {sidecar}")))?
+        );
+        let Some(pair) = pairs.get_mut(&path) else {
+            continue;
+        };
+        let mut metadata: Value = serde_json::from_slice(&pair.metadata)?;
+        metadata["resources"]["animations"][motion.resource]["targets"] = json!(targets);
+        pair.metadata = serde_json::to_vec(&metadata)?;
+    }
+    Ok(())
+}
+
+fn submit_stream_pair(sink: &AssetSink, path: String, pair: PackedPair) -> CoreResult<()> {
+    if let Some(buffer) = pair.buffer {
+        sink.submit(
+            buffer_path(&path),
+            ArtifactBytes::Owned(buffer),
+            Category::Model,
+        )?;
+    }
+    let sidecar = Path::new(&path)
+        .with_extension("game.json")
+        .to_string_lossy()
+        .replace('\\', "/");
+    sink.submit(path, ArtifactBytes::Owned(pair.gltf), Category::Model)?;
+    sink.submit(
+        sidecar,
+        ArtifactBytes::Owned(pair.metadata),
+        Category::Model,
+    )
+}
+
 fn collect(dir: &Path, files: &mut Vec<PathBuf>) -> CoreResult<()> {
     for e in fs::read_dir(dir)? {
         let p = e?.path();
@@ -3679,13 +4270,6 @@ fn collect(dir: &Path, files: &mut Vec<PathBuf>) -> CoreResult<()> {
         }
     }
     Ok(())
-}
-
-fn source_alias(raw: &Path, path: &Path) -> String {
-    path.strip_prefix(raw)
-        .unwrap()
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 struct MemoryCardIcon {
@@ -3724,29 +4308,70 @@ struct FileAnalysis {
     resources: Vec<Resource>,
 }
 
+impl FileAnalysis {
+    fn pack_artifacts(&mut self) -> CoreResult<()> {
+        for model in &mut self.models {
+            model.artifact.pack()?;
+        }
+        for (_, step) in &mut self.standalone {
+            if let Standalone::Artifact(artifact, _) = step {
+                artifact.pack()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Assigns unique flattened PNG names to every memory-card icon before parallel conversion.
+fn icon_texture_paths(
+    inventory: &super::inventory::Inventory,
+    png_names: &BTreeSet<String>,
+) -> CoreResult<BTreeMap<String, String>> {
+    let mut used: BTreeSet<_> = png_names
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let mut paths = BTreeMap::new();
+    for alias in inventory
+        .names()
+        .filter(|alias| extension(alias).eq_ignore_ascii_case("ico"))
+    {
+        let candidate = super::textures::document_path(
+            &Path::new(alias).with_extension("img").to_string_lossy(),
+        )?
+        .replace(".json", ".png");
+        paths.insert(
+            alias.to_owned(),
+            super::textures::reserve_path(candidate, alias, &mut used),
+        );
+    }
+    Ok(paths)
+}
+
 fn analyze_file(
-    raw: &Path,
-    p: &Path,
+    source: &super::archive::SourceTree,
+    alias: &str,
     all_textures: &[Texture],
+    icon_paths: &BTreeMap<String, String>,
     phase: &Phase,
+    embedded_gameplay: bool,
 ) -> CoreResult<Option<FileAnalysis>> {
-    let alias = source_alias(raw, p);
-    phase.item(&alias);
-    if fs::metadata(p)?.len() > 128 << 20 {
+    phase.item(alias);
+    if source.len(alias)? > 128 << 20 {
         return Ok(None);
     }
     let mut resources = Vec::new();
-    discover(&fs::read(p)?, &alias, &mut resources, 0)?;
+    discover(&source.read(alias)?, alias, &mut resources, 0)?;
     let mut icons = Vec::new();
     for icon in resources
         .iter()
         .filter(|resource| extension(&resource.alias).eq_ignore_ascii_case("ico"))
     {
         let path = super::configs::native_path(&icon.alias, "gltf");
-        let image = Path::new(&path)
-            .with_extension("png")
-            .to_string_lossy()
-            .replace('\\', "/");
+        let image = icon_paths
+            .get(&icon.alias)
+            .ok_or_else(|| fail(format!("unplanned icon image: {}", icon.alias)))?
+            .clone();
         let (gltf, png) = memory_card_icon(&icon.data, &relative_uri(&path, &image))?;
         icons.push(MemoryCardIcon {
             alias: icon.alias.clone(),
@@ -3756,12 +4381,19 @@ fn analyze_file(
             png,
         });
     }
-    if matches!(extension(&alias), "mds" | "mdt") {
+    if matches!(extension(alias), "mds" | "mdt") {
         for ext in ["mot", "wgt", "bbp"] {
-            let sibling = p.with_extension(ext);
-            if sibling.is_file() {
-                let sibling_alias = source_alias(raw, &sibling);
-                discover(&fs::read(&sibling)?, &sibling_alias, &mut resources, 0)?;
+            let sibling_alias = Path::new(alias)
+                .with_extension(ext)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if source.contains(&sibling_alias) {
+                discover(
+                    &source.read(&sibling_alias)?,
+                    &sibling_alias,
+                    &mut resources,
+                    0,
+                )?;
             }
         }
     }
@@ -3780,14 +4412,39 @@ fn analyze_file(
         ));
     }
     let links = script_links(&resources);
-    let mut profiles = Vec::new();
-    for r in resources
-        .iter()
-        .filter(|r| extension(&r.alias) == "cfg" && character_parent(&r.alias).is_some())
-    {
-        profiles.push((r.alias.clone(), super::configs::parse(&r.data)?));
-    }
-    let keyed = super::actions::key_actions(&profiles)?;
+    let keyed = if embedded_gameplay {
+        let mut actions = super::actions::ProfileActions::default();
+        for character in resources
+            .iter()
+            .filter(|resource| is_character(&resource.alias))
+        {
+            if let Some(plan) = super::configs::profile_actions_for(&character.alias)? {
+                actions.motions.extend(plan.actions.motions.clone());
+                actions.unbound.extend(plan.actions.unbound.clone());
+                actions.order.extend(plan.actions.order.clone());
+            } else if resources.iter().any(|resource| {
+                extension(&resource.alias).eq_ignore_ascii_case("cfg")
+                    && character_parent(&resource.alias) == Some(character.alias.as_str())
+            }) {
+                return Err(fail(format!(
+                    "missing checked-in gameplay clip plan for {}",
+                    character.alias
+                )));
+            }
+        }
+        actions
+    } else {
+        let mut profiles = Vec::new();
+        for resource in resources.iter().filter(|resource| {
+            extension(&resource.alias) == "cfg" && character_parent(&resource.alias).is_some()
+        }) {
+            profiles.push((
+                resource.alias.clone(),
+                super::configs::parse(&resource.data)?,
+            ));
+        }
+        super::actions::key_actions(&profiles)?
+    };
     let mut parsed = BTreeMap::new();
     let mut poses = BTreeMap::new();
     for r in &resources {
@@ -3997,6 +4654,7 @@ fn analyze_file(
                 gltf: gltf.finish(),
                 metadata,
                 animations: animation_aliases,
+                packed: None,
             },
             catalog,
             stats,
@@ -4064,6 +4722,7 @@ fn analyze_file(
                     gltf: gltf.finish(),
                     metadata,
                     animations: Vec::new(),
+                    packed: None,
                 },
                 entry,
             )
@@ -4071,7 +4730,7 @@ fn analyze_file(
         standalone.push((r.alias.clone(), step));
     }
     Ok(Some(FileAnalysis {
-        alias,
+        alias: alias.to_owned(),
         icons,
         script_loads,
         script_literals,
@@ -4086,8 +4745,97 @@ fn analyze_file(
 struct NativeJob {
     resources: Vec<Resource>,
     artifacts: BTreeMap<String, NativeArtifact>,
+    icons: Vec<MemoryCardIcon>,
     files: Vec<String>,
     externals: Vec<ExternalMotion>,
+}
+
+impl NativeJob {
+    fn estimated_expanded_bytes(&self) -> usize {
+        let source = self
+            .resources
+            .iter()
+            .map(|resource| resource.data.len())
+            .sum::<usize>()
+            .saturating_mul(4);
+        let decoded = self
+            .artifacts
+            .values()
+            .map(|artifact| {
+                artifact
+                    .packed
+                    .as_ref()
+                    .map_or(0, |packed| packed.decoded_len)
+            })
+            .sum::<usize>()
+            .saturating_mul(5);
+        source.saturating_add(decoded).max(1 << 20)
+    }
+}
+
+pub(crate) const MODEL_DEFERRED_WORK_MULTIPLIER: u64 = 8;
+pub(crate) const MODEL_PREVIEW_WORK_DIVISOR: u64 = 3;
+
+fn apportion_model_work(weights: &[u128], budget: u64) -> Vec<u64> {
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    let minimum = u64::from(budget >= weights.len() as u64);
+    let variable_budget = budget - minimum * weights.len() as u64;
+    let raw_total: u128 = weights.iter().sum();
+    let total = if raw_total == 0 {
+        weights.len() as u128
+    } else {
+        raw_total
+    };
+    let mut previous = 0u128;
+    weights
+        .iter()
+        .map(|&raw_weight| {
+            let weight = if raw_total == 0 { 1 } else { raw_weight };
+            let next = previous + weight;
+            let work = minimum
+                + ((next * variable_budget as u128) / total
+                    - (previous * variable_budget as u128) / total) as u64;
+            previous = next;
+            work
+        })
+        .collect()
+}
+
+fn external_motion_work(motion: &ExternalMotion) -> u128 {
+    let channels = motion.channels.len() as u128;
+    let keys = motion
+        .channels
+        .iter()
+        .map(|channel| channel["keys"].as_array().map_or(0, Vec::len) as u128)
+        .sum::<u128>();
+    let scales = motion
+        .channels
+        .iter()
+        .filter(|channel| channel["type"].as_i64() == Some(1))
+        .count() as u128;
+    motion.actions.iter().fold(0u128, |work, (_, start, end)| {
+        let frames = end.saturating_sub(*start).saturating_add(1) as u128;
+        work.saturating_add(keys + channels + frames.saturating_mul(scales))
+    })
+}
+
+fn final_model_weights(preview_nanos: &[u128], external_ops: &[u128]) -> Vec<u128> {
+    let preview_total: u128 = preview_nanos.iter().sum::<u128>().max(1);
+    let external_total: u128 = external_ops.iter().sum();
+    preview_nanos
+        .iter()
+        .zip(external_ops)
+        .map(|(&preview, &external)| {
+            let external_weight = external
+                .saturating_mul(preview_total)
+                .saturating_mul(2)
+                .checked_div(external_total)
+                .unwrap_or(0);
+            preview.saturating_add(external_weight).max(1)
+        })
+        .collect()
 }
 
 fn commit_file(
@@ -4097,26 +4845,34 @@ fn commit_file(
     catalog_resources: &mut BTreeMap<String, Value>,
     used_textures: &mut BTreeSet<String>,
     report: &mut ConversionReport,
+    stream: bool,
 ) -> CoreResult<Option<NativeJob>> {
     if converted.contains(&analysis.alias) {
         return Ok(None);
     }
     let mut files = Vec::new();
     let mut externals = Vec::new();
+    let mut icons = Vec::new();
     for icon in analysis.icons {
-        let image_path = published.join("port_data").join(&icon.image);
-        if image_path.exists() && fs::read(&image_path)? != icon.png {
-            return Err(fail(format!(
-                "memory card icon image collides: {}",
-                icon.image
-            )));
+        if !stream {
+            let image_path = published.join("data").join(&icon.image);
+            if image_path.exists() && fs::read(&image_path)? != icon.png {
+                return Err(fail(format!(
+                    "memory card icon image collides: {}",
+                    icon.image
+                )));
+            }
+            save(&published.join("data").join(&icon.path), &icon.gltf)?;
+            fs::create_dir_all(image_path.parent().unwrap())?;
+            fs::write(&image_path, &icon.png)?;
         }
-        save(&published.join("port_data").join(&icon.path), &icon.gltf)?;
-        fs::write(&image_path, &icon.png)?;
         report.referenced_pngs.insert(icon.image.clone());
-        files.push(icon.image);
-        files.push(icon.path);
-        converted.insert(icon.alias);
+        files.push(icon.image.clone());
+        files.push(icon.path.clone());
+        converted.insert(icon.alias.clone());
+        if stream {
+            icons.push(icon);
+        }
     }
     used_textures.extend(analysis.used_textures);
     report.script_loads.extend(analysis.script_loads);
@@ -4154,6 +4910,7 @@ fn commit_file(
     Ok(Some(NativeJob {
         resources: analysis.resources,
         artifacts,
+        icons,
         files,
         externals,
     }))
@@ -4211,6 +4968,531 @@ fn publish_jobs(
     Ok(())
 }
 
+/// An in-memory model pass whose resource analysis can run beside every other asset family.
+pub struct ModelPlan {
+    pub consumed: BTreeSet<String>,
+    pub embedded_texture_sources: BTreeSet<String>,
+    pub deferred_work: u64,
+    jobs: Vec<Job>,
+    analyses: Arc<Mutex<Vec<Option<Option<FileAnalysis>>>>>,
+    documents: Arc<Vec<super::textures::ConvertedTextureDocument>>,
+    png_names: Arc<BTreeSet<String>>,
+}
+
+impl ModelPlan {
+    pub fn into_initial_jobs(&mut self) -> Vec<Job> {
+        std::mem::take(&mut self.jobs)
+    }
+
+    /// Resolves model ownership and external-motion placement before final ZIP entries are sent.
+    pub fn finish_jobs(
+        self,
+        sink: &AssetSink,
+        on_preview: &(dyn Fn(u64, &str) + Sync),
+    ) -> CoreResult<Vec<Job>> {
+        let mut report = ConversionReport::default();
+        let mut converted = BTreeSet::new();
+        let mut catalog_resources = BTreeMap::new();
+        let mut used_textures = BTreeSet::new();
+        let mut native_jobs = Vec::new();
+        let analyses = Arc::try_unwrap(self.analyses)
+            .map_err(|_| fail("model analysis jobs are still running"))?
+            .into_inner()
+            .map_err(|_| fail("model analysis lock poisoned"))?;
+        for analysis in analyses {
+            let analysis = analysis.ok_or_else(|| fail("model analysis job did not complete"))?;
+            if let Some(analysis) = analysis
+                && let Some(job) = commit_file(
+                    Path::new("published"),
+                    analysis,
+                    &mut converted,
+                    &mut catalog_resources,
+                    &mut used_textures,
+                    &mut report,
+                    true,
+                )?
+            {
+                native_jobs.push(job);
+            }
+        }
+        let documents = self.documents;
+        let png_names = self.png_names;
+        let weights: Vec<u128> = native_jobs
+            .iter()
+            .map(|job| job.estimated_expanded_bytes() as u128)
+            .collect();
+        let preview_budget = if weights.is_empty() {
+            0
+        } else {
+            self.deferred_work / MODEL_PREVIEW_WORK_DIVISOR
+        };
+        let preview_work = apportion_model_work(&weights, preview_budget);
+        // This pass records ownership and rigs without retaining generated glTF buffers.
+        // Each final job regenerates only its own pairs under the sink's memory admission.
+        let previews: Vec<CoreResult<(BTreeSet<String>, ConversionReport, std::time::Duration)>> =
+            native_jobs
+                .par_iter()
+                .enumerate()
+                .map(|(index, job)| {
+                    let estimate = job.estimated_expanded_bytes();
+                    let result = sink.with_admission(estimate, || {
+                        let started = std::time::Instant::now();
+                        let mut pairs = BTreeMap::new();
+                        let mut local = ConversionReport::default();
+                        let mut stream = StreamPairs {
+                            pairs: &mut pairs,
+                            png_names: &png_names,
+                            gameplay: None,
+                            preview: true,
+                        };
+                        publish_native_impl(
+                            Path::new("published"),
+                            &job.resources,
+                            &job.artifacts,
+                            &documents,
+                            &mut local,
+                            Some(&mut stream),
+                        )?;
+                        let elapsed = started.elapsed();
+                        if elapsed.as_secs() >= 1
+                            && std::env::var_os("DC2DATA_PROFILE_JOBS").is_some()
+                        {
+                            let label = job
+                                .resources
+                                .first()
+                                .map_or("model-job", |resource| resource.alias.as_str());
+                            eprintln!("dc2data job preview {label}: {:.3}s", elapsed.as_secs_f64());
+                        }
+                        Ok((pairs.into_keys().collect(), local, elapsed))
+                    })?;
+                    let work = preview_work[index];
+                    sink.complete(work)?;
+                    let label = job
+                        .resources
+                        .first()
+                        .map_or("", |resource| resource.alias.as_str());
+                    on_preview(work, label);
+                    Ok(result)
+                })
+                .collect();
+        let mut owners = BTreeMap::<String, usize>::new();
+        let mut icon_names = BTreeSet::new();
+        let mut preview_nanos = Vec::with_capacity(native_jobs.len());
+        for (index, (job, result)) in native_jobs.iter().zip(previews).enumerate() {
+            let (names, local, elapsed) = result?;
+            preview_nanos.push(elapsed.as_nanos().max(1));
+            for name in names {
+                owners.insert(name, index);
+            }
+            report.rigs.extend(local.rigs);
+            report.externals.extend(job.externals.iter().cloned());
+            report.externals.extend(local.externals);
+            report.referenced_pngs.extend(local.referenced_pngs);
+            report
+                .consumed_texture_sources
+                .extend(local.consumed_texture_sources);
+            for icon in &job.icons {
+                if !icon_names.insert(icon.path.clone()) {
+                    return Err(fail("duplicate memory-card icon output"));
+                }
+            }
+        }
+        // A missing target is still an error; partial final jobs may omit other owners.
+        let selected = place_externals(&mut report);
+        let mut external_work = BTreeMap::<String, Vec<(usize, usize)>>::new();
+        let mut external_targets = vec![BTreeSet::<String>::new(); report.externals.len()];
+        for (motion_index, (motion, rigs)) in report.externals.iter().zip(selected).enumerate() {
+            for rig in rigs {
+                let path = &report.rigs[rig].path;
+                if !owners.contains_key(path) {
+                    return Err(fail(format!(
+                        "external motion target missing: {} ({})",
+                        path, motion.key
+                    )));
+                }
+                external_work
+                    .entry(path.clone())
+                    .or_default()
+                    .push((motion_index, rig));
+                external_targets[motion_index].insert(path.clone());
+            }
+            if let Some(sidecar) = &motion.sidecar {
+                let path = format!(
+                    "{}.gltf",
+                    sidecar
+                        .strip_suffix(".game.json")
+                        .ok_or_else(|| fail(format!("invalid external sidecar path: {sidecar}")))?
+                );
+                if !owners.contains_key(&path) {
+                    return Err(fail(format!("external sidecar missing: {sidecar}")));
+                }
+            }
+        }
+        let owners = Arc::new(owners);
+        let report = Arc::new(report);
+        let mut external_ops = vec![0u128; native_jobs.len()];
+        for (path, placements) in &external_work {
+            let Some(&owner) = owners.get(path) else {
+                continue;
+            };
+            for &(motion, _) in placements {
+                external_ops[owner] = external_ops[owner]
+                    .saturating_add(external_motion_work(&report.externals[motion]));
+            }
+        }
+        let external_work = Arc::new(external_work);
+        let external_targets = Arc::new(external_targets);
+        let count = native_jobs.len();
+        let final_budget = self.deferred_work - preview_budget;
+        let final_weights = final_model_weights(&preview_nanos, &external_ops);
+        let final_work = apportion_model_work(&final_weights, final_budget);
+        let mut jobs = Vec::with_capacity(count.max(1));
+        for (index, job) in native_jobs.into_iter().enumerate() {
+            let work = final_work[index];
+            let estimate = job.estimated_expanded_bytes();
+            let documents = documents.clone();
+            let png_names = png_names.clone();
+            let report = report.clone();
+            let owners = owners.clone();
+            let external_work = external_work.clone();
+            let external_targets = external_targets.clone();
+            let label = job.resources.first().map_or_else(
+                || format!("model-job-{index}"),
+                |resource| resource.alias.clone(),
+            );
+            jobs.push(Job {
+                category: Category::Model,
+                label,
+                work,
+                estimated_bytes: estimate,
+                run: Box::new(move |sink| {
+                    let mut pairs = BTreeMap::new();
+                    let mut local = ConversionReport::default();
+                    let mut stream = StreamPairs {
+                        pairs: &mut pairs,
+                        png_names: &png_names,
+                        gameplay: None,
+                        preview: false,
+                    };
+                    publish_native_impl(
+                        Path::new("published"),
+                        &job.resources,
+                        &job.artifacts,
+                        &documents,
+                        &mut local,
+                        Some(&mut stream),
+                    )?;
+                    let mut pairs = pairs
+                        .into_iter()
+                        .map(|(name, pair)| Ok((name, pair.compact()?)))
+                        .collect::<CoreResult<BTreeMap<_, _>>>()?;
+                    publish_external_memory(
+                        &mut pairs,
+                        &report,
+                        &external_work,
+                        &external_targets,
+                    )?;
+                    for (name, pair) in pairs {
+                        if owners.get(&name) == Some(&index) {
+                            submit_stream_pair(sink, name, pair)?;
+                        }
+                    }
+                    for icon in job.icons {
+                        sink.submit(
+                            icon.path,
+                            ArtifactBytes::Owned(serde_json::to_vec(&icon.gltf)?),
+                            Category::Model,
+                        )?;
+                        sink.submit(icon.image, ArtifactBytes::Owned(icon.png), Category::Model)?;
+                    }
+                    Ok(())
+                }),
+            });
+        }
+        if jobs.is_empty() && self.deferred_work > 0 {
+            jobs.push(Job {
+                category: Category::Model,
+                label: "models-finalize".into(),
+                work: self.deferred_work,
+                estimated_bytes: 1,
+                run: Box::new(|_| Ok(())),
+            });
+        }
+        Ok(jobs)
+    }
+}
+
+fn collect_character_gameplay(
+    source: &super::archive::SourceTree,
+) -> CoreResult<BTreeMap<String, Value>> {
+    let inventory = super::inventory::Inventory::build(source)?;
+    let texture_plan = super::textures::plan_source(&inventory)?;
+    let documents = texture_plan.documents;
+    let png_names = texture_plan.png_names;
+    let all_textures = textures(Path::new("published"), &documents)?;
+    let icon_paths = icon_texture_paths(&inventory, &png_names)?;
+    let mut character_roots = BTreeSet::new();
+    for alias in inventory.names().filter(|alias| is_character(alias)) {
+        let mut ancestor = alias;
+        loop {
+            if source.contains(ancestor) {
+                character_roots.insert(ancestor.to_owned());
+                break;
+            }
+            let Some((parent, _)) = ancestor.rsplit_once('/') else {
+                break;
+            };
+            ancestor = parent;
+        }
+    }
+    let mut files: Vec<&str> = source
+        .names()
+        .filter(|name| character_roots.contains(*name))
+        .collect();
+    files.sort_by_key(|alias| (!matches!(extension(alias), "mds" | "mdt"), *alias));
+    let mut report = ConversionReport::default();
+    let mut converted = BTreeSet::new();
+    let mut catalog_resources = BTreeMap::new();
+    let mut used_textures = BTreeSet::new();
+    let mut gameplay = BTreeMap::new();
+    for alias in files {
+        let analysis = analyze_file(
+            source,
+            alias,
+            &all_textures,
+            &icon_paths,
+            &Phase::noop(),
+            false,
+        )
+        .map_err(|error| fail(format!("analyze gameplay source {alias}: {error}")))?;
+        let Some(analysis) = analysis else { continue };
+        let Some(job) = commit_file(
+            Path::new("published"),
+            analysis,
+            &mut converted,
+            &mut catalog_resources,
+            &mut used_textures,
+            &mut report,
+            true,
+        )
+        .map_err(|error| fail(format!("commit gameplay source {alias}: {error}")))?
+        else {
+            continue;
+        };
+        if !job
+            .resources
+            .iter()
+            .any(|resource| is_character(&resource.alias))
+        {
+            continue;
+        }
+        let mut pairs = BTreeMap::new();
+        let mut local = ConversionReport::default();
+        let mut stream = StreamPairs {
+            pairs: &mut pairs,
+            png_names: &png_names,
+            gameplay: Some(&mut gameplay),
+            preview: false,
+        };
+        publish_native_impl(
+            Path::new("published"),
+            &job.resources,
+            &job.artifacts,
+            &documents,
+            &mut local,
+            Some(&mut stream),
+        )
+        .map_err(|error| fail(format!("render gameplay source {alias}: {error}")))?;
+    }
+    Ok(gameplay)
+}
+
+/// Refreshes loose, human-editable gameplay documents directly from one indexed ISO.
+pub fn export_character_gameplay(
+    source: &super::archive::SourceTree,
+    destination: &Path,
+) -> CoreResult<usize> {
+    let documents = collect_character_gameplay(source)?;
+    for (name, document) in &documents {
+        let path = destination.join(name);
+        let parent = path
+            .parent()
+            .ok_or_else(|| fail("gameplay path has no parent"))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            fail(format!(
+                "create gameplay directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let mut bytes = serde_json::to_vec_pretty(document)?;
+        bytes.push(b'\n');
+        fs::write(&path, bytes).map_err(|error| {
+            fail(format!(
+                "write gameplay document {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(documents.len())
+}
+
+/// Compares loose gameplay semantics against the retail source without staging assets.
+pub fn audit_character_gameplay(
+    source: &super::archive::SourceTree,
+    destination: &Path,
+) -> CoreResult<usize> {
+    let documents = collect_character_gameplay(source)?;
+    for (name, expected) in &documents {
+        let path = destination.join(name);
+        let actual: Value = serde_json::from_slice(&fs::read(&path).map_err(|error| {
+            fail(format!(
+                "missing gameplay document {}: {error}",
+                path.display()
+            ))
+        })?)?;
+        // The exported document is the gameplay contract. Normalize the expected
+        // value through that representation before comparing parsed JSON numbers.
+        let exported: Value = serde_json::from_slice(&serde_json::to_vec(expected)?)?;
+        if actual != exported {
+            return Err(fail(format!(
+                "gameplay document differs from retail: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(documents.len())
+}
+
+/// Plans model source ownership and fixed work before the shared worker pool starts.
+pub fn plan_source(
+    source: Arc<super::archive::SourceTree>,
+    inventory: &super::inventory::Inventory,
+    documents: Arc<Vec<super::textures::ConvertedTextureDocument>>,
+    png_names: Arc<BTreeSet<String>>,
+) -> CoreResult<ModelPlan> {
+    let all_textures = Arc::new(textures(Path::new("published"), &documents)?);
+    let icon_paths = Arc::new(icon_texture_paths(inventory, &png_names)?);
+    let mut candidates = BTreeSet::new();
+    for resource in inventory.leaves() {
+        if !matches!(
+            extension(&resource.alias).to_ascii_lowercase().as_str(),
+            "mds" | "mdt" | "mot" | "wgt" | "bbp" | "ico" | "stb" | "chr" | "chr_"
+        ) {
+            continue;
+        }
+        let mut ancestor = resource.alias.as_str();
+        loop {
+            if source.contains(ancestor) {
+                candidates.insert(ancestor.to_owned());
+                break;
+            }
+            let Some((parent, _)) = ancestor.rsplit_once('/') else {
+                break;
+            };
+            ancestor = parent;
+        }
+    }
+    for alias in inventory.names().filter(|alias| is_character(alias)) {
+        let mut ancestor = alias;
+        loop {
+            if source.contains(ancestor) {
+                candidates.insert(ancestor.to_owned());
+                break;
+            }
+            let Some((parent, _)) = ancestor.rsplit_once('/') else {
+                break;
+            };
+            ancestor = parent;
+        }
+    }
+    let mut files: Vec<String> = source
+        .names()
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            !lower.ends_with(".pss")
+                && !matches!(lower.as_str(), "sound/sound.dat" | "sound/sound.hd3")
+                && (candidates.contains(*name)
+                    || source.resource(name).is_ok_and(|resource| {
+                        resource
+                            .bytes()
+                            .windows(4)
+                            .any(|signature| signature == b"MDS\0" || signature == b"MDT\0")
+                    }))
+        })
+        .map(str::to_owned)
+        .collect();
+    files.sort_by_key(|alias| (!matches!(extension(alias), "mds" | "mdt"), alias.clone()));
+    let analyses = Arc::new(Mutex::new(
+        (0..files.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Option<FileAnalysis>>>>(),
+    ));
+    let mut jobs = Vec::with_capacity(files.len());
+    let mut deferred_work = 0u64;
+    for (index, alias) in files.into_iter().enumerate() {
+        let len = source.len(&alias)?;
+        let work = 1 + len.min(8 << 20).div_ceil(256 << 10);
+        deferred_work += work;
+        let source = source.clone();
+        let all_textures = all_textures.clone();
+        let icon_paths = icon_paths.clone();
+        let analyses = analyses.clone();
+        jobs.push(Job {
+            category: Category::Model,
+            label: alias.clone(),
+            work,
+            estimated_bytes: (len as usize).saturating_mul(16).max(1 << 20),
+            run: Box::new(move |_| {
+                let mut analysis = analyze_file(
+                    &source,
+                    &alias,
+                    &all_textures,
+                    &icon_paths,
+                    &Phase::noop(),
+                    true,
+                )?;
+                if let Some(analysis) = analysis.as_mut() {
+                    analysis.pack_artifacts()?;
+                }
+                analyses
+                    .lock()
+                    .map_err(|_| fail("model analysis lock poisoned"))?[index] = Some(analysis);
+                Ok(())
+            }),
+        });
+    }
+    deferred_work = deferred_work.saturating_mul(MODEL_DEFERRED_WORK_MULTIPLIER);
+    let mut consumed = BTreeSet::new();
+    for resource in inventory.leaves() {
+        let alias = resource.alias.as_str();
+        if matches!(
+            extension(alias).to_ascii_lowercase().as_str(),
+            "mds" | "mdt" | "mot" | "wgt" | "bbp" | "ico" | "clo"
+        ) {
+            consumed.insert(alias.to_owned());
+        }
+    }
+    for name in inventory.names() {
+        if is_character(name) {
+            consumed.insert(name.to_owned());
+        }
+    }
+    let embedded_texture_sources = documents
+        .iter()
+        .filter(|document| character_parent(&document.source_alias).is_some())
+        .map(|document| document.source_alias.clone())
+        .collect();
+    Ok(ModelPlan {
+        consumed,
+        embedded_texture_sources,
+        deferred_work,
+        jobs,
+        analyses,
+        documents,
+        png_names,
+    })
+}
+
 /// Publishes all model resources and removes their proprietary payloads from the compatibility tree.
 pub fn convert_tree(
     raw: &Path,
@@ -4218,29 +5500,81 @@ pub fn convert_tree(
     documents: &[super::textures::ConvertedTextureDocument],
     phase: &Phase,
 ) -> CoreResult<ConversionReport> {
+    convert_source(
+        &super::archive::SourceTree::directory(raw)?,
+        published,
+        documents,
+        phase,
+    )
+}
+
+pub fn convert_source(
+    source: &super::archive::SourceTree,
+    published: &Path,
+    documents: &[super::textures::ConvertedTextureDocument],
+    phase: &Phase,
+) -> CoreResult<ConversionReport> {
     let mut report = ConversionReport::default();
-    let mut files = Vec::new();
-    collect(raw, &mut files)?;
+    let mut files: Vec<&str> = source
+        .names()
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            !lower.ends_with(".pss")
+                && !matches!(lower.as_str(), "sound/sound.dat" | "sound/sound.hd3")
+        })
+        .collect();
     files.sort_by_key(|p| {
         (
-            !matches!(p.extension().and_then(|e| e.to_str()), Some("mds" | "mdt")),
-            p.clone(),
+            !matches!(
+                Path::new(p).extension().and_then(|e| e.to_str()),
+                Some("mds" | "mdt")
+            ),
+            *p,
         )
     });
-    phase.set_total(files.len() as u64 + 1);
+    let work: Vec<u64> = files
+        .iter()
+        .map(|name| -> CoreResult<u64> {
+            let length = source.len(name)?;
+            if length > 128 << 20 {
+                return Ok(1);
+            }
+            let base = 1 + length.min(8 << 20).div_ceil(256 << 10);
+            let multiplier = match extension(name) {
+                "mds" | "mdt" => 4,
+                "chr" | "chr_" | "mot" | "wgt" | "bbp" | "ico" => 2,
+                _ => 1,
+            };
+            Ok(base * multiplier)
+        })
+        .collect::<CoreResult<_>>()?;
+    let scan_work: u64 = work.iter().sum();
+    let total = scan_work + (scan_work / 20).max(1);
+    phase.set_total(total);
     let all_textures = textures(published, documents)?;
+    let inventory = super::inventory::Inventory::build(source)?;
+    let mut png_names = BTreeSet::new();
+    for document in documents {
+        png_names.extend(super::textures::picture_assets(
+            &document.document_path,
+            &document.document,
+        )?);
+    }
+    let icon_paths = icon_texture_paths(&inventory, &png_names)?;
     let mut used_textures = BTreeSet::new();
     let mut catalog_resources = BTreeMap::<String, Value>::new();
     let mut converted = BTreeSet::new();
-    let analyze = |chunk: &[PathBuf]| -> Vec<CoreResult<Option<FileAnalysis>>> {
+    let analyze = |chunk: &[&str]| -> Vec<CoreResult<Option<FileAnalysis>>> {
         chunk
             .par_iter()
-            .map(|p| analyze_file(raw, p, &all_textures, phase))
+            .map(|p| analyze_file(source, p, &all_textures, &icon_paths, phase, false))
             .collect()
     };
-    let mut chunks = files.chunks(64);
-    let mut next = chunks.next().map(|chunk| (chunk, analyze(chunk)));
-    while let Some((chunk, analyses)) = next {
+    let mut chunks = files.chunks(64).zip(work.chunks(64));
+    let mut next = chunks
+        .next()
+        .map(|(chunk, units)| (chunk, units, analyze(chunk)));
+    while let Some((chunk, units, analyses)) = next {
         let mut jobs = Vec::new();
         for (p, analysis) in chunk.iter().zip(analyses) {
             match analysis {
@@ -4251,10 +5585,11 @@ pub fn convert_tree(
                     &mut catalog_resources,
                     &mut used_textures,
                     &mut report,
+                    false,
                 )?),
                 Ok(None) => {}
                 Err(error) => {
-                    if !converted.contains(&source_alias(raw, p)) {
+                    if !converted.contains(*p) {
                         return Err(error);
                     }
                 }
@@ -4263,14 +5598,18 @@ pub fn convert_tree(
         // Analysis never reads committed state, so the next chunk is analysed while this one publishes.
         let (published_jobs, following) = rayon::join(
             || publish_jobs(published, jobs, documents, &mut report),
-            || chunks.next().map(|chunk| (chunk, analyze(chunk))),
+            || {
+                chunks
+                    .next()
+                    .map(|(chunk, units)| (chunk, units, analyze(chunk)))
+            },
         );
         published_jobs?;
-        phase.inc(chunk.len() as u64);
+        phase.inc(units.iter().sum());
         next = following;
     }
     publish_external(published, &mut report)?;
-    phase.inc(1);
+    phase.set_done(total);
     phase.log(format!(
         "models: {} plain, {} rebaked (max pose error {:.2e}), {} shear helpers, {} boundary keys, {} external motions",
         report.transforms.plain,
@@ -4297,23 +5636,36 @@ pub fn strip_data(
     report: &ConversionReport,
     phase: &Phase,
 ) -> CoreResult<()> {
+    strip_source(
+        &super::archive::SourceTree::directory(raw)?,
+        published,
+        report,
+        phase,
+    )
+}
+
+pub fn strip_source(
+    source: &super::archive::SourceTree,
+    published: &Path,
+    report: &ConversionReport,
+    phase: &Phase,
+) -> CoreResult<()> {
     let converted = &report.converted;
-    let mut files = Vec::new();
-    collect(raw, &mut files)?;
+    let mut files: Vec<&str> = source.names().collect();
     files.sort();
     phase.add_total(files.len() as u64);
     let results: Vec<CoreResult<()>> = files
         .par_iter()
         .map(|p| {
-            let alias = source_alias(raw, p);
-            let dest = published.join("data").join(p.strip_prefix(raw).unwrap());
-            if converted.contains(&alias) {
+            let alias = *p;
+            let dest = super::archive::compatibility_path(published, p);
+            if converted.contains(alias) {
                 if dest.is_file() {
                     fs::remove_file(dest)?
                 }
             } else if dest.is_file() && fs::metadata(&dest)?.len() <= 128 << 20 {
                 let mut b = fs::read(&dest)?;
-                if scrub(&mut b, &alias, converted, 0)? {
+                if scrub(&mut b, alias, converted, 0)? {
                     fs::write(dest, b)?
                 }
             }
@@ -4443,7 +5795,7 @@ fn decode_uri(uri: &str, prefix: &str) -> CoreResult<Vec<u8>> {
     }
     Ok(out)
 }
-/// Resolves a relative glTF URI against its port_data document into a port_data path.
+/// Resolves a relative glTF URI against its data document into a data path.
 fn resolve_uri(document: &str, uri: &str) -> CoreResult<String> {
     let invalid = || fail(format!("invalid glTF image URI {uri:?} in {document}"));
     if uri.is_empty() || uri.starts_with('/') || uri.contains([':', '?', '#', '\\']) {
@@ -4478,7 +5830,7 @@ fn resolve_uri(document: &str, uri: &str) -> CoreResult<String> {
     }
     Ok(parts.join("/"))
 }
-/// Checks that every glTF image references an existing standalone PNG in port_data.
+/// Checks that every glTF image references an existing standalone PNG in data.
 fn verify_images(
     port: &Path,
     document: &str,
@@ -4515,24 +5867,6 @@ fn verify_images(
         }
     }
     Ok(())
-}
-fn reference(root: &Path, value: &Value, key: &str) -> CoreResult<PathBuf> {
-    let s = value[key]
-        .as_str()
-        .ok_or_else(|| fail(format!("missing model {key}")))?;
-    if s.is_empty()
-        || s.contains(['\\', ':', '\0'])
-        || Path::new(s)
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return Err(fail("unsafe model reference"));
-    }
-    let path = root.join(s);
-    if !path.is_file() {
-        return Err(fail(format!("missing model asset {s}")));
-    }
-    Ok(path)
 }
 fn index(value: &Value, limit: usize, what: &str) -> CoreResult<usize> {
     let i = value
@@ -4988,7 +6322,7 @@ fn validate_profile_names(metadata: &Value, names: &BTreeSet<String>) -> CoreRes
 
 /// Verifies direct glTF assets, embedded semantic resources and remaining retail payloads.
 pub fn verify(root: &Path) -> CoreResult<()> {
-    let port = root.join("port_data");
+    let port = root.join("data");
     let mut files = Vec::new();
     if port.is_dir() {
         collect(&port, &mut files)?;
@@ -5002,212 +6336,256 @@ pub fn verify(root: &Path) -> CoreResult<()> {
                 .replace('\\', "/")
         })
         .collect();
-    let documents: Vec<&PathBuf> = files
+    verify_files(root, &names, &Phase::noop())?;
+    for name in &names {
+        let file = port.join(name);
+        if fs::metadata(&file)?.len() <= 128 << 20 {
+            audit_payload(name, &fs::read(file)?)?;
+        }
+    }
+    Ok(())
+}
+
+/// Counts glTF documents that require semantic verification.
+pub fn verify_work(names: &BTreeSet<String>) -> u64 {
+    names.iter().filter(|name| name.ends_with(".gltf")).count() as u64
+}
+
+/// Verifies models against a previously collected data-tree inventory.
+pub fn verify_files(root: &Path, names: &BTreeSet<String>, phase: &Phase) -> CoreResult<()> {
+    verify_files_with_script_policy(root, names, phase, true)
+}
+
+/// Verifies models while allowing omitted compiled script paths only under Luau-only publication.
+pub fn verify_files_with_script_policy(
+    root: &Path,
+    names: &BTreeSet<String>,
+    phase: &Phase,
+    publish_scripts: bool,
+) -> CoreResult<()> {
+    let port = root.join("data");
+    let documents: Vec<PathBuf> = names
         .iter()
-        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("gltf"))
+        .filter(|name| name.ends_with(".gltf"))
+        .map(|name| port.join(name))
         .collect();
     let checked: Vec<CoreResult<BTreeSet<String>>> = documents
         .par_iter()
         .map(|path| -> CoreResult<BTreeSet<String>> {
-            let mut checked_pngs = BTreeSet::new();
-            let mut buffer_files = BTreeSet::new();
-            let doc: Value = serde_json::from_slice(&fs::read(path)?)?;
-            let metadata: Value = if doc["asset"]["generator"] == "Kazarov Memory Card Icon" {
-                json!({"schema_version":1})
-            } else {
-                serde_json::from_slice(&fs::read(path.with_extension("game.json"))?)?
-            };
-            if doc.get("extras").is_some() {
-                return Err(fail("custom model extras must be in the semantic sidecar"));
-            }
-            if metadata["schema_version"] != 1 {
-                return Err(fail(format!(
-                    "unsupported native glTF metadata: {}",
-                    path.display()
-                )));
-            }
-            let document = path
-                .strip_prefix(&port)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            for buffer in doc["buffers"].as_array().into_iter().flatten() {
-                let uri = buffer["uri"].as_str().unwrap_or("");
-                if uri.starts_with("data:") {
-                    continue;
+            let result = (|| -> CoreResult<BTreeSet<String>> {
+                let mut checked_pngs = BTreeSet::new();
+                let mut buffer_files = BTreeSet::new();
+                let doc: Value = serde_json::from_slice(&fs::read(path)?)?;
+                let metadata: Value = if doc["asset"]["generator"] == "Kazarov Memory Card Icon" {
+                    json!({"schema_version":1})
+                } else {
+                    serde_json::from_slice(&fs::read(path.with_extension("game.json"))?)?
+                };
+                if doc.get("extras").is_some() {
+                    return Err(fail("custom model extras must be in the semantic sidecar"));
                 }
-                let target = resolve_uri(&document, uri)?;
-                if target != buffer_path(&document) || !names.contains(&target) {
-                    return Err(fail(format!("invalid glTF buffer {uri}: {document}")));
-                }
-                buffer_files.insert(target);
-            }
-            let buffers = load_buffers(&port, &document, &doc)?;
-            validate_gltf_buffers(&doc, &metadata, &buffers)?;
-            let animations = doc["animations"].as_array().map_or(&[][..], Vec::as_slice);
-            let has_model = doc["meshes"].as_array().is_some_and(|m| !m.is_empty())
-                || doc["skins"].as_array().is_some_and(|s| !s.is_empty())
-                || metadata["models"].as_array().is_some_and(|models| {
-                    models
-                        .iter()
-                        .any(|m| m["frames"].as_array().is_some_and(|f| !f.is_empty()))
-                })
-                || metadata["frames"].as_array().is_some_and(|f| !f.is_empty());
-            if !animations.is_empty() && !has_model {
-                return Err(fail(format!("animation-only glTF: {}", path.display())));
-            }
-            let mut clip_names = BTreeSet::new();
-            for animation in animations {
-                let name = animation["name"].as_str().unwrap_or("");
-                if name.is_empty() || !clip_names.insert(name) {
+                if metadata["schema_version"] != 1 {
                     return Err(fail(format!(
-                        "animation name empty or repeated in {}: {name}",
+                        "unsupported native glTF metadata: {}",
                         path.display()
                     )));
                 }
-            }
-            verify_images(&port, &document, &doc, &metadata, &names, &mut checked_pngs)?;
-            if metadata["kind"] == "character" {
-                for model in metadata["models"]
-                    .as_array()
-                    .ok_or_else(|| fail("character models missing"))?
-                {
-                    validate_gltf_buffers(&doc, model, &buffers)?;
-                    index(
-                        &model["scene"],
-                        doc["scenes"].as_array().map_or(0, Vec::len),
-                        "character model scene",
-                    )?;
+                let document = path
+                    .strip_prefix(&port)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                for buffer in doc["buffers"].as_array().into_iter().flatten() {
+                    let uri = buffer["uri"].as_str().unwrap_or("");
+                    if uri.starts_with("data:") {
+                        continue;
+                    }
+                    let target = resolve_uri(&document, uri)?;
+                    if target != buffer_path(&document) || !names.contains(&target) {
+                        return Err(fail(format!("invalid glTF buffer {uri}: {document}")));
+                    }
+                    buffer_files.insert(target);
                 }
-                let resources = &metadata["resources"];
-                for key in ["scripts", "children"] {
-                    for resource in resources[key]
+                let buffers = load_buffers(&port, &document, &doc)?;
+                validate_gltf_buffers(&doc, &metadata, &buffers)?;
+                let animations = doc["animations"].as_array().map_or(&[][..], Vec::as_slice);
+                let has_model = doc["meshes"].as_array().is_some_and(|m| !m.is_empty())
+                    || doc["skins"].as_array().is_some_and(|s| !s.is_empty())
+                    || metadata["models"].as_array().is_some_and(|models| {
+                        models
+                            .iter()
+                            .any(|m| m["frames"].as_array().is_some_and(|f| !f.is_empty()))
+                    })
+                    || metadata["frames"].as_array().is_some_and(|f| !f.is_empty());
+                if !animations.is_empty() && !has_model {
+                    return Err(fail(format!("animation-only glTF: {}", path.display())));
+                }
+                let mut clip_names = BTreeSet::new();
+                for animation in animations {
+                    let name = animation["name"].as_str().unwrap_or("");
+                    if name.is_empty() || !clip_names.insert(name) {
+                        return Err(fail(format!(
+                            "animation name empty or repeated in {}: {name}",
+                            path.display()
+                        )));
+                    }
+                }
+                verify_images(&port, &document, &doc, &metadata, names, &mut checked_pngs)?;
+                if metadata["kind"] == "character" {
+                    for model in metadata["models"]
                         .as_array()
-                        .ok_or_else(|| fail("character resource array missing"))?
+                        .ok_or_else(|| fail("character models missing"))?
                     {
-                        reference(&port, resource, "path")?;
+                        validate_gltf_buffers(&doc, model, &buffers)?;
+                        index(
+                            &model["scene"],
+                            doc["scenes"].as_array().map_or(0, Vec::len),
+                            "character model scene",
+                        )?;
                     }
-                }
-                for animation in resources["animations"]
-                    .as_array()
-                    .ok_or_else(|| fail("character animations missing"))?
-                {
-                    validate_actions(animation)?;
-                    for variant in animation["variants"].as_array().into_iter().flatten() {
-                        validate_animation_variant(&doc, &metadata, animation, variant)?;
-                    }
-                    if animation["variants"].is_null() {
-                        let external = animation["external"]
-                            .as_str()
-                            .ok_or_else(|| fail("animation without clips or external identity"))?;
-                        if !external.starts_with(&format!("{document}#")) {
-                            return Err(fail(format!(
-                                "external motion {external} names another bundle"
-                            )));
-                        }
-                        for target in animation["targets"]
+                    let resources = &metadata["resources"];
+                    for key in ["scripts", "children"] {
+                        for resource in resources[key]
                             .as_array()
-                            .ok_or_else(|| fail("external motion targets missing"))?
+                            .ok_or_else(|| fail("character resource array missing"))?
                         {
-                            if !target.as_str().is_some_and(|t| names.contains(t)) {
+                            let resource_path = resource["path"]
+                                .as_str()
+                                .ok_or_else(|| fail("character resource path missing"))?;
+                            if !names.contains(resource_path)
+                                && !may_omit_character_resource(key, resource_path, publish_scripts)
+                            {
                                 return Err(fail(format!(
-                                    "external motion target missing: {target}"
+                                    "missing character resource: {resource_path}"
                                 )));
                             }
                         }
                     }
-                }
-                let motion_names = validate_game_names(&metadata)?;
-                validate_profile_names(&metadata, &motion_names)?;
-                for profile in metadata["profiles"]
-                    .as_object()
-                    .ok_or_else(|| fail("character profiles missing"))?
-                    .values()
-                {
-                    for command in profile["commands"]
+                    for animation in resources["animations"]
                         .as_array()
-                        .ok_or_else(|| fail("character commands missing"))?
+                        .ok_or_else(|| fail("character animations missing"))?
                     {
-                        for arg in command["args"]
-                            .as_array()
-                            .ok_or_else(|| fail("character command arguments missing"))?
-                        {
-                            if arg["type"] != "resource" || arg["index"].is_null() {
-                                continue;
-                            }
-                            let key = match arg["kind"].as_str() {
-                                Some("model") => "models",
-                                Some("animation") => "animations",
-                                Some("bind_pose") => "bind_poses",
-                                Some("weights") => "weights",
-                                Some("texture_set") => "texture_sets",
-                                Some("cloth") => "cloths",
-                                Some("character") => "children",
-                                Some("script") => "scripts",
-                                _ => return Err(fail("unknown character resource kind")),
-                            };
-                            let count = if key == "models" {
-                                metadata[key].as_array()
-                            } else {
-                                resources[key].as_array()
-                            }
-                            .map_or(0, Vec::len);
-                            index(&arg["index"], count, "character command resource")?;
+                        validate_actions(animation)?;
+                        for variant in animation["variants"].as_array().into_iter().flatten() {
+                            validate_animation_variant(&doc, &metadata, animation, variant)?;
                         }
-                    }
-                }
-                for set in resources["texture_sets"]
-                    .as_array()
-                    .ok_or_else(|| fail("character texture sets missing"))?
-                {
-                    if set["document"]["schema_version"] != 3 {
-                        return Err(fail("invalid embedded texture schema"));
-                    }
-                    for entry in set["document"]["entries"]
-                        .as_array()
-                        .ok_or_else(|| fail("embedded texture entries missing"))?
-                    {
-                        let Some(pictures) = entry["pictures"].as_array() else {
-                            if entry["script"].is_array() {
-                                continue;
-                            } else {
-                                return Err(fail("embedded texture pictures missing"));
+                        if animation["variants"].is_null() {
+                            let external = animation["external"].as_str().ok_or_else(|| {
+                                fail("animation without clips or external identity")
+                            })?;
+                            if !external.starts_with(&format!("{document}#")) {
+                                return Err(fail(format!(
+                                    "external motion {external} names another bundle"
+                                )));
                             }
-                        };
-                        for picture in pictures {
-                            let mut levels = Vec::new();
-                            for key in ["levels", "variants"] {
-                                if picture.get(key).is_some_and(|value| !value.is_array()) {
+                            for target in animation["targets"]
+                                .as_array()
+                                .ok_or_else(|| fail("external motion targets missing"))?
+                            {
+                                if !target.as_str().is_some_and(|t| names.contains(t)) {
                                     return Err(fail(format!(
-                                        "embedded texture {key} is not an array"
+                                        "external motion target missing: {target}"
                                     )));
                                 }
                             }
-                            if let Some(values) = picture["levels"].as_array() {
-                                levels.extend(values);
-                            }
-                            if let Some(variants) = picture["variants"].as_array() {
-                                for variant in variants {
-                                    levels.extend(variant["levels"].as_array().ok_or_else(
-                                        || fail("embedded texture variant levels missing"),
-                                    )?);
+                        }
+                    }
+                    let motion_names = validate_game_names(&metadata)?;
+                    validate_profile_names(&metadata, &motion_names)?;
+                    for profile in metadata["profiles"]
+                        .as_object()
+                        .ok_or_else(|| fail("character profiles missing"))?
+                        .values()
+                    {
+                        for command in profile["commands"]
+                            .as_array()
+                            .ok_or_else(|| fail("character commands missing"))?
+                        {
+                            for arg in command["args"]
+                                .as_array()
+                                .ok_or_else(|| fail("character command arguments missing"))?
+                            {
+                                if arg["type"] != "resource" || arg["index"].is_null() {
+                                    continue;
                                 }
+                                let key = match arg["kind"].as_str() {
+                                    Some("model") => "models",
+                                    Some("animation") => "animations",
+                                    Some("bind_pose") => "bind_poses",
+                                    Some("weights") => "weights",
+                                    Some("texture_set") => "texture_sets",
+                                    Some("cloth") => "cloths",
+                                    Some("character") => "children",
+                                    Some("script") => "scripts",
+                                    _ => return Err(fail("unknown character resource kind")),
+                                };
+                                let count = if key == "models" {
+                                    metadata[key].as_array()
+                                } else {
+                                    resources[key].as_array()
+                                }
+                                .map_or(0, Vec::len);
+                                index(&arg["index"], count, "character command resource")?;
                             }
-                            for level in levels {
-                                let id = level
-                                    .as_str()
-                                    .and_then(|s| s.strip_prefix("#/images/"))
-                                    .and_then(|s| s.parse::<usize>().ok())
-                                    .ok_or_else(|| fail("invalid embedded texture image URI"))?;
-                                if id >= doc["images"].as_array().map_or(0, Vec::len) {
-                                    return Err(fail("embedded texture image out of range"));
+                        }
+                    }
+                    for set in resources["texture_sets"]
+                        .as_array()
+                        .ok_or_else(|| fail("character texture sets missing"))?
+                    {
+                        if set["document"]["schema_version"] != 3 {
+                            return Err(fail("invalid embedded texture schema"));
+                        }
+                        for entry in set["document"]["entries"]
+                            .as_array()
+                            .ok_or_else(|| fail("embedded texture entries missing"))?
+                        {
+                            let Some(pictures) = entry["pictures"].as_array() else {
+                                if entry["script"].is_array() {
+                                    continue;
+                                } else {
+                                    return Err(fail("embedded texture pictures missing"));
+                                }
+                            };
+                            for picture in pictures {
+                                let mut levels = Vec::new();
+                                for key in ["levels", "variants"] {
+                                    if picture.get(key).is_some_and(|value| !value.is_array()) {
+                                        return Err(fail(format!(
+                                            "embedded texture {key} is not an array"
+                                        )));
+                                    }
+                                }
+                                if let Some(values) = picture["levels"].as_array() {
+                                    levels.extend(values);
+                                }
+                                if let Some(variants) = picture["variants"].as_array() {
+                                    for variant in variants {
+                                        levels.extend(variant["levels"].as_array().ok_or_else(
+                                            || fail("embedded texture variant levels missing"),
+                                        )?);
+                                    }
+                                }
+                                for level in levels {
+                                    let id = level
+                                        .as_str()
+                                        .and_then(|s| s.strip_prefix("#/images/"))
+                                        .and_then(|s| s.parse::<usize>().ok())
+                                        .ok_or_else(|| {
+                                            fail("invalid embedded texture image URI")
+                                        })?;
+                                    if id >= doc["images"].as_array().map_or(0, Vec::len) {
+                                        return Err(fail("embedded texture image out of range"));
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            Ok(buffer_files)
+                Ok(buffer_files)
+            })();
+            phase.inc(1);
+            result
         })
         .collect();
     let mut buffer_files = BTreeSet::new();
@@ -5220,42 +6598,299 @@ pub fn verify(root: &Path) -> CoreResult<()> {
     {
         return Err(fail(format!("glTF buffer without its document: {orphan}")));
     }
-    let data = root.join("data");
-    if data.is_dir() {
-        let mut files = Vec::new();
-        collect(&data, &mut files)?;
-        for file in files {
-            if fs::metadata(&file)?.len() > 128 << 20 {
-                continue;
-            }
-            let alias = file
-                .strip_prefix(&data)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let mut resources = Vec::new();
-            discover(&fs::read(&file)?, &alias, &mut resources, 0)?;
-            if let Some(resource) = resources.iter().find(|r| {
-                r.data.starts_with(b"MDS ")
-                    || r.data.starts_with(b"MDT ")
-                    || matches!(
-                        extension(&r.alias),
-                        "chr" | "chr_" | "mds" | "mdt" | "mot" | "wgt" | "bbp" | "ico"
-                    )
-            }) {
-                return Err(fail(format!(
-                    "proprietary model payload remains: {}",
-                    resource.alias
-                )));
-            }
-        }
+    Ok(())
+}
+
+/// Number of model documents checked after the archive stream is fully sealed.
+pub fn verify_archive_work(names: &[String]) -> u64 {
+    names.iter().filter(|name| name.ends_with(".gltf")).count() as u64
+}
+
+/// Validates model structure and cross-asset references directly from the final ZIP.
+pub fn verify_archive(reader: &dyn super::publish::ArchiveReader, phase: &Phase) -> CoreResult<()> {
+    verify_archive_with_script_policy(reader, phase, true)
+}
+
+pub fn verify_archive_with_script_policy(
+    reader: &dyn super::publish::ArchiveReader,
+    phase: &Phase,
+    publish_scripts: bool,
+) -> CoreResult<()> {
+    let names: BTreeSet<String> = reader.names().into_iter().collect();
+    let documents: Vec<String> = names
+        .iter()
+        .filter(|name| name.ends_with(".gltf"))
+        .cloned()
+        .collect();
+    let checked: Vec<CoreResult<BTreeSet<String>>> = documents
+        .par_iter()
+        .map(|document| {
+            let result = (|| -> CoreResult<BTreeSet<String>> {
+                let doc: Value = serde_json::from_slice(&reader.read(document)?)?;
+                let icon = doc["asset"]["generator"] == "Kazarov Memory Card Icon";
+                let metadata: Value = if icon {
+                    json!({"schema_version":1})
+                } else {
+                    let sidecar = Path::new(document)
+                        .with_extension("game.json")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    serde_json::from_slice(&reader.read(&sidecar)?)?
+                };
+                if doc.get("extras").is_some() || metadata["schema_version"] != 1 {
+                    return Err(fail(format!("invalid native glTF metadata: {document}")));
+                }
+                let mut buffers = Vec::new();
+                let mut buffer_files = BTreeSet::new();
+                for buffer in doc["buffers"].as_array().into_iter().flatten() {
+                    let uri = buffer["uri"]
+                        .as_str()
+                        .ok_or_else(|| fail("glTF buffer URI missing"))?;
+                    if uri.starts_with("data:") {
+                        buffers.push(decode_uri(uri, "data:application/octet-stream;base64,")?);
+                    } else {
+                        let target = resolve_uri(document, uri)?;
+                        if target != buffer_path(document) || !reader.contains(&target) {
+                            return Err(fail(format!("invalid glTF buffer {uri}: {document}")));
+                        }
+                        buffers.push(reader.read(&target)?);
+                        buffer_files.insert(target);
+                    }
+                }
+                validate_gltf_buffers(&doc, &metadata, &buffers)?;
+                let mut animation_names = BTreeSet::new();
+                for animation in doc["animations"].as_array().into_iter().flatten() {
+                    let name = animation["name"].as_str().unwrap_or("");
+                    if name.is_empty() || !animation_names.insert(name) {
+                        return Err(fail(format!(
+                            "animation name empty or repeated in {document}: {name}"
+                        )));
+                    }
+                }
+                let mut image_paths = Vec::new();
+                for image in doc["images"].as_array().into_iter().flatten() {
+                    let uri = image["uri"]
+                        .as_str()
+                        .ok_or_else(|| fail("glTF image URI missing"))?;
+                    let target = resolve_uri(document, uri)?;
+                    if !reader.contains(&target) {
+                        return Err(fail(format!("invalid model PNG {target}: {document}")));
+                    }
+                    image_paths.push(target);
+                }
+                for image in metadata["images"].as_array().into_iter().flatten() {
+                    let index = index(&image["image"], image_paths.len(), "metadata image")?;
+                    if image["png"].as_str() != Some(image_paths[index].as_str()) {
+                        return Err(fail(format!(
+                            "metadata image differs from glTF URI: {document}"
+                        )));
+                    }
+                }
+                if metadata["kind"] == "character" {
+                    for model in metadata["models"]
+                        .as_array()
+                        .ok_or_else(|| fail("character models missing"))?
+                    {
+                        validate_gltf_buffers(&doc, model, &buffers)?;
+                        index(
+                            &model["scene"],
+                            doc["scenes"].as_array().map_or(0, Vec::len),
+                            "character model scene",
+                        )?;
+                    }
+                    let resources = &metadata["resources"];
+                    for key in ["scripts", "children"] {
+                        for resource in resources[key]
+                            .as_array()
+                            .ok_or_else(|| fail("character resource array missing"))?
+                        {
+                            let path = resource["path"]
+                                .as_str()
+                                .ok_or_else(|| fail("character resource path missing"))?;
+                            if !reader.contains(path)
+                                && !may_omit_character_resource(key, path, publish_scripts)
+                            {
+                                return Err(fail(format!("missing character resource: {path}")));
+                            }
+                        }
+                    }
+                    for animation in resources["animations"]
+                        .as_array()
+                        .ok_or_else(|| fail("character animations missing"))?
+                    {
+                        validate_actions(animation)?;
+                        for variant in animation["variants"].as_array().into_iter().flatten() {
+                            validate_animation_variant(&doc, &metadata, animation, variant)?;
+                        }
+                    }
+                    if metadata.get("profiles").is_some() || metadata.get("game_names").is_some() {
+                        return Err(fail(format!(
+                            "gameplay profile leaked into model archive: {document}"
+                        )));
+                    }
+                }
+                Ok(buffer_files)
+            })();
+            phase.inc(1);
+            result
+        })
+        .collect();
+    let mut used_buffers = BTreeSet::new();
+    for result in checked {
+        used_buffers.extend(result?);
+    }
+    if let Some(orphan) = names
+        .iter()
+        .find(|name| name.ends_with(".gltf.bin") && !used_buffers.contains(*name))
+    {
+        return Err(fail(format!("glTF buffer without document: {orphan}")));
+    }
+    Ok(())
+}
+
+/// Rejects model payloads that must have been converted before publication.
+pub fn audit_payload(alias: &str, bytes: &[u8]) -> CoreResult<()> {
+    if bytes.len() > 128 << 20 {
+        return Ok(());
+    }
+    let mut resources = Vec::new();
+    discover(bytes, alias, &mut resources, 0)?;
+    if let Some(resource) = resources.iter().find(|resource| {
+        resource.data.starts_with(b"MDS\0")
+            || resource.data.starts_with(b"MDT\0")
+            || matches!(
+                extension(&resource.alias),
+                "chr" | "chr_" | "mds" | "mdt" | "mot" | "wgt" | "bbp" | "ico"
+            )
+    }) {
+        return Err(fail(format!(
+            "proprietary model payload remains: {}",
+            resource.alias
+        )));
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn luau_only_allows_missing_script_paths_but_not_other_character_resources() {
+        assert!(is_compiled_script_path("event/map/test.stb"));
+        assert!(is_compiled_script_path("mainchr/c02.stb_"));
+        assert!(!is_compiled_script_path("character/model.gltf"));
+        assert!(!is_compiled_script_path("../outside.stb"));
+        assert!(!is_compiled_script_path("event\\map\\test.stb"));
+        assert!(may_omit_character_resource(
+            "scripts",
+            "event/map/test.stb",
+            false
+        ));
+        assert!(may_omit_character_resource(
+            "scripts",
+            "mainchr/c02.stb_",
+            false
+        ));
+        assert!(!may_omit_character_resource(
+            "scripts",
+            "character/model.gltf",
+            false
+        ));
+        assert!(!may_omit_character_resource(
+            "children",
+            "event/map/test.stb",
+            false
+        ));
+        assert!(!may_omit_character_resource(
+            "scripts",
+            "event/map/test.stb",
+            true
+        ));
+        for index in 0..33 {
+            let path = format!("event/e{index:03}/e{index:03}.stb");
+            assert!(may_omit_character_resource("scripts", &path, false));
+            assert!(!may_omit_character_resource("children", &path, false));
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn linked_copies_use_each_motion_index_when_placement_details_match() {
+        let external = |key: &str| ExternalMotion {
+            key: key.into(),
+            sidecar: None,
+            resource: 0,
+            channels: Vec::new(),
+            actions: Vec::new(),
+        };
+        let motions = vec![
+            external("event/a/foo.gltf#0"),
+            external("event/b/foo.gltf#0"),
+            external("event/c/bar.gltf#0"),
+        ];
+        let placements = vec![
+            json!({"method":"linked"}),
+            json!({"method":"linked"}),
+            json!({"method":"heuristic"}),
+        ];
+        let selected = vec![
+            BTreeSet::from([1]),
+            BTreeSet::from([2]),
+            BTreeSet::from([3]),
+        ];
+        let (copies, names) =
+            linked_copy_candidates(&motions, &placements, &selected, "event/orphan/foo.gltf");
+        assert_eq!(copies, BTreeSet::from([1, 2]));
+        assert_eq!(names, vec![motions[0].key.clone(), motions[1].key.clone()]);
+    }
+
+    #[test]
+    fn external_motion_cost_moves_heavy_final_jobs_forward_without_changing_work_total() {
+        let motion = ExternalMotion {
+            key: "motion#0".into(),
+            sidecar: None,
+            resource: 0,
+            channels: vec![json!({"type":1,"keys":[{}, {}, {}]})],
+            actions: vec![("clip".into(), 0, 90)],
+        };
+        let external = external_motion_work(&motion);
+        assert!(external > 90);
+        let weights = final_model_weights(
+            &[5_000_000_000, 1_000_000_000, 4_000_000_000],
+            &[0, external, 0],
+        );
+        assert!(weights[1] > weights[0]);
+        let work = apportion_model_work(&weights, 61);
+        assert_eq!(work.iter().sum::<u64>(), 61);
+        assert!(work.iter().all(|&item| item > 0));
+        assert!(work[1] > work[0] && work[1] > work[2]);
+        assert_eq!(apportion_model_work(&[0, 0, 0], 5).iter().sum::<u64>(), 5);
+    }
+
+    #[test]
+    fn gameplay_audit_preserves_native_float_bits_and_rejects_edits() {
+        let native = [0x3dcccccd_u32, 0x3f800001, 0x40490fdb].map(f32::from_bits);
+        let expected = json!({"schema_version":1,"kind":"character_gameplay",
+            "profiles":{"idle":{"commands":[{"command":"KEY","args":native}]}},
+            "game_names":{}});
+        let exported = serde_json::to_vec_pretty(&expected).unwrap();
+        let actual: Value = serde_json::from_slice(&exported).unwrap();
+        let normalized: Value =
+            serde_json::from_slice(&serde_json::to_vec(&expected).unwrap()).unwrap();
+        assert_eq!(actual, normalized);
+        let args = actual["profiles"]["idle"]["commands"][0]["args"]
+            .as_array()
+            .unwrap();
+        for (number, original) in args.iter().zip(native) {
+            assert_eq!(
+                (number.as_f64().unwrap() as f32).to_bits(),
+                original.to_bits()
+            );
+        }
+        let mut edited = actual.clone();
+        edited["profiles"]["idle"]["commands"][0]["args"][1] = json!(2.0);
+        assert_ne!(edited, normalized);
+    }
 
     fn convert_and_strip(
         raw: &Path,
@@ -5276,6 +6911,26 @@ mod tests {
         put(&mut b, 8, 1);
         put(&mut b, 12, 16);
         assert!(scene_extent(&b).is_err());
+    }
+    #[test]
+    fn flattened_icon_names_reserve_distinct_images_across_packs_and_textures() {
+        let temporary = tempfile::tempdir().unwrap();
+        for folder in ["menu/first.pac", "menu/second.pac"] {
+            fs::create_dir_all(temporary.path().join(folder)).unwrap();
+            fs::write(temporary.path().join(folder).join("icon.ico"), b"icon").unwrap();
+        }
+        let source = super::super::archive::SourceTree::directory(temporary.path()).unwrap();
+        let inventory = super::super::inventory::Inventory::build(&source).unwrap();
+        let existing = BTreeSet::from(["textures/menu/icon.png".to_owned()]);
+        let paths = icon_texture_paths(&inventory, &existing).unwrap();
+        assert_eq!(paths.len(), 2);
+        let unique: BTreeSet<_> = paths.values().collect();
+        assert_eq!(unique.len(), 2);
+        for path in paths.values() {
+            assert!(path.starts_with("textures/menu/icon-"));
+            assert!(!existing.contains(path));
+            assert!(path.len() <= 160);
+        }
     }
     #[test]
     fn memory_card_icon_becomes_standard_gltf_without_unnecessary_sidecar() {
@@ -5303,23 +6958,21 @@ mod tests {
         fs::write(temp.path().join("out/data/title/icon.ico"), &raw).unwrap();
         convert_and_strip(&temp.path().join("raw"), &temp.path().join("out"), &[]).unwrap();
         verify(&temp.path().join("out")).unwrap();
-        assert!(temp.path().join("out/port_data/title/icon.gltf").is_file());
-        let image = temp.path().join("out/port_data/title/icon.png");
+        assert!(temp.path().join("out/data/title/icon.gltf").is_file());
+        let image = temp.path().join("out/data/textures/title/icon.png");
         assert_eq!(fs::read(&image).unwrap(), png);
         let published: Value = serde_json::from_slice(
-            &fs::read(temp.path().join("out/port_data/title/icon.gltf")).unwrap(),
+            &fs::read(temp.path().join("out/data/title/icon.gltf")).unwrap(),
         )
         .unwrap();
-        assert_eq!(published["images"], json!([{"uri":"icon.png"}]));
+        assert_eq!(
+            published["images"],
+            json!([{"uri":"../textures/title/icon.png"}])
+        );
         fs::remove_file(&image).unwrap();
         assert!(verify(&temp.path().join("out")).is_err());
         fs::write(&image, &png).unwrap();
-        assert!(
-            !temp
-                .path()
-                .join("out/port_data/title/icon.game.json")
-                .exists()
-        );
+        assert!(!temp.path().join("out/data/title/icon.game.json").exists());
         assert!(!temp.path().join("out/data/title/icon.ico").exists());
         fs::write(temp.path().join("out/data/title/icon.ico"), raw).unwrap();
         assert!(verify(&temp.path().join("out")).is_err());
@@ -5400,7 +7053,7 @@ mod tests {
     #[test]
     fn shared_model_images_reference_standalone_pngs_externally() {
         let temp = tempfile::tempdir().unwrap();
-        let port = temp.path().join("port_data");
+        let port = temp.path().join("data");
         fs::create_dir_all(port.join("map/d01/tex")).unwrap();
         fs::create_dir_all(port.join("shared")).unwrap();
         let stone = test_png(1);
@@ -5520,7 +7173,7 @@ mod tests {
     #[test]
     fn embedded_texture_options_remain_absent_for_plain_and_canvas_pictures() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("port_data")).unwrap();
+        fs::create_dir_all(temp.path().join("data")).unwrap();
         let mut png = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut png, 1, 1);
@@ -5532,7 +7185,7 @@ mod tests {
                 .write_image_data(&[255; 4])
                 .unwrap();
         }
-        fs::write(temp.path().join("port_data/plain.png"), png).unwrap();
+        fs::write(temp.path().join("data/plain.png"), png).unwrap();
         let source = super::super::textures::ConvertedTextureDocument {
             source_alias: "plain.img".into(),
             document_path: "plain.json".into(),
@@ -5808,6 +7461,71 @@ mod tests {
         }
     }
     #[test]
+    fn rebaked_scale_keys_keep_the_authored_rotation_in_every_clip() {
+        let mut gltf = Gltf::new();
+        // Authored a quarter turn about z, as e101a's jnt21_1 is, with the uniform scale and an offset
+        // event/tbox/p00_27a's c20a has.
+        let scale = 1.2802608f32;
+        let mut matrix = identity();
+        matrix[0] = 0.;
+        matrix[1] = scale;
+        matrix[4] = -scale;
+        matrix[5] = 0.;
+        matrix[10] = scale;
+        matrix[12] = 2.;
+        matrix[13] = 3.;
+        matrix[14] = 4.;
+        gltf.doc["nodes"] = json!([{"matrix":matrix}]);
+        gltf.doc["scenes"][0]["nodes"] = json!([0]);
+        // Scale keys only: retail scales the authored matrix in every action.
+        let channels = vec![json!({"frame":0,"type":1,"keys":[
+            {"frame":0,"value":[1,1,1,0]},
+            {"frame":4,"value":[1.35,1.35,1.35,0]},
+            {"frame":8,"value":[1,1,1,0]},
+            {"frame":12,"value":[1.35,1.35,1.35,0]}
+        ]})];
+        prepare_transform_nodes(&mut gltf, &[&channels]).unwrap();
+        assert!(gltf.baked.contains(&0));
+        animation_clip(&mut gltf, "first", &channels, (0, 4), 0, true).unwrap();
+        animation_clip(&mut gltf, "second", &channels, (8, 12), 0, true).unwrap();
+        assert_eq!(gltf.doc["nodes"][0]["translation"], json!([2., 3., 4.]));
+        let animations = gltf.doc["animations"].as_array().unwrap();
+        assert_eq!(animations.len(), 2);
+        let output = |animation: &Value, path: &str| {
+            let channel = animation["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|channel| channel["target"]["path"] == path)
+                .unwrap();
+            let sampler = channel["sampler"].as_u64().unwrap() as usize;
+            test_accessor(
+                &gltf,
+                animation["samplers"][sampler]["output"].as_u64().unwrap() as usize,
+            )
+        };
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        for animation in animations {
+            for q in output(animation, "rotation").chunks(4) {
+                let dot = q[2] * half + q[3] * half;
+                assert!(
+                    (dot.abs() - 1.).abs() < 1e-5,
+                    "{} rotation {q:?}",
+                    animation["name"]
+                );
+            }
+            // The authored scale times the key: 1.2802608 at rest, rising to 1.728352, not 1.35.
+            let scales = output(animation, "scale");
+            let (first, last) = (&scales[..3], &scales[scales.len() - 3..]);
+            assert!(
+                first.iter().all(|value| (value - scale).abs() < 1e-5)
+                    && last.iter().all(|value| (value - 1.728352).abs() < 1e-5),
+                "{} scale {scales:?}",
+                animation["name"]
+            );
+        }
+    }
+    #[test]
     fn scalar_first_native_rotations_become_standard_conjugate_quaternions() {
         for raw in [
             [1., 0., 0., 0.],
@@ -5868,7 +7586,7 @@ mod tests {
         let raw = temp.path().join("raw");
         fs::create_dir_all(&raw).unwrap();
         let mut model = vec![0; 128];
-        model[..4].copy_from_slice(b"MDS ");
+        model[..4].copy_from_slice(b"MDS\0");
         put(&mut model, 8, 1);
         put(&mut model, 12, 16);
         put(&mut model, 20, 112);
@@ -5884,7 +7602,7 @@ mod tests {
         let textures = super::super::textures::convert_tree(&raw, &published, 1).unwrap();
         convert_and_strip(&raw, &published, &textures.documents).unwrap();
         let doc: Value = serde_json::from_slice(
-            &fs::read(published.join("port_data/gsys.pak/hake.game.json")).unwrap(),
+            &fs::read(published.join("data/gsys.pak/hake.game.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(doc["kind"], "character");
@@ -6122,8 +7840,8 @@ mod tests {
         assert_eq!(report.unwrap().transforms.boundary_keys, 3);
         let published = temp.path().join("published");
         verify(&published).unwrap();
-        let doc = read_json(published.join("port_data/hero.gltf"));
-        let game = read_json(published.join("port_data/hero.game.json"));
+        let doc = read_json(published.join("data/hero.gltf"));
+        let game = read_json(published.join("data/hero.game.json"));
         let names: Vec<_> = doc["animations"]
             .as_array()
             .unwrap()
@@ -6248,14 +7966,14 @@ mod tests {
         );
         let published = temp.path().join("published");
         verify(&published).unwrap();
-        let walker_doc = read_json(published.join("port_data/walker.gltf"));
+        let walker_doc = read_json(published.join("data/walker.gltf"));
         assert!(walker_doc.get("animations").is_none());
-        let walker_game = read_json(published.join("port_data/walker.game.json"));
+        let walker_game = read_json(published.join("data/walker.game.json"));
         let resource = &walker_game["resources"]["animations"][0];
         assert_eq!(resource["external"], "walker.gltf#0");
         assert_eq!(resource["targets"], json!(["hero.gltf"]));
         assert_eq!(resource["actions"][0]["name"], "walk");
-        let hero_doc = read_json(published.join("port_data/hero.gltf"));
+        let hero_doc = read_json(published.join("data/hero.gltf"));
         assert_eq!(hero_doc["buffers"][0]["uri"], "hero.gltf.bin");
         let clip = hero_doc["animations"]
             .as_array()
@@ -6263,7 +7981,7 @@ mod tests {
             .iter()
             .position(|a| a["name"] == "walker/walk")
             .unwrap();
-        let hero_game = read_json(published.join("port_data/hero.game.json"));
+        let hero_game = read_json(published.join("data/hero.game.json"));
         let entry = hero_game["resources"]["animations"]
             .as_array()
             .unwrap()
@@ -6272,7 +7990,7 @@ mod tests {
             .unwrap();
         assert_eq!(entry["variants"][0]["animations"], json!([clip]));
         assert_eq!(entry["variants"][0]["model"], 0);
-        let twin_doc = read_json(published.join("port_data/twin.gltf"));
+        let twin_doc = read_json(published.join("data/twin.gltf"));
         assert!(
             !twin_doc["animations"]
                 .as_array()
@@ -6281,7 +7999,7 @@ mod tests {
                 .any(|a| a["name"] == "walker/walk")
         );
         // A glTF that only carries clips is rejected.
-        let port = published.join("port_data");
+        let port = published.join("data");
         let mut animation_only = walker_doc.clone();
         for key in ["animations", "accessors", "bufferViews", "nodes"] {
             animation_only[key] = hero_doc[key].clone();
@@ -6401,16 +8119,15 @@ mod tests {
         fs::write(published.join("data/fixture.chr"), b).unwrap();
         convert_and_strip(&raw, &published, &[]).unwrap();
         verify(&published).unwrap();
-        let doc: Value = serde_json::from_slice(
-            &fs::read(published.join("port_data/fixture.game.json")).unwrap(),
-        )
-        .unwrap();
+        let doc: Value =
+            serde_json::from_slice(&fs::read(published.join("data/fixture.game.json")).unwrap())
+                .unwrap();
         assert!(!doc["models"].as_array().unwrap().is_empty());
         assert!(!published.join("data/fixture.chr").exists());
         if let Some(path) = std::env::var_os("KZ_MODEL_FIXTURE_OUTPUT") {
-            fs::copy(published.join("port_data/fixture.gltf"), &path).unwrap();
+            fs::copy(published.join("data/fixture.gltf"), &path).unwrap();
             fs::copy(
-                published.join("port_data/fixture.game.json"),
+                published.join("data/fixture.game.json"),
                 Path::new(&path).with_extension("game.json"),
             )
             .unwrap();
@@ -6429,7 +8146,7 @@ mod tests {
             counts[key] = json!(counts[key].as_u64().unwrap() + value);
         };
         for file in report.files.iter().filter(|file| file.ends_with(".gltf")) {
-            let path = output.join("port_data").join(file);
+            let path = output.join("data").join(file);
             let doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             add(&mut counts, "assets", 1);
             if !path.with_extension("game.json").is_file() {
@@ -6438,7 +8155,7 @@ mod tests {
             let metadata: Value =
                 serde_json::from_slice(&fs::read(path.with_extension("game.json")).unwrap())
                     .unwrap();
-            let buffers = load_buffers(&output.join("port_data"), file, &doc).unwrap();
+            let buffers = load_buffers(&output.join("data"), file, &doc).unwrap();
             validate_gltf_buffers(&doc, &metadata, &buffers)
                 .unwrap_or_else(|error| panic!("{file}: {error}"));
             add(
@@ -6484,6 +8201,20 @@ mod tests {
         }
         save(&output.join("transform-audit.json"), &counts).unwrap();
         println!("{}", serde_json::to_string_pretty(&counts).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires extracted retail data in KZ_MODEL_RAW and isolated KZ_MODEL_OUTPUT"]
+    fn retail_external_placement() {
+        let raw = PathBuf::from(std::env::var("KZ_MODEL_RAW").expect("KZ_MODEL_RAW"));
+        let output = PathBuf::from(std::env::var("KZ_MODEL_OUTPUT").expect("KZ_MODEL_OUTPUT"));
+        // Placement needs no textures; the models are converted without them.
+        let report = convert_tree(&raw, &output, &[], &Phase::noop()).unwrap();
+        save(
+            &output.join("external-placement.json"),
+            &json!({"placements":report.placements,"unresolved":report.unresolved}),
+        )
+        .unwrap();
     }
 
     #[test]

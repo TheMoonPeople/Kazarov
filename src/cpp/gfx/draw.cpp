@@ -4,6 +4,7 @@
 
 #include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
+#include "gfx/profile.hpp"
 
 namespace gfx {
 
@@ -51,18 +52,24 @@ ImageState DepthAttachment() {
             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
 }
 
-void EnsureRendering(Target &target) {
+// With sample_depth the rendering leaves the depth buffer unattached, for a depth_coverage draw to
+// read; a rendering begun the other way is ended and begun again.
+void EnsureRendering(Target &target, bool sample_depth = false) {
+    AssertDeviceThread(__func__);
     target = ResolveTarget(g.target);
     if (target.color == nullptr) {
         g.target = kMainTarget;
         target = ResolveTarget(g.target);
+    }
+    if (g.rendering && g.rendering_samples_depth != sample_depth) {
+        EndRendering();
     }
     if (g.rendering) {
         return;
     }
     VkCommandBuffer cmd = DrawCommands();
     Transition(cmd, *target.color, ColorAttachment());
-    Transition(cmd, *target.depth, DepthAttachment());
+    Transition(cmd, *target.depth, sample_depth ? DepthSampled() : DepthAttachment());
     if (target.texture != nullptr) {
         target.texture->last_draw_use = g.frame_serial;
     }
@@ -83,10 +90,13 @@ void EnsureRendering(Target &target) {
     info.layerCount = 1;
     info.colorAttachmentCount = 1;
     info.pColorAttachments = &color;
-    info.pDepthAttachment = &depth;
-    info.pStencilAttachment = &depth;
+    info.pDepthAttachment = sample_depth ? nullptr : &depth;
+    info.pStencilAttachment = sample_depth ? nullptr : &depth;
     vkCmdBeginRendering(cmd, &info);
+    KZ_PROFILE_GPU_BEGIN(rendering_zone, cmd, "Kazarov rendering");
     g.rendering = true;
+    g.rendering_samples_depth = sample_depth;
+    g.sampled_depth = sample_depth ? target.depth : nullptr;
 
     VkViewport viewport = {
         0.0f, 0.0f, static_cast<float>(target.color->width), static_cast<float>(target.color->height),
@@ -145,7 +155,7 @@ VkRect2D FrameLineClip(VkPrimitiveTopology topology, std::span<const Vertex2D> v
         {0,                   0                   },
         {mapping.pixel_width, mapping.pixel_height}
     };
-    if (!FillsWindow() || g.host_draws ||
+    if (!FillsWindow() || tls.host_draws ||
         (topology != VK_PRIMITIVE_TOPOLOGY_LINE_LIST && topology != VK_PRIMITIVE_TOPOLOGY_LINE_STRIP)) {
         return area;
     }
@@ -277,12 +287,38 @@ void UiSideShift(UiSide side, const LogicalMapping &logical, const LogicalMappin
 // Resolves the binding and the state into push constants and binds the pipeline and dynamic
 // state. ui places the draw by the target's UI mapping, moved to the edges side names; the scissor
 // stays where the frame has it unless the side follows it. False when the draw must be dropped.
+// A depth_coverage draw as the pipeline takes it: none of the state it does without.
+DrawState CoverageState(const DrawState &state) {
+    DrawState plain = state;
+    plain.blend = false;
+    plain.premultiplied = false;
+    plain.depth_test = DepthTest::Always;
+    plain.depth_write = false;
+    plain.alpha_test = false;
+    plain.fog = false;
+    plain.stencil_test = false;
+    return plain;
+}
+
 bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureBinding &binding,
-             const DrawState &state, PushConstants &push, bool ui = false, UiSide side = {},
+             const DrawState &given, PushConstants &push, bool ui = false, UiSide side = {},
              std::span<const Vertex2D> vertices = {}) {
     if (!g.in_frame) {
         return false;
     }
+    AssertDeviceThread(__func__);
+    const bool coverage = given.depth_coverage != 0;
+    if (coverage) {
+        Target    resolved = ResolveTarget(g.target);
+        bool      shares = resolved.color == nullptr || resolved.texture == nullptr || resolved.texture->shares_main_depth;
+        if (!g.depth_sampling || family != kFamily2DTriangles || given.depth_coverage > kCoveragePlanes || !shares) {
+            Error("a depth_coverage draw needs a device that samples depth, 2D triangles, at most %u planes and "
+                  "the main target or one sharing its depth",
+                  kCoveragePlanes);
+            return false;
+        }
+    }
+    const DrawState state = coverage ? CoverageState(given) : given;
     std::memset(&push, 0, sizeof(push));
     push.uv_xform[0] = 1.0f;
     push.uv_xform[1] = 1.0f;
@@ -332,9 +368,16 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
                     Error("index texture %#x is drawn without a palette", binding.texture);
                     return false;
                 }
-                palette->last_draw_use = g.frame_serial;
-                push.palette_slot = binding.palette & kSlotMask;
-                mode = kTexturePalette;
+                TextureHandle expanded = PaletteExpansion(binding.texture, binding.palette);
+                if (expanded != kNullTexture) {
+                    LookupTexture(expanded)->last_draw_use = g.frame_serial;
+                    push.texture_slot = expanded & kSlotMask;
+                    mode = kTextureRgba;
+                } else {
+                    LookupTexture(binding.palette)->last_draw_use = g.frame_serial;
+                    push.palette_slot = binding.palette & kSlotMask;
+                    mode = kTexturePalette;
+                }
             } else {
                 mode = kTextureRgba;
                 texa = !texture->desc.has_alpha || binding.ignore_alpha;
@@ -342,14 +385,24 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
         }
     }
 
+    if (coverage && mode != kTextureRgba) {
+        Error("a depth_coverage draw needs an RGBA texture");
+        return false;
+    }
+
     Target target;
-    EnsureRendering(target);
+    EnsureRendering(target, coverage);
     VkCommandBuffer cmd = DrawCommands();
 
-    BlendMapping blend = MapBlend(state.alpha, state.blend);
+    // The shader writes As as the factor when C is not FIX, which premultiplied takes as its own.
+    BlendMapping blend = state.blend && state.premultiplied ? BlendMapping{g.premultiplied_slot, kSourceColor, false}
+                                                            : MapBlend(state.alpha, state.blend);
     uint32_t     pipeline = !g.dynamic_color_write_mask && state.color_write_mask == 0
                                 ? NoColorPipelineIndex(family, mode, state.alpha_test)
                                 : PipelineIndex(family, blend.slot, mode, state.alpha_test);
+    if (coverage) {
+        pipeline = g.coverage_pipeline;
+    }
     if (g.bound.pipeline != g.pipelines[pipeline]) {
         g.bound.pipeline = g.pipelines[pipeline];
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.bound.pipeline);
@@ -374,7 +427,7 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
         push.sampler_slot = kBaseSamplerCount + (g.anisotropy_level - 1) * 4 + (push.sampler_slot & 3);
     }
     push.flags = (static_cast<uint32_t>(blend.transform) << kPushTransformShift) |
-                 (g.interpolation_tint << 8);
+                 (tls.interpolation_tint << 8);
     if (state.fog) {
         push.flags |= kPushFog;
     }
@@ -392,7 +445,33 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     }
     push.alpha = state.alpha_ref | (static_cast<uint32_t>(state.alpha_func) & 7) << 8 |
                  static_cast<uint32_t>(state.alpha.fix) << 16 | static_cast<uint32_t>(state.texa_ta0) << 24;
+    // The alpha test's verdicts on less, equal and greater, in alpha's bits 11 to 13. AlphaFunc's
+    // order: never, always, less, lequal, equal, gequal, greater, notequal.
+    constexpr uint32_t kAlphaPass[8] = {0b000, 0b111, 0b001, 0b011, 0b010, 0b110, 0b100, 0b101};
+    push.alpha |= kAlphaPass[static_cast<uint32_t>(state.alpha_func) & 7] << 11;
     push.fog_color = state.fog_color[0] | state.fog_color[1] << 8 | state.fog_color[2] << 16;
+    push.face = state.prog0_face;
+    // PushConstants::per_draw, the values the shader would work out from flags, alpha and fog_color;
+    // the divisions by 0x80 are exact.
+    for (int i = 0; i < 3; i++) {
+        push.per_draw[i] = static_cast<float>(state.fog_color[i]) * (1.0f / 255.0f);
+    }
+    push.per_draw[3] = static_cast<float>(state.alpha.fix) / 128.0f;
+    push.per_draw[4] = blend.fix ? 1.0f : 0.0f;
+    push.per_draw[5] = blend.transform == 1 ? 1.0f : 0.0f;
+    push.per_draw[6] = blend.transform == 2 ? 1.0f : 0.0f;
+    push.per_draw[7] = static_cast<float>(state.texa_ta0) / 128.0f;
+    // A 2D draw's fog is its vertices' F; a mesh draw's terms come with its constants (BindConstants).
+    push.fog_mode[2] = -1.0f;
+    if (coverage) {
+        // A coverage draw has no palette and no fog: the depth to sample, the plane count and the
+        // planes' depths (-1 past the count, which no depth is at or under) take their place.
+        push.palette_slot = target.depth == &g.display_depth ? kDisplayDepthSlot : kMainDepthSlot;
+        push.fog_color = given.depth_coverage;
+        for (uint32_t i = 0; i < kCoveragePlanes; i++) {
+            push.per_draw[i] = i < given.depth_coverage ? given.coverage_depths[i] : -1.0f;
+        }
+    }
     vkCmdPushConstants(cmd, PipelineLayoutOf(family), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(push), &push);
 
@@ -461,7 +540,7 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     };
     // An anchored HUD can slide outside its logical frame to hide. Its shifted frame, not the
     // wider window, bounds that animation; otherwise Fill reveals the hidden piece at the far edge.
-    if (ui && g.target == kMainTarget && (side.x != 0 || side.y != 0) && !g.host_draws) {
+    if (ui && g.target == kMainTarget && (side.x != 0 || side.y != 0) && !tls.host_draws) {
         scissor = Intersect(scissor, PixelRect(mapping, LogicalFrame(g.target), dx, dy));
     }
     if (ClipsToFrame(g.target)) {
@@ -485,20 +564,180 @@ void BindVertices(VkBuffer buffer, VkDeviceSize offset) {
     }
 }
 
-// prog0 is the draw's Vu_prog0 block at set 2, or nullptr for a plain draw.
-void BindConstants(VkPipelineLayout layout, const MeshConstants &constants, const Prog0Constants *prog0) {
-    TransientSpan span = AllocateConstants(false);
-    std::memcpy(span.data, &constants, sizeof(MeshConstants));
-    uint32_t offset = static_cast<uint32_t>(span.offset);
-    VkCommandBuffer cmd = DrawCommands();
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &span.set, 1, &offset);
-    if (prog0 == nullptr) {
-        return;
+// Forgets the records bound at set 1, for a new command buffer or a layout that may disturb them.
+void InvalidateBoundConstants() {
+    g.bound_constants.layout = VK_NULL_HANDLE;
+    g.bound_constants.set = VK_NULL_HANDLE;
+    g.bound_constants.mesh_valid = false;
+    g.bound_constants.prog0_valid = false;
+    g.bound_constants.palette_valid = false;
+    g.bound_constants.mesh_source = nullptr;
+    g.bound_constants.prog0_source = nullptr;
+    g.bound_constants.palette_source = nullptr;
+    g.bound_constants.mesh_set = VK_NULL_HANDLE;
+    g.bound_constants.prog0_set = VK_NULL_HANDLE;
+    g.bound_constants.palette_set = VK_NULL_HANDLE;
+    g.bound_constants.mesh_index = 0;
+    g.bound_constants.prog0_index = 0;
+    g.bound_constants.palette_index = 0;
+}
+
+// Copies a draw's MeshConstants into a new record of the current chunk.
+void PlaceMesh(const MeshConstants &constants) {
+    BoundConstants &bound = g.bound_constants;
+    ConstantRecord  record = AllocateConstantRecord(sizeof(MeshConstants));
+    std::memcpy(record.data, &constants, sizeof(MeshConstants));
+    bound.mesh = constants;
+    bound.mesh_source = tls.replaying ? &constants : nullptr;
+    bound.mesh_valid = true;
+    bound.mesh_set = record.set;
+    bound.mesh_index = record.index;
+}
+
+// Copies a draw's Prog0Constants into a new record of the current chunk.
+void PlaceProg0(const Prog0Constants &prog0) {
+    BoundConstants &bound = g.bound_constants;
+    ConstantRecord  record = AllocateConstantRecord(sizeof(Prog0Constants));
+    std::memcpy(record.data, &prog0, sizeof(Prog0Constants));
+    bound.prog0 = prog0;
+    bound.prog0_source = tls.replaying ? &prog0 : nullptr;
+    bound.prog0_valid = true;
+    bound.prog0_set = record.set;
+    bound.prog0_index = record.index;
+}
+
+// Copies a draw's Prog0Palette into a new record of the current chunk.
+void PlacePalette(const Prog0Palette &palette) {
+    BoundConstants &bound = g.bound_constants;
+    ConstantRecord  record = AllocateConstantRecord(sizeof(Prog0Palette));
+    std::memcpy(record.data, &palette, sizeof(Prog0Palette));
+    bound.palette = palette;
+    bound.palette_source = tls.replaying ? &palette : nullptr;
+    bound.palette_valid = true;
+    bound.palette_set = record.set;
+    bound.palette_index = record.index;
+}
+
+// The palette a draw of this family reads: its own, or identity bones for a skinned draw without one.
+// Other families read none.
+const Prog0Palette *SkinnedPalette(PipelineFamily family, const Prog0Palette *palette) {
+    if (family != kFamilyMeshProg0Skinned) {
+        return nullptr;
     }
-    TransientSpan block = AllocateConstants(true);
-    std::memcpy(block.data, prog0, sizeof(Prog0Constants));
-    uint32_t block_offset = static_cast<uint32_t>(block.offset);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 2, 1, &block.set, 1, &block_offset);
+    if (palette != nullptr) {
+        return palette;
+    }
+    static const Prog0Palette kIdentityPalette = [] {
+        Prog0Palette identity = {};
+        for (auto &bone : identity.bones) {
+            for (uint32_t row = 0; row < 3; row++) {
+                bone[row][row] = 1.0f;
+            }
+        }
+        return identity;
+    }();
+    return &kIdentityPalette;
+}
+
+static_assert(offsetof(PushConstants, palette_index) == offsetof(PushConstants, mesh_index) + 2 * sizeof(uint32_t));
+
+// PushConstants::fog_mode and fog_line of a mesh draw: what its vertex shader would give at every
+// vertex, as the mesh's F is clamp(fog[0] + fog[1] / w, fog[2], fog[3]) (draw.frag's mode 0) and a
+// prog0 draw's floor(clamp(fog.x + fog.w / w, near fog.y, far fog.z)) (mode 1), constant where the
+// 1 / w term is zero (mode -2).
+struct MeshFogTerms {
+    float mode[4];
+    float line[2];
+};
+static_assert(sizeof(MeshFogTerms) == offsetof(PushConstants, fog_line) + sizeof(PushConstants::fog_line) -
+                                         offsetof(PushConstants, fog_mode));
+
+MeshFogTerms FogTerms(const MeshConstants &constants, const Prog0Constants *prog0) {
+    MeshFogTerms terms = {};
+    if (prog0 != nullptr) {
+        const float *fog = prog0->fog; // offset, near value, far value, scale
+        terms.mode[0] = fog[1];
+        terms.mode[1] = fog[2];
+        if (fog[3] == 0.0f) {
+            // VU1 clamps against the near value first and the far value last, then truncates.
+            terms.mode[2] = -2.0f;
+            terms.mode[3] = std::floor(std::max(std::max(std::min(fog[0], fog[1]), fog[2]), 0.0f)) / 255.0f;
+        } else {
+            terms.mode[2] = 1.0f;
+            terms.line[0] = fog[0];
+            terms.line[1] = fog[3];
+        }
+        return terms;
+    }
+    const float *fog = constants.fog; // F = clamp(fog[0] + fog[1] / w, fog[2], fog[3])
+    terms.mode[0] = fog[3];
+    terms.mode[1] = fog[2];
+    terms.mode[3] = 1.0f;
+    if ((constants.flags & kMeshFog) == 0) {
+        terms.mode[2] = -2.0f;
+    } else if (fog[1] == 0.0f) {
+        terms.mode[2] = -2.0f;
+        terms.mode[3] = std::min(std::max(fog[0], fog[2]), fog[3]) / 255.0f;
+    } else {
+        terms.line[0] = fog[0];
+        terms.line[1] = fog[1];
+    }
+    return terms;
+}
+
+// prog0 is the draw's Vu_prog0 block, or nullptr for a plain draw; palette is its Prog0Palette, or nullptr
+// unless the draw is skinned. Called after Prepare, which pushes the rest.
+void BindConstants(VkPipelineLayout layout, const MeshConstants &constants, const Prog0Constants *prog0,
+                   const Prog0Palette *palette) {
+    BoundConstants &bound = g.bound_constants;
+    if (layout != bound.layout) {
+        InvalidateBoundConstants();
+        bound.layout = layout;
+    }
+    // A replay's sources are list entries that hold still, so the same address holds the same block.
+    bool mesh_same = bound.mesh_valid && ((tls.replaying && bound.mesh_source == &constants) ||
+                                          std::memcmp(&constants, &bound.mesh, sizeof(MeshConstants)) == 0);
+    if (!mesh_same) {
+        PlaceMesh(constants);
+    }
+    if (prog0 != nullptr) {
+        bool prog0_same = bound.prog0_valid && ((tls.replaying && bound.prog0_source == prog0) ||
+                                                std::memcmp(prog0, &bound.prog0, sizeof(Prog0Constants)) == 0);
+        if (!prog0_same) {
+            PlaceProg0(*prog0);
+        }
+    }
+    if (palette != nullptr) {
+        bool palette_same = bound.palette_valid && ((tls.replaying && bound.palette_source == palette) ||
+                                                    std::memcmp(palette, &bound.palette, sizeof(Prog0Palette)) == 0);
+        if (!palette_same) {
+            PlacePalette(*palette);
+        }
+    }
+    if (prog0 != nullptr) {
+        // The records must sit in one chunk's set. Each pass places them in the current chunk, and a
+        // fresh chunk has room for all of them, so this ends after at most one more pass.
+        while (bound.mesh_set != bound.prog0_set || (palette != nullptr && bound.palette_set != bound.mesh_set)) {
+            PlaceMesh(constants);
+            PlaceProg0(*prog0);
+            if (palette != nullptr) {
+                PlacePalette(*palette);
+            }
+        }
+    }
+    VkCommandBuffer cmd = DrawCommands();
+    if (bound.set != bound.mesh_set) {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &bound.mesh_set, 0, nullptr);
+        g.counters.descriptor_binds++;
+        bound.set = bound.mesh_set;
+    }
+    uint32_t indices[3] = {bound.mesh_index, prog0 != nullptr ? bound.prog0_index : 0,
+                           palette != nullptr ? bound.palette_index : 0};
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       offsetof(PushConstants, mesh_index), sizeof(indices), indices);
+    MeshFogTerms terms = FogTerms(constants, prog0);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       offsetof(PushConstants, fog_mode), sizeof(terms), &terms);
 }
 
 // Pixel rectangle of a logical one on an image, for copies and blits; along the axes in extend it
@@ -779,6 +1018,8 @@ void MarkUsed(Texture *texture) {
 // Vulkan copies within an image need GENERAL layout and must not overlap.
 void Transfer(VkCommandBuffer cmd, Image &src, const VkOffset3D src_offsets[2], Image &dst,
               const VkOffset3D dst_offsets[2], VkFilter filter) {
+    AssertDeviceThread(__func__);
+    KZ_PROFILE_GPU_ZONE(cmd, "Kazarov grab copy");
     auto width = [](const VkOffset3D o[2]) { return std::abs(o[1].x - o[0].x); };
     auto height = [](const VkOffset3D o[2]) { return std::abs(o[1].y - o[0].y); };
 
@@ -835,6 +1076,7 @@ void Transfer(VkCommandBuffer cmd, Image &src, const VkOffset3D src_offsets[2], 
         vkCmdBlitImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, filter);
     }
+    g.counters.grab_copies++;
     ToRest(cmd, src);
     ToRest(cmd, dst);
 }
@@ -948,15 +1190,25 @@ LogicalRect ExtendRect(LogicalRect rect, uint32_t axes, const LogicalRect &frame
 void EndRendering() {
     if (g.rendering) {
         vkCmdEndRendering(DrawCommands());
+        KZ_PROFILE_GPU_END(rendering_zone);
         g.rendering = false;
+    }
+    // Every depth image rests as an attachment between operations.
+    if (g.sampled_depth != nullptr) {
+        ToRest(DrawCommands(), *g.sampled_depth);
+        g.sampled_depth = nullptr;
     }
 }
 
 void ResetDrawState() {
+    AssertDeviceThread(__func__);
     g.bound = {};
+    // A new frame's command buffer has bound nothing, and its transients start over.
+    InvalidateBoundConstants();
     VkCommandBuffer cmd = DrawCommands();
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline_layout, 0, 1, &g.texture_set, 0,
                             nullptr);
+    g.counters.descriptor_binds++;
     vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
 }
 
@@ -987,11 +1239,13 @@ void SetRenderTarget(TextureHandle handle) {
         g.record_target = handle;
         return;
     }
-    if (g.in_frame) {
-        EndRendering();
-        ReleaseTarget();
-    }
-    g.target = handle;
+    RunOnRenderThread([&] {
+        if (g.in_frame) {
+            EndRendering();
+            ReleaseTarget();
+        }
+        g.target = handle;
+    });
 }
 
 TextureHandle CurrentRenderTarget() { return RecordingCalls() ? g.record_target : g.target; }
@@ -1048,38 +1302,40 @@ void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const 
         RecordEntry(std::move(entry));
         return;
     }
-    // Depth places a draw among the meshes, and an image of the frame lies where the frame does.
-    bool ui = state.depth_test == DepthTest::Always && !state.depth_write && !SamplesFrame(binding);
-    if (ui && g.target == kMainTarget && (side.x != 0 || side.y != 0)) {
-        // An anchored draw is a piece of the HUD, never the frame's cover: nothing flanks it.
-        DrawPrepared(primitive, vertices, binding, state, ui, side);
-        return;
-    }
-    uint32_t        extend = ExtentAxes(g.target);
-    LogicalMapping  mapping = GetLogicalMapping(g.target);
-    if (ui && g.target == kMainTarget) {
-        mapping = UiMapping(mapping);
-    }
-    LogicalRect               frame = LogicalFrame(g.target);
-    std::vector<Vertex2D>     stretched;
-    std::span<const Vertex2D> draw = vertices;
-    if (!g.host_draws) {
-        stretched = StretchFrameCovers(primitive, vertices, binding, extend, frame, mapping);
-        if (!stretched.empty()) {
-            draw = stretched;
+    RunOnRenderThread([&] {
+        // Depth places a draw among the meshes, and an image of the frame lies where the frame does.
+        bool ui = state.depth_test == DepthTest::Always && !state.depth_write && !SamplesFrame(binding);
+        if (ui && g.target == kMainTarget && (side.x != 0 || side.y != 0)) {
+            // An anchored draw is a piece of the HUD, never the frame's cover: nothing flanks it.
+            DrawPrepared(primitive, vertices, binding, state, ui, side);
+            return;
         }
-    }
-    DrawPrepared(primitive, draw, binding, state, ui);
-    if (uint32_t axes = extend & TextureAxes(binding); axes != 0 && g.in_frame && !g.host_draws) {
-        std::vector<Vertex2D> flanks = FrameFlanks(primitive, vertices, axes, frame, mapping);
-        if (!flanks.empty()) {
-            // Flanks sample past the frame's edge, where a repeating texture would wrap in its far side.
-            TextureBinding clamped = binding;
-            clamped.wrap_u = Wrap::Clamp;
-            clamped.wrap_v = Wrap::Clamp;
-            DrawPrepared(Primitive::Quads, flanks, clamped, state, ui);
+        uint32_t       extend = ExtentAxes(g.target);
+        LogicalMapping mapping = GetLogicalMapping(g.target);
+        if (ui && g.target == kMainTarget) {
+            mapping = UiMapping(mapping);
         }
-    }
+        LogicalRect               frame = LogicalFrame(g.target);
+        std::vector<Vertex2D>     stretched;
+        std::span<const Vertex2D> draw = vertices;
+        if (!tls.host_draws) {
+            stretched = StretchFrameCovers(primitive, vertices, binding, extend, frame, mapping);
+            if (!stretched.empty()) {
+                draw = stretched;
+            }
+        }
+        DrawPrepared(primitive, draw, binding, state, ui);
+        if (uint32_t axes = extend & TextureAxes(binding); axes != 0 && g.in_frame && !tls.host_draws) {
+            std::vector<Vertex2D> flanks = FrameFlanks(primitive, vertices, axes, frame, mapping);
+            if (!flanks.empty()) {
+                // Flanks sample past the frame's edge, where a repeating texture would wrap in its far side.
+                TextureBinding clamped = binding;
+                clamped.wrap_u = Wrap::Clamp;
+                clamped.wrap_v = Wrap::Clamp;
+                DrawPrepared(Primitive::Quads, flanks, clamped, state, ui);
+            }
+        }
+    });
 }
 
 namespace {
@@ -1110,6 +1366,7 @@ void DrawPrepared(Primitive primitive, std::span<const Vertex2D> vertices, const
     if (!Prepare(lines ? kFamily2DLines : kFamily2DTriangles, topology, binding, state, push, ui, side, vertices)) {
         return;
     }
+    g.counters.draws_2d++;
     VkCommandBuffer cmd = DrawCommands();
     TransientSpan   data = AllocateTransient(vertices.size_bytes(), sizeof(float));
     std::memcpy(data.data, vertices.data(), vertices.size_bytes());
@@ -1172,10 +1429,10 @@ void ReportPlainProg0Flag(const MeshConstants &constants) {
     }
 }
 
-// prog0 is the draw's Vu_prog0 block, or nullptr for a plain draw.
+// prog0 is the draw's Vu_prog0 block, or nullptr for a plain draw; palette is its Prog0Palette, or nullptr.
 void DrawIndexedMesh(MeshHandle handle, uint32_t first_index, uint32_t index_count, const MeshConstants &constants,
-                     const Prog0Constants *prog0, const TextureBinding &binding, const DrawState &state,
-                     const MeshTransform *transform) {
+                     const Prog0Constants *prog0, const Prog0Palette *palette, const TextureBinding &binding,
+                     const DrawState &state, const MeshTransform *transform) {
     Mesh *mesh = LookupMesh(handle);
     if (mesh == nullptr || first_index + index_count > mesh->index_count) {
         Error("DrawMesh: bad mesh %#x or index range", handle);
@@ -1184,22 +1441,26 @@ void DrawIndexedMesh(MeshHandle handle, uint32_t first_index, uint32_t index_cou
     if (RecordingCalls()) {
         if (index_count != 0) {
             RecordMesh(MeshEntry{handle, first_index, index_count, {}, {}, constants, binding, state, 0},
-                       transform, prog0);
+                       transform, prog0, palette);
         }
         return;
     }
-    PipelineFamily family = MeshFamily(prog0);
-    PushConstants  push;
-    if (index_count == 0 || !Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push)) {
-        return;
-    }
-    mesh->last_draw_use = g.frame_serial;
-    VkCommandBuffer cmd = DrawCommands();
-    BindConstants(PipelineLayoutOf(family), constants, family > kFamilyMesh ? prog0 : nullptr);
-    BindVertices(mesh->buffer.buffer, 0);
-    vkCmdBindIndexBuffer(cmd, mesh->buffer.buffer, mesh->vertex_count * sizeof(Vertex3D),
-                         VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, index_count, 1, first_index, 0, 0);
+    RunOnRenderThread([&] {
+        PipelineFamily family = MeshFamily(prog0);
+        PushConstants  push;
+        if (index_count == 0 || !Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push)) {
+            return;
+        }
+        mesh->last_draw_use = g.frame_serial;
+        VkCommandBuffer cmd = DrawCommands();
+        BindConstants(PipelineLayoutOf(family), constants, family > kFamilyMesh ? prog0 : nullptr,
+                      SkinnedPalette(family, palette));
+        BindVertices(mesh->buffer.buffer, 0);
+        vkCmdBindIndexBuffer(cmd, mesh->buffer.buffer, mesh->vertex_count * sizeof(Vertex3D),
+                             VK_INDEX_TYPE_UINT32);
+        g.counters.mesh_draws++;
+        vkCmdDrawIndexed(cmd, index_count, 1, first_index, 0, 0);
+    });
 }
 
 } // namespace
@@ -1207,20 +1468,20 @@ void DrawIndexedMesh(MeshHandle handle, uint32_t first_index, uint32_t index_cou
 void DrawMesh(MeshHandle handle, uint32_t first_index, uint32_t index_count, const MeshConstants &constants,
               const TextureBinding &binding, const DrawState &state, const MeshTransform *transform) {
     ReportPlainProg0Flag(constants);
-    DrawIndexedMesh(handle, first_index, index_count, constants, nullptr, binding, state, transform);
+    DrawIndexedMesh(handle, first_index, index_count, constants, nullptr, nullptr, binding, state, transform);
 }
 
 void DrawMeshProg0(MeshHandle handle, uint32_t first_index, uint32_t index_count, const MeshConstants &constants,
                    const Prog0Constants &prog0, const TextureBinding &binding, const DrawState &state,
-                   const MeshTransform *transform) {
-    DrawIndexedMesh(handle, first_index, index_count, constants, &prog0, binding, state, transform);
+                   const MeshTransform *transform, const Prog0Palette *palette) {
+    DrawIndexedMesh(handle, first_index, index_count, constants, &prog0, palette, binding, state, transform);
 }
 
 namespace {
 
-// prog0 is the draw's Vu_prog0 block, or nullptr for a plain draw.
+// prog0 is the draw's Vu_prog0 block, or nullptr for a plain draw; palette is its Prog0Palette, or nullptr.
 void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint32_t> indices,
-                       const MeshConstants &constants, const Prog0Constants *prog0,
+                       const MeshConstants &constants, const Prog0Constants *prog0, const Prog0Palette *palette,
                        const TextureBinding &binding, const DrawState &state, const MeshTransform *transform) {
     if (RecordingCalls()) {
         if (!vertices.empty() && !indices.empty()) {
@@ -1228,25 +1489,29 @@ void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint3
             entry.index_count = static_cast<uint32_t>(indices.size());
             entry.vertices.assign(vertices.begin(), vertices.end());
             entry.indices.assign(indices.begin(), indices.end());
-            RecordMesh(std::move(entry), transform, prog0);
+            RecordMesh(std::move(entry), transform, prog0, palette);
         }
         return;
     }
-    PipelineFamily family = MeshFamily(prog0);
-    PushConstants  push;
-    if (vertices.empty() || indices.empty() ||
-        !Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push)) {
-        return;
-    }
-    VkCommandBuffer cmd = DrawCommands();
-    TransientSpan   vertex_data = AllocateTransient(vertices.size_bytes(), sizeof(float));
-    std::memcpy(vertex_data.data, vertices.data(), vertices.size_bytes());
-    TransientSpan index_data = AllocateTransient(indices.size_bytes(), sizeof(uint32_t));
-    std::memcpy(index_data.data, indices.data(), indices.size_bytes());
-    BindConstants(PipelineLayoutOf(family), constants, family > kFamilyMesh ? prog0 : nullptr);
-    BindVertices(vertex_data.buffer, vertex_data.offset);
-    vkCmdBindIndexBuffer(cmd, index_data.buffer, index_data.offset, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    RunOnRenderThread([&] {
+        PipelineFamily family = MeshFamily(prog0);
+        PushConstants  push;
+        if (vertices.empty() || indices.empty() ||
+            !Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push)) {
+            return;
+        }
+        VkCommandBuffer cmd = DrawCommands();
+        TransientSpan   vertex_data = AllocateTransient(vertices.size_bytes(), sizeof(float));
+        std::memcpy(vertex_data.data, vertices.data(), vertices.size_bytes());
+        TransientSpan index_data = AllocateTransient(indices.size_bytes(), sizeof(uint32_t));
+        std::memcpy(index_data.data, indices.data(), indices.size_bytes());
+        BindConstants(PipelineLayoutOf(family), constants, family > kFamilyMesh ? prog0 : nullptr,
+                      SkinnedPalette(family, palette));
+        BindVertices(vertex_data.buffer, vertex_data.offset);
+        vkCmdBindIndexBuffer(cmd, index_data.buffer, index_data.offset, VK_INDEX_TYPE_UINT32);
+        g.counters.mesh_draws++;
+        vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    });
 }
 
 } // namespace
@@ -1255,13 +1520,14 @@ void DrawMeshImmediate(std::span<const Vertex3D> vertices, std::span<const uint3
                        const MeshConstants &constants, const TextureBinding &binding, const DrawState &state,
                        const MeshTransform *transform) {
     ReportPlainProg0Flag(constants);
-    DrawImmediateMesh(vertices, indices, constants, nullptr, binding, state, transform);
+    DrawImmediateMesh(vertices, indices, constants, nullptr, nullptr, binding, state, transform);
 }
 
 void DrawMeshImmediateProg0(std::span<const Vertex3D> vertices, std::span<const uint32_t> indices,
                             const MeshConstants &constants, const Prog0Constants &prog0,
-                            const TextureBinding &binding, const DrawState &state, const MeshTransform *transform) {
-    DrawImmediateMesh(vertices, indices, constants, &prog0, binding, state, transform);
+                            const TextureBinding &binding, const DrawState &state, const MeshTransform *transform,
+                            const Prog0Palette *palette) {
+    DrawImmediateMesh(vertices, indices, constants, &prog0, palette, binding, state, transform);
 }
 
 void Clear(bool clear_color, const uint8_t color[4], bool clear_depth, float depth, const LogicalRect *rect,
@@ -1281,33 +1547,35 @@ void Clear(bool clear_color, const uint8_t color[4], bool clear_depth, float dep
         RecordClear(entry);
         return;
     }
-    if (!g.in_frame || (!clear_color && !clear_depth)) {
-        return;
-    }
-    Target target;
-    EnsureRendering(target);
-    VkClearRect clear = {};
-    clear.rect = ClearArea(rect, target);
-    clear.layerCount = 1;
-    if (clear.rect.extent.width == 0 || clear.rect.extent.height == 0) {
-        return;
-    }
-    VkClearAttachment attachments[2] = {};
-    uint32_t          count = 0;
-    if (clear_color) {
-        float alpha = target.has_alpha ? std::min(static_cast<float>(color[3]) / 128.0f, 1.0f) : 1.0f;
-        attachments[count].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        attachments[count].clearValue.color = {
-            {color[0] / 255.0f, color[1] / 255.0f, color[2] / 255.0f, alpha}
-        };
-        count++;
-    }
-    if (clear_depth) {
-        attachments[count].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        attachments[count].clearValue.depthStencil = {std::clamp(depth, 0.0f, 1.0f), 0};
-        count++;
-    }
-    vkCmdClearAttachments(DrawCommands(), count, attachments, 1, &clear);
+    RunOnRenderThread([&] {
+        if (!g.in_frame || (!clear_color && !clear_depth)) {
+            return;
+        }
+        Target target;
+        EnsureRendering(target);
+        VkClearRect clear = {};
+        clear.rect = ClearArea(rect, target);
+        clear.layerCount = 1;
+        if (clear.rect.extent.width == 0 || clear.rect.extent.height == 0) {
+            return;
+        }
+        VkClearAttachment attachments[2] = {};
+        uint32_t          count = 0;
+        if (clear_color) {
+            float alpha = target.has_alpha ? std::min(static_cast<float>(color[3]) / 128.0f, 1.0f) : 1.0f;
+            attachments[count].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            attachments[count].clearValue.color = {
+                {color[0] / 255.0f, color[1] / 255.0f, color[2] / 255.0f, alpha}
+            };
+            count++;
+        }
+        if (clear_depth) {
+            attachments[count].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            attachments[count].clearValue.depthStencil = {std::clamp(depth, 0.0f, 1.0f), 0};
+            count++;
+        }
+        vkCmdClearAttachments(DrawCommands(), count, attachments, 1, &clear);
+    });
 }
 
 void ClearStencil(uint8_t value, const LogicalRect *rect) {
@@ -1320,21 +1588,23 @@ void ClearStencil(uint8_t value, const LogicalRect *rect) {
         RecordClear(entry);
         return;
     }
-    if (!g.in_frame) {
-        return;
-    }
-    Target target;
-    EnsureRendering(target);
-    VkClearRect clear = {};
-    clear.rect = ClearArea(rect, target);
-    clear.layerCount = 1;
-    if (clear.rect.extent.width == 0 || clear.rect.extent.height == 0) {
-        return;
-    }
-    VkClearAttachment attachment = {};
-    attachment.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-    attachment.clearValue.depthStencil = {0.0f, value};
-    vkCmdClearAttachments(DrawCommands(), 1, &attachment, 1, &clear);
+    RunOnRenderThread([&] {
+        if (!g.in_frame) {
+            return;
+        }
+        Target target;
+        EnsureRendering(target);
+        VkClearRect clear = {};
+        clear.rect = ClearArea(rect, target);
+        clear.layerCount = 1;
+        if (clear.rect.extent.width == 0 || clear.rect.extent.height == 0) {
+            return;
+        }
+        VkClearAttachment attachment = {};
+        attachment.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        attachment.clearValue.depthStencil = {0.0f, value};
+        vkCmdClearAttachments(DrawCommands(), 1, &attachment, 1, &clear);
+    });
 }
 
 bool CopyTexture(TextureHandle src, Rect src_rect, TextureHandle dst, int32_t dst_x, int32_t dst_y) {
@@ -1369,10 +1639,13 @@ bool CopyTexture(TextureHandle src, Rect src_rect, TextureHandle dst, int32_t ds
         RecordEntry(CopyEntry{CopyEntry::Copy, src, src_rect, dst, dst_rect, Filter::Nearest});
         return true;
     }
-    VkCommandBuffer cmd = CopyCommands();
-    MarkUsed(src_texture);
-    MarkUsed(dst_texture);
-    Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, VK_FILTER_NEAREST);
+    RunOnRenderThread([&] {
+        VkCommandBuffer cmd = CopyCommands();
+        MarkUsed(src_texture);
+        MarkUsed(dst_texture);
+        Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, VK_FILTER_NEAREST);
+        ForgetContents(dst_texture);
+    });
     return true;
 }
 
@@ -1396,12 +1669,15 @@ bool BlitTexture(TextureHandle src, Rect src_rect, TextureHandle dst, Rect dst_r
         RecordEntry(CopyEntry{CopyEntry::Blit, src, src_rect, dst, dst_rect, filter});
         return true;
     }
-    VkFilter vk_filter =
-        filter == Filter::Linear && src_image->format == kColorFormat ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    VkCommandBuffer cmd = CopyCommands();
-    MarkUsed(src_texture);
-    MarkUsed(dst_texture);
-    Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, vk_filter);
+    RunOnRenderThread([&] {
+        VkFilter vk_filter =
+            filter == Filter::Linear && src_image->format == kColorFormat ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        VkCommandBuffer cmd = CopyCommands();
+        MarkUsed(src_texture);
+        MarkUsed(dst_texture);
+        Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, vk_filter);
+        ForgetContents(dst_texture);
+    });
     return true;
 }
 

@@ -5,12 +5,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 
 #include "audio/wav.hpp"
+#include "kazarov/log.hpp"
 #include "platform/clock.hpp"
 #include "platform/settings.hpp"
 
@@ -115,7 +115,7 @@ void CaptureTicks() {
 
 bool StartCapture(const char *path, int rate) {
     if (!g_wav.writer.Open(path, rate)) {
-        std::fprintf(stderr, "audio: cannot write %s\n", path);
+        kz::Logf(kz::LogLevel::Error, "audio", "cannot write {}", path);
         return false;
     }
     g_wav.rate = rate;
@@ -143,13 +143,13 @@ bool AudioOutputStart(int rate, AudioRenderFn render, void *user) {
         return false;
     }
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-        std::fprintf(stderr, "audio: no audio subsystem: %s\n", SDL_GetError());
+        kz::Logf(kz::LogLevel::Warning, "audio", "no audio subsystem: {}", SDL_GetError());
         return false;
     }
     const SDL_AudioSpec spec{SDL_AUDIO_F32, g_surround ? 6 : 2, rate};
     g_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, Feed, nullptr);
     if (g_stream == nullptr) {
-        std::fprintf(stderr, "audio: no playback device: %s\n", SDL_GetError());
+        kz::Logf(kz::LogLevel::Warning, "audio", "no playback device: {}", SDL_GetError());
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
         return false;
     }

@@ -277,6 +277,15 @@ Do not wrap `PORT_RETURN` in a PS2-visible `if`. The PS2 build then compiles tha
 - On Android the window is fixed fullscreen in landscape (`WindowSetMode` changes nothing), and the game draws its own on-screen gamepad: it passes the gamepad's state to `InputSetTouchOverlay`, which pad 0 takes while `InputTouchOverlayVisible()`, true after an `InputPoll` that found no gamepad, keyboard or mouse in use.
 - Behaviour change (main after f1b8e80): the flanks that carry a full-frame `Draw2D` rectangle to the edge of a window wider or taller than the logical frame always sample with clamped wrap (`gfx/README.md`, "Fill"). A full-frame draw of a repeating texture used to tile into the flanks and now repeats its edge texels there, which removes the seam at the frame's border. Output at the logical aspect is unchanged; only non-4:3 windows differ, and only for such draws.
 
+### Diagnostics
+
+The host code reports through `kazarov/log.hpp` (`platform/log.cpp`). Only `PathsConsumeArgs`' usage errors (`--data needs a directory`), printed before a host can install a sink, go straight to stderr.
+
+- `kz::Log(level, subsystem, message)` and `kz::Logf(level, subsystem, format, args...)` (`std::format`) send one line to the sink installed with `kz::SetLogSink`. Without a sink each line goes to stderr as `<subsystem>: <message>`, as one write. The sink is an atomic function pointer, so `Log` takes no lock and may be called from any thread, the audio callback and pipeline workers included; a sink must be safe the same way and must not log back into Kazarov. `nullptr` restores stderr.
+- `kz::Fatal(subsystem, message, unimplemented)` logs the line at `kz::LogLevel::Fatal`, flushes stderr, and calls the hook installed with `kz::SetFatalHook`, once per process. The hook normally writes a crash report and does not return; if it returns, the caller's own exit follows. `kz::Abort(subsystem, message)` is `Fatal` with `unimplemented` false, then `std::abort()`.
+- `Ps2Unimplemented` calls `Fatal` with `unimplemented` true, the call's `<file>:<line>` as the subsystem and `<function>: PlayStation 2 code is not implemented on PC` as the message, then aborts. `gfx::Fatal` (and so `gfx::Check`) and the window's SDL failures call `Fatal` and exit with status 1. Arena overflows (subsystem `arena <name>`), failed arena mappings, fiber creation failures and `eekernel` deadlocks call `Abort`.
+- `<prefix>_AUDIO_TRACE` lines (`audio::Trace`) go through `Log` at `Debug`, formatted into a stack buffer, so a trace line costs no allocation on the audio callback.
+
 CMake entry points are in `cmake/KazarovPort.cmake`:
 
 | Name | Purpose |
@@ -321,11 +330,14 @@ need a portal backend for their desktop. The setup window uses eframe/egui with
 OpenGL and supports X11 and Wayland. Linux build dependencies are included in the
 toolchain image (`pkg-config`, X11, Wayland, xkbcommon and EGL development files).
 
-Extraction runs on a worker thread. `extract_with_progress` reports weighted
-phases: source checking (0–5%), raw files (5–40%), conversion (40–90%), final
-texture manifests and publication (90–100%). Percentages measure completed work,
-not estimated elapsed time. Concurrent callbacks are coalesced monotonically by
-the window. Only successful publication reaches 100%; then setup closes and
+Extraction runs on a worker thread. `extract_with_progress` reports planned work
+for the ISO read, asset planning, concurrent texture, model, audio, movie, script
+and retained-asset conversion, ZIP streaming, final archive verification and
+transactional publication. Model publication has the largest progress share because
+it determines the conversion tail; the ETA is withheld when critical model work
+stops advancing. Percentages measure completed work, not estimated elapsed time.
+Concurrent callbacks are coalesced monotonically by the window. Only successful
+publication reaches 100%; then setup closes and
 returns to the caller automatically. Errors allow retry. Closing is disabled
 while extraction is active so publishing is never abandoned mid-operation.
 

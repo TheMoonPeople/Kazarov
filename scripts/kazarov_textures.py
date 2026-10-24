@@ -289,7 +289,7 @@ def safe_component(value: str) -> str:
                    else f"%{c:02X}" for c in value.encode("utf-8"))
 
 
-def document_path(key: str) -> str:
+def legacy_document_path(key: str) -> str:
     raw = [part for part in key.split("/") if part]
     position = 0
     while position < len(raw):
@@ -318,6 +318,31 @@ def document_path(key: str) -> str:
     path = "/".join(parts)
     if len(path) > 180:
         path = "/".join(parts[:2] + ["long-path-" + hashlib.sha256(path.encode()).hexdigest()[:20] + ".json"])
+    return path
+
+
+def document_path(key: str) -> str:
+    """Mirror the native extractor's texture document namespace before collisions."""
+    legacy = legacy_document_path(key)
+    raw = [part for part in key.split("/") if part]
+    parts = ["textures"]
+    character = None
+    for index, component in enumerate(raw):
+        base = component.split("#", 1)[0]
+        if "." in base:
+            if base.rsplit(".", 1)[1].lower() in ("chr", "chr_"):
+                character = safe_component(base)
+        elif index + 1 < len(raw):
+            parts.append(safe_component(base))
+    leaf = legacy.rsplit("/", 1)[-1]
+    if character is not None:
+        stem = character.rsplit(".", 1)[0]
+        suffix = "_" if character.lower().endswith(".chr_") else ""
+        leaf = f"{stem}{suffix}-{leaf}"
+    parts.append(leaf)
+    path = "/".join(parts)
+    if len(path) > 160:
+        return "textures/long-path-" + hashlib.sha256(key.encode()).hexdigest()[:24] + ".json"
     return path
 
 
@@ -465,7 +490,7 @@ class Converter:
     def convert_pictures(self, key: str, name: str, pictures: list[Picture], metadata: dict,
                          ordinal: int = 0) -> list[dict]:
         out = []
-        document = document_path(key)
+        document = legacy_document_path(key)
         for index, picture in enumerate(pictures):
             levels = [self.write_asset(document,
                                        png(w, h, colorize(raster, picture.palette)
@@ -686,7 +711,7 @@ class Converter:
         self.bake_animation_variants()
         document_paths = set()
         for source in self.sources:
-            relative = document_path(source["source"])
+            relative = legacy_document_path(source["source"])
             collision_key = relative.casefold()
             if collision_key in document_paths or collision_key in ("catalog.json", "manifest.json"):
                 raise TextureError(f"texture document path collision: {relative}")

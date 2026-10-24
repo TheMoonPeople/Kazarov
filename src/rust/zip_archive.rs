@@ -1,6 +1,7 @@
 //! Deterministic ZIP64 asset archives holding stored or Zstandard entries.
 //!
 //! The format is specified in `docs/PORT_ARCHIVE_FORMAT.md` of the game repository.
+use super::artifacts::ArtifactBytes;
 use super::{CoreError, CoreResult};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// Alignment of every entry's data within the archive.
 pub const ALIGNMENT: u64 = 64;
 /// Zstandard level used for compressed entries.
-pub const ZSTD_LEVEL: i32 = 9;
+pub const ZSTD_LEVEL: i32 = 1;
 /// Uncompressed entry stored as-is.
 pub const METHOD_STORED: u16 = 0;
 /// Zstandard-compressed entry.
@@ -547,6 +548,24 @@ pub struct Input {
     pub source: PathBuf,
 }
 
+/// A staged archive whose entries can be added as immutable inputs become ready.
+/// The output path remains unpublished until `finish` writes the central directory.
+pub struct ProgressiveWriter {
+    output: PathBuf,
+    partial: PathBuf,
+    out: CountingWriter<BufWriter<File>>,
+    central: Vec<CentralEntry>,
+    records: Vec<OwnedContentRecord>,
+    seen: HashSet<String>,
+    exact_names: HashSet<String>,
+}
+
+struct OwnedContentRecord {
+    name: String,
+    size: u64,
+    sha256: [u8; 32],
+}
+
 struct Prepared {
     method: u16,
     crc: u32,
@@ -554,6 +573,99 @@ struct Prepared {
     sha256: [u8; 32],
     /// Compressed bytes; stored entries are copied from the source while writing.
     payload: Option<Vec<u8>>,
+}
+
+/// One compressed or stored artifact prepared by a conversion worker.
+pub(crate) struct PreparedEntry {
+    name: String,
+    method: u16,
+    crc: u32,
+    size: u64,
+    sha256: [u8; 32],
+    payload: PreparedPayload,
+}
+
+enum PreparedPayload {
+    Stored(ArtifactBytes),
+    Compressed(Vec<u8>),
+}
+
+pub(crate) fn prepare_artifact(name: String, bytes: ArtifactBytes) -> CoreResult<PreparedEntry> {
+    validate_name(&name)?;
+    let source = bytes.as_slice();
+    let size = source.len() as u64;
+    let crc = crc32fast::hash(source);
+    let sha256 = Sha256::digest(source).into();
+    let (method, payload) = if stored_by_name(&name) {
+        (METHOD_STORED, PreparedPayload::Stored(bytes))
+    } else {
+        let compressed = zstd::bulk::compress(source, ZSTD_LEVEL)
+            .map_err(|error| fail(format!("{name}: {error}")))?;
+        (METHOD_ZSTD, PreparedPayload::Compressed(compressed))
+    };
+    Ok(PreparedEntry {
+        name,
+        method,
+        crc,
+        size,
+        sha256,
+        payload,
+    })
+}
+
+/// A single-writer ZIP sink for prepared in-memory or source-range artifacts.
+pub(crate) struct StreamWriter(ProgressiveWriter);
+
+impl StreamWriter {
+    pub(crate) fn new(output: &Path) -> CoreResult<Self> {
+        Ok(Self(ProgressiveWriter::new(output)?))
+    }
+
+    pub(crate) fn append(&mut self, entry: PreparedEntry) -> CoreResult<u64> {
+        if self.0.contains_name(&entry.name) {
+            return Err(fail(format!(
+                "archive entry names collide ignoring case: {}",
+                entry.name
+            )));
+        }
+        let compressed = match &entry.payload {
+            PreparedPayload::Stored(bytes) => bytes.as_slice().len() as u64,
+            PreparedPayload::Compressed(bytes) => bytes.len() as u64,
+        };
+        let local = self.0.out.position;
+        self.0.out.put(&local_header(
+            &entry.name,
+            entry.method,
+            entry.crc,
+            compressed,
+            entry.size,
+            local,
+        ))?;
+        match &entry.payload {
+            PreparedPayload::Stored(bytes) => self.0.out.put(bytes.as_slice())?,
+            PreparedPayload::Compressed(bytes) => self.0.out.put(bytes)?,
+        }
+        self.0.central.push(CentralEntry {
+            name: entry.name.clone(),
+            method: entry.method,
+            crc: entry.crc,
+            compressed,
+            size: entry.size,
+            local,
+        });
+        self.0.records.push(OwnedContentRecord {
+            name: entry.name.clone(),
+            size: entry.size,
+            sha256: entry.sha256,
+        });
+        self.0.seen.insert(entry.name.to_ascii_lowercase());
+        self.0.exact_names.insert(entry.name);
+        Ok(self.0.out.position - local)
+    }
+
+    pub(crate) fn finish(self) -> CoreResult<Written> {
+        self.0.finish()
+    }
 }
 
 /// Bytes an entry holds in memory while its batch is prepared and written.
@@ -763,155 +875,224 @@ fn copy_stored<W: Write>(
     Ok(())
 }
 
-/// Writes a deterministic archive of `inputs`, optionally deleting each source once written.
-///
-/// The archive is written beside `output` and renamed over it only when complete.
+impl ProgressiveWriter {
+    /// Starts a private partial archive beside the final output path.
+    pub fn new(output: &Path) -> CoreResult<Self> {
+        let mut partial_name = output
+            .file_name()
+            .ok_or_else(|| fail("archive output has no file name"))?
+            .to_os_string();
+        partial_name.push(".partial");
+        let partial = output.with_file_name(partial_name);
+        let file = File::create(&partial)?;
+        Ok(Self {
+            output: output.to_path_buf(),
+            partial,
+            out: CountingWriter {
+                inner: BufWriter::with_capacity(COPY_CHUNK, file),
+                position: 0,
+            },
+            central: Vec::new(),
+            records: Vec::new(),
+            seen: HashSet::new(),
+            exact_names: HashSet::new(),
+        })
+    }
+
+    /// True when a case-insensitively equivalent name has already been appended.
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.seen.contains(&name.to_ascii_lowercase())
+    }
+
+    /// True when this exact path has already been appended.
+    pub fn contains_exact_name(&self, name: &str) -> bool {
+        self.exact_names.contains(name)
+    }
+
+    /// Appends final, immutable inputs using bounded parallel preparation.
+    /// Sources remain in place for later cross-file verification.
+    pub fn append(
+        &mut self,
+        mut inputs: Vec<Input>,
+        progress: &(dyn Fn(u64, u64) + Sync),
+    ) -> CoreResult<()> {
+        for input in &inputs {
+            validate_name(&input.name)?;
+            if self.contains_name(&input.name) {
+                return Err(fail(format!(
+                    "archive entry names collide ignoring case: {}",
+                    input.name
+                )));
+            }
+        }
+        inputs.sort_by(|a, b| a.name.cmp(&b.name));
+        check_unique(inputs.iter().map(|input| input.name.as_str()))?;
+        let lengths = inputs
+            .iter()
+            .map(|input| Ok(fs::metadata(&input.source)?.len()))
+            .collect::<CoreResult<Vec<u64>>>()?;
+        let total: u64 = lengths.iter().sum();
+        progress(0, total);
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        while start < inputs.len() {
+            let mut end = start;
+            let mut batch_bytes = 0u64;
+            while end < inputs.len()
+                && end - start < BATCH_ENTRIES
+                && (end == start || batch_bytes < BATCH_BYTES)
+            {
+                batch_bytes += resident_bytes(&inputs[end].name, lengths[end]);
+                end += 1;
+            }
+            ranges.push(start..end);
+            start = end;
+        }
+        let out = &mut self.out;
+        let (inputs, ranges) = (&inputs[..], &ranges[..]);
+        let (central, records) = std::thread::scope(|scope| -> CoreResult<_> {
+            // The rendezvous channel bounds resident prepared data to two batches.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Prepared>>(0);
+            let writer = scope.spawn(move || -> CoreResult<_> {
+                let mut central = Vec::with_capacity(inputs.len());
+                let mut records = Vec::with_capacity(inputs.len());
+                let mut done = 0u64;
+                for (range, prepared) in ranges.iter().zip(rx) {
+                    for (input, prepared) in inputs[range.clone()].iter().zip(prepared) {
+                        let compressed = prepared
+                            .payload
+                            .as_ref()
+                            .map_or(prepared.size, |payload| payload.len() as u64);
+                        let local = out.position;
+                        out.put(&local_header(
+                            &input.name,
+                            prepared.method,
+                            prepared.crc,
+                            compressed,
+                            prepared.size,
+                            local,
+                        ))?;
+                        match &prepared.payload {
+                            Some(payload) => out.put(payload)?,
+                            None => copy_stored(input, &prepared, out)?,
+                        }
+                        central.push(CentralEntry {
+                            name: input.name.clone(),
+                            method: prepared.method,
+                            crc: prepared.crc,
+                            compressed,
+                            size: prepared.size,
+                            local,
+                        });
+                        records.push(OwnedContentRecord {
+                            name: input.name.clone(),
+                            size: prepared.size,
+                            sha256: prepared.sha256,
+                        });
+                        done += prepared.size;
+                        progress(done, total);
+                    }
+                }
+                Ok((central, records))
+            });
+            let mut prepare_error = None;
+            for range in ranges {
+                let prepared = inputs[range.clone()]
+                    .par_iter()
+                    .map(prepare)
+                    .collect::<CoreResult<Vec<_>>>();
+                match prepared {
+                    Ok(prepared) => {
+                        if tx.send(prepared).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        prepare_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            drop(tx);
+            let written = match writer.join() {
+                Ok(result) => result?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+            if let Some(error) = prepare_error {
+                return Err(error);
+            }
+            Ok(written)
+        })?;
+        self.seen
+            .extend(central.iter().map(|entry| entry.name.to_ascii_lowercase()));
+        self.exact_names
+            .extend(central.iter().map(|entry| entry.name.clone()));
+        self.central.extend(central);
+        self.records.extend(records);
+        Ok(())
+    }
+
+    /// Completes the directory and atomically renames the archive into place.
+    pub fn finish(mut self) -> CoreResult<Written> {
+        self.central.sort_by(|a, b| a.name.cmp(&b.name));
+        self.records.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut hash = Sha256::new();
+        hash.update(b"kazarov-archive-content-v1\0");
+        for record in &self.records {
+            hash.update((record.name.len() as u64).to_le_bytes());
+            hash.update(record.name.as_bytes());
+            hash.update(record.size.to_le_bytes());
+            hash.update(record.sha256);
+        }
+        let directory_offset = self.out.position;
+        for entry in &self.central {
+            self.out.put(&central_header(entry))?;
+        }
+        let directory_size = self.out.position - directory_offset;
+        self.out.put(&end_records(
+            self.central.len() as u64,
+            directory_offset,
+            directory_size,
+        ))?;
+        let size = self.out.position;
+        let file = self
+            .out
+            .inner
+            .into_inner()
+            .map_err(|error| CoreError(error.error().to_string()))?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.partial, &self.output)?;
+        Ok(Written {
+            size,
+            entries: self.central.len() as u64,
+            content_sha256: hex(&hash.finalize()),
+        })
+    }
+}
+
+/// Writes a deterministic archive of `inputs`, optionally deleting sources on success.
 pub fn write(
-    mut inputs: Vec<Input>,
+    inputs: Vec<Input>,
     output: &Path,
     remove_sources: bool,
     progress: &(dyn Fn(u64, u64) + Sync),
 ) -> CoreResult<Written> {
-    for input in &inputs {
-        validate_name(&input.name)?;
-    }
-    inputs.sort_by(|a, b| a.name.cmp(&b.name));
-    check_unique(inputs.iter().map(|input| input.name.as_str()))?;
-    let lengths = inputs
-        .iter()
-        .map(|input| Ok(fs::metadata(&input.source)?.len()))
-        .collect::<CoreResult<Vec<u64>>>()?;
-    let total: u64 = lengths.iter().sum();
-    progress(0, total);
-    let mut partial_name = output
-        .file_name()
-        .ok_or_else(|| fail("archive output has no file name"))?
-        .to_os_string();
-    partial_name.push(".partial");
-    let partial = output.with_file_name(partial_name);
-    if partial.exists() {
-        fs::remove_file(&partial)?;
-    }
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while start < inputs.len() {
-        let mut end = start;
-        let mut batch_bytes = 0u64;
-        while end < inputs.len()
-            && end - start < BATCH_ENTRIES
-            && (end == start || batch_bytes < BATCH_BYTES)
-        {
-            batch_bytes += resident_bytes(&inputs[end].name, lengths[end]);
-            end += 1;
+    let sources = remove_sources.then(|| {
+        inputs
+            .iter()
+            .map(|input| input.source.clone())
+            .collect::<Vec<_>>()
+    });
+    let mut writer = ProgressiveWriter::new(output)?;
+    writer.append(inputs, progress)?;
+    let written = writer.finish()?;
+    if let Some(sources) = sources {
+        for source in sources {
+            fs::remove_file(source)?;
         }
-        ranges.push(start..end);
-        start = end;
     }
-    let file = File::create(&partial)?;
-    let mut out = CountingWriter {
-        inner: BufWriter::with_capacity(COPY_CHUNK, file),
-        position: 0,
-    };
-    let (inputs, ranges) = (&inputs[..], &ranges[..]);
-    let (mut out, central, hash) = std::thread::scope(|scope| -> CoreResult<_> {
-        // A rendezvous channel keeps one batch being written and one being prepared resident.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Prepared>>(0);
-        let writer = scope.spawn(move || -> CoreResult<_> {
-            let mut central = Vec::with_capacity(inputs.len());
-            let mut hash = Sha256::new();
-            hash.update(b"kazarov-archive-content-v1\0");
-            let mut done = 0u64;
-            for (range, prepared) in ranges.iter().zip(rx) {
-                for (input, prepared) in inputs[range.clone()].iter().zip(prepared) {
-                    let compressed = prepared
-                        .payload
-                        .as_ref()
-                        .map_or(prepared.size, |payload| payload.len() as u64);
-                    let local = out.position;
-                    out.put(&local_header(
-                        &input.name,
-                        prepared.method,
-                        prepared.crc,
-                        compressed,
-                        prepared.size,
-                        local,
-                    ))?;
-                    match &prepared.payload {
-                        Some(payload) => out.put(payload)?,
-                        None => copy_stored(input, &prepared, &mut out)?,
-                    }
-                    hash.update((input.name.len() as u64).to_le_bytes());
-                    hash.update(input.name.as_bytes());
-                    hash.update(prepared.size.to_le_bytes());
-                    hash.update(prepared.sha256);
-                    central.push(CentralEntry {
-                        name: input.name.clone(),
-                        method: prepared.method,
-                        crc: prepared.crc,
-                        compressed,
-                        size: prepared.size,
-                        local,
-                    });
-                    if remove_sources {
-                        fs::remove_file(&input.source)?;
-                    }
-                    done += prepared.size;
-                    progress(done, total);
-                }
-            }
-            Ok((out, central, hash))
-        });
-        let mut prepare_error = None;
-        for range in ranges {
-            let prepared = inputs[range.clone()]
-                .par_iter()
-                .map(prepare)
-                .collect::<CoreResult<Vec<_>>>();
-            match prepared {
-                Ok(prepared) => {
-                    if tx.send(prepared).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    prepare_error = Some(error);
-                    break;
-                }
-            }
-        }
-        drop(tx);
-        let written = match writer.join() {
-            Ok(result) => result?,
-            Err(panic) => std::panic::resume_unwind(panic),
-        };
-        if let Some(error) = prepare_error {
-            return Err(error);
-        }
-        Ok(written)
-    })?;
-    let directory_offset = out.position;
-    for entry in &central {
-        out.put(&central_header(entry))?;
-    }
-    let directory_size = out.position - directory_offset;
-    out.put(&end_records(
-        central.len() as u64,
-        directory_offset,
-        directory_size,
-    ))?;
-    let size = out.position;
-    let file = out
-        .inner
-        .into_inner()
-        .map_err(|error| CoreError(error.error().to_string()))?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&partial, output)?;
-    Ok(Written {
-        size,
-        entries: central.len() as u64,
-        content_sha256: hex(&hash.finalize()),
-    })
+    Ok(written)
 }
 
 /// Lists every regular file under `root` as archive inputs named by relative path.
@@ -1053,6 +1234,53 @@ mod tests {
         let mut records = archive.verify_entries(&|_, _| Ok(())).unwrap();
         assert_eq!(content_digest(&mut records), written.content_sha256);
         assert_eq!(written.size, fs::metadata(&output).unwrap().len());
+    }
+
+    #[test]
+    fn progressive_batches_keep_sorted_directory_and_content_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        tree(&source, &[("z.bin", b"last"), ("a.png", b"first")]);
+        let output = temp.path().join("progressive.zip");
+        let mut writer = ProgressiveWriter::new(&output).unwrap();
+        writer
+            .append(
+                vec![Input {
+                    name: "z.bin".into(),
+                    source: source.join("z.bin"),
+                }],
+                &|_, _| {},
+            )
+            .unwrap();
+        assert!(!output.exists());
+        assert!(writer.contains_exact_name("z.bin"));
+        assert!(writer.contains_name("Z.BIN"));
+        assert!(
+            writer
+                .append(
+                    vec![Input {
+                        name: "Z.BIN".into(),
+                        source: source.join("z.bin"),
+                    }],
+                    &|_, _| {},
+                )
+                .is_err()
+        );
+        writer
+            .append(
+                vec![Input {
+                    name: "a.png".into(),
+                    source: source.join("a.png"),
+                }],
+                &|_, _| {},
+            )
+            .unwrap();
+        let written = writer.finish().unwrap();
+        let archive = Archive::open(&output).unwrap();
+        assert_eq!(archive.name(0), "a.png");
+        assert_eq!(archive.name(1), "z.bin");
+        let mut records = archive.verify_entries(&|_, _| Ok(())).unwrap();
+        assert_eq!(written.content_sha256, content_digest(&mut records));
     }
 
     #[test]

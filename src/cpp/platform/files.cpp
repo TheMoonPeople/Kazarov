@@ -188,12 +188,17 @@ void Remove(const fs::path &path) {
 }
 
 bool SyncDirectory(const fs::path &path) {
+#ifdef __SWITCH__
+    // Horizon commits a name when its creating operation returns and cannot open directories.
+    return true;
+#else
     File directory = open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory == kNoFile) {
         return false;
     }
     bool synced = Fsync(directory);
     return close(directory) == 0 && synced;
+#endif
 }
 
 // Moves temp onto path unless path exists, in one step where the system can: -1 with errno set
@@ -204,17 +209,48 @@ int RenameExclusive(const fs::path &temp, const fs::path &path) {
     return static_cast<int>(syscall(SYS_renameat2, AT_FDCWD, temp.c_str(), AT_FDCWD, path.c_str(), kNoReplace));
 #elif defined(__APPLE__)
     return renamex_np(temp.c_str(), path.c_str(), RENAME_EXCL);
+#elif defined(__SWITCH__)
+    return rename(temp.c_str(), path.c_str());
 #else
     errno = ENOSYS;
     return -1;
 #endif
 }
 
+#ifdef __SWITCH__
+// Horizon's rename cannot replace an existing file. Keep the old contents at a unique name while
+// publishing the new file; an interruption can leave either file under that name.
+int RenameReplacing(const fs::path &temp, const fs::path &path) {
+    fs::path backup = TempPath(path);
+    bool     moved = rename(path.c_str(), backup.c_str()) == 0;
+    if (!moved && errno != ENOENT) {
+        return -1;
+    }
+    if (rename(temp.c_str(), path.c_str()) != 0) {
+        if (moved && rename(backup.c_str(), path.c_str()) != 0) {
+            std::fprintf(stderr, "files: previous contents remain at %s; could not restore %s\n", backup.c_str(),
+                         path.c_str());
+        }
+        return -1;
+    }
+    if (moved) {
+        Remove(backup);
+    }
+    return 0;
+}
+#endif
+
 FilesResult Commit(const fs::path &temp, const fs::path &path, bool replace) {
     if (replace) {
+#ifdef __SWITCH__
+        if (RenameReplacing(temp, path) != 0) {
+            return FilesResult::kFailed;
+        }
+#else
         if (rename(temp.c_str(), path.c_str()) != 0) {
             return FilesResult::kFailed;
         }
+#endif
     } else if (RenameExclusive(temp, path) != 0) {
         if (Taken()) {
             return FilesResult::kExists;

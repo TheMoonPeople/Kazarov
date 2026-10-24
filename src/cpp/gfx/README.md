@@ -26,13 +26,35 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
   `--offscreen` forces it.
 - `RendererResize()` after the window's pixel size changes (`WindowPollEvents` does it); the
   swapchain and main target follow at the next `BeginFrame`. Main-target contents are lost.
-- Single-threaded: call everything from one thread.
+- Threads: the caller and the device worker split the work; see Threads below.
 - Textures, palettes, meshes and render targets can be created, updated and destroyed at any time,
   inside or outside a frame. Destruction is deferred until the GPU is done with them; a handle is
   dead as soon as it is destroyed outside a recording (handles carry a generation). When the texture
   or mesh table is full, a create outside a frame or recording first runs the pending destructions.
   The table sizes are the build maximums, which `RendererConfig::texture_slots` and `mesh_slots`
   can lower (for tests).
+
+## Threads
+
+- Three modes, from `RendererConfig::render_thread` or `KZ_RENDER_THREAD=off|lockstep|async` (the
+  variable wins): Off (default) runs everything on the caller; Lockstep and Async run device work on
+  a worker. Android is always Off.
+- Device-thread rule: device work runs on the worker. Recording stays on the caller. A public call
+  that touches the device is forwarded to the worker and waited for, or run inline when the caller
+  is the worker or holds a `RenderLease`.
+- `RenderLease` parks the worker and holds it off the device, so the holder runs device work inline.
+  The game holds one per tick around its canonical render and other per-tick device work.
+- Idle hook (`SetRenderIdleHook`, Async only): the worker calls it when the queue is empty and no
+  lease is wanted. It runs on the worker and must only call `gfx` functions. Its return value is how
+  long the worker sleeps before calling it again; zero calls again at once. `WakeRenderThread` and
+  any dispatch or lease end the sleep early.
+- The worker never recreates the swapchain. A display frame from the idle hook that finds the
+  swapchain out of date or pending a resize fails and leaves the swapchain to the game thread's next
+  recording.
+- A stale handle to a slot the worker reuses for a grab twin resolves to nothing, because the
+  generation no longer matches.
+- `KZ_GFX_THREAD_CHECKS` (on in builds without `NDEBUG`) makes every device function fail fast when called off the device thread.
+- A GPU timestamp zone must begin and end on one thread, so the frame upload zone is only recorded in Off.
 
 ## Spaces
 
@@ -229,6 +251,29 @@ otherwise a colourless pipeline per family, texture mode and alpha test (18) is 
 partial mask writes every channel. `RendererConfig::dynamic_color_write_mask = false` forces that
 path.
 
+## Depth coverage
+
+A 2D draw with `DrawState::depth_coverage` set to 1 to `kCoveragePlanes` (8) reads the main depth
+buffer instead of testing it. Its colour and alpha, after the texture function, are scaled by the
+fraction of `coverage_depths[0, depth_coverage)` at or nearer than the depth at the pixel (GEqual's
+comparison, 1 near). That is the image a stack of depth-tested draws at those depths makes, each
+adding its share: Chronicle's heat haze accumulates the frame beyond eight planes that way, and on
+the Switch eight blended full-screen draws per image cost 5 to 9 ms where this one costs under 1.
+
+- The draw goes into the main target or a target sharing its depth (anything else is refused with
+  a message), from an RGBA texture, as 2D triangles. It is unblended and has no fog, depth test,
+  depth write, alpha test or stencil test, whatever the state says.
+- The rendering it draws in has no depth attachment: the main or display depth buffer is moved to
+  `DEPTH_STENCIL_READ_ONLY_OPTIMAL` and sampled through a depth-only view at `kMainDepthSlot` or
+  `kDisplayDepthSlot`, the slots after `kPreviousFrame`, and put back to rest as an attachment when
+  that rendering ends. The next draw that needs the attachment begins a rendering of its own.
+- `draw.frag` takes it as a third specialisation constant, `kDepthCoverage`: the depth slot rides
+  in `palette_slot` and the plane count in `fog_color`, since such a draw has no palette or fog, and
+  the depths in `per_draw`, the eight floats that otherwise carry the draw's precomputed fog colour,
+  blend factor and TA0 (below).
+- It needs a depth format the device can sample (`ActiveRendererFeatures().depth_coverage`);
+  without one there is no pipeline for it and a caller draws the planes one by one.
+
 ## Ordering
 
 Everything happens in the order it was called. An update or copy into a texture or mesh the
@@ -245,7 +290,8 @@ above), all created in `RendererInit` on up to eight threads against the pipelin
 `RendererConfig::prog0_meshes` two more mesh families (Vu_prog0 and Vu_prog0 skinned, one vertex
 specialisation constant apart) give 5 x 28 x 3 x 2 = 840 pipelines (870 without a dynamic colour
 write mask); without it the families stop after the plain mesh family, so a renderer that does not
-ask builds exactly the 504 (522) it always did, at the same indices. Depth
+ask builds exactly the 504 (522) it always did, at the same indices. A device that samples its
+depth format adds the depth coverage pipeline after all of them (above). Depth
 test, depth write, compare op, the whole stencil state, cull mode, front face, viewport, scissor
 and topology within a class are dynamic state, so they add none. The cache file is checked against the device before use and written through a temporary
 file and a rename.
@@ -253,15 +299,21 @@ file and a rename.
 ## Dark Chronicle's Vu_prog0 meshes
 
 `DrawMeshProg0` and `DrawMeshImmediateProg0` draw through `shaders/mesh_prog0.vert`, taking the
-game's `Prog0Constants` beside the `MeshConstants` (which reads only `mvp` of them). The block is a
-separate per-draw uniform at set 2, so Chronicle's `MeshConstants` stay 400 bytes and its pipeline
-layout is unchanged. `Prog0Constants` is the VU1 memory the game writes: `model_world`, the four
+game's `Prog0Constants` beside the `MeshConstants` (which reads only `mvp` of them). Both are records in
+storage-buffer arrays at set 1 (binding 0 for `MeshConstants`, binding 1 for `Prog0Constants`), one set of
+arrays per transient chunk, bound once per chunk. A skinned draw also carries its `Prog0Palette`, the 32
+bone matrices, as a record at binding 2 that only skinned draws use; a skinned draw without one uses
+identity bones. Each draw's record indices travel in push constants (`PushConstants::mesh_index`,
+`prog0_index` and `palette_index`), so Chronicle's `MeshConstants` stay 400 bytes and plain and prog0 draws
+share one pipeline layout. `Prog0Constants` is the VU1 memory the game writes: `model_world`, the four
 world light directions as x/y/z rows, the light colours, ambient times object alpha, object colour,
 the eye in object space, the clip-or-view block, material diffuse and specular with the exponent,
-four point lights relative to the object origin with their power, the fog quadword (0x3B) and the
-32 bone slots. It is in the VU's units: colours on 128 = 1.0, the material on 1.0. The game copies
+four point lights relative to the object origin with their power, and the fog quadword (0x3B). It is in
+the VU's units: colours on 128 = 1.0, the material on 1.0. The game copies
 what its render-info packet would upload instead of converting units. A display list records the
-block with its draw, and replays it as recorded.
+block with its draw, and replays it as recorded; a skinned draw's palette is recorded beside it. The face
+bits arrive in push constants instead (`PushConstants::face`, from `DrawState::prog0_face`); the block's
+`pad0` is padding.
 
 Dispatch follows the program. The matcap (`kProg0RefSphere`, 0x100) takes its UV from the unblended
 normal. Skinning (0x040) blends the vertices through the bone slots. Then, unless the face is
@@ -291,6 +343,10 @@ Retail quirks kept on purpose, with the spec's names: O-4 (a negative point powe
 magnitude), O-8 (influence 3's normal takes column 1 for its z term), O-9 (the matcap ignores
 skinning), O-10 (the add step's alpha is 128 x vertex alpha squared), O-11 (the exponent is
 2^(n+1), r^16 for the game's 3).
+
+## Transient memory
+
+Transient chunks prefer device-local host-visible memory (ReBAR or unified memory), each in its own allocation capped at a quarter of that heap, and fall back to host memory when there is none, the cap is reached or the driver refuses the allocation. `KZ_TRANSIENT_MEMORY=host` keeps them in host memory for A/B measurement.
 
 ## Readback
 
@@ -336,7 +392,7 @@ renders one.
   its destination (the destination's contents with the grab laid over them), and the draws and
   target changes that follow use the twin, so what is drawn back from the grab (the depth of
   field's blurred bands, the water) lines up with the interpolated scene. The destination itself
-  keeps the canonical grab. With `options.present` it is presented and becomes what `ReadbackFrame` reads. A list
+  keeps the canonical grab. A display frame copies the destination into its twin before the first re-grab only when the grab does not cover the whole destination. With `options.present` it is presented and becomes what `ReadbackFrame` reads. A list
   that draws to the main target before clearing its logical frame starts from the canonical image.
   Display renders are refused once an immediate frame has followed the canonical render (the
   loading screen took the window). `options.overlay` names a second list whose drawing entries run
@@ -406,8 +462,8 @@ renders one.
   vertices are the same grid points in world space, under an identity model, every tick. The shadow
   volumes must not: they are rebuilt in each tick's eye space, so a vertex of one tick is not the
   same point as that vertex of the next.
-  A matched Prog0 draw (`DrawMeshProg0`, `DrawMeshImmediateProg0`) has its 32-bone model-space
-  palette (`Prog0Constants::bones`) blended per bone: translation lerped, rotation slerped from the
+  A matched skinned Prog0 draw (`DrawMeshProg0`, `DrawMeshImmediateProg0` with a `Prog0Palette`) has its
+  32-bone model-space palette blended per bone: translation lerped, rotation slerped from the
   Gram-Schmidt rotation, scale and shear lerped in that rotation's frame. A bone that moved further
   than the draw's teleport distance keeps the newest pose. `no_interpolation` and `CutInterpolation()`
   apply as for other draws. The rest of the block follows the interpolated model and camera:
@@ -463,7 +519,8 @@ Nothing the renderer calls was introduced by Vulkan 1.4, so 1.3 is the floor:
 | `synchronization2` (`vkCmdPipelineBarrier2`, `vkQueueSubmit2`, the `*_2` stages and accesses) | 1.3 feature |
 | Cull mode, front face, topology, depth test/write/compare, stencil test and ops as dynamic state | 1.3 core (no feature bit) |
 | `D32_SFLOAT_S8_UINT` or `D24_UNORM_S8_UINT` as an attachment that copies both ways | format support |
-| `maxPushConstantsSize` of 56 bytes | 1.0 limit (128 guaranteed) |
+| `maxPushConstantsSize` of 72 bytes | 1.0 limit (128 guaranteed) |
+| `maxStorageBufferRange` of 8 MiB and `maxPerStageDescriptorStorageBuffers` of 3 | 1.0 limits (128 MiB and 4 guaranteed) |
 | `VK_KHR_swapchain` and a graphics queue that presents to the window | not when offscreen |
 
 Optional, used when present:
@@ -496,6 +553,24 @@ rotation to the compositor; the SUBOPTIMAL results that rotation reports keep th
 surface's capabilities are unchanged. A surface lost while the app is in the background is dropped
 with its swapchain and made again on a later frame. Errors also go to the system log.
 
+## Profiling
+
+Kazarov's renderer instrumentation is compiled in with the `KZ_PORT_TRACY` CMake option, which links `Tracy::TracyClient` into the host library. Without it the macros in `gfx/profile.hpp` compile to nothing. At run time zones record only while `gfx::profile::SetEnabled(true)` is set (the host sets it from its debug-mode gate) and a profiler is connected.
+
+- `KZ_PROFILE_ZONE` and `KZ_PROFILE_PLOT` are CPU zones and plots.
+- `KZ_PROFILE_GPU_ZONE(cmd, name)` scopes a GPU timestamp zone. `KZ_PROFILE_GPU_BEGIN` and `KZ_PROFILE_GPU_END` open and close one across functions (dynamic rendering spans).
+- The GPU context is created in `RendererInit` on the graphics queue and collected when a frame slot's command buffer begins, after its fence wait.
+- GPU zones may only be recorded into command buffers that are always submitted. Tracy reads queries in order, so an unsubmitted one stalls every later GPU zone.
+
+Plots, reset each frame:
+
+- `Kazarov mesh draws`
+- `Kazarov 2D draws`
+- `Kazarov descriptor binds`
+- `Kazarov grab copies`
+- `Kazarov grab pre-copies`
+- `Kazarov transient bytes`
+
 ## Not done here
 
 - DATE/DATM (destination alpha test; `clsmes.cpp` MakeFukidashi) is not emulated; a stencil pass
@@ -522,3 +597,18 @@ also CPU-only. Existing renderer/texture GPU families retain their existing excl
 A consumer that previously excluded only `^(GfxMisc|TexDecode)\.` must add
 `|(^|/)GfxGpu` to its CTest exclusion before adopting this dependency, or label
 this family and use `-LE gpu`. CPU display-list coverage continues to run.
+
+## Per-draw values in push constants
+
+`draw.frag` reads nothing per draw that it would have to decode: on the Switch's GPU (Maxwell, through
+NVK) integer conversions and variable shifts are slow, and in a busy town a few of them per pixel
+cost milliseconds. `PushConstants::per_draw` holds the fog colour as floats, FIX / 0x80, whether C is
+FIX, the source transform and TA0 / 0x80, and `alpha` bits 11 to 13 the alpha test's verdict on less,
+equal and greater for the draw's function.
+
+The fog's per-draw terms come the same way (`fog_mode`, `fog_line`) rather than from every vertex:
+a mesh's limits, mode and constant F, and its unlimited F as `a + b / w`, which the fragment
+shader works out exactly from `gl_FragCoord.w` (perspective-correct interpolation of `a w + b`
+divided by `w` is `a + b / w` at the pixel). The vertex shaders pass three fog values, the weighted
+F, the near/eye blend weight and the weight, where they passed eight. The block is 128 bytes,
+Vulkan's guaranteed size.

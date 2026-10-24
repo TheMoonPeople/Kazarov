@@ -4,17 +4,18 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <utility>
 #include <vector>
 
 #include "gfx/gfx.hpp"
+#include "kazarov/log.hpp"
 
 namespace {
 
 // Android shows the window fullscreen at the display's size, whatever is asked.
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__SWITCH__)
 constexpr bool kFixedWindow = true;
 #else
 constexpr bool kFixedWindow = false;
@@ -24,7 +25,7 @@ SDL_Window                              *g_window = nullptr;
 bool                                     g_headless = false;
 bool                                     g_mode_event = false;
 std::vector<void (*)(const SDL_Event &)> g_hooks;
-WindowIdentity                          g_identity;
+WindowIdentity                           g_identity;
 
 void ApplyIcon() {
     if (g_identity.icon_rgba == nullptr) {
@@ -39,13 +40,13 @@ void ApplyIcon() {
 }
 
 [[noreturn]] void Fatal(const char *what) {
-    std::fprintf(stderr, "%s: %s\n", what, SDL_GetError());
+    kz::Fatal("window", std::format("{}: {}", what, SDL_GetError()), /*unimplemented=*/false);
     std::exit(1);
 }
 
 void Check(bool ok, const char *what) {
     if (!ok) {
-        std::fprintf(stderr, "window: %s: %s\n", what, SDL_GetError());
+        kz::Logf(kz::LogLevel::Warning, "window", "{}: {}", what, SDL_GetError());
     }
 }
 

@@ -18,9 +18,27 @@ FetchContent_MakeAvailable(corrosion)
 
 get_filename_component(KZ_RUST_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/../Cargo.toml" ABSOLUTE)
 corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core)
+# Keep the build's seed separate from a completed extraction in the build directory.
+set(KZ_GAMEPLAY_ARCHIVE "${CMAKE_BINARY_DIR}/assets/data.zip")
+corrosion_set_env_vars(kazarov_core "KAZAROV_GAMEPLAY_ARCHIVE=${KZ_GAMEPLAY_ARCHIVE}")
+include(GNUInstallDirs)
+install(FILES "${KZ_GAMEPLAY_ARCHIVE}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+include("${CMAKE_CURRENT_LIST_DIR}/KazarovFfmpeg.cmake")
+kz_ffmpeg(kazarov_core INTERFACE)
+if(DEFINED KAZAROV_GAMEPLAY_ROOT)
+    corrosion_set_env_vars(kazarov_core "KAZAROV_GAMEPLAY_ROOT=${KAZAROV_GAMEPLAY_ROOT}")
+else()
+    get_filename_component(KZ_GAMEPLAY_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../port/gameplay" ABSOLUTE)
+    if(EXISTS "${KZ_GAMEPLAY_ROOT}/character_clips.json")
+        corrosion_set_env_vars(kazarov_core "KAZAROV_GAMEPLAY_ROOT=${KZ_GAMEPLAY_ROOT}")
+    endif()
+endif()
 find_program(KZ_FFMPEG_EXECUTABLE NAMES ffmpeg.exe ffmpeg HINTS "${KZ_FFMPEG_DIR}/bin")
 if(KZ_FFMPEG_EXECUTABLE)
     corrosion_set_env_vars(kazarov_core "KAZAROV_FFMPEG=${KZ_FFMPEG_EXECUTABLE}")
+endif()
+if(KZ_FFMPEG_DIR)
+    corrosion_set_env_vars(kazarov_core "KAZAROV_FFMPEG_INCLUDE=${KZ_FFMPEG_DIR}/include" "KAZAROV_FFMPEG_LIB=${KZ_FFMPEG_DIR}/lib")
 endif()
 corrosion_add_cxxbridge(kazarov_bridge CRATE kazarov_core FILES rust/lib.rs)
 
@@ -33,4 +51,7 @@ elseif(APPLE)
         "-framework AppKit" "-framework Carbon" "-framework CoreFoundation" "-framework CoreGraphics"
         "-framework CoreVideo" "-framework Foundation" "-framework IOKit"
         "-framework OpenGL" "-framework QuartzCore" "-framework UniformTypeIdentifiers" objc)
+    # Corrosion adds the Command Line Tools SDK's usr/lib by a fixed path for Rust's native libraries (System, c, m).
+    # The link's own sysroot supplies them, and a CLT SDK newer than the selected linker is unreadable to it.
+    set_property(TARGET kazarov_core-static PROPERTY INTERFACE_LINK_DIRECTORIES "")
 endif()

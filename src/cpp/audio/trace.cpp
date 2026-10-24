@@ -3,6 +3,7 @@
 #include <cstdarg>
 #include <cstdio>
 
+#include "kazarov/log.hpp"
 #include "platform/settings.hpp"
 
 namespace audio {
@@ -24,7 +25,7 @@ void Trace(const char *format, ...) {
     va_start(args, format);
     std::vsnprintf(line, sizeof(line), format, args);
     va_end(args);
-    std::fprintf(stderr, "audio: %s\n", line);
+    kz::Log(kz::LogLevel::Debug, "audio", line);
 }
 
 } // namespace audio

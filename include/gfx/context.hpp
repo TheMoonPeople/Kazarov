@@ -6,10 +6,19 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gfx/gfx.hpp"
 #include "gfx/requirements.hpp"
+
+#ifdef KZ_PORT_TRACY
+#include <tracy/TracyVulkan.hpp>
+#endif
+
+#ifndef NDEBUG
+#define KZ_GFX_THREAD_CHECKS 1
+#endif
 
 namespace gfx::detail {
 
@@ -22,7 +31,10 @@ inline constexpr uint32_t kAnisotropyLevels = 4;
 inline constexpr uint32_t kSamplerCount = kBaseSamplerCount + kAnisotropyLevels * 4;
 inline constexpr uint32_t kMaxMeshes = 65535;
 inline constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
-inline constexpr uint32_t kFirstUserSlot = 3;
+// Slots 3 and 4 hold the main and display depth buffers' depth, for DrawState::depth_coverage.
+inline constexpr uint32_t kMainDepthSlot = 3;
+inline constexpr uint32_t kDisplayDepthSlot = 4;
+inline constexpr uint32_t kFirstUserSlot = 5;
 
 [[noreturn]] void Fatal(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void              Error(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -68,6 +80,8 @@ struct ImageState {
 struct Image {
     VkImage            image = VK_NULL_HANDLE;
     VkImageView        view = VK_NULL_HANDLE;
+    // A sampled depth image's view of its depth alone.
+    VkImageView        depth_view = VK_NULL_HANDLE;
     Allocation         memory;
     VkFormat           format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspect = 0;
@@ -88,6 +102,10 @@ void       Transition(VkCommandBuffer cmd, Image &image, const ImageState &to);
 void       ToRest(VkCommandBuffer cmd, Image &image);
 ImageState TransferSrc();
 ImageState TransferDst();
+// A depth image a depth_coverage draw samples: read-only, by fragment shaders.
+ImageState DepthSampled();
+// The main and display depth buffers' depth views into kMainDepthSlot and kDisplayDepthSlot.
+void WriteDepthDescriptors();
 
 // ---- Resources -------------------------------------------------------------------------------
 
@@ -106,6 +124,20 @@ struct Texture {
     uint64_t last_draw_use = 0;
     // The recording that owns destruction: only it may record further uses, but replays stay live.
     const DisplayList *doomed = nullptr;
+    // RendererConfig::expand_palettes, for index textures and palettes: the texels last uploaded,
+    // mip by mip, and a count of the uploads. Empty once the image is written any other way.
+    std::vector<std::vector<uint8_t>> contents;
+    uint32_t                          contents_version = 0;
+};
+
+// An index texture and palette pair's RGBA expansion (RendererConfig::expand_palettes).
+struct Expansion {
+    TextureHandle rgba = kNullTexture;
+    uint32_t      index_version = 0;
+    uint32_t      palette_version = 0;
+    uint64_t      expanded = 0; // frame serial
+    uint32_t      churn = 0;    // re-expansions each soon after the last
+    uint64_t      lookup_until = 0; // frame serial before which the pair keeps the shader lookup
 };
 
 struct Mesh {
@@ -121,18 +153,23 @@ struct Mesh {
 struct TransientChunk {
     Buffer          buffer;
     VkDeviceSize    used = 0;
-    // The chunk's MeshConstants at set 1, allocated once the chunk first holds a MeshConstants.
+    // Its memory is device-local and counts against the device-local transient cap.
+    bool            device_local = false;
+    // The chunk's constant records at set 1, allocated once the chunk first holds a record.
     VkDescriptorSet constants_set = VK_NULL_HANDLE;
-    // The chunk's Prog0Constants at set 2, likewise; only with RendererConfig::prog0_meshes.
-    VkDescriptorSet prog0_set = VK_NULL_HANDLE;
 };
 
 struct TransientSpan {
-    VkBuffer        buffer;
-    VkDeviceSize    offset;
-    uint8_t        *data;
-    // The chunk's uniform block set; only from AllocateConstants.
+    VkBuffer     buffer;
+    VkDeviceSize offset;
+    uint8_t     *data;
+};
+
+// A record in the current chunk: its set, its index in that chunk's array, and where to write it.
+struct ConstantRecord {
     VkDescriptorSet set;
+    uint32_t        index;
+    uint8_t        *data;
 };
 
 struct DepthQuery {
@@ -197,6 +234,28 @@ struct BoundState {
     VkDeviceSize vertex_offset = 0;
 };
 
+// The constant records the draw command buffer has bound at set 1, so an identical next draw skips the upload.
+struct BoundConstants {
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet  set = VK_NULL_HANDLE; // the chunk set bound at set 1
+    bool             mesh_valid = false;
+    bool             prog0_valid = false;
+    bool             palette_valid = false;
+    // Only valid during a display list replay, whose blocks sit still; otherwise the source is a temporary.
+    const void      *mesh_source = nullptr;
+    const void      *prog0_source = nullptr;
+    const void      *palette_source = nullptr;
+    MeshConstants    mesh;
+    Prog0Constants   prog0;
+    Prog0Palette     palette;
+    VkDescriptorSet  mesh_set = VK_NULL_HANDLE;    // chunk set holding the bound mesh record
+    VkDescriptorSet  prog0_set = VK_NULL_HANDLE;   // chunk set holding the bound prog0 record
+    VkDescriptorSet  palette_set = VK_NULL_HANDLE; // chunk set holding the bound palette record
+    uint32_t         mesh_index = 0;
+    uint32_t         prog0_index = 0;
+    uint32_t         palette_index = 0;
+};
+
 struct BlendMapping {
     uint16_t slot;      // index into the precompiled blend states
     uint8_t  transform; // what the shader writes as source colour, kSourceTransform*
@@ -219,7 +278,23 @@ struct PushConstants {
     uint32_t flags;
     uint32_t alpha; // ref 0-7, func 8-10, fix 16-23, ta0 24-31
     uint32_t fog_color;
+    uint32_t face; // Prog0Face bits of a prog0 mesh draw
+    uint32_t mesh_index;  // record of the draw's MeshConstants in its chunk's array
+    uint32_t prog0_index; // record of the draw's Prog0Constants, prog0 draws only
+    uint32_t palette_index; // record of a skinned draw's Prog0Palette, skinned draws only
+    // draw.frag alone declares what follows. What the draw's flags and alpha give, worked out once
+    // here rather than per pixel (on the Switch's GPU the conversions cost more than the work they
+    // fed): fog colour rgb, FIX / 0x80, 1 where C is FIX, 1 for transform 1, 1 for transform 2, and
+    // TA0 / 0x80. A depth_coverage draw's planes instead (DrawState::coverage_depths).
+    float per_draw[kCoveragePlanes];
+    // The fog's per-draw terms, the same at every vertex of a draw: near and far limits, mode (-2
+    // constant, -1 direct 2D, 0 DC1 mesh, 1 DC2 prog0) and the constant F (fog_mode); and the
+    // unlimited F as fog_line[0] + fog_line[1] / w, which draw.frag works out from gl_FragCoord.w.
+    float fog_mode[4];
+    float fog_line[2];
 };
+// Vulkan's guaranteed push constant size, which Android's drivers keep to.
+static_assert(sizeof(PushConstants) == 128);
 
 enum PushFlags : uint32_t {
     kPushFog = 1u << 0,
@@ -254,6 +329,16 @@ enum TextureMode : uint32_t {
     kTextureModeCount,
 };
 
+// Per-frame renderer work counts, plotted to the profiler when a frame closes.
+struct FrameCounters {
+    uint32_t mesh_draws = 0;
+    uint32_t draws_2d = 0;
+    uint32_t grab_copies = 0;
+    uint32_t grab_precopies = 0;
+    uint32_t descriptor_binds = 0;
+    uint64_t transient_bytes = 0;
+};
+
 struct Context {
     SDL_Window                      *window = nullptr;
     RendererConfig                   config;
@@ -279,7 +364,6 @@ struct Context {
     uint32_t                      anisotropy_level = 0;
     PFN_vkCmdSetColorWriteMaskEXT cmd_set_color_write_mask = nullptr;
     Swapchain                     swapchain;
-    bool                          resize_pending = false;
 
     std::array<Frame, kFramesInFlight> frames;
     uint32_t                           frame_slot = 0;
@@ -298,28 +382,37 @@ struct Context {
     VkSampler                    samplers[kSamplerCount] = {};
     VkDescriptorSetLayout        texture_set_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout        constants_set_layout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout        prog0_set_layout = VK_NULL_HANDLE;
     VkDescriptorPool             texture_pool = VK_NULL_HANDLE;
     VkDescriptorPool             constants_pool = VK_NULL_HANDLE;
-    VkDescriptorPool             prog0_descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet              texture_set = VK_NULL_HANDLE;
     VkPipelineLayout             pipeline_layout = VK_NULL_HANDLE;
-    VkPipelineLayout             prog0_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineCache              pipeline_cache = VK_NULL_HANDLE;
     std::vector<VkPipeline>      pipelines;
     uint32_t                     blend_slot_count = 0;
+    uint16_t                     premultiplied_slot = 0; // DrawState::premultiplied's blend state
     std::array<BlendMapping, 81> blend_map = {};
     double                       pipeline_seconds = 0.0;
 
     std::vector<Texture>                              textures;
     std::map<std::string, TextureHandle, std::less<>> named_targets;
     std::vector<uint32_t>                             free_texture_slots;
+    std::unordered_map<uint64_t, Expansion>           expansions; // by index texture << 32 | palette
+    uint64_t                                          expansion_frame = 0;
+    size_t                                            expansion_texels = 0; // in expansion_frame
     std::vector<Mesh>                                 meshes;
     std::vector<uint32_t>                             free_mesh_slots;
 
     TextureHandle target = kMainTarget;
     bool          rendering = false;
+    // The rendering in progress has no depth attachment: a depth_coverage draw samples it.
+    bool          rendering_samples_depth = false;
+    Image        *sampled_depth = nullptr;
+    // The device samples depth_format, so depth_coverage draws have their pipeline.
+    bool          depth_sampling = false;
+    uint32_t      coverage_pipeline = 0;
     BoundState    bound;
+
+    BoundConstants bound_constants;
 
     std::array<DepthQuery, kDepthQueryCount> depth_queries;
 
@@ -334,23 +427,53 @@ struct Context {
     bool                         interp_no_interpolation = false;
     float                        interp_teleport_distance = INFINITY;
     bool                         interp_blend_vertices = false;
-    bool                         replaying = false;
-    bool                         display_pass = false;
-    // Errors are reported by the canonical render; display renders of the same list stay quiet.
-    uint32_t interpolation_tint = 0; // display replay only, packed into push flags bits 8-10
-    bool  quiet = false;
-    // The list being replayed is the host's own 2D, which the full-frame rule leaves as drawn.
-    bool  host_draws = false;
     Image display_color;
     Image display_depth;
     // The newest main_color image is a canonical render no immediate frame has followed.
     bool canonical_newest = false;
     bool presented_display = false;
 
-    uint32_t validation_messages = 0;
+    FrameCounters counters;
+
+#ifdef KZ_PORT_TRACY
+    tracy::VkCtx                       *tracy_vk = nullptr;      // GPU timestamp context on the graphics queue
+    // Unique pointers rather than optionals: VkCtxScope is not assignable, and Context is assigned in RendererInit.
+    std::unique_ptr<tracy::VkCtxScope> rendering_zone;           // open dynamic-rendering span
+    std::unique_ptr<tracy::VkCtxScope> upload_zone;              // open frame upload command buffer
+#endif
 };
 
 extern Context g;
+
+// Flags a thread sets around its own replay or frame; the other thread must never see them.
+// quiet: errors are reported by the canonical render, so display renders of the same list stay quiet.
+// host_draws: the list being replayed is the host's own 2D, which the full-frame rule leaves as drawn.
+// interpolation_tint: display replay only, packed into push flags bits 8-10.
+struct ThreadFlags {
+    bool     replaying = false;
+    bool     display_pass = false;
+    bool     quiet = false;
+    bool     host_draws = false;
+    bool     in_idle_hook = false;
+    uint32_t interpolation_tint = 0;
+};
+
+extern thread_local ThreadFlags tls;
+
+// thread.cpp
+// Runs fn on the device thread: inline when the caller is one, else queued to the worker and waited for.
+void RunOnRenderThread(const std::function<void()> &fn);
+void Dispatch(std::function<void()> fn);
+// Waits until the worker has run every queued command.
+void Drain();
+// The worker exists and this is it.
+bool OnWorkerThread();
+// OnRenderThread(), also true before StartRenderThread and after StopRenderThread; what device calls assert.
+bool DeviceThreadAllowed();
+void StartRenderThread(RenderThreadMode mode);
+void StopRenderThread();
+// Fatal unless DeviceThreadAllowed(). Compiled to nothing unless KZ_GFX_THREAD_CHECKS.
+void AssertDeviceThread(const char *what);
 
 // renderer.cpp
 // Frames of RenderList: a canonical one draws into main_color and harvests depth queries, a
@@ -359,6 +482,8 @@ extern Context g;
 bool OpenListFrame(bool canonical, bool present, bool base);
 // The main targets take the window's size before a tick records draws laid out for them.
 void            PrepareRecording();
+// PrepareRecording, dispatched only when it has work; callable from the game thread while it records.
+void            PrepareRecordingFromCaller();
 void            CloseListFrame(bool canonical, bool present);
 Frame          &CurrentFrame();
 VkCommandBuffer UploadCommands();
@@ -378,11 +503,13 @@ Image   &PreviousFrameImage();
 uint32_t PreviousFrameSlot();
 void     CreateMainTargets();
 void     DestroyMainTargets();
+// Whether a game frame is open between OpenFrame and its submit or present (not an idle-hook frame).
+bool GameFrameOpen();
 
 // memory.cpp
 TransientSpan AllocateTransient(VkDeviceSize size, VkDeviceSize alignment);
-// A MeshConstants block, or a Prog0Constants one when prog0, with the set that binds it.
-TransientSpan AllocateConstants(bool prog0);
+// A record of MeshConstants or Prog0Constants (stride bytes) in the current chunk.
+ConstantRecord AllocateConstantRecord(VkDeviceSize stride);
 // The source of a copy into a buffer or image.
 TransientSpan AllocateStaging(VkDeviceSize size);
 void          ResetTransients(Frame &frame);
@@ -409,6 +536,11 @@ bool           FrameShaped(const Texture &texture);
 bool FullHeightFrame(const Texture &texture);
 // What DestroyTexture and DestroyMesh do once no list may draw the resource any more.
 void DestroyDoomedTexture(TextureHandle handle);
+// The RGBA expansion to draw the pair from, made or remade now if it must be; kNullTexture keeps
+// the shader lookup. May add texture slots, so earlier Texture pointers are stale after it.
+TextureHandle PaletteExpansion(TextureHandle index, TextureHandle palette);
+// The image was written other than by an upload: no expansion is made from it any more.
+void ForgetContents(Texture *texture);
 void DestroyDoomedMesh(MeshHandle handle);
 
 // pipelines.cpp
@@ -427,6 +559,8 @@ VkPipelineLayout PipelineLayoutOf(PipelineFamily family);
 // displaylist.cpp
 // The public resource calls that record instead of executing while a list is recorded.
 bool RecordingCalls();
+// The list being recorded, or nullptr; readable from the worker while the game thread records.
+const DisplayList *RecordingList();
 
 // draw.cpp
 void           EndRendering();

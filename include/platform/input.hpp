@@ -194,6 +194,21 @@ void InputSetKeyboardStickNavigation(bool on);
 void InputSetDeveloperMenu(bool on);
 bool InputDeveloperMenu();
 
+/**
+ * Routes physical typing to an active text field.
+ *
+ * While active, the keys that type a printable
+ * ASCII character, Backspace, Delete and Return no longer press their pad bindings, Return presses
+ * Cross, and each key press (repeats included) queues its character, '\b' for Backspace, '\x7f'
+ * for Delete and '\r' for Return.
+ * It expires after more than two pad reads without a refresh.
+ */
+void InputSetTextEntry(bool on);
+/**
+ * Takes the characters queued since the last call.
+ */
+std::string InputTakeText();
+
 // Takes the pointer's motion and wheel since the last call, live and scripted.
 InputMenuMouse InputTakeMenuMouse();
 
@@ -241,6 +256,11 @@ InputGlyphFamily InputGlyphFamilyForGamepad(int sdl_gamepad_type, unsigned vendo
 
 InputGlyphFamily InputActiveGlyphFamily();
 
+/**
+ * Returns the first gamepad's glyph family independently of the last active input device, defaulting to PS4 before a gamepad is opened.
+ */
+InputGlyphFamily InputGamepadGlyphFamily();
+
 // The first key or mouse button bound to a pad action ("cross", "start", "up"...), named as the
 // glyph table spells them: SDL's scancode name lower-cased with spaces dropped ("space", "return",
 // "leftshift"), or "mouse1" to "mouse5" (left, right, middle, X1, X2). Empty if none is bound.
@@ -251,13 +271,18 @@ std::string InputPrimaryBindingName(std::string_view action);
 int InputScancodeFromName(std::string_view name);
 
 // Keys that drive the port rather than a pad, bound like the pad's actions ("fps_toggle"), which
-// also take Gamepad:<SDL gamepad button name> (Gamepad:guide).
+// also take Gamepad:<SDL gamepad button name> (Gamepad:guide). Their controller buttons are
+// bound apart, as the pad's are (InputBindPadButtons).
 enum class InputHostAction {
     FpsToggle,
     DeveloperMenu,
     DebugMenu,
+    // A game's in-mode debug menu (Dark Cloud 2: R3 with its debug flag on).
+    ModeDebugMenu,
     GyroHold,
     ZoomReset,
+    // A game's quick equipment panel (Dark Cloud 2: the dungeon's quick loadout).
+    QuickLoadout,
 };
 
 // Whether a key, mouse button or gamepad button bound to the action is held, live or scripted.
@@ -290,6 +315,7 @@ struct InputActionInfo {
     std::string_view action;
     bool             host = false;
     bool             whole_axis = false;
+    bool             pad = false; /**< Reports whether the action accepts a separate controller binding. */
 };
 
 // Every action of the binding table, in the order the game reads them.
@@ -312,7 +338,42 @@ void InputBeginBindCapture();
 // only reported when allow_gamepad is set.
 std::string InputTakeBindKey(bool allow_gamepad);
 
-// Whether the source InputTakeBindKey named is held now. A caller that has just bound it keeps
-// swallowing input until it is let go, so the press that made the binding does not also act on the
-// action it was given to.
+/**
+ * Rebinds an action's physical controller sources independently of its keyboard bindings.
+ *
+ * Actions accepting InputActionInfo::pad use SDL names ("a", "dpdown", "leftshoulder",
+ * "paddle1"...) with or without a Gamepad: prefix, and "lefttrigger" or "righttrigger" for the
+ * triggers. Every gamepad presses it. An empty list leaves the action without a button. Returns
+ * false if the action or a name is unknown.
+ */
+bool InputBindPadButtons(std::string_view action, std::span<const std::string_view> buttons);
+
+/**
+ * Returns current or default physical controller buttons for an action using InputBindPadButtons names.
+ *
+ * Unconfigured actions and calls with defaults set use the default layout, which for Select depends on the first
+ * gamepad's make (the touchpad click on a PS4 or PS5 pad, Back on the others; see gamepad_map.hpp).
+ */
+std::vector<std::string> InputPadBindingNames(std::string_view action, bool defaults = false);
+
+/**
+ * Takes a newly pressed controller button or trigger from an active binding capture.
+ *
+ * Returns an InputBindPadButtons name, or "" when none is pressed; keys and mouse buttons are left
+ * to InputTakeBindKey.
+ */
+std::string InputTakeBindPadButton();
+
+/**
+ * Returns the default-layout gamepad action naming the first controller button bound to an action.
+ *
+ * The result names the symbol a prompt shows, such as "circle"
+ * for cross after Cross was rebound to the right face button. The action itself while it has no
+ * controller binding, and "" for a button the DualShock 2 has no counterpart for (a paddle).
+ */
+std::string InputPadGlyphAction(std::string_view action);
+
+// Whether the source InputTakeBindKey or InputTakeBindPadButton named is held now. A caller that
+// has just bound it keeps swallowing input until it is let go, so the press that made the binding
+// does not also act on the action it was given to.
 bool InputBindSourceHeld(std::string_view name);
