@@ -12,6 +12,10 @@
 #include <string_view>
 #include <thread>
 
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
+
 #include "gfx/context.hpp"
 #include "gfx/profile.hpp"
 
@@ -47,6 +51,13 @@ bool HookWanted() {
 
 void WorkerMain() {
     KZ_PROFILE_THREAD("Kazarov render");
+#ifdef __SWITCH__
+    // libnx starts every thread on the process's core, 0, where the game thread runs: the worker
+    // gets core 1 to itself, or it only interleaves with the game.
+    if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, 1, 1u << 1))) {
+        Error("render thread: cannot move to core 1");
+    }
+#endif
     for (;;) {
         std::unique_lock lock(g_mutex);
         g_cv.wait(lock, [] { return g_stop || (!g_queue.empty() && !g_leased) || HookWanted(); });
