@@ -282,9 +282,19 @@ struct PushConstants {
     uint32_t mesh_index;  // record of the draw's MeshConstants in its chunk's array
     uint32_t prog0_index; // record of the draw's Prog0Constants, prog0 draws only
     uint32_t palette_index; // record of a skinned draw's Prog0Palette, skinned draws only
-    // A depth_coverage draw's planes (DrawState::coverage_depths; draw.frag alone declares them).
-    float coverage[kCoveragePlanes];
+    // draw.frag alone declares what follows. What the draw's flags and alpha give, worked out once
+    // here rather than per pixel (on the Switch's GPU the conversions cost more than the work they
+    // fed): fog colour rgb, FIX / 0x80, 1 where C is FIX, 1 for transform 1, 1 for transform 2, and
+    // TA0 / 0x80. A depth_coverage draw's planes instead (DrawState::coverage_depths).
+    float per_draw[kCoveragePlanes];
+    // The fog's per-draw terms, the same at every vertex of a draw: near and far limits, mode (-2
+    // constant, -1 direct 2D, 0 DC1 mesh, 1 DC2 prog0) and the constant F (fog_mode); and the
+    // unlimited F as fog_line[0] + fog_line[1] / w, which draw.frag works out from gl_FragCoord.w.
+    float fog_mode[4];
+    float fog_line[2];
 };
+// Vulkan's guaranteed push constant size, which Android's drivers keep to.
+static_assert(sizeof(PushConstants) == 128);
 
 enum PushFlags : uint32_t {
     kPushFog = 1u << 0,

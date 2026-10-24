@@ -106,8 +106,8 @@ const float kVuMax    = 3.40282347e38;
 
 layout(location = 0) out vec4 v_color;
 layout(location = 1) out vec2 v_uv;
-layout(location = 2) out vec4 v_fog;
-layout(location = 3) flat out vec4 v_fog_mode;
+// draw.frag's v_fog, as mesh.vert's; the fog's per-draw terms come with the draw.
+layout(location = 2) out vec3 v_fog;
 
 out float gl_ClipDistance[6];
 
@@ -247,13 +247,9 @@ void main() {
     // ftoi0 truncates the VU's colour channels.
     v_color = floor(clamp(color, 0.0, 255.0)) / 255.0;
     v_uv = uv;
-    v_fog_mode = vec4(p0.fog.y, p0.fog.z, 1.0, 0.0);
     if (p0.fog.w == 0.0) {
-        // A constant factor needs no perspective correction; clamp before truncating as VU1 does.
-        float fog = floor(max(max(min(p0.fog.x, p0.fog.y), p0.fog.z), 0.0)) / 255.0;
-        v_fog = vec4(fog, 0.0, 0.0, 0.0);
-        v_fog_mode.z = -2.0;
-        v_fog_mode.w = fog;
+        // A constant factor (fog_mode's) needs no perspective correction.
+        v_fog = vec3(0.0);
     } else {
         // Reverse-Z: only near/eye crossings need fresh fog; far-plane vertices retain their F.
         // The full homogeneous norm keeps the weight continuous at z=w=0 with nonzero x/y.
@@ -263,6 +259,6 @@ void main() {
         fog = floor(max(max(min(fog, p0.fog.y), p0.fog.z), 0.0));
         // Retain weighted vertex F and its weight alongside the unlimited homogeneous numerator.
         float weight = max(clip.w, 0.0) * (1.0 - marker);
-        v_fog = vec4(fog * weight, p0.fog.x * clip.w + p0.fog.w, marker, weight);
+        v_fog = vec3(fog * weight, marker, weight);
     }
 }

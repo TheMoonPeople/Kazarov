@@ -269,8 +269,8 @@ the Switch eight blended full-screen draws per image cost 5 to 9 ms where this o
   that rendering ends. The next draw that needs the attachment begins a rendering of its own.
 - `draw.frag` takes it as a third specialisation constant, `kDepthCoverage`: the depth slot rides
   in `palette_slot` and the plane count in `fog_color`, since such a draw has no palette or fog, and
-  the depths in `coverage`, eight floats at the end of the push block (104 bytes) that only
-  `draw.frag` declares.
+  the depths in `per_draw`, the eight floats that otherwise carry the draw's precomputed fog colour,
+  blend factor and TA0 (below).
 - It needs a depth format the device can sample (`ActiveRendererFeatures().depth_coverage`);
   without one there is no pipeline for it and a caller draws the planes one by one.
 
@@ -597,3 +597,18 @@ also CPU-only. Existing renderer/texture GPU families retain their existing excl
 A consumer that previously excluded only `^(GfxMisc|TexDecode)\.` must add
 `|(^|/)GfxGpu` to its CTest exclusion before adopting this dependency, or label
 this family and use `-LE gpu`. CPU display-list coverage continues to run.
+
+## Per-draw values in push constants
+
+`draw.frag` reads nothing per draw that it would have to decode: on the Switch's GPU (Maxwell, through
+NVK) integer conversions and variable shifts are slow, and in a busy town a few of them per pixel
+cost milliseconds. `PushConstants::per_draw` holds the fog colour as floats, FIX / 0x80, whether C is
+FIX, the source transform and TA0 / 0x80, and `alpha` bits 11 to 13 the alpha test's verdict on less,
+equal and greater for the draw's function.
+
+The fog's per-draw terms come the same way (`fog_mode`, `fog_line`) rather than from every vertex:
+a mesh's limits, mode and constant F, and its unlimited F as `a + b / w`, which the fragment
+shader works out exactly from `gl_FragCoord.w` (perspective-correct interpolation of `a w + b`
+divided by `w` is `a + b / w` at the pixel). The vertex shaders pass three fog values, the weighted
+F, the near/eye blend weight and the weight, where they passed eight. The block is 128 bytes,
+Vulkan's guaranteed size.
