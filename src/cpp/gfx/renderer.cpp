@@ -2,22 +2,24 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include <algorithm>
-#include <array>
-#include <chrono>
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
-#if defined(__ANDROID__)
+#ifdef __ANDROID__
 #include <android/log.h>
 #endif
 
 #include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
+#include "gfx/profile.hpp"
+#include "kazarov/log.hpp"
 
 namespace gfx {
 
@@ -25,40 +27,52 @@ namespace detail {
 
 Context g;
 
+namespace {
+
+// Validation and performance messages seen, from any thread the driver reports on.
+std::atomic<uint32_t> g_validation_messages{0};
+// The swapchain or surface must be made again before the next frame.
+std::atomic<bool> g_resize_pending{false};
+// Set by a game frame's OpenFrame, not by the idle hook's frames.
+std::atomic<bool> g_game_frame_open{false};
+
+// Formats a message, writes it to the Android system log, where stderr is not shown, and returns it.
+std::string Format([[maybe_unused]] bool fatal, const char *format, std::va_list args) {
+    std::va_list size_args{};
+    va_copy(size_args, args);
+    int size = std::vsnprintf(nullptr, 0, format, size_args);
+    va_end(size_args);
+    std::string message(static_cast<std::size_t>(std::max(size, 0)), '\0');
+#ifdef __ANDROID__
+    std::va_list log_args{};
+    va_copy(log_args, args);
+    __android_log_vprint(fatal ? ANDROID_LOG_ERROR : ANDROID_LOG_WARN, "gfx", format, log_args);
+    va_end(log_args);
+#endif
+    std::vsnprintf(message.data(), message.size() + 1, format, args);
+    return message;
+}
+
+} // namespace
+
 void Fatal(const char *format, ...) {
     std::va_list args;
     va_start(args, format);
-#if defined(__ANDROID__)
-    std::va_list log_args;
-    va_copy(log_args, args);
-    __android_log_vprint(ANDROID_LOG_ERROR, "ChronicleGfx", format, log_args);
-    va_end(log_args);
-#endif
-    std::fputs("gfx: ", stderr);
-    std::vfprintf(stderr, format, args);
-    std::fputc('\n', stderr);
+    std::string message = Format(true, format, args);
     va_end(args);
+    kz::Fatal("gfx", message, /*unimplemented=*/false);
     std::exit(1);
 }
 
 void Error(const char *format, ...) {
-#if !defined(__ANDROID__)
-    if (g.quiet) {
+    if (tls.quiet) {
         return;
     }
-#endif
     std::va_list args;
     va_start(args, format);
-#if defined(__ANDROID__)
-    std::va_list log_args;
-    va_copy(log_args, args);
-    __android_log_vprint(ANDROID_LOG_WARN, "ChronicleGfx", format, log_args);
-    va_end(log_args);
-#endif
-    std::fputs("gfx: ", stderr);
-    std::vfprintf(stderr, format, args);
-    std::fputc('\n', stderr);
+    std::string message = Format(false, format, args);
     va_end(args);
+    kz::Log(kz::LogLevel::Error, "gfx", message);
 }
 
 void Check(VkResult result, const char *call) {
@@ -71,100 +85,14 @@ namespace {
 
 VkCommandPool g_oneshot_pool = VK_NULL_HANDLE;
 
-#if defined(__ANDROID__)
-enum class TimedOp {
-    FenceSlot,
-    FenceDepth,
-    PoolReset,
-    QueueSubmit,
-    Acquire,
-    Present,
-    GpuCanonical,
-    GpuDisplay,
-    Count
-};
-
-struct Timing {
-    unsigned count = 0;
-    double   total_ms = 0;
-    double   max_ms = 0;
-};
-
-std::array<Timing, static_cast<std::size_t>(TimedOp::Count)> g_timing{};
-auto                                                         g_timing_start = std::chrono::steady_clock::now();
-using Clock = std::chrono::steady_clock;
-
-template <typename F>
-auto Timed(TimedOp op, F &&fn) {
-    auto   start = Clock::now();
-    auto   result = fn();
-    double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-    auto  &item = g_timing[static_cast<std::size_t>(op)];
-    ++item.count;
-    item.total_ms += ms;
-    item.max_ms = std::max(item.max_ms, ms);
-    return result;
-}
-
-void LogTimings() {
-    auto now = Clock::now();
-    if (now - g_timing_start < std::chrono::seconds(5)) {
-        return;
-    }
-    const char *names[] = {"fence_slot", "fence_depth", "pool_reset", "queue_submit", "acquire", "present",
-                           "gpu_canonical", "gpu_display"};
-    for (std::size_t i = 0; i < g_timing.size(); ++i) {
-        const auto &t = g_timing[i];
-        __android_log_print(ANDROID_LOG_INFO, "ChronicleVkTiming",
-                            "%s count=%u avg=%.3fms max=%.3fms total=%.1fms",
-                            names[i], t.count, t.count ? t.total_ms / t.count : 0.0, t.max_ms, t.total_ms);
-    }
-    g_timing = {};
-    g_timing_start = now;
-}
-
-void BeginGpuTimer(Frame &frame, VkCommandBuffer cmd) {
-    if (frame.timer_pool == VK_NULL_HANDLE) {
-        return;
-    }
-    vkCmdResetQueryPool(cmd, frame.timer_pool, 0, 2);
-    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.timer_pool, 0);
-    frame.timer_recorded = true;
-}
-
-void EndGpuTimer(Frame &frame, VkCommandBuffer cmd) {
-    if (frame.timer_recorded) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, frame.timer_pool, 1);
-    }
-}
-
-void CollectGpuTimer(Frame &frame) {
-    if (!frame.timer_recorded) {
-        return;
-    }
-    std::uint64_t ticks[2]{};
-    if (vkGetQueryPoolResults(g.device, frame.timer_pool, 0, 2, sizeof(ticks), ticks,
-                              sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
-        ticks[1] >= ticks[0]) {
-        double ms = static_cast<double>(ticks[1] - ticks[0]) * g.properties.limits.timestampPeriod / 1000000.0;
-        auto   op = frame.timer_canonical ? TimedOp::GpuCanonical : TimedOp::GpuDisplay;
-        auto  &item = g_timing[static_cast<std::size_t>(op)];
-        ++item.count;
-        item.total_ms += ms;
-        item.max_ms = std::max(item.max_ms, ms);
-    }
-    frame.timer_recorded = false;
-}
-#endif
-
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
                                              VkDebugUtilsMessageTypeFlagsEXT             types,
                                              const VkDebugUtilsMessengerCallbackDataEXT *data, void *) {
-    std::fprintf(stderr, "Vulkan validation: %s\n", data->pMessage);
+    kz::Log(kz::LogLevel::Warning, "Vulkan validation", data->pMessage);
     // General messages are the loader's (layer/driver version notes), not misuse of the API.
     if (types &
         (VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)) {
-        g.validation_messages++;
+        g_validation_messages.fetch_add(1, std::memory_order_relaxed);
     }
     return VK_FALSE;
 }
@@ -232,8 +160,12 @@ void CreateInstance() {
     app.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     app.pEngineName = "Kazarov";
     app.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    // Vulkan 1.3 is the renderer floor (including on Android); 1.4 is preferred when available.
+#if defined(__ANDROID__) || defined(__SWITCH__)
+    // Android and Switch target Vulkan 1.3, the renderer's floor.
     app.apiVersion = VK_API_VERSION_1_3;
+#else
+    app.apiVersion = VK_API_VERSION_1_4;
+#endif
 
     VkDebugUtilsMessengerCreateInfoEXT messenger = {};
     messenger.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
@@ -346,11 +278,12 @@ void PickPhysicalDevice() {
     g.triangle_fans = g.config.triangle_fans && !chosen.portability_subset;
     g.separate_stencil_masks =
         g.config.separate_stencil_masks && (!chosen.portability_subset || chosen.portability.separateStencilMaskRef);
-    std::fprintf(stderr, "Vulkan: using %s (Vulkan %u.%u.%u)%s\n", g.properties.deviceName,
-                 VK_API_VERSION_MAJOR(g.properties.apiVersion), VK_API_VERSION_MINOR(g.properties.apiVersion),
-                 VK_API_VERSION_PATCH(g.properties.apiVersion), g.offscreen ? ", offscreen" : "");
+    kz::Logf(kz::LogLevel::Info, "Vulkan", "using {} (Vulkan {}.{}.{}){}",
+             static_cast<const char *>(g.properties.deviceName),
+             VK_API_VERSION_MAJOR(g.properties.apiVersion), VK_API_VERSION_MINOR(g.properties.apiVersion),
+             VK_API_VERSION_PATCH(g.properties.apiVersion), g.offscreen ? ", offscreen" : "");
     if (std::vector<std::string> workarounds = PortabilityWorkarounds(chosen); !workarounds.empty()) {
-        std::fprintf(stderr, "Vulkan: portability subset: %s\n", Join(workarounds).c_str());
+        kz::Logf(kz::LogLevel::Info, "Vulkan", "portability subset: {}", Join(workarounds));
     }
 }
 
@@ -457,24 +390,7 @@ void CreateDevice() {
     info.ppEnabledExtensionNames = extensions.data();
     Check(vkCreateDevice(g.physical_device, &info, nullptr, &g.device), "vkCreateDevice");
 #ifdef __ANDROID__
-#define LOAD_DEVICE_PROC(member, proc)                                                     \
-    g.member = reinterpret_cast<decltype(g.member)>(vkGetDeviceProcAddr(g.device, #proc)); \
-    if (g.member == nullptr) {                                                             \
-        Fatal("missing Vulkan device function: %s", #proc);                                \
-    }
-    LOAD_DEVICE_PROC(cmd_pipeline_barrier2, vkCmdPipelineBarrier2)
-    LOAD_DEVICE_PROC(queue_submit2, vkQueueSubmit2)
-    LOAD_DEVICE_PROC(cmd_begin_rendering, vkCmdBeginRendering)
-    LOAD_DEVICE_PROC(cmd_end_rendering, vkCmdEndRendering)
-    LOAD_DEVICE_PROC(cmd_set_cull_mode, vkCmdSetCullMode)
-    LOAD_DEVICE_PROC(cmd_set_depth_test_enable, vkCmdSetDepthTestEnable)
-    LOAD_DEVICE_PROC(cmd_set_depth_write_enable, vkCmdSetDepthWriteEnable)
-    LOAD_DEVICE_PROC(cmd_set_depth_compare_op, vkCmdSetDepthCompareOp)
-    LOAD_DEVICE_PROC(cmd_set_stencil_test_enable, vkCmdSetStencilTestEnable)
-    LOAD_DEVICE_PROC(cmd_set_primitive_topology, vkCmdSetPrimitiveTopology)
-    LOAD_DEVICE_PROC(cmd_set_stencil_op, vkCmdSetStencilOp)
-    LOAD_DEVICE_PROC(cmd_set_front_face, vkCmdSetFrontFace)
-#undef LOAD_DEVICE_PROC
+    LoadCoreDeviceCommands(g.device);
 #endif
     vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
     if (g.dynamic_color_write_mask) {
@@ -526,27 +442,75 @@ void DestroySwapchainResources() {
     g.swapchain.images.clear();
 }
 
-bool CreateSwapchain() {
-    if (g.surface == VK_NULL_HANDLE && !SDL_Vulkan_CreateSurface(g.window, g.instance, nullptr, &g.surface)) {
-        Error("SDL_Vulkan_CreateSurface: %s", SDL_GetError());
-        return false;
+#ifdef __ANDROID__
+// Android takes the window's surface away while the app is in the background. The swapchain and
+// surface are dropped then and made again, on a later frame, once the window is back.
+void DropSurface() {
+    if (g.swapchain.handle != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(g.device, g.swapchain.handle, nullptr);
+        g.swapchain.handle = VK_NULL_HANDLE;
     }
-    VkSurfaceCapabilitiesKHR capabilities;
-    VkResult                 surface_result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.physical_device, g.surface, &capabilities);
-    if (surface_result == VK_ERROR_SURFACE_LOST_KHR) {
-        if (g.swapchain.handle != VK_NULL_HANDLE) {
-            vkDestroySwapchainKHR(g.device, g.swapchain.handle, nullptr);
-            g.swapchain.handle = VK_NULL_HANDLE;
-        }
+    if (g.surface != VK_NULL_HANDLE) {
         SDL_Vulkan_DestroySurface(g.instance, g.surface, nullptr);
         g.surface = VK_NULL_HANDLE;
-        if (!SDL_Vulkan_CreateSurface(g.window, g.instance, nullptr, &g.surface)) {
-            Error("SDL_Vulkan_CreateSurface after surface loss: %s", SDL_GetError());
+    }
+    g_resize_pending.store(true);
+}
+
+bool EnsureSurface() {
+    if (g.surface == VK_NULL_HANDLE && !SDL_Vulkan_CreateSurface(g.window, g.instance, nullptr, &g.surface)) {
+        Error("SDL_Vulkan_CreateSurface: %s", SDL_GetError());
+        g.surface = VK_NULL_HANDLE;
+        g_resize_pending.store(true);
+        return false;
+    }
+    return true;
+}
+#endif
+
+// Whether a result means the swapchain no longer matches its surface and must be made again.
+bool SwapchainLost(VkResult result) {
+#ifdef __ANDROID__
+    if (result == VK_ERROR_SURFACE_LOST_KHR) {
+        return true;
+    }
+#endif
+    return result == VK_ERROR_OUT_OF_DATE_KHR;
+}
+
+// Whether a SUBOPTIMAL result calls for a new swapchain. Android reports it on every present while
+// the compositor rotates the frame, so there the swapchain is kept while the surface is unchanged.
+bool SuboptimalNeedsRecreate() {
+#ifdef __ANDROID__
+    VkSurfaceCapabilitiesKHR current;
+    if (g.swapchain.compositor_rotation &&
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.physical_device, g.surface, &current) == VK_SUCCESS) {
+        static_assert(std::has_unique_object_representations_v<VkSurfaceCapabilitiesKHR>);
+        return std::memcmp(&current, &g.swapchain.capabilities, sizeof current) != 0;
+    }
+#endif
+    return true;
+}
+
+bool CreateSwapchain() {
+#ifdef __ANDROID__
+    if (!EnsureSurface()) {
+        return false;
+    }
+#endif
+    VkSurfaceCapabilitiesKHR capabilities;
+    VkResult                 surface =
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.physical_device, g.surface, &capabilities);
+#ifdef __ANDROID__
+    if (surface == VK_ERROR_SURFACE_LOST_KHR) {
+        DropSurface();
+        if (!EnsureSurface()) {
             return false;
         }
-        surface_result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.physical_device, g.surface, &capabilities);
+        surface = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.physical_device, g.surface, &capabilities);
     }
-    Check(surface_result, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+#endif
+    Check(surface, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
     if (!(capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         Fatal("the surface cannot be a transfer destination");
     }
@@ -584,8 +548,8 @@ bool CreateSwapchain() {
     info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = capabilities.currentTransform;
-#if defined(__ANDROID__)
-    // Let Android apply the display rotation when presenting the landscape frame.
+#ifdef __ANDROID__
+    // The compositor rotates the landscape frame onto the display.
     if ((capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0) {
         info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     }
@@ -594,29 +558,24 @@ bool CreateSwapchain() {
     info.presentMode = PickPresentMode();
     info.clipped = VK_TRUE;
     info.oldSwapchain = old;
-    VkSwapchainKHR replacement = VK_NULL_HANDLE;
-    VkResult       create_result = vkCreateSwapchainKHR(g.device, &info, nullptr, &replacement);
-    if (create_result == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR || create_result == VK_ERROR_SURFACE_LOST_KHR) {
-        if (old != VK_NULL_HANDLE) {
-            vkDestroySwapchainKHR(g.device, old, nullptr);
-        }
-        g.swapchain.handle = VK_NULL_HANDLE;
-        SDL_Vulkan_DestroySurface(g.instance, g.surface, nullptr);
-        g.surface = VK_NULL_HANDLE;
-        g.resize_pending = true;
-        Error("vkCreateSwapchainKHR lost the Android window (%d); retrying next frame", static_cast<int>(create_result));
+    VkSwapchainKHR created = VK_NULL_HANDLE;
+    VkResult       result = vkCreateSwapchainKHR(g.device, &info, nullptr, &created);
+#ifdef __ANDROID__
+    if (result == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR || result == VK_ERROR_SURFACE_LOST_KHR) {
+        DropSurface();
         return false;
     }
-    Check(create_result, "vkCreateSwapchainKHR");
-    g.swapchain.handle = replacement;
+#endif
+    Check(result, "vkCreateSwapchainKHR");
+    g.swapchain.handle = created;
     if (old != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(g.device, old, nullptr);
     }
 
     g.swapchain.format = format.format;
     g.swapchain.extent = extent;
-#if defined(__ANDROID__)
-    g.swapchain.surface_capabilities = capabilities;
+#ifdef __ANDROID__
+    g.swapchain.capabilities = capabilities;
     g.swapchain.compositor_rotation = info.preTransform != capabilities.currentTransform;
 #endif
     uint32_t count = 0;
@@ -638,7 +597,7 @@ bool ResizeOffscreen() {
     int width = 0;
     int height = 0;
     SDL_GetWindowSizeInPixels(g.window, &width, &height);
-    g.resize_pending = false;
+    g_resize_pending.store(false);
     if (width <= 0 || height <= 0) {
         return false;
     }
@@ -657,9 +616,7 @@ bool ResizeOffscreen() {
 // The main targets follow the swapchain's size, losing their contents.
 void SyncMainTargets() {
     const Image &main = g.main_color[0];
-    uint32_t     width = g.offscreen ? g.swapchain.extent.width : std::max(1u, static_cast<uint32_t>(std::lround(static_cast<float>(g.swapchain.extent.width) * g.render_scale_factor)));
-    uint32_t     height = g.offscreen ? g.swapchain.extent.height : std::max(1u, static_cast<uint32_t>(std::lround(static_cast<float>(g.swapchain.extent.height) * g.render_scale_factor)));
-    if (main.width != width || main.height != height) {
+    if (main.width != g.swapchain.extent.width || main.height != g.swapchain.extent.height) {
         vkDeviceWaitIdle(g.device);
         DestroyMainTargets();
         CreateMainTargets();
@@ -671,6 +628,7 @@ void SyncMainTargets() {
 // Without targets the main targets keep their size until a frame that draws the game's state
 // (immediate, or a list's canonical render) syncs them; a display frame blits across the difference.
 bool RecreateSwapchain(bool targets = true) {
+    AssertDeviceThread(__func__);
     if (g.offscreen) {
         return ResizeOffscreen();
     }
@@ -679,7 +637,7 @@ bool RecreateSwapchain(bool targets = true) {
     if (!CreateSwapchain()) {
         return false;
     }
-    g.resize_pending = false;
+    g_resize_pending.store(false);
     if (targets) {
         SyncMainTargets();
     }
@@ -687,13 +645,6 @@ bool RecreateSwapchain(bool targets = true) {
 }
 
 void CreateFrames() {
-#if defined(__ANDROID__)
-    uint32_t family_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(g.physical_device, &family_count, nullptr);
-    std::vector<VkQueueFamilyProperties> families(family_count);
-    vkGetPhysicalDeviceQueueFamilyProperties(g.physical_device, &family_count, families.data());
-    bool timestamps = g.queue_family < family_count && families[g.queue_family].timestampValidBits != 0;
-#endif
     for (Frame &frame : g.frames) {
         VkCommandPoolCreateInfo pool = {};
         pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -718,15 +669,6 @@ void CreateFrames() {
         VkFenceCreateInfo fence = {};
         fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         Check(vkCreateFence(g.device, &fence, nullptr, &frame.fence), "vkCreateFence");
-#if defined(__ANDROID__)
-        if (timestamps) {
-            VkQueryPoolCreateInfo query = {};
-            query.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-            query.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            query.queryCount = 2;
-            Check(vkCreateQueryPool(g.device, &query, nullptr, &frame.timer_pool), "vkCreateQueryPool");
-        }
-#endif
     }
 
     VkCommandPoolCreateInfo pool = {};
@@ -736,50 +678,58 @@ void CreateFrames() {
     Check(vkCreateCommandPool(g.device, &pool, nullptr, &g_oneshot_pool), "vkCreateCommandPool");
 }
 
+#ifdef KZ_PORT_TRACY
+// Tracy records a calibration submission on the given command buffer and waits for it.
+void CreateGpuProfiler() {
+    VkCommandBufferAllocateInfo allocate = {};
+    allocate.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocate.commandPool = g_oneshot_pool;
+    allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocate.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    Check(vkAllocateCommandBuffers(g.device, &allocate, &cmd), "vkAllocateCommandBuffers");
+    g.tracy_vk = TracyVkContext(g.physical_device, g.device, g.queue, cmd);
+    TracyVkContextName(g.tracy_vk, "Kazarov", 7);
+    vkFreeCommandBuffers(g.device, g_oneshot_pool, 1, &cmd);
+}
+#endif
+
 void RunDeletions(Frame &frame) {
-    std::vector<std::function<void()>> deletions;
+    std::vector<std::function<void()> > deletions;
     deletions.swap(frame.deletions);
     for (std::function<void()> &deletion : deletions) {
         deletion();
     }
 }
 
-void WaitFrame(Frame &frame, bool depth = false) {
+void WaitFrame(Frame &frame) {
+    KZ_PROFILE_ZONE("Kazarov WaitFrame");
     if (frame.pending) {
-#if defined(__ANDROID__)
-        Check(Timed(depth ? TimedOp::FenceDepth : TimedOp::FenceSlot,
-                    [&] { return vkWaitForFences(g.device, 1, &frame.fence, VK_TRUE, UINT64_MAX); }),
-              "vkWaitForFences");
-        CollectGpuTimer(frame);
-#else
         Check(vkWaitForFences(g.device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-#endif
         frame.pending = false;
+        HarvestDepthQueries(frame);
     }
 }
 
 // Moves recording to the next slot once the GPU is done with what that slot last submitted.
 void AdvanceSlot() {
+    AssertDeviceThread(__func__);
     g.frame_slot = (g.frame_slot + 1) % kFramesInFlight;
     Frame &frame = CurrentFrame();
     WaitFrame(frame);
-    // The oldest frame in flight: nothing newer has been answered yet.
-    HarvestFrameDepthQueries(frame);
     RunDeletions(frame);
     ResetTransients(frame);
-#if defined(__ANDROID__)
-    Check(Timed(TimedOp::PoolReset, [&] { return vkResetCommandPool(g.device, frame.pool, 0); }), "vkResetCommandPool");
-    LogTimings();
-#else
     Check(vkResetCommandPool(g.device, frame.pool, 0), "vkResetCommandPool");
-#endif
     frame.upload_open = false;
 }
 
 void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal) {
+    AssertDeviceThread(__func__);
+    KZ_PROFILE_ZONE("Kazarov Submit");
     Frame                                 &frame = CurrentFrame();
     std::vector<VkCommandBufferSubmitInfo> commands;
     if (frame.upload_open) {
+        KZ_PROFILE_GPU_END(upload_zone);
         Check(vkEndCommandBuffer(frame.upload_cmd), "vkEndCommandBuffer");
         frame.upload_open = false;
         commands.push_back({VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, frame.upload_cmd, 0});
@@ -806,11 +756,7 @@ void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal) {
     submit.signalSemaphoreInfoCount = signal != VK_NULL_HANDLE ? 1 : 0;
     submit.pSignalSemaphoreInfos = &signal_info;
     Check(vkResetFences(g.device, 1, &frame.fence), "vkResetFences");
-#ifdef __ANDROID__
-    Check(Timed(TimedOp::QueueSubmit, [&] { return g.queue_submit2(g.queue, 1, &submit, frame.fence); }), "vkQueueSubmit2");
-#else
     Check(vkQueueSubmit2(g.queue, 1, &submit, frame.fence), "vkQueueSubmit2");
-#endif
     frame.pending = true;
 }
 
@@ -842,11 +788,7 @@ void SwapchainBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, Vk
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.imageMemoryBarrierCount = 1;
     dependency.pImageMemoryBarriers = &barrier;
-#ifdef __ANDROID__
-    g.cmd_pipeline_barrier2(cmd, &dependency);
-#else
     vkCmdPipelineBarrier2(cmd, &dependency);
-#endif
 }
 
 } // namespace
@@ -854,17 +796,28 @@ void SwapchainBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, Vk
 Frame &CurrentFrame() { return g.frames[g.frame_slot]; }
 
 VkCommandBuffer UploadCommands() {
+    AssertDeviceThread(__func__);
     Frame &frame = CurrentFrame();
     if (!frame.upload_open) {
         BeginCommands(frame.upload_cmd);
         frame.upload_open = true;
+        // Tracy needs a zone's begin and end on one thread; with a render thread the open and the submit can differ.
+        if (ActiveRenderThreadMode() == RenderThreadMode::Off) {
+            KZ_PROFILE_GPU_BEGIN(upload_zone, frame.upload_cmd, "Kazarov uploads");
+        }
     }
     return frame.upload_cmd;
 }
 
-VkCommandBuffer DrawCommands() { return CurrentFrame().draw_cmd; }
+VkCommandBuffer DrawCommands() {
+    AssertDeviceThread(__func__);
+    return CurrentFrame().draw_cmd;
+}
 
-void DeferDestroy(std::function<void()> destroy) { CurrentFrame().deletions.push_back(std::move(destroy)); }
+void DeferDestroy(std::function<void()> destroy) {
+    AssertDeviceThread(__func__);
+    CurrentFrame().deletions.push_back(std::move(destroy));
+}
 
 void SubmitUploadsAndWait() {
     if (g.in_frame || !CurrentFrame().upload_open) {
@@ -878,6 +831,7 @@ void SubmitUploadsAndWait() {
 // A slot's freed resources come back only when that slot's deletions run, and a full table is
 // otherwise only drained by the frame ring advancing.
 void RetireDeletions() {
+    AssertDeviceThread(__func__);
     SubmitUploadsAndWait();
     for (Frame &frame : g.frames) {
         WaitFrame(frame);
@@ -889,6 +843,7 @@ void RetireDeletions() {
 }
 
 void RunOneShot(const std::function<void(VkCommandBuffer)> &record) {
+    AssertDeviceThread(__func__);
     SubmitUploadsAndWait();
 
     VkCommandBuffer             cmd;
@@ -911,12 +866,12 @@ void RunOneShot(const std::function<void(VkCommandBuffer)> &record) {
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
     submit.commandBufferInfoCount = 1;
     submit.pCommandBufferInfos = &command;
-#ifdef __ANDROID__
-    Check(g.queue_submit2(g.queue, 1, &submit, fence), "vkQueueSubmit2");
-#else
     Check(vkQueueSubmit2(g.queue, 1, &submit, fence), "vkQueueSubmit2");
-#endif
     Check(vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    // Synchronous readback completes earlier submissions; publish their depth answers oldest first.
+    for (uint32_t frame_offset = 1; frame_offset <= kFramesInFlight; ++frame_offset) {
+        WaitFrame(g.frames[(g.frame_slot + frame_offset) % kFramesInFlight]);
+    }
     vkDestroyFence(g.device, fence, nullptr);
     vkFreeCommandBuffers(g.device, g_oneshot_pool, 1, &cmd);
 }
@@ -932,23 +887,21 @@ VkImageUsageFlags MainDepthUsage() {
 }
 
 void CreateMainTargets() {
+    AssertDeviceThread(__func__);
     uint32_t width = g.swapchain.extent.width;
     uint32_t height = g.swapchain.extent.height;
-    uint32_t render_width = g.offscreen ? width : std::max(1u, static_cast<uint32_t>(std::lround(static_cast<float>(width) * g.render_scale_factor)));
-    uint32_t render_height = g.offscreen ? height : std::max(1u, static_cast<uint32_t>(std::lround(static_cast<float>(height) * g.render_scale_factor)));
-    PublishMainSize(render_width, render_height);
     for (Image &image : g.main_color) {
-        image = CreateImage(render_width, render_height, 1, kColorFormat,
+        image = CreateImage(width, height, 1, kColorFormat,
                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     }
     g.display_color = CreateImage(width, height, 1, kColorFormat,
                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    g.main_depth = CreateImage(render_width, render_height, 1, g.depth_format,
-                               MainDepthUsage());
-    g.display_depth = CreateImage(width, height, 1, g.depth_format,
-                                  MainDepthUsage());
+    for (Image *depth : {&g.main_depth, &g.display_depth}) {
+        *depth = CreateImage(width, height, 1, g.depth_format,
+                             MainDepthUsage());
+    }
 
     RunOneShot([](VkCommandBuffer cmd) {
         VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -986,72 +939,6 @@ void CreateMainTargets() {
     WriteDepthDescriptors();
 }
 
-// Render targets' pixels per logical texel before the render scale multiplies them.
-float BaseTargetScale() {
-    if (g.config.target_scale > 0.0f) {
-        return g.config.target_scale;
-    }
-    return std::max(1.0f, std::round(static_cast<float>(g.swapchain.extent.height) / g.config.logical_height));
-}
-
-void RecreateScaledMainTargets() {
-    if (g.offscreen || g.device == VK_NULL_HANDLE) {
-        return;
-    }
-    vkDeviceWaitIdle(g.device);
-    Image    old_main[2] = {g.main_color[0], g.main_color[1]};
-    Image    old_depth = g.main_depth;
-    uint32_t width = std::max(
-        1u, static_cast<uint32_t>(std::lround(static_cast<float>(g.swapchain.extent.width) * g.render_scale_factor)));
-    uint32_t height = std::max(
-        1u, static_cast<uint32_t>(std::lround(static_cast<float>(g.swapchain.extent.height) * g.render_scale_factor)));
-    for (Image &image : g.main_color) {
-        image = CreateImage(width, height, 1, kColorFormat,
-                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    }
-    g.main_depth = CreateImage(width, height, 1, g.depth_format,
-                               MainDepthUsage());
-    RunOneShot([&](VkCommandBuffer cmd) {
-        VkImageSubresourceRange color_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        VkClearColorValue       black = {
-            {0.0f, 0.0f, 0.0f, 1.0f}
-        };
-        for (Image *image : {&g.main_color[0], &g.main_color[1]}) {
-            Transition(cmd, *image, TransferDst());
-            vkCmdClearColorImage(cmd, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &color_range);
-            ToRest(cmd, *image);
-        }
-        VkImageSubresourceRange  depth_range = {g.main_depth.aspect, 0, 1, 0, 1};
-        VkClearDepthStencilValue far = {0.0f, 0};
-        Transition(cmd, g.main_depth, TransferDst());
-        vkCmdClearDepthStencilImage(cmd, g.main_depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1,
-                                    &depth_range);
-        ToRest(cmd, g.main_depth);
-    });
-    VkDescriptorImageInfo images[2];
-    for (uint32_t i = 0; i < 2; i++) {
-        images[i] = {VK_NULL_HANDLE, g.main_color[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    }
-    VkWriteDescriptorSet write = {};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = g.texture_set;
-    write.dstBinding = 0;
-    write.dstArrayElement = kMainTarget;
-    write.descriptorCount = 2;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    write.pImageInfo = images;
-    vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
-    WriteDepthDescriptors();
-    DeferDestroy([old_main, old_depth]() mutable {
-        DestroyImage(old_main[0]);
-        DestroyImage(old_main[1]);
-        DestroyImage(old_depth);
-    });
-    RecreateSharedTargets();
-    g.canonical_newest = false;
-}
-
 void DestroyMainTargets() {
     for (Image &image : g.main_color) {
         DestroyImage(image);
@@ -1061,15 +948,17 @@ void DestroyMainTargets() {
     DestroyImage(g.display_depth);
 }
 
-Image &MainColorTarget() { return g.display_pass ? g.display_color : CurrentMainColor(); }
+Image &MainColorTarget() { return tls.display_pass ? g.display_color : CurrentMainColor(); }
 
-Image &MainDepth() { return g.display_pass ? g.display_depth : g.main_depth; }
+Image &MainDepth() { return tls.display_pass ? g.display_depth : g.main_depth; }
+
+bool GameFrameOpen() { return g_game_frame_open.load(); }
 
 // A display render of the newest list samples what its canonical render sampled, which the flip at
 // the end of that render left as the current image.
-Image &PreviousFrameImage() { return g.display_pass ? CurrentMainColor() : PreviousMainColor(); }
+Image &PreviousFrameImage() { return tls.display_pass ? CurrentMainColor() : PreviousMainColor(); }
 
-uint32_t PreviousFrameSlot() { return kMainTarget + (g.display_pass ? g.main_current : g.main_current ^ 1); }
+uint32_t PreviousFrameSlot() { return kMainTarget + (tls.display_pass ? g.main_current : g.main_current ^ 1); }
 
 } // namespace detail
 
@@ -1083,10 +972,23 @@ LogicalRect LogicalFrame() { return {0.0f, 0.0f, LogicalWidth(), LogicalHeight()
 
 void RendererInit(SDL_Window *window, const RendererConfig &config) {
     static uint64_t instances = 0;
+    g_validation_messages.store(0);
+    g_resize_pending.store(false);
+    g_game_frame_open.store(false);
     g = {};
     g.renderer_instance = ++instances;
     g.window = window;
     g.config = config;
+    if (const char *setting = std::getenv("KZ_RENDER_THREAD")) {
+        if (auto mode = ParseRenderThreadMode(setting)) {
+            g.config.render_thread = *mode;
+        } else {
+            Error("KZ_RENDER_THREAD=%s is not off, lockstep or async", setting);
+        }
+    }
+#ifdef __ANDROID__
+    g.config.render_thread = RenderThreadMode::Off;
+#endif
     g.texture_slot_limit = config.texture_slots == 0 ? kMaxTextures : std::min(config.texture_slots, kMaxTextures);
     g.mesh_slot_limit = config.mesh_slots == 0 ? kMaxMeshes : std::min(config.mesh_slots, kMaxMeshes);
     g.offscreen = config.offscreen;
@@ -1098,6 +1000,9 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
     PickPhysicalDevice();
     CreateDevice();
     CreateFrames();
+#ifdef KZ_PORT_TRACY
+    CreateGpuProfiler();
+#endif
     CreatePipelineLayout();
     InitResources();
     if (g.offscreen || !CreateSwapchain()) {
@@ -1107,23 +1012,33 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
         SDL_GetWindowSizeInPixels(window, &width, &height);
         g.swapchain.extent = {static_cast<uint32_t>(std::max(width, 1)),
                               static_cast<uint32_t>(std::max(height, 1))};
-        g.resize_pending = true;
+        g_resize_pending.store(true);
     }
-    g.render_scale_factor = config.render_scale > 0.0f ? config.render_scale : 1.0f;
     CreateMainTargets();
-    g.render_scale = BaseTargetScale() * g.render_scale_factor;
+    g.render_scale =
+        config.render_scale > 0.0f
+            ? config.render_scale
+            : std::max(1.0f, std::round(static_cast<float>(g.swapchain.extent.height) / g.config.logical_height));
     CreatePipelines();
+    StartRenderThread(g.config.render_thread);
 }
 
 void RendererShutdown() {
-    RendererLock lock = LockRenderer();
+    // No idle hook call may start once shutdown begins.
+    SetRenderIdleHook(nullptr, nullptr);
     if (g.device == VK_NULL_HANDLE) {
         return;
     }
-    g.list.reset();
-    SetRecordingThread({});
-    SetFrameThread({});
+    StopRenderThread();
+    EndRecording();
     vkDeviceWaitIdle(g.device);
+#ifdef KZ_PORT_TRACY
+    // Zones write into their command buffers when they close, so they close before the pools go.
+    g.rendering_zone.reset();
+    g.upload_zone.reset();
+    TracyVkDestroy(g.tracy_vk);
+    g.tracy_vk = nullptr;
+#endif
     for (Frame &frame : g.frames) {
         RunDeletions(frame);
     }
@@ -1132,11 +1047,6 @@ void RendererShutdown() {
     for (Frame &frame : g.frames) {
         DestroyTransients(frame);
         DestroyBuffer(frame.depth_readback);
-#if defined(__ANDROID__)
-        if (frame.timer_pool != VK_NULL_HANDLE) {
-            vkDestroyQueryPool(g.device, frame.timer_pool, nullptr);
-        }
-#endif
         vkDestroyFence(g.device, frame.fence, nullptr);
         vkDestroySemaphore(g.device, frame.image_available, nullptr);
         vkDestroyCommandPool(g.device, frame.pool, nullptr);
@@ -1150,11 +1060,8 @@ void RendererShutdown() {
     }
     vkDestroyDescriptorPool(g.device, g.texture_pool, nullptr);
     vkDestroyDescriptorPool(g.device, g.constants_pool, nullptr);
-    vkDestroyDescriptorPool(g.device, g.prog0_descriptor_pool, nullptr);
     vkDestroyDescriptorSetLayout(g.device, g.texture_set_layout, nullptr);
     vkDestroyDescriptorSetLayout(g.device, g.constants_set_layout, nullptr);
-    vkDestroyDescriptorSetLayout(g.device, g.prog0_set_layout, nullptr);
-    vkDestroyPipelineLayout(g.device, g.prog0_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(g.device, g.pipeline_layout, nullptr);
     for (VkSampler sampler : g.samplers) {
         vkDestroySampler(g.device, sampler, nullptr);
@@ -1170,99 +1077,80 @@ void RendererShutdown() {
         destroy(g.instance, g.messenger, nullptr);
     }
     vkDestroyInstance(g.instance, nullptr);
-    uint32_t messages = g.validation_messages;
     g = {};
-    g.validation_messages = messages;
 }
 
-void RendererResize() { g.resize_pending = true; }
+void RendererResize() { g_resize_pending.store(true); }
 
 void SetAnisotropy(int samples) {
-    uint32_t level = 0;
-    while (level < kAnisotropyLevels && (2 << level) <= samples) {
-        ++level;
-    }
-    g.anisotropy_level = level;
+    RunOnRenderThread([&] {
+        uint32_t level = 0;
+        while (level < kAnisotropyLevels && (2 << level) <= samples) {
+            ++level;
+        }
+        g.anisotropy_level = level;
+    });
 }
 
 void SetPresentMode(PresentMode mode) {
-    if (mode != g.config.present_mode) {
-        g.config.present_mode = mode;
-        g.resize_pending = true;
-    }
+    RunOnRenderThread([&] {
+        if (mode != g.config.present_mode) {
+            g.config.present_mode = mode;
+            g_resize_pending.store(true);
+        }
+    });
 }
 
 namespace detail {
 namespace {
 
-void HandleSuboptimalSwapchain() {
-#if defined(__ANDROID__)
-    VkSurfaceCapabilitiesKHR current{};
-    if (g.swapchain.compositor_rotation &&
-        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.physical_device, g.surface, &current) == VK_SUCCESS) {
-        const auto &previous = g.swapchain.surface_capabilities;
-        auto        same_extent = [](VkExtent2D a, VkExtent2D b) { return a.width == b.width && a.height == b.height; };
-        // Android can keep reporting SUBOPTIMAL while the compositor rotates an unchanged surface.
-        if (same_extent(current.currentExtent, previous.currentExtent) &&
-            same_extent(current.minImageExtent, previous.minImageExtent) &&
-            same_extent(current.maxImageExtent, previous.maxImageExtent) &&
-            current.currentTransform == previous.currentTransform &&
-            current.supportedTransforms == previous.supportedTransforms &&
-            current.minImageCount == previous.minImageCount &&
-            current.maxImageCount == previous.maxImageCount &&
-            current.maxImageArrayLayers == previous.maxImageArrayLayers &&
-            current.supportedCompositeAlpha == previous.supportedCompositeAlpha &&
-            current.supportedUsageFlags == previous.supportedUsageFlags) {
-            return;
-        }
+bool OpenFrame() {
+    AssertDeviceThread(__func__);
+    BeginCommands(CurrentFrame().draw_cmd);
+#ifdef KZ_PORT_TRACY
+    // Reads back the GPU timestamps of earlier frames; nothing is recorded while profiling is off.
+    if (g.tracy_vk != nullptr && profile::Enabled()) {
+        TracyVkCollect(g.tracy_vk, CurrentFrame().draw_cmd);
     }
 #endif
-    g.resize_pending = true;
-}
-
-bool OpenFrame() {
-    BeginCommands(CurrentFrame().draw_cmd);
-#if defined(__ANDROID__)
-    BeginGpuTimer(CurrentFrame(), CurrentFrame().draw_cmd);
-#endif
     g.in_frame = true;
-    SetFrameThread(std::this_thread::get_id());
+    if (!tls.in_idle_hook) {
+        g_game_frame_open.store(true);
+    }
     g.frame_serial++;
     g.target = kMainTarget;
     g.rendering = false;
+    // Before ResetDrawState, which binds descriptors.
+    g.counters = {};
     ResetDrawState();
     return true;
 }
 
-void FinishFrame(Frame &frame) {
-    if (g.depth_queries_recorded) {
-        WaitFrame(frame, true);
-        HarvestDepthQueries();
-    }
-    if (kAsyncDepthQueries) {
-        HarvestReadyDepthQueries();
-    }
+void FinishFrame() {
     g.main_current ^= 1;
     AdvanceSlot();
 }
 
 // A swapchain image for this frame slot, recreating the swapchain when it is out of date.
 bool AcquireImage(bool targets) {
-    if ((g.resize_pending || g.swapchain.handle == VK_NULL_HANDLE) && !RecreateSwapchain(targets)) {
+    AssertDeviceThread(__func__);
+    KZ_PROFILE_ZONE("Kazarov AcquireImage");
+    // The idle hook leaves swapchain recreation to the game thread's next recording.
+    if (tls.in_idle_hook && (g_resize_pending.load() || g.swapchain.handle == VK_NULL_HANDLE)) {
+        return false;
+    }
+    if ((g_resize_pending.load() || g.swapchain.handle == VK_NULL_HANDLE) && !RecreateSwapchain(targets)) {
         SubmitUploadsAndWait();
         return false;
     }
-#if defined(__ANDROID__)
-    VkResult result = Timed(TimedOp::Acquire, [&] {
-        return vkAcquireNextImageKHR(g.device, g.swapchain.handle, UINT64_MAX,
-                                     CurrentFrame().image_available, VK_NULL_HANDLE, &g.image_index);
-    });
-#else
     VkResult result = vkAcquireNextImageKHR(g.device, g.swapchain.handle, UINT64_MAX,
                                             CurrentFrame().image_available, VK_NULL_HANDLE, &g.image_index);
-#endif
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR) {
+    if (SwapchainLost(result)) {
         // Recreating may submit pending uploads and move to the next slot.
+        if (tls.in_idle_hook) {
+            g_resize_pending.store(true);
+            return false;
+        }
         if (!RecreateSwapchain(targets)) {
             SubmitUploadsAndWait();
             return false;
@@ -1271,7 +1159,9 @@ bool AcquireImage(bool targets) {
                                        CurrentFrame().image_available, VK_NULL_HANDLE, &g.image_index);
     }
     if (result == VK_SUBOPTIMAL_KHR) {
-        HandleSuboptimalSwapchain();
+        if (SuboptimalNeedsRecreate()) {
+            g_resize_pending.store(true);
+        }
     } else if (result != VK_SUCCESS) {
         Error("vkAcquireNextImageKHR failed (%d)", static_cast<int>(result));
         SubmitUploadsAndWait();
@@ -1283,6 +1173,8 @@ bool AcquireImage(bool targets) {
 // Ends the frame's draw commands with source blitted onto the acquired swapchain image, submits
 // and presents.
 void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
+    AssertDeviceThread(__func__);
+    KZ_PROFILE_ZONE("Kazarov PresentImage");
     VkImage swapchain = g.swapchain.images[g.image_index];
     Transition(cmd, source, TransferSrc());
     // Chained to the acquire semaphore, which the submit waits on at the transfer stage.
@@ -1295,21 +1187,21 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstOffsets[1] = {static_cast<int32_t>(g.swapchain.extent.width),
                             static_cast<int32_t>(g.swapchain.extent.height), 1};
-    vkCmdBlitImage(cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+    {
+        KZ_PROFILE_GPU_ZONE(cmd, "Kazarov swapchain blit");
+        vkCmdBlitImage(cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+    }
     SwapchainBarrier(cmd, swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE);
     ToRest(cmd, source);
-#if defined(__ANDROID__)
-    EndGpuTimer(frame, cmd);
-#endif
     Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
     VkSemaphore render_finished = g.swapchain.render_finished[g.image_index];
     Submit(true, frame.image_available, render_finished);
     g.in_frame = false;
-    SetFrameThread({});
+    g_game_frame_open.store(false);
 
     VkPresentInfoKHR present = {};
     present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1318,78 +1210,80 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     present.swapchainCount = 1;
     present.pSwapchains = &g.swapchain.handle;
     present.pImageIndices = &g.image_index;
-#if defined(__ANDROID__)
-    VkResult result = Timed(TimedOp::Present, [&] { return vkQueuePresentKHR(g.queue, &present); });
-#else
     VkResult result = vkQueuePresentKHR(g.queue, &present);
-#endif
     if (result == VK_SUBOPTIMAL_KHR) {
-        HandleSuboptimalSwapchain();
-    } else if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR) {
-        g.resize_pending = true;
+        if (SuboptimalNeedsRecreate()) {
+            g_resize_pending.store(true);
+        }
+    } else if (SwapchainLost(result)) {
+        g_resize_pending.store(true);
     } else {
         Check(result, "vkQueuePresentKHR");
     }
+}
+
+void PlotFrameCounters() {
+    KZ_PROFILE_PLOT("Kazarov mesh draws", g.counters.mesh_draws);
+    KZ_PROFILE_PLOT("Kazarov 2D draws", g.counters.draws_2d);
+    KZ_PROFILE_PLOT("Kazarov grab copies", g.counters.grab_copies);
+    KZ_PROFILE_PLOT("Kazarov grab pre-copies", g.counters.grab_precopies);
+    KZ_PROFILE_PLOT("Kazarov descriptor binds", g.counters.descriptor_binds);
+    KZ_PROFILE_PLOT("Kazarov transient bytes", g.counters.transient_bytes);
 }
 
 void SubmitWithoutPresent(VkCommandBuffer cmd, Image &main) {
     // Every colour image rests shader-readable between operations; the next frame samples this
     // one as kPreviousFrame.
     ToRest(cmd, main);
-#if defined(__ANDROID__)
-    EndGpuTimer(CurrentFrame(), cmd);
-#endif
     Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
     Submit(true, VK_NULL_HANDLE, VK_NULL_HANDLE);
     g.in_frame = false;
-    SetFrameThread({});
+    g_game_frame_open.store(false);
 }
 
 } // namespace
 
 void PrepareRecording() {
-    // Read without the lock, as a render on another thread may hold it: the main targets change
-    // only under it, and only when they must follow the window.
-    const Image &main = g.main_color[0];
-    bool follow = g.resize_pending || (!g.offscreen && (main.width != g.swapchain.extent.width ||
-                                                         main.height != g.swapchain.extent.height));
-    if (!follow) {
-        return;
-    }
-    RendererLock lock = LockRenderer();
-    if (g.resize_pending) {
+    if (g_resize_pending.load()) {
         RecreateSwapchain();
     } else if (!g.offscreen) {
         SyncMainTargets();
     }
 }
 
+void PrepareRecordingFromCaller() {
+    // PrepareRecording does nothing unless a resize is pending or, onscreen, the main targets differ
+    // from the swapchain. The idle hook never recreates the swapchain, so the extents change only on
+    // the game thread; the pending flag is atomic.
+    const Image &main = g.main_color[0];
+    const bool   same_size =
+        main.width == g.swapchain.extent.width && main.height == g.swapchain.extent.height;
+    if (!g_resize_pending.load() && (g.offscreen || same_size)) {
+        return;
+    }
+    RunOnRenderThread(PrepareRecording);
+}
+
 bool OpenListFrame(bool canonical, bool present, bool base) {
+    KZ_PROFILE_ZONE("Kazarov open frame");
     if (canonical) {
         // The game's state is drawn whether or not the window can show it: later ticks sample it.
         if (g.offscreen) {
-            if (g.resize_pending) {
+            if (g_resize_pending.load()) {
                 ResizeOffscreen();
             }
-        } else if (g.resize_pending || g.swapchain.handle == VK_NULL_HANDLE) {
+        } else if (g_resize_pending.load() || g.swapchain.handle == VK_NULL_HANDLE) {
             RecreateSwapchain();
         } else {
             SyncMainTargets();
         }
-        bool opened = OpenFrame();
-#if defined(__ANDROID__)
-        CurrentFrame().timer_canonical = true;
-#endif
-        return opened;
+        return OpenFrame();
     }
     if (present && !g.offscreen && !AcquireImage(false)) {
         return false;
     }
     OpenFrame();
-#if defined(__ANDROID__)
-    CurrentFrame().timer_canonical = false;
-#endif
-    g.display_pass = true;
+    tls.display_pass = true;
     if (base) {
         VkCommandBuffer cmd = DrawCommands();
         Image          &source = PreviousMainColor();
@@ -1415,14 +1309,19 @@ bool OpenListFrame(bool canonical, bool present, bool base) {
 }
 
 void CloseListFrame(bool canonical, bool present) {
+    KZ_PROFILE_ZONE("Kazarov close frame");
     Frame          &frame = CurrentFrame();
     VkCommandBuffer cmd = frame.draw_cmd;
     EndRendering();
     ReleaseTarget();
+    PlotFrameCounters();
     if (canonical) {
-        RecordDepthQueries(cmd);
+        {
+            KZ_PROFILE_GPU_ZONE(cmd, "Kazarov depth queries");
+            RecordDepthQueries(cmd);
+        }
         SubmitWithoutPresent(cmd, CurrentMainColor());
-        FinishFrame(frame);
+        FinishFrame();
         g.canonical_newest = true;
         g.presented_display = false;
         return;
@@ -1432,7 +1331,7 @@ void CloseListFrame(bool canonical, bool present) {
     } else {
         SubmitWithoutPresent(cmd, g.display_color);
     }
-    g.display_pass = false;
+    tls.display_pass = false;
     g.target = kMainTarget;
     if (present) {
         g.presented_display = true;
@@ -1443,83 +1342,83 @@ void CloseListFrame(bool canonical, bool present) {
 } // namespace detail
 
 bool BeginFrame() {
-    if (FrameOnThisThread() || RecordingCalls()) {
-        Error("BeginFrame inside a frame");
-        return true;
-    }
-    // Held until EndFrame: the frame's draws run as they are called.
-    RendererLock lock = LockRenderer();
-    if (g.render_scale_pending) {
-        RecreateScaledMainTargets();
-        RecreateRenderTargets();
-        g.render_scale_pending = false;
-    }
-    if (g.offscreen) {
-        if (g.resize_pending && !ResizeOffscreen()) {
-            SubmitUploadsAndWait();
-            return false;
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    bool       opened = false;
+    RunOnRenderThread([&] {
+        if (g.in_frame || recording) {
+            Error("BeginFrame inside a frame");
+            opened = true;
+            return;
         }
-    } else if (!AcquireImage(true)) {
-        return false;
-    }
-    OpenFrame();
-    g.frame_locked = true;
-    lock.release();
-    return true;
+        if (g.offscreen) {
+            if (g_resize_pending.load() && !ResizeOffscreen()) {
+                SubmitUploadsAndWait();
+                return;
+            }
+            opened = OpenFrame();
+            return;
+        }
+        if (!AcquireImage(true)) {
+            return;
+        }
+        opened = OpenFrame();
+    });
+    return opened;
 }
 
 void EndFrame() {
-    if (!FrameOnThisThread()) {
-        return;
-    }
-    // The lock BeginFrame took, given back as the frame ends.
-    RendererLock lock;
-    if (g.frame_locked) {
-        g.frame_locked = false;
-        lock = RendererLock(RendererMutex(), std::adopt_lock);
-    }
-    Frame          &frame = CurrentFrame();
-    VkCommandBuffer cmd = frame.draw_cmd;
-    EndRendering();
-    ReleaseTarget();
-    RecordDepthQueries(cmd);
-    g.canonical_newest = false;
-    g.presented_display = false;
-    if (g.offscreen) {
-        SubmitWithoutPresent(cmd, CurrentMainColor());
-    } else {
-        PresentImage(frame, cmd, CurrentMainColor());
-    }
-    FinishFrame(frame);
+    RunOnRenderThread([&] {
+        if (!g.in_frame) {
+            return;
+        }
+        Frame          &frame = CurrentFrame();
+        VkCommandBuffer cmd = frame.draw_cmd;
+        EndRendering();
+        ReleaseTarget();
+        PlotFrameCounters();
+        {
+            KZ_PROFILE_GPU_ZONE(cmd, "Kazarov depth queries");
+            RecordDepthQueries(cmd);
+        }
+        g.canonical_newest = false;
+        g.presented_display = false;
+        if (g.offscreen) {
+            SubmitWithoutPresent(cmd, CurrentMainColor());
+        } else {
+            PresentImage(frame, cmd, CurrentMainColor());
+        }
+        FinishFrame();
+    });
 }
 
 bool PresentCanonical() {
-    RendererLock lock = LockRenderer();
-    if (!g.canonical_newest || g.in_frame || RecordingCalls()) {
-        return false;
-    }
-    if (g.render_scale_pending) {
-        RecreateScaledMainTargets();
-        RecreateRenderTargets();
-        g.render_scale_pending = false;
-        return false;
-    }
-    g.presented_display = false;
-    if (g.offscreen) {
-        return true;
-    }
-    if (!AcquireImage(false)) {
-        return false;
-    }
-    OpenFrame();
-    Frame &frame = CurrentFrame();
-    PresentImage(frame, frame.draw_cmd, PreviousMainColor());
-    g.target = kMainTarget;
-    AdvanceSlot();
-    return true;
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    bool       presented = false;
+    RunOnRenderThread([&] {
+        if (!g.canonical_newest || g.in_frame || recording) {
+            return;
+        }
+        g.presented_display = false;
+        if (g.offscreen) {
+            presented = true;
+            return;
+        }
+        if (!AcquireImage(false)) {
+            return;
+        }
+        OpenFrame();
+        Frame &frame = CurrentFrame();
+        PresentImage(frame, frame.draw_cmd, PreviousMainColor());
+        g.target = kMainTarget;
+        AdvanceSlot();
+        presented = true;
+    });
+    return presented;
 }
 
-bool InFrame() { return FrameOnThisThread() || RecordingCalls(); }
+bool InFrame() { return GameFrameOpen() || RecordingCalls(); }
 
 RendererFeatures ActiveRendererFeatures() {
     return {g.properties.apiVersion, g.offscreen, g.triangle_fans, g.separate_stencil_masks,
@@ -1528,45 +1427,41 @@ RendererFeatures ActiveRendererFeatures() {
 
 bool HeadlessSurfaceAvailable() { return InstanceHasExtension(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME); }
 
-uint32_t ValidationMessageCount() { return g.validation_messages; }
+uint32_t ValidationMessageCount() { return g_validation_messages.load(std::memory_order_relaxed); }
 
 float RenderScale() { return g.render_scale; }
 
 void SetFrameLayout(const FrameLayout &layout) {
-    RendererLock lock = LockRenderer();
-    if (g.in_frame || RecordingCalls()) {
-        Error("SetFrameLayout inside a frame");
-        return;
-    }
-    if (!(layout.ui_scale > 0.0f) || !std::isfinite(layout.ui_scale)) {
-        Error("SetFrameLayout: ui_scale %g", static_cast<double>(layout.ui_scale));
-        return;
-    }
-    g.layout = layout;
-    if (g.device != VK_NULL_HANDLE) {
-        RecreateRenderTargets();
-    }
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    RunOnRenderThread([&] {
+        if (g.in_frame || recording) {
+            Error("SetFrameLayout inside a frame");
+            return;
+        }
+        if (!(layout.ui_scale > 0.0f) || !std::isfinite(layout.ui_scale)) {
+            Error("SetFrameLayout: ui_scale %g", static_cast<double>(layout.ui_scale));
+            return;
+        }
+        g.layout = layout;
+        if (g.device != VK_NULL_HANDLE) {
+            RecreateRenderTargets();
+        }
+    });
 }
 
 FrameLayout CurrentFrameLayout() { return g.layout; }
 
 void SetRenderScale(float scale) {
-    RendererLock lock = LockRenderer();
-    if (!(scale >= 0.5f && scale <= 2.0f) || !std::isfinite(scale) || scale == g.render_scale_factor) {
-        return;
-    }
-    g.render_scale_factor = scale;
-    g.render_scale = BaseTargetScale() * g.render_scale_factor;
-    if (g.device == VK_NULL_HANDLE) {
-        return;
-    }
-    if (g.in_frame || RecordingCalls()) {
-        g.render_scale_pending = true;
-        return;
-    }
-    RecreateScaledMainTargets();
-    RecreateRenderTargets();
-    g.canonical_newest = false;
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    RunOnRenderThread([&] {
+        if (scale <= 0.0f || scale == g.render_scale || g.in_frame || recording) {
+            return;
+        }
+        g.render_scale = scale;
+        RecreateRenderTargets();
+    });
 }
 
 } // namespace gfx

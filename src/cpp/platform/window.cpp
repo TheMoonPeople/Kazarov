@@ -4,21 +4,28 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <utility>
 #include <vector>
 
 #include "gfx/gfx.hpp"
+#include "kazarov/log.hpp"
 
 namespace {
 
+// Android shows the window fullscreen at the display's size, whatever is asked.
+#if defined(__ANDROID__) || defined(__SWITCH__)
+constexpr bool kFixedWindow = true;
+#else
+constexpr bool kFixedWindow = false;
+#endif
+
 SDL_Window                              *g_window = nullptr;
 bool                                     g_headless = false;
-bool                                     g_fixed_display = false;
 bool                                     g_mode_event = false;
 std::vector<void (*)(const SDL_Event &)> g_hooks;
-WindowIdentity                          g_identity;
+WindowIdentity                           g_identity;
 
 void ApplyIcon() {
     if (g_identity.icon_rgba == nullptr) {
@@ -33,13 +40,13 @@ void ApplyIcon() {
 }
 
 [[noreturn]] void Fatal(const char *what) {
-    std::fprintf(stderr, "%s: %s\n", what, SDL_GetError());
+    kz::Fatal("window", std::format("{}: {}", what, SDL_GetError()), /*unimplemented=*/false);
     std::exit(1);
 }
 
 void Check(bool ok, const char *what) {
     if (!ok) {
-        std::fprintf(stderr, "window: %s: %s\n", what, SDL_GetError());
+        kz::Logf(kz::LogLevel::Warning, "window", "{}: {}", what, SDL_GetError());
     }
 }
 
@@ -77,7 +84,6 @@ void WindowInit(const WindowConfig &config) {
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #endif
     g_headless = config.headless;
-    g_fixed_display = config.fixed_display;
     if (config.headless) {
 #ifdef _WIN32
         SDL_SetHint(SDL_HINT_VIDEO_DRIVER, config.vulkan ? "windows" : "offscreen");
@@ -91,18 +97,7 @@ void WindowInit(const WindowConfig &config) {
     }
     // SDL3 backs a Vulkan window on macOS with a CAMetalLayer (VK_EXT_metal_surface) by itself.
     SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    if (config.opengl) {
-        flags |= SDL_WINDOW_OPENGL;
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-        SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
-        SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
-        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
-        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
-        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    } else if (config.vulkan) {
+    if (config.vulkan) {
         flags |= SDL_WINDOW_VULKAN;
 #ifdef _WIN32
         if (config.headless) {
@@ -120,8 +115,7 @@ void WindowInit(const WindowConfig &config) {
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, placement.height);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, static_cast<Sint64>(flags));
     // Without a Vulkan surface, macOS would give the window OpenGL, which the offscreen driver cannot load.
-    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN,
-                           !config.vulkan && !config.opengl);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, !config.vulkan);
     g_window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (g_window == nullptr) {
@@ -140,7 +134,7 @@ void WindowSetIcon(const std::uint8_t *rgba, int size) {
 
 WindowModeResult WindowSetMode(const WindowConfig &config) {
     WindowModeResult result;
-    if (g_window == nullptr || config.headless || g_fixed_display) {
+    if (g_window == nullptr || config.headless || kFixedWindow) {
         return result;
     }
     SDL_DisplayID display = SDL_GetDisplayForWindow(g_window);
@@ -199,14 +193,7 @@ void WindowShutdown() {
 SDL_Window *WindowHandle() { return g_window; }
 
 bool WindowSize(int &width, int &height) {
-    if (g_window == nullptr) {
-        return false;
-    }
-#ifdef __ANDROID__
-    return SDL_GetWindowSizeInPixels(g_window, &width, &height) && width > 0 && height > 0;
-#else
-    return SDL_GetWindowSize(g_window, &width, &height) && width > 0 && height > 0;
-#endif
+    return g_window != nullptr && SDL_GetWindowSize(g_window, &width, &height) && width > 0 && height > 0;
 }
 
 bool WindowDisplaySize(int &width, int &height, bool windowed) {
@@ -233,8 +220,6 @@ bool WindowDisplaySize(int &width, int &height, bool windowed) {
     }
     return true;
 }
-
-bool WindowHasFixedDisplay() { return g_fixed_display; }
 
 std::vector<DisplayModeSize> WindowDisplayModes() {
     std::vector<DisplayModeSize> sizes;

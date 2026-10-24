@@ -12,14 +12,17 @@ TEST(GfxGpuMeshDc2, SlotRetirementWaitsEverySubmittedFrameBeforeDeleting) {
     options.offscreen = true;
     options.texture_slots = gfx::detail::kFirstUserSlot + 1;
     GfxFixture    fixture(64, 48, 1.0f, options);
+    // The test drives internal device calls directly, so it holds the device thread in every render-thread mode.
+    gfx::RenderLease lease;
     const uint8_t texel[] = {255, 0, 0, 255};
     const auto    texture = gfx::CreateTexture(gfx::TextureDesc{1, 1});
     ASSERT_NE(texture, gfx::kNullTexture);
     ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 1, 1, texel));
     gfx::detail::SubmitUploadsAndWait();
 
-    // Leave slot 1 submitted and slot 0 idle, with no upload that could wait for the draw.
-    while (gfx::detail::g.frame_slot != 1) {
+    // Leave the final ring slot submitted and slot zero idle, with no upload that could wait for the draw.
+    constexpr auto submitted_slot = gfx::detail::kFramesInFlight - 1;
+    while (gfx::detail::g.frame_slot != submitted_slot) {
         ASSERT_TRUE(gfx::BeginFrame());
         gfx::EndFrame();
     }
@@ -28,7 +31,7 @@ TEST(GfxGpuMeshDc2, SlotRetirementWaitsEverySubmittedFrameBeforeDeleting) {
                 gfx::TextureBinding{.texture = texture}, gfx::DrawState{});
     gfx::EndFrame();
     ASSERT_EQ(gfx::detail::g.frame_slot, 0u);
-    ASSERT_TRUE(gfx::detail::g.frames[1].pending);
+    ASSERT_TRUE(gfx::detail::g.frames[submitted_slot].pending);
     ASSERT_FALSE(gfx::detail::CurrentFrame().upload_open);
 
     // Observe the CPU fence contract, independent of how quickly the GPU finishes the draw.

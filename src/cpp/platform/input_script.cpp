@@ -6,7 +6,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <ranges>
 #include <sstream>
+#include <string>
+#include <type_traits>
 
 #include "platform/paths.hpp"
 
@@ -45,21 +48,24 @@ InputPadState Released() {
     return state;
 }
 
+// Android's libc++ has no floating-point std::from_chars.
+#ifdef __ANDROID__
+constexpr bool kFloatFromChars = false;
+#else
+constexpr bool kFloatFromChars = true;
+#endif
+
 template <class T>
 bool ParseNumber(std::string_view token, T &value) {
-#ifdef __ANDROID__
-    std::string copy(token);
-    char       *end = nullptr;
-    if constexpr (std::is_floating_point_v<T>) {
-        value = static_cast<T>(std::strtod(copy.c_str(), &end));
+    if constexpr (kFloatFromChars || !std::is_floating_point_v<T>) {
+        auto [end, error] = std::from_chars(token.data(), token.data() + token.size(), value);
+        return error == std::errc() && end == token.data() + token.size();
     } else {
-        value = static_cast<T>(std::strtoll(copy.c_str(), &end, 10));
+        std::string text(token);
+        char       *end = nullptr;
+        value = static_cast<T>(std::strtod(text.c_str(), &end));
+        return !text.empty() && end == text.c_str() + text.size();
     }
-    return end == copy.c_str() + copy.size();
-#else
-    auto [end, error] = std::from_chars(token.data(), token.data() + token.size(), value);
-    return error == std::errc() && end == token.data() + token.size();
-#endif
 }
 
 std::vector<std::string_view> Tokens(std::string_view line) {
@@ -195,8 +201,10 @@ bool InputScriptParse(std::string_view text, InputScript &script, std::string &e
             return false;
         }
         auto same_pad = [&](const InputScriptStep &other) { return other.pad == step.pad; };
-        auto previous = std::find_if(script.steps.rbegin(), script.steps.rend(), same_pad);
-        if (previous != script.steps.rend() && step.frame < previous->frame) {
+        // A reversed view rather than std::ranges::find_last_if, which Android's libc++ lacks.
+        auto earlier = std::views::reverse(script.steps);
+        auto previous = std::ranges::find_if(earlier, same_pad);
+        if (previous != earlier.end() && step.frame < previous->frame) {
             error = "line " + std::to_string(number) + ": frames must not decrease";
             return false;
         }

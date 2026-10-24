@@ -10,7 +10,9 @@
 #endif
 
 #include <cstdio>
-#include <cstdlib>
+#include <format>
+
+#include "kazarov/log.hpp"
 
 namespace {
 
@@ -52,15 +54,13 @@ ArenaMemory ArenaMemoryMap(std::size_t bytes, std::size_t lead) {
     std::size_t map_size = RoundUp(lead + capacity, page) + page;
     void       *map = Map(nullptr, map_size, 0);
     if (map == nullptr) {
-        std::fprintf(stderr, "arena: cannot map %zu bytes\n", map_size);
-        std::abort();
+        kz::Abort("arena", std::format("cannot map {} bytes", map_size));
     }
     auto *bytes_map = static_cast<unsigned char *>(map);
 #ifdef _WIN32
     DWORD previous;
     if (!VirtualProtect(bytes_map + map_size - page, page, PAGE_NOACCESS, &previous)) {
-        std::fprintf(stderr, "arena: cannot protect guard page\n");
-        std::abort();
+        kz::Abort("arena", "cannot protect guard page");
     }
 #else
     mprotect(bytes_map + map_size - page, page, PROT_NONE);
@@ -89,9 +89,9 @@ void ArenaMemoryZeroByRemap(const ArenaMemory &memory) {
 #else
     if (Map(memory.map, usable, MAP_FIXED) != memory.map) {
 #endif
-        std::fprintf(stderr, "arena: cannot re-map %zu bytes at %p to zero them\n", usable,
-                     static_cast<void *>(memory.map));
-        std::abort();
+        char address[32];
+        std::snprintf(address, sizeof(address), "%p", static_cast<void *>(memory.map));
+        kz::Abort("arena", std::format("cannot re-map {} bytes at {} to zero them", usable, address));
     }
 }
 

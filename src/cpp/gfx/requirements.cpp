@@ -115,6 +115,8 @@ std::vector<std::string> MissingRequirements(const DeviceCaps &caps, bool offscr
     need(caps.features13.dynamicRendering, "dynamicRendering");
     need(caps.features13.synchronization2, "synchronization2");
     need(caps.limits.maxPushConstantsSize >= sizeof(PushConstants), "maxPushConstantsSize");
+    need(caps.limits.maxStorageBufferRange >= (8u << 20), "maxStorageBufferRange of 8 MiB for constant records");
+    need(caps.limits.maxPerStageDescriptorStorageBuffers >= 3, "maxPerStageDescriptorStorageBuffers");
     need(caps.depth_stencil_format, "a D32_SFLOAT_S8_UINT or D24_UNORM_S8_UINT attachment");
     if (caps.portability_subset) {
         uint32_t alignment = std::max(caps.portability_properties.minVertexInputBindingStrideAlignment, 1u);

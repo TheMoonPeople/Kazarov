@@ -200,10 +200,10 @@ InputMenuMouse InputTakeMenuMouse();
 // Pending live/touch motion only; scripts remain sampled once per logic tick.
 // Does not drain motion, wheel, buttons or tap edges.
 void InputPeekMenuMouseMotion(float &dx, float &dy);
-#if defined(__ANDROID__)
-bool InputTouchOverlayVisible();
 
-// Active-high PS2 button word plus normalized left and right stick positions.
+#ifdef __ANDROID__
+// The on-screen gamepad of a touch screen: an active-high button word and stick deflections from -1
+// to 1.
 struct InputTouchOverlayState {
     std::uint16_t buttons = 0;
     float         left_x = 0.0f;
@@ -212,7 +212,11 @@ struct InputTouchOverlayState {
     float         right_y = 0.0f;
 };
 
+// Sets the on-screen gamepad's state, which pad 0 takes while InputTouchOverlayVisible().
 void InputSetTouchOverlay(const InputTouchOverlayState &state);
+// Whether the on-screen gamepad is to be shown: while no gamepad, keyboard or mouse is connected and
+// no key or mouse button is held. InputPoll updates it.
+bool InputTouchOverlayVisible();
 #endif
 
 // The family of button symbols that matches the device last used: keyboard and mouse after a key,

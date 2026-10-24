@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -13,17 +12,6 @@ namespace gfx {
 namespace detail {
 
 namespace {
-
-// The answers, published for DepthResult, which another thread may call while a render harvests
-// (README, "Threads"): bit 32 set when there is one, the float's bits below.
-std::atomic<uint64_t> g_answers[kDepthQueryCount];
-
-void Publish(uint32_t id) {
-    const DepthQuery &query = g.depth_queries[id];
-    uint32_t          bits;
-    std::memcpy(&bits, &query.result, sizeof(bits));
-    g_answers[id].store(query.valid ? (uint64_t{1} << 32 | bits) : 0, std::memory_order_relaxed);
-}
 
 // A query reads at most this many pixels on a side; at high resolutions a small logical rect
 // still covers hundreds of pixels and the farthest of them is as good as the farthest of all.
@@ -41,11 +29,7 @@ void HostBarrier(VkCommandBuffer cmd) {
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
-#ifdef __ANDROID__
-    g.cmd_pipeline_barrier2(cmd, &dependency);
-#else
     vkCmdPipelineBarrier2(cmd, &dependency);
-#endif
 }
 
 bool ReadImage(Image &image, uint32_t texel_size, std::vector<uint8_t> &pixels) {
@@ -105,17 +89,13 @@ void PutChunk(std::vector<uint8_t> &out, const char type[4], const std::vector<u
 void RecordDepthQueries(VkCommandBuffer cmd) {
     Image         &depth = g.main_depth;
     LogicalMapping mapping = MainMapping(depth.width, depth.height);
+    Frame         &frame = CurrentFrame();
     bool           transition = false;
     for (DepthQuery &query : g.depth_queries) {
         if (!query.queued) {
             continue;
         }
         query.queued = false;
-        query.recorded = false;
-        if (!kAsyncDepthQueries) {
-            query.valid = false;
-            Publish(static_cast<uint32_t>(&query - g.depth_queries.data()));
-        }
         float x0 = std::floor(query.rect.x * mapping.scale_x + mapping.offset_x);
         float y0 = std::floor(query.rect.y * mapping.scale_y + mapping.offset_y);
         float x1 = std::ceil((query.rect.x + query.rect.w) * mapping.scale_x + mapping.offset_x);
@@ -126,7 +106,6 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         y1 = std::min(y1, static_cast<float>(depth.height));
         if (x1 <= x0 || y1 <= y0) {
             query.valid = false;
-            Publish(static_cast<uint32_t>(&query - g.depth_queries.data()));
             continue;
         }
         uint32_t width = std::min(static_cast<uint32_t>(x1 - x0), kMaxQuerySide);
@@ -136,98 +115,56 @@ void RecordDepthQueries(VkCommandBuffer cmd) {
         x = std::clamp(x, 0, static_cast<int32_t>(depth.width - width));
         y = std::clamp(y, 0, static_cast<int32_t>(depth.height - height));
 
-        Buffer &buffer = CurrentFrame().depth_readback;
+        Buffer &buffer = frame.depth_readback;
         if (buffer.buffer == VK_NULL_HANDLE) {
             buffer = CreateBuffer(kDepthQueryCount * kQueryBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
         }
-        VkDeviceSize offset = static_cast<VkDeviceSize>(&query - g.depth_queries.data()) * kQueryBytes;
+        size_t index = static_cast<size_t>(&query - g.depth_queries.data());
         if (!transition) {
             Transition(cmd, depth, TransferSrc());
             transition = true;
         }
         VkBufferImageCopy region = {};
-        region.bufferOffset = offset;
+        region.bufferOffset = index * kQueryBytes;
         region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
         region.imageOffset = {x, y, 0};
         region.imageExtent = {width, height, 1};
         vkCmdCopyImageToBuffer(cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1,
                                &region);
-        if (kAsyncDepthQueries) {
-            Frame &frame = CurrentFrame();
-            frame.depth_pending.push_back({static_cast<uint32_t>(&query - g.depth_queries.data()), offset, width * height});
-            frame.depth_serial = g.frame_serial;
-            continue;
-        }
-        query.data = buffer.memory.mapped + offset;
-        query.texels = width * height;
-        query.recorded = true;
+        frame.depth_texels[index] = width * height;
     }
     if (transition) {
         HostBarrier(cmd);
         ToRest(cmd, depth);
-        g.depth_queries_recorded = !kAsyncDepthQueries;
     }
 }
 
-namespace {
-
-// The farthest of texels depth values, which copy out as a float for D32S8 and as 24 bits in a
-// word for D24S8.
-float Farthest(const uint8_t *data, uint32_t texels) {
-    bool  unorm = g.depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
-    float farthest = 1.0f;
-    for (uint32_t i = 0; i < texels; i++) {
-        float value;
-        if (unorm) {
-            uint32_t word;
-            std::memcpy(&word, data + i * sizeof(word), sizeof(word));
-            value = static_cast<float>(word & 0xFFFFFF) / static_cast<float>(0xFFFFFF);
-        } else {
-            std::memcpy(&value, data + i * sizeof(float), sizeof(float));
-        }
-        farthest = std::min(farthest, value);
-    }
-    return farthest;
-}
-
-} // namespace
-
-void HarvestFrameDepthQueries(Frame &frame) {
-    for (const PendingDepth &pending : frame.depth_pending) {
-        DepthQuery &query = g.depth_queries[pending.id];
-        query.result = Farthest(frame.depth_readback.memory.mapped + pending.offset, pending.texels);
-        query.valid = true;
-        Publish(pending.id);
-    }
-    frame.depth_pending.clear();
-}
-
-void HarvestReadyDepthQueries() {
-    std::vector<Frame *> ready;
-    for (Frame &frame : g.frames) {
-        if (!frame.depth_pending.empty() &&
-            (!frame.pending || vkGetFenceStatus(g.device, frame.fence) == VK_SUCCESS)) {
-            ready.push_back(&frame);
-        }
-    }
-    std::sort(ready.begin(), ready.end(), [](const Frame *a, const Frame *b) { return a->depth_serial < b->depth_serial; });
-    for (Frame *frame : ready) {
-        HarvestFrameDepthQueries(*frame);
-    }
-}
-
-void HarvestDepthQueries() {
-    for (DepthQuery &query : g.depth_queries) {
-        if (!query.recorded) {
+void HarvestDepthQueries(Frame &frame) {
+    for (size_t index = 0; index < kDepthQueryCount; index++) {
+        uint32_t texels = frame.depth_texels[index];
+        if (texels == 0) {
             continue;
         }
-        query.result = Farthest(query.data, query.texels);
+        frame.depth_texels[index] = 0;
+        const uint8_t *data = frame.depth_readback.memory.mapped + index * kQueryBytes;
+        // The depth aspect copies out as a float for D32S8 and as 24 bits in a word for D24S8.
+        bool  unorm = g.depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
+        float farthest = 1.0f;
+        for (uint32_t i = 0; i < texels; i++) {
+            float value;
+            if (unorm) {
+                uint32_t word;
+                std::memcpy(&word, data + i * sizeof(word), sizeof(word));
+                value = static_cast<float>(word & 0xFFFFFF) / static_cast<float>(0xFFFFFF);
+            } else {
+                std::memcpy(&value, data + i * sizeof(float), sizeof(float));
+            }
+            farthest = std::min(farthest, value);
+        }
+        DepthQuery &query = g.depth_queries[index];
+        query.result = farthest;
         query.valid = true;
-        query.recorded = false;
-        query.data = nullptr;
-        Publish(static_cast<uint32_t>(&query - g.depth_queries.data()));
     }
-    g.depth_queries_recorded = false;
 }
 
 } // namespace detail
@@ -235,7 +172,6 @@ void HarvestDepthQueries() {
 using namespace detail;
 
 void ReadDepth(uint32_t id, float x, float y, float w, float h) {
-    RendererLock lock = LockUnlessRecording();
     if (id >= kDepthQueryCount) {
         Error("ReadDepth: query %u is past %u", id, kDepthQueryCount);
         return;
@@ -246,51 +182,59 @@ void ReadDepth(uint32_t id, float x, float y, float w, float h) {
         });
         return;
     }
-    DepthQuery &query = g.depth_queries[id];
-    query.rect = LogicalRect{x, y, w, h};
-    query.queued = true;
+    RunOnRenderThread([&] {
+        DepthQuery &query = g.depth_queries[id];
+        query.rect = LogicalRect{x, y, w, h};
+        query.queued = true;
+    });
 }
 
 std::optional<float> DepthResult(uint32_t id) {
-    if (id >= kDepthQueryCount) {
-        return std::nullopt;
-    }
-    uint64_t answer = g_answers[id].load(std::memory_order_relaxed);
-    if ((answer >> 32) == 0) {
-        return std::nullopt;
-    }
-    uint32_t bits = static_cast<uint32_t>(answer);
-    float    result;
-    std::memcpy(&result, &bits, sizeof(result));
+    std::optional<float> result;
+    RunOnRenderThread([&] {
+        if (id < kDepthQueryCount && g.depth_queries[id].valid) {
+            result = g.depth_queries[id].result;
+        }
+    });
     return result;
 }
 
 bool ReadbackFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) {
-    RendererLock lock = LockRenderer();
-    if (g.in_frame || RecordingCalls()) {
-        Error("ReadbackFrame inside a frame");
-        return false;
-    }
-    Image &image = g.presented_display ? g.display_color : PreviousMainColor();
-    width = image.width;
-    height = image.height;
-    return ReadImage(image, 4, rgba);
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    bool       read = false;
+    RunOnRenderThread([&] {
+        if (g.in_frame || recording) {
+            Error("ReadbackFrame inside a frame");
+            return;
+        }
+        Image &image = g.presented_display ? g.display_color : PreviousMainColor();
+        width = image.width;
+        height = image.height;
+        read = ReadImage(image, 4, rgba);
+    });
+    return read;
 }
 
 bool ReadbackTexture(TextureHandle handle, std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height) {
-    RendererLock lock = LockRenderer();
-    if (g.in_frame || RecordingCalls()) {
-        Error("ReadbackTexture inside a frame");
-        return false;
-    }
-    Image *image = ColorImageOf(handle);
-    if (image == nullptr) {
-        Error("ReadbackTexture: no texture %#x", handle);
-        return false;
-    }
-    width = image->width;
-    height = image->height;
-    return ReadImage(*image, image->format == kColorFormat ? 4 : 1, pixels);
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    bool       read = false;
+    RunOnRenderThread([&] {
+        if (g.in_frame || recording) {
+            Error("ReadbackTexture inside a frame");
+            return;
+        }
+        Image *image = ColorImageOf(handle);
+        if (image == nullptr) {
+            Error("ReadbackTexture: no texture %#x", handle);
+            return;
+        }
+        width = image->width;
+        height = image->height;
+        read = ReadImage(*image, image->format == kColorFormat ? 4 : 1, pixels);
+    });
+    return read;
 }
 
 bool WritePng(const std::filesystem::path &path, const uint8_t *rgba, uint32_t width, uint32_t height) {

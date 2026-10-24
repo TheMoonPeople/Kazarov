@@ -1,160 +1,62 @@
 #include "audio/sq.hpp"
 
-#include <algorithm>
-
-#include "audio/hdbank.hpp"
+#include <nlohmann/json.hpp>
 
 namespace audio {
+std::span<const SqEvent> SqFile::Events(const SqSong &song) const {
+    return std::span<const SqEvent>(events_).subspan(song.begin, song.end - song.begin);
+}
 
-std::shared_ptr<SqFile> SqFile::Create(std::span<const std::uint8_t> sq) {
-    auto file = std::make_shared<SqFile>();
-    file->data_ = std::vector<std::uint8_t>(sq.begin(), sq.end());
-    const std::span<const std::uint8_t> data(file->data_);
-
-    const std::uint32_t midi = FindChunk(data, kChunkMidi);
-    if (midi == kUnused) {
-        return nullptr;
-    }
-    std::size_t         chunk_end = data.size();
-    const std::uint32_t size = ReadU32(data, midi + 8);
-    if (size != kUnused && size >= sq::kMidiOffsets && size <= data.size() - midi) {
-        chunk_end = midi + size;
-    }
-    const std::uint32_t max_index = ReadU32(data, midi + sq::kMidiCount);
-    if (max_index == kUnused) {
-        return nullptr;
-    }
-    const std::size_t        count = std::min<std::size_t>(max_index + 1, (chunk_end - midi - sq::kMidiOffsets) / 4);
-    std::vector<std::size_t> starts;
-    for (std::size_t i = 0; i < count; i++) {
-        const std::uint32_t offset = ReadU32(data, midi + sq::kMidiOffsets + i * 4);
-        if (offset != kUnused && midi + std::size_t{offset} + sq::kBlockMinSize <= chunk_end) {
-            starts.push_back(midi + offset);
+std::shared_ptr<SqFile> SqFile::CreateFromJson(std::string_view text) {
+    try {
+        const auto root = nlohmann::json::parse(text);
+        if (root.at("schema_version") != 1 || root.at("kind") != "sequence") {
+            return nullptr;
         }
-    }
-    for (std::size_t i = 0; i < count; i++) {
-        SqSong             &song = file->songs_.emplace_back();
-        const std::uint32_t offset = ReadU32(data, midi + sq::kMidiOffsets + i * 4);
-        if (offset == kUnused || midi + std::size_t{offset} + sq::kBlockMinSize > chunk_end) {
-            continue;
-        }
-        const std::size_t block = midi + offset;
-        // A song's events run to the next song's block, or to the end of the chunk.
-        std::size_t end = chunk_end;
-        for (std::size_t start : starts) {
-            if (start > block) {
-                end = std::min(end, start);
+        auto file = std::make_shared<SqFile>();
+        for (const auto &s : root.at("songs")) {
+            auto &song = file->songs_.emplace_back();
+            song.begin = file->events_.size();
+            song.division = s.at("division");
+            if (song.division <= 0) {
+                return nullptr;
             }
+            for (const auto &e : s.at("events")) {
+                auto &event = file->events_.emplace_back();
+                event.delta = e.at("delta");
+                const std::string kind = e.at("kind");
+                if (kind == "channel") {
+                    event.kind = SqEventKind::Channel;
+                    event.status = e.at("status");
+                    event.data[0] = e.at("data").at(0);
+                    event.data[1] = e.at("data").at(1);
+                } else {
+                    if (kind == "meta") {
+                        event.kind = SqEventKind::Meta;
+                        event.meta = e.at("meta");
+                    } else if (kind == "sysex") {
+                        event.kind = SqEventKind::SysEx;
+                    } else if (kind == "end") {
+                        event.kind = SqEventKind::End;
+                    } else {
+                        return nullptr;
+                    }
+                    auto &payload = file->payloads_.emplace_back(e.value("payload", std::vector<std::uint8_t>{}));
+                    event.payload = payload;
+                }
+            }
+            song.end = file->events_.size();
         }
-        std::size_t data_offset = ReadU32(data, block + sq::kBlockDataOffset);
-        if (data_offset < sq::kBlockMinSize || block + data_offset > end) {
-            data_offset = sq::kBlockMinSize;
-        }
-        const int division = ReadU16(data, block + sq::kBlockDivision);
-        song.begin = block + data_offset;
-        song.end = end;
-        song.division = division > 0 && division < 0x8000 ? division : 480;
-    }
-    return file;
-}
-
-bool SqReader::ReadVarLen(std::uint32_t &value) {
-    value = 0;
-    for (int i = 0; i < 4; i++) {
-        if (position_ >= events_.size()) {
-            return false;
-        }
-        const std::uint8_t byte = events_[position_++];
-        value = (value << 7) | (byte & 0x7F);
-        if ((byte & 0x80) == 0) {
-            return true;
-        }
-    }
-    return true;
-}
-
-int SqReader::DataBytes(std::uint8_t status) {
-    switch (status & 0xF0) {
-        case 0x80:
-        case 0xC0:
-        case 0xD0:
-            return 1;
-        default:
-            return 2;
+        return file;
+    } catch (const nlohmann::json::exception &) {
+        return nullptr;
     }
 }
 
 SqEvent SqReader::Next() {
-    SqEvent event;
-    while (true) {
-        if (no_delta_) {
-            event.delta = 0;
-            no_delta_ = false;
-        } else if (!ReadVarLen(event.delta)) {
-            return SqEvent{};
-        }
-        if (position_ >= events_.size()) {
-            return SqEvent{};
-        }
-        std::uint8_t status = events_[position_];
-        if (status & 0x80) {
-            position_++;
-        } else if (running_ != 0) {
-            status = running_;
-        } else {
-            // A data byte with no status to run on: skip it and its delta.
-            position_++;
-            continue;
-        }
-
-        if (status == 0xFF) {
-            if (position_ >= events_.size()) {
-                return SqEvent{};
-            }
-            event.kind = SqEventKind::Meta;
-            event.meta = events_[position_++];
-            std::uint32_t length;
-            if (!ReadVarLen(length) || length > events_.size() - position_) {
-                return SqEvent{};
-            }
-            event.payload = events_.subspan(position_, length);
-            position_ += length;
-            if (event.meta == 0x2F) {
-                event.kind = SqEventKind::End;
-            }
-            return event;
-        }
-        if (status == 0xF0 || status == 0xF7) {
-            std::uint32_t length;
-            if (!ReadVarLen(length) || length > events_.size() - position_) {
-                return SqEvent{};
-            }
-            event.kind = SqEventKind::SysEx;
-            event.payload = events_.subspan(position_, length);
-            position_ += length;
-            return event;
-        }
-        if (status >= 0xF0) {
-            const int length = status == 0xF2 ? 2 : (status == 0xF1 || status == 0xF3) ? 1
-                                                                                       : 0;
-            position_ = std::min(position_ + length, events_.size());
-            event.kind = SqEventKind::SysEx;
-            return event;
-        }
-
-        running_ = status;
-        const int length = DataBytes(status);
-        if (position_ + length > events_.size()) {
-            return SqEvent{};
-        }
-        event.kind = SqEventKind::Channel;
-        event.status = status;
-        for (int i = 0; i < length; i++) {
-            event.data[i] = events_[position_++] & 0x7F;
-        }
-        no_delta_ = (events_[position_ - 1] & 0x80) != 0;
-        return event;
+    if (position_ >= events_.size()) {
+        return {};
     }
+    return events_[position_++];
 }
-
 } // namespace audio

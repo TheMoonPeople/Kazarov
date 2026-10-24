@@ -10,7 +10,8 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
 - `RendererInit(window, config)` creates the device, the swapchain, the main targets and every
   pipeline (below). `config.pipeline_cache` defaults to `save/pipeline_cache.bin`;
   `config.progress(done, total)` is called on the calling thread while pipelines compile.
-- `BeginFrame()` / `EndFrame()` bracket a frame drawn as it is called. Two frames are in flight.
+- `BeginFrame()` / `EndFrame()` bracket a frame drawn as it is called. Four frames are in flight:
+  a tick submits a canonical render and its display renders, so the GPU may run two ticks behind.
   `BeginFrame` returns false when there is nothing to draw to (minimised); draws are then dropped and
   `EndFrame` does nothing. Every frame starts on the main target. `EndFrame` presents. The game's
   ticks are recorded instead and rendered from their display lists (below).
@@ -25,7 +26,7 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
   `--offscreen` forces it.
 - `RendererResize()` after the window's pixel size changes (`WindowPollEvents` does it); the
   swapchain and main target follow at the next `BeginFrame`. Main-target contents are lost.
-- Threads: see "Threads" below. One thread records while another renders; nothing else is shared.
+- Threads: the caller and the device worker split the work; see Threads below.
 - Textures, palettes, meshes and render targets can be created, updated and destroyed at any time,
   inside or outside a frame. Destruction is deferred until the GPU is done with them; a handle is
   dead as soon as it is destroyed outside a recording (handles carry a generation). When the texture
@@ -35,27 +36,25 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
 
 ## Threads
 
-A list can be recorded on one thread while lists recorded earlier render on another: a game runs a
-tick while the tick before is rendered and presented.
-
-- Recording belongs to the thread that called `BeginRecording`: `Recording()`, `InFrame()` and the
-  calls that record answer for the calling thread, so a render on another thread executes its
-  entries instead of recording them. A frame opened by `BeginFrame` or a list's render belongs to
-  its thread the same way.
-- The renderer's state is guarded by one recursive lock. A list's render (`RenderList`,
-  `PresentCanonical`) holds it throughout, `BeginFrame` takes it until `EndFrame`, and every call that
-  changes the renderer outside a recording takes it: creating and destroying textures, meshes and
-  targets, uploads that run at once (`UpdateTextureNow`), readback, the render scale and layout, and
-  a list's release when it destroys what it held. A call that only records takes no lock, so a
-  recording does not wait for a render; creating something while recording waits for the render
-  in progress.
-- Calls that record still look handles up: the texture and mesh tables are reserved whole at init
-  and never move, and `NamedRenderTarget` finds an existing target without the lock (the names are
-  the recording thread's alone).
-- The answers a render leaves (`DepthResult`, `GetTextureInfo` of the main target) are read without
-  the lock and may be a render behind.
-- A caller that needs its own frame (a loading screen) after a render on another thread waits for
-  that render first: the lock orders the two, not their submission order.
+- Three modes, from `RendererConfig::render_thread` or `KZ_RENDER_THREAD=off|lockstep|async` (the
+  variable wins): Off (default) runs everything on the caller; Lockstep and Async run device work on
+  a worker. Android is always Off.
+- Device-thread rule: device work runs on the worker. Recording stays on the caller. A public call
+  that touches the device is forwarded to the worker and waited for, or run inline when the caller
+  is the worker or holds a `RenderLease`.
+- `RenderLease` parks the worker and holds it off the device, so the holder runs device work inline.
+  The game holds one per tick around its canonical render and other per-tick device work.
+- Idle hook (`SetRenderIdleHook`, Async only): the worker calls it when the queue is empty and no
+  lease is wanted. It runs on the worker and must only call `gfx` functions. Its return value is how
+  long the worker sleeps before calling it again; zero calls again at once. `WakeRenderThread` and
+  any dispatch or lease end the sleep early.
+- The worker never recreates the swapchain. A display frame from the idle hook that finds the
+  swapchain out of date or pending a resize fails and leaves the swapchain to the game thread's next
+  recording.
+- A stale handle to a slot the worker reuses for a grab twin resolves to nothing, because the
+  generation no longer matches.
+- `KZ_GFX_THREAD_CHECKS` (on in builds without `NDEBUG`) makes every device function fail fast when called off the device thread.
+- A GPU timestamp zone must begin and end on one thread, so the frame upload zone is only recorded in Off.
 
 ## Spaces
 
@@ -104,7 +103,8 @@ tick while the tick before is rendered and presented.
     keeps the frame's width and shows more above and below). `VisibleLogicalRect(target)` is the
     logical rect the target's pixels cover; the game's culls test against it.
   - **The full-frame rule.** Along each axis on which the target shows past its frame (both on the
-    main target and the targets mapped like it, x on a frame target), a scissor or clear rect, and
+    main target, the targets mapped like it and a full-height frame target, x on another frame
+    target), a scissor or clear rect, and
     every axis-aligned rectangle of a `Quads` or four-vertex strip `Draw2D` whose texture is none, an
     image of the frame (`kPreviousFrame`, a frame target, a target sharing the main depth) or
     another image that shows past its frame, is carried to the target's edge on every side where it
@@ -129,8 +129,9 @@ tick while the tick before is rendered and presented.
     along an axis, copies them edge to edge along it.
   - **Frame targets** (`CreateRenderTarget(..., frame_target = true)`; the game's `frame_*` grabs)
     are the main target's pixel width with their logical width laid over its logical frame, and
-    rows at the main target's scale, so a grab of the frame keeps its sides. Other render targets
-    keep their logical size at the render scale.
+    rows at the main target's scale, so a grab of the frame keeps its sides. A full-height one (as
+    tall as the logical frame) is the main target's size and keeps the rows above and below as well.
+    Other render targets keep their logical size at the render scale.
 - **`UiAnchor`** (`SetUiAnchor`, `UiAnchorScope`; the default anchors nothing). While one is set,
   each `Draw2D` the UI mapping places on the main target is classified by the centre of its bounds
   against the anchor's four limits and moved, whole and unscaled, by the pixels between the UI
@@ -141,8 +142,10 @@ tick while the tick before is rendered and presented.
   made and travels with it in a display list; the shift is taken at render time, so it follows
   the window and `ui_scale` (a HUD scaled past the window is pulled back to its edges). An
   anchored draw is never flanked by the full-frame rule and its scissor stays the frame's unless
-  the anchor's `scissor` flag (`Side(x, y, true)`) moves it with the draw. With
-  `AspectMode::Letterbox` at `ui_scale` 1 the shift is zero.
+  the anchor's `scissor` flag (`Side(x, y, true)`) moves it with the draw. A positive `max_aspect`
+  moves draws to the edges of a centred area no wider than that aspect instead, so a layout made for
+  16:9 stays together on an ultrawide window. With `AspectMode::Letterbox` at `ui_scale` 1 the shift
+  is zero.
 - **`AspectMode::Letterbox`** (`aspect = 4:3`). Nothing is carried past the frame: draws and clears on
   the main target stop at the frame's pixels, so the bars keep what they held, and frame targets are
   ordinary render targets.
@@ -265,8 +268,9 @@ the Switch eight blended full-screen draws per image cost 5 to 9 ms where this o
   `kDisplayDepthSlot`, the slots after `kPreviousFrame`, and put back to rest as an attachment when
   that rendering ends. The next draw that needs the attachment begins a rendering of its own.
 - `draw.frag` takes it as a third specialisation constant, `kDepthCoverage`: the depth slot rides
-  in `palette_slot`, the plane count in `pad` and the depths in `fog` and `blend`, since such a draw
-  has no palette, fog or blending, so the push block stays at 112 bytes.
+  in `palette_slot` and the plane count in `fog_color`, since such a draw has no palette or fog, and
+  the depths in `coverage`, eight floats at the end of the push block (104 bytes) that only
+  `draw.frag` declares.
 - It needs a depth format the device can sample (`ActiveRendererFeatures().depth_coverage`);
   without one there is no pipeline for it and a caller draws the planes one by one.
 
@@ -295,15 +299,21 @@ file and a rename.
 ## Dark Chronicle's Vu_prog0 meshes
 
 `DrawMeshProg0` and `DrawMeshImmediateProg0` draw through `shaders/mesh_prog0.vert`, taking the
-game's `Prog0Constants` beside the `MeshConstants` (which reads only `mvp` of them). The block is a
-separate per-draw uniform at set 2, so Chronicle's `MeshConstants` stay 400 bytes and its pipeline
-layout is unchanged. `Prog0Constants` is the VU1 memory the game writes: `model_world`, the four
+game's `Prog0Constants` beside the `MeshConstants` (which reads only `mvp` of them). Both are records in
+storage-buffer arrays at set 1 (binding 0 for `MeshConstants`, binding 1 for `Prog0Constants`), one set of
+arrays per transient chunk, bound once per chunk. A skinned draw also carries its `Prog0Palette`, the 32
+bone matrices, as a record at binding 2 that only skinned draws use; a skinned draw without one uses
+identity bones. Each draw's record indices travel in push constants (`PushConstants::mesh_index`,
+`prog0_index` and `palette_index`), so Chronicle's `MeshConstants` stay 400 bytes and plain and prog0 draws
+share one pipeline layout. `Prog0Constants` is the VU1 memory the game writes: `model_world`, the four
 world light directions as x/y/z rows, the light colours, ambient times object alpha, object colour,
 the eye in object space, the clip-or-view block, material diffuse and specular with the exponent,
-four point lights relative to the object origin with their power, the fog quadword (0x3B) and the
-32 bone slots. It is in the VU's units: colours on 128 = 1.0, the material on 1.0. The game copies
+four point lights relative to the object origin with their power, and the fog quadword (0x3B). It is in
+the VU's units: colours on 128 = 1.0, the material on 1.0. The game copies
 what its render-info packet would upload instead of converting units. A display list records the
-block with its draw, and replays it as recorded.
+block with its draw, and replays it as recorded; a skinned draw's palette is recorded beside it. The face
+bits arrive in push constants instead (`PushConstants::face`, from `DrawState::prog0_face`); the block's
+`pad0` is padding.
 
 Dispatch follows the program. The matcap (`kProg0RefSphere`, 0x100) takes its UV from the unblended
 normal. Skinning (0x040) blends the vertices through the bone slots. Then, unless the face is
@@ -334,13 +344,18 @@ magnitude), O-8 (influence 3's normal takes column 1 for its z term), O-9 (the m
 skinning), O-10 (the add step's alpha is 128 x vertex alpha squared), O-11 (the exponent is
 2^(n+1), r^16 for the game's 3).
 
+## Transient memory
+
+Transient chunks prefer device-local host-visible memory (ReBAR or unified memory), each in its own allocation capped at a quarter of that heap, and fall back to host memory when there is none, the cap is reached or the driver refuses the allocation. `KZ_TRANSIENT_MEMORY=host` keeps them in host memory for A/B measurement.
+
 ## Readback
 
 - `ReadDepth(id, rect)` (16 ids) reads the main depth buffer at `EndFrame` (or at the end of a
   list's canonical render), at most 64x64 pixels
   around the rect's centre, and keeps the farthest (smallest) value: the game's pick-Z keeps the
-  farthest of an 8x8 block. `EndFrame` waits for that frame when a query was made, so
-  `DepthResult(id)` holds the answer as soon as `EndFrame` returns.
+  farthest of an 8x8 block. Nothing waits for it: the answer lands when the CPU next waits on
+  that frame's slot, so `DepthResult(id)` holds a frame or two late (a tick or two of the game's)
+  and keeps the last answer until then.
 - `ReadbackFrame` (the last presented frame: a display render, else the newest main image) and
   `ReadbackTexture` are synchronous and only allowed outside a frame or recording. `WritePng`
   writes an RGB PNG with stored (uncompressed) deflate.
@@ -364,7 +379,7 @@ renders one.
   screen).
 - **Canonical render** (`options.canonical`): every entry runs, in order, into the next of the two
   main colour images, which then becomes what `kPreviousFrame` samples and what a copy or snapshot
-  of `kMainTarget` reads; depth queries are answered from it before `RenderList` returns. It is the
+  of `kMainTarget` reads; depth queries read it (answered later, see Readback). It is the
   frame `BeginFrame` / `EndFrame` would have drawn, pixel for pixel, and nothing is presented.
   `PresentCanonical()` presents it as it is.
 - **Display render**: only the drawing entries run, into a third colour image with its own depth
@@ -377,7 +392,7 @@ renders one.
   its destination (the destination's contents with the grab laid over them), and the draws and
   target changes that follow use the twin, so what is drawn back from the grab (the depth of
   field's blurred bands, the water) lines up with the interpolated scene. The destination itself
-  keeps the canonical grab. With `options.present` it is presented and becomes what `ReadbackFrame` reads. A list
+  keeps the canonical grab. A display frame copies the destination into its twin before the first re-grab only when the grab does not cover the whole destination. With `options.present` it is presented and becomes what `ReadbackFrame` reads. A list
   that draws to the main target before clearing its logical frame starts from the canonical image.
   Display renders are refused once an immediate frame has followed the canonical render (the
   loading screen took the window). `options.overlay` names a second list whose drawing entries run
@@ -433,20 +448,22 @@ renders one.
   so this path conservatively requires one camera in each list. Canonical and alpha-1 renders
   keep recorded vertices exactly.
   Vertex animation (skinning written with `UpdateMeshVertices`) is interpolated too: the rewrite a
-  matched draw's mesh took this tick is blended with the one its match's mesh took in the previous
-  tick (the game keeps a mesh per display buffer, so the two differ), positions lerped and normals
-  lerped and normalised, unless a vertex moved further than the draw's teleport distance. The mesh
-  holds the tick's pose again when the display render ends. Left in the tick's pose, a skinned body
-  stood ahead of what hangs from it by matrices or vertices of its own (a weapon, the cloth) by
-  what was left of the tick, every display frame.
+  matched draw saw this tick (the latest of its mesh before it) is blended with the one its match saw
+  in the previous tick (the game keeps a mesh per display buffer, so the two differ), positions lerped
+  and normals lerped and normalised, unless a vertex moved further than the draw's teleport distance.
+  A mesh shared by several models is rewritten before each one's draw; a range rewritten more than
+  once in a tick is uploaded again at each rewrite, interpolated or as recorded, so every draw takes
+  its own pose. The mesh holds the tick's pose again when the display render ends. Left in the
+  tick's pose, a skinned body stood ahead of what hangs from it by matrices or vertices of its own
+  (a weapon, the cloth) by what was left of the tick, every display frame.
   A matched immediate mesh (`DrawMeshImmediate`) tagged `blend_vertices` in both ticks, with as
   many vertices as its predecessor, has them interpolated instead: positions lerped, normals lerped
   and normalised, unless one moved further than the teleport distance. The cloth asks for it: its
   vertices are the same grid points in world space, under an identity model, every tick. The shadow
   volumes must not: they are rebuilt in each tick's eye space, so a vertex of one tick is not the
   same point as that vertex of the next.
-  A matched Prog0 draw (`DrawMeshProg0`, `DrawMeshImmediateProg0`) has its 32-bone model-space
-  palette (`Prog0Constants::bones`) blended per bone: translation lerped, rotation slerped from the
+  A matched skinned Prog0 draw (`DrawMeshProg0`, `DrawMeshImmediateProg0` with a `Prog0Palette`) has its
+  32-bone model-space palette blended per bone: translation lerped, rotation slerped from the
   Gram-Schmidt rotation, scale and shear lerped in that rotation's frame. A bone that moved further
   than the draw's teleport distance keeps the newest pose. `no_interpolation` and `CutInterpolation()`
   apply as for other draws. The rest of the block follows the interpolated model and camera:
@@ -502,7 +519,8 @@ Nothing the renderer calls was introduced by Vulkan 1.4, so 1.3 is the floor:
 | `synchronization2` (`vkCmdPipelineBarrier2`, `vkQueueSubmit2`, the `*_2` stages and accesses) | 1.3 feature |
 | Cull mode, front face, topology, depth test/write/compare, stencil test and ops as dynamic state | 1.3 core (no feature bit) |
 | `D32_SFLOAT_S8_UINT` or `D24_UNORM_S8_UINT` as an attachment that copies both ways | format support |
-| `maxPushConstantsSize` of 56 bytes | 1.0 limit (128 guaranteed) |
+| `maxPushConstantsSize` of 72 bytes | 1.0 limit (128 guaranteed) |
+| `maxStorageBufferRange` of 8 MiB and `maxPerStageDescriptorStorageBuffers` of 3 | 1.0 limits (128 MiB and 4 guaranteed) |
 | `VK_KHR_swapchain` and a graphics queue that presents to the window | not when offscreen |
 
 Optional, used when present:
@@ -525,6 +543,33 @@ Optional, used when present:
 
 Shaders are compiled for `--target-env vulkan1.4`, which emits SPIR-V 1.6 with no capability beyond
 what 1.3 supports (`spirv-val --target-env vulkan1.3` accepts all three).
+
+### Android
+
+Android asks for Vulkan 1.3 and compiles the shaders for `vulkan1.3`. Its `libvulkan` does not
+export the 1.3 commands at every API level, so `vulkan_android.cpp` defines the twelve the renderer
+calls, each forwarding to the device's own. The swapchain keeps the identity transform and leaves the
+rotation to the compositor; the SUBOPTIMAL results that rotation reports keep the swapchain while the
+surface's capabilities are unchanged. A surface lost while the app is in the background is dropped
+with its swapchain and made again on a later frame. Errors also go to the system log.
+
+## Profiling
+
+Kazarov's renderer instrumentation is compiled in with the `KZ_PORT_TRACY` CMake option, which links `Tracy::TracyClient` into the host library. Without it the macros in `gfx/profile.hpp` compile to nothing. At run time zones record only while `gfx::profile::SetEnabled(true)` is set (the host sets it from its debug-mode gate) and a profiler is connected.
+
+- `KZ_PROFILE_ZONE` and `KZ_PROFILE_PLOT` are CPU zones and plots.
+- `KZ_PROFILE_GPU_ZONE(cmd, name)` scopes a GPU timestamp zone. `KZ_PROFILE_GPU_BEGIN` and `KZ_PROFILE_GPU_END` open and close one across functions (dynamic rendering spans).
+- The GPU context is created in `RendererInit` on the graphics queue and collected when a frame slot's command buffer begins, after its fence wait.
+- GPU zones may only be recorded into command buffers that are always submitted. Tracy reads queries in order, so an unsubmitted one stalls every later GPU zone.
+
+Plots, reset each frame:
+
+- `Kazarov mesh draws`
+- `Kazarov 2D draws`
+- `Kazarov descriptor binds`
+- `Kazarov grab copies`
+- `Kazarov grab pre-copies`
+- `Kazarov transient bytes`
 
 ## Not done here
 

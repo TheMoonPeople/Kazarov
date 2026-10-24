@@ -39,8 +39,12 @@ std::shared_ptr<PcmTrack> LoadPcmTrack(const std::filesystem::path &path, std::s
         error = "cannot open the file";
         return nullptr;
     }
-    const std::vector<char> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    std::string             extension = path.extension().string();
+    const std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    return LoadPcmTrack(data, path.extension().string(), error);
+}
+
+std::shared_ptr<PcmTrack> LoadPcmTrack(std::span<const std::uint8_t> data, std::string_view extension_name, std::string &error) {
+    std::string extension(extension_name);
     std::ranges::transform(extension, extension.begin(), [](unsigned char c) { return std::tolower(c); });
 
     auto     track = std::make_shared<PcmTrack>();
@@ -67,10 +71,11 @@ std::shared_ptr<PcmTrack> LoadPcmTrack(const std::filesystem::path &path, std::s
         int       ogg_channels = 0;
         int       ogg_rate = 0;
         short    *ogg = nullptr;
-        const int count = stb_vorbis_decode_memory(reinterpret_cast<const unsigned char *>(data.data()),
+        const int count = stb_vorbis_decode_memory(data.data(),
                                                    static_cast<int>(data.size()), &ogg_channels, &ogg_rate, &ogg);
         if (count > 0 && ogg != nullptr) {
             rate = static_cast<unsigned>(ogg_rate);
+            channels = static_cast<unsigned>(ogg_channels);
             ToStereo(ogg, static_cast<std::uint64_t>(count), ogg_channels, track->samples);
             decoded = true;
         }
@@ -84,6 +89,7 @@ std::shared_ptr<PcmTrack> LoadPcmTrack(const std::filesystem::path &path, std::s
         return nullptr;
     }
     track->rate = static_cast<int>(rate);
+    track->source_channels = static_cast<int>(channels);
     return track;
 }
 

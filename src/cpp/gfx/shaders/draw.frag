@@ -22,19 +22,20 @@ layout(push_constant, std430) uniform Push {
     uint flags;
     uint alpha; // ref 0-7, func 8-10, fix 16-23, ta0 24-31
     uint fog_color;
-    // flags, alpha and fog_color as values to select between: a uniform branch costs NAK (the
-    // Switch's NVK) an ssy/bra/sync and padding each, which on Maxwell outweighed the work it skipped.
-    uint  alpha_pass; // the alpha test's result for less, equal, greater (bits 0-2)
-    uint  pad;
-    vec4  fog;    // the colour as unpackUnorm4x8 gives it; a: 1 when fogged
-    vec4  blend;  // x: 1 when C is FIX, y: FIX / 0x80, z: 1 for transform 1, w: 1 for transform 2
-    vec4  target; // x: 1 when the target has no alpha, y: TA0 / 0x80
+    uint face;
+    uint mesh_index;
+    uint prog0_index;
+    uint palette_index;
+    float coverage[8];
 }
 pc;
 
 layout(location = 0) in vec4 v_color;
 layout(location = 1) in vec2 v_uv;
-layout(location = 2) in float v_fog;
+// xw: weighted vertex F*w and weight*w; y: unlimited F*w; z: near/eye blend weight.
+layout(location = 2) in vec4 v_fog;
+// xy: near/far limits; z: -2 constant, -1 direct 2D, 0 DC1 mesh, 1 DC2 prog0; w: constant F.
+layout(location = 3) flat in vec4 v_fog_mode;
 
 layout(location = 0, index = 0) out vec4 o_color;
 layout(location = 0, index = 1) out vec4 o_factor;
@@ -86,30 +87,36 @@ vec4 SamplePalette() {
 
 // TEXA expands alpha per texel before filtering too: with AEM a filtered edge between black and
 // coloured texels fades out instead of taking TA0 throughout.
+//
+// Per-draw choices here and in main are selected between rather than branched on: NVK's compiler
+// (NAK) gives every uniform branch a sync and padding, which on the Switch's Maxwell GPU cost more
+// than the work they skipped. Only the filtered AEM case, three gathers, keeps its branch.
 vec4 SampleRgba() {
     vec4  t   = texture(TEXTURE, v_uv);
-    float ta0 = pc.target.y;
-    bool  aem = (pc.flags & kAem) != 0u;
+    float ta0 = float(pc.alpha >> 24) / 128.0;
     if ((pc.flags & (kTexa | kAem | kLinear)) == (kTexa | kAem | kLinear)) {
         vec2 corner = FootprintCorner();
         vec4 sum    = textureGather(TEXTURE, corner, 0) + textureGather(TEXTURE, corner, 1) + textureGather(TEXTURE, corner, 2);
         t.a         = Bilerp(vec4(greaterThan(sum, vec4(0.0))) * ta0, Footprint());
     } else {
-        // Both sides evaluated and combined as integers: && is a branch to NAK.
+        // Combined as integers: && is a branch to NAK.
         bool  black = t.r + t.g + t.b == 0.0;
-        float texa  = mix(ta0, 0.0, (uint(aem) & uint(black)) != 0u);
-        t.a        = mix(t.a, texa, (pc.flags & kTexa) != 0u);
+        float texa  = mix(ta0, 0.0, ((pc.flags & kAem) != 0u ? 1u : 0u) * (black ? 1u : 0u) != 0u);
+        t.a         = mix(t.a, texa, (pc.flags & kTexa) != 0u);
     }
     return t;
 }
 
-// The function's verdict on less, equal and greater is a bit each of alpha_pass, so the test
-// takes no branch per function.
+// Each function's verdict on less, equal and greater, three bits a function from NEVER (0) to
+// NOTEQUAL (7), so the test takes no branch per function.
+const uint kAlphaPassBits = (0u << 0) | (7u << 3) | (1u << 6) | (3u << 9) | (2u << 12) | (6u << 15) | (4u << 18) | (5u << 21);
+
 bool AlphaPasses(float alpha) {
     int  value = int(alpha * 128.0 + 0.5);
     int  ref   = int(pc.alpha & 0xFFu);
+    uint func  = (pc.alpha >> 8) & 7u;
     uint order = value < ref ? 0u : value == ref ? 1u : 2u;
-    return ((pc.alpha_pass >> order) & 1u) != 0u;
+    return ((kAlphaPassBits >> (func * 3u + order)) & 1u) != 0u;
 }
 
 void main() {
@@ -124,35 +131,55 @@ void main() {
     }
 
     if (kDepthCoverage) {
-        // The planes at or nearer than the scene here, as GEqual depth tests at them would pass.
+        // The planes at or nearer than the scene here, as GEqual depth tests at them would pass;
+        // fog_color holds the plane count and unused planes are -1.
         float depth   = texelFetch(DEPTH, ivec2(gl_FragCoord.xy), 0).r;
-        float covered = dot(vec4(greaterThanEqual(pc.fog, vec4(depth))), vec4(1.0)) +
-                        dot(vec4(greaterThanEqual(pc.blend, vec4(depth))), vec4(1.0));
-        color *= covered / float(pc.pad);
-        o_color  = vec4(color.rgb, mix(color.a, 1.0, pc.target.x != 0.0));
+        float covered = 0.0;
+        for (int i = 0; i < 8; i++) {
+            covered += pc.coverage[i] >= depth ? 1.0 : 0.0;
+        }
+        color *= covered / float(pc.fog_color);
+        o_color  = vec4(color.rgb, mix(color.a, 1.0, (pc.flags & kOpaqueTarget) != 0u));
         o_factor = vec4(color.a);
         return;
     }
 
-    color.rgb = mix(color.rgb, mix(pc.fog.rgb, color.rgb, v_fog), bvec3(pc.fog.a != 0.0));
+    {
+        // Every pixel works the fog out, and the draw's flag selects it.
+        float direct = mix(v_fog.x, v_fog_mode.w, v_fog_mode.z < -1.5);
+        // Each edge depends only on its own endpoints, including after homogeneous clipping.
+        // Zero markers give PS2 vertex-clamp-then-screen-interpolate.
+        // Hardware clipping cannot emit fresh PS2 vertex F; near/eye crossings blend towards it.
+        bool  dc2   = v_fog_mode.z > 0.5;
+        float fresh = v_fog.y * gl_FragCoord.w;
+        fresh       = mix(min(max(fresh, v_fog_mode.y), v_fog_mode.x), floor(max(max(min(fresh, v_fog_mode.x), v_fog_mode.y), 0.0)), dc2);
+        // The weighted F only where its weight is positive; elsewhere the quotient is never selected.
+        float weighted = v_fog.x / max(v_fog.w, 1e-30);
+        float limited  = mix(fresh, mix(weighted, fresh, clamp(v_fog.z, 0.0, 1.0)), v_fog.w > 0.0) / 255.0;
+        float fog      = mix(direct, limited, v_fog_mode.z >= 0.0);
+        color.rgb      = mix(color.rgb, mix(unpackUnorm4x8(pc.fog_color).rgb, color.rgb, fog), bvec3((pc.flags & kFog) != 0u));
+    }
 
     if (kAlphaTest && !AlphaPasses(color.a)) {
         discard;
     }
 
 #ifdef KZ_INTERPOLATION_TINT
-    // Keep the original coverage, alpha test and blending. Only presentation RGB is tinted: selected,
-    // not branched on, as everything per draw here (a uniform branch costs NAK a sync).
+    // Keep the original coverage, alpha test and blending. Only presentation RGB is tinted.
     uint status = (pc.flags >> 8) & 7u;
-    vec3 tint   = status == 1u ? vec3(0.1, 1.0, 0.1) : status == 2u ? vec3(1.0, 0.1, 0.1)
-                : status == 3u ? vec3(0.1, 0.2, 1.0) : status == 4u ? vec3(1.0, 1.0, 0.1)
-                               : vec3(0.1, 1.0, 1.0);
-    color.rgb   = mix(color.rgb, tint, status != 0u ? 0.8 : 0.0);
+    if (status != 0u) {
+        vec3 tint = status == 1u ? vec3(0.1, 1.0, 0.1) : status == 2u ? vec3(1.0, 0.1, 0.1)
+                                                     : status == 3u   ? vec3(0.1, 0.2, 1.0)
+                                                     : status == 4u   ? vec3(1.0, 1.0, 0.1)
+                                                                      : vec3(0.1, 1.0, 1.0);
+        color.rgb = mix(color.rgb, tint, 0.8);
+    }
 #endif
 
-    float factor = mix(color.a, pc.blend.y, pc.blend.x != 0.0);
-    vec3  rgb    = mix(color.rgb, color.rgb * (1.0 + factor), bvec3(pc.blend.z != 0.0));
-    rgb          = mix(rgb, vec3(factor), bvec3(pc.blend.w != 0.0));
-    o_color      = vec4(rgb, mix(color.a, 1.0, pc.target.x != 0.0));
-    o_factor     = vec4(factor);
+    float factor    = mix(color.a, float((pc.alpha >> 16) & 0xFFu) / 128.0, (pc.flags & kFactorFix) != 0u);
+    uint  transform = (pc.flags >> kTransformShift) & 3u;
+    vec3  rgb       = mix(color.rgb, color.rgb * (1.0 + factor), bvec3(transform == 1u));
+    rgb             = mix(rgb, vec3(factor), bvec3(transform == 2u));
+    o_color         = vec4(rgb, mix(color.a, 1.0, (pc.flags & kOpaqueTarget) != 0u));
+    o_factor        = vec4(factor);
 }

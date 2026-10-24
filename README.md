@@ -259,7 +259,7 @@ Do not wrap `PORT_RETURN` in a PS2-visible `if`. The PS2 build then compiles tha
 | Directory | Contents |
 |---|---|
 | `gfx/` | Vulkan renderer: display lists, pipelines, readback, `shaders/` (compiled to headers by the consumer) |
-| `audio/` | Sony HD/BD/SQ/VAG stack, mixer, reverb, sequencer, WAV/FLAC/Vorbis decoding |
+| `audio/` | PCM WAV banks, mixer, reverb, versioned JSON musical/effect sequences, WAV/FLAC/Vorbis decoding |
 | `platform/` | Host services: window, input, display, clock, files, paths, settings, glyphs, overlay, TrueType font, memory, audio output, image files |
 | `platform/arena` | Per-owner arena blocks over `platform/memory`: zeroed, 64-byte aligned, 4x headroom, a guard page after each, named overflow aborts, a debug check that a block lies above 4 GiB, `WidenNear` and `PortImagePointer` for truncated pointers |
 | `sce/` | PS2 SDK replacements (eekernel, eekernel_threads, libcdvd, libgraph, libmc, libpad, libvu0, sifdev, sifrpc). `eekernel_threads` runs kernel threads and semaphores as cooperative fibers on the main OS thread, and a switch inside `ClockPump` aborts; `sce/unimplemented.cpp` defines `Ps2Unimplemented`, behind `PS2_UNIMPLEMENTED()` in `kazarov/port.h` |
@@ -274,7 +274,17 @@ Do not wrap `PORT_RETURN` in a PS2-visible `if`. The PS2 build then compiles tha
   - `WindowSetIdentity()`: the window title and icon.
   - `gfx::RendererConfig`: `app_name`, `logical_width` and `logical_height`, and `display_aspect`.
 - Shared tests run after the game's `main()` has set its identity. They must not assume a particular game.
+- On Android the window is fixed fullscreen in landscape (`WindowSetMode` changes nothing), and the game draws its own on-screen gamepad: it passes the gamepad's state to `InputSetTouchOverlay`, which pad 0 takes while `InputTouchOverlayVisible()`, true after an `InputPoll` that found no gamepad, keyboard or mouse in use.
 - Behaviour change (main after f1b8e80): the flanks that carry a full-frame `Draw2D` rectangle to the edge of a window wider or taller than the logical frame always sample with clamped wrap (`gfx/README.md`, "Fill"). A full-frame draw of a repeating texture used to tile into the flanks and now repeats its edge texels there, which removes the seam at the frame's border. Output at the logical aspect is unchanged; only non-4:3 windows differ, and only for such draws.
+
+### Diagnostics
+
+The host code reports through `kazarov/log.hpp` (`platform/log.cpp`). Only `PathsConsumeArgs`' usage errors (`--data needs a directory`), printed before a host can install a sink, go straight to stderr.
+
+- `kz::Log(level, subsystem, message)` and `kz::Logf(level, subsystem, format, args...)` (`std::format`) send one line to the sink installed with `kz::SetLogSink`. Without a sink each line goes to stderr as `<subsystem>: <message>`, as one write. The sink is an atomic function pointer, so `Log` takes no lock and may be called from any thread, the audio callback and pipeline workers included; a sink must be safe the same way and must not log back into Kazarov. `nullptr` restores stderr.
+- `kz::Fatal(subsystem, message, unimplemented)` logs the line at `kz::LogLevel::Fatal`, flushes stderr, and calls the hook installed with `kz::SetFatalHook`, once per process. The hook normally writes a crash report and does not return; if it returns, the caller's own exit follows. `kz::Abort(subsystem, message)` is `Fatal` with `unimplemented` false, then `std::abort()`.
+- `Ps2Unimplemented` calls `Fatal` with `unimplemented` true, the call's `<file>:<line>` as the subsystem and `<function>: PlayStation 2 code is not implemented on PC` as the message, then aborts. `gfx::Fatal` (and so `gfx::Check`) and the window's SDL failures call `Fatal` and exit with status 1. Arena overflows (subsystem `arena <name>`), failed arena mappings, fiber creation failures and `eekernel` deadlocks call `Abort`.
+- `<prefix>_AUDIO_TRACE` lines (`audio::Trace`) go through `Log` at `Debug`, formatted into a stack buffer, so a trace line costs no allocation on the audio callback.
 
 CMake entry points are in `cmake/KazarovPort.cmake`:
 
@@ -312,18 +322,22 @@ when the game's data-version check reports missing or outdated data. It returns
 setup before starting. Window initialization failures cross the bridge as errors.
 The game should recheck its data marker before continuing startup.
 
-Setup provides an editable source path, **Choose folder**, a progress bar and
-**Okay**. The source can be a disc folder or a typed ISO path. The picker is native
+Setup provides an editable source path, **Choose image**, **Choose folder**, a
+progress bar and **Okay**. The source can be a disc folder or an ISO image; a folder
+holding no `DATA.DAT` and a single `.iso` file stands for that image. The pickers are native
 on Windows and macOS, and uses the XDG desktop portal on Linux; Linux installations
 need a portal backend for their desktop. The setup window uses eframe/egui with
 OpenGL and supports X11 and Wayland. Linux build dependencies are included in the
 toolchain image (`pkg-config`, X11, Wayland, xkbcommon and EGL development files).
 
-Extraction runs on a worker thread. `extract_with_progress` reports weighted
-phases: source checking (0–5%), raw files (5–40%), conversion (40–90%), final
-texture manifests and publication (90–100%). Percentages measure completed work,
-not estimated elapsed time. Concurrent callbacks are coalesced monotonically by
-the window. Only successful publication reaches 100%; then setup closes and
+Extraction runs on a worker thread. `extract_with_progress` reports planned work
+for the ISO read, asset planning, concurrent texture, model, audio, movie, script
+and retained-asset conversion, ZIP streaming, final archive verification and
+transactional publication. Model publication has the largest progress share because
+it determines the conversion tail; the ETA is withheld when critical model work
+stops advancing. Percentages measure completed work, not estimated elapsed time.
+Concurrent callbacks are coalesced monotonically by the window. Only successful
+publication reaches 100%; then setup closes and
 returns to the caller automatically. Errors allow retry. Closing is disabled
 while extraction is active so publishing is never abandoned mid-operation.
 
@@ -339,6 +353,19 @@ DLLs and emits a runtime package list; `EXECUTABLES` adds named executable targe
 to that list. The Vulkan loader download
 is pinned and hash-checked when `KZ_VULKAN_RUNTIME_DIR` is not supplied. These
 rules copy program dependencies only; they never include retail game assets.
+
+## Models and actions
+
+`src/rust/models.rs` converts the game's models, skeletons and motions into glTF with
+gameplay sidecars, and `src/rust/actions.rs` names their actions. Every CFG `KEY`
+interval becomes one glTF animation named in English from
+`assets/motion_names.json`; conversion fails when a motion name has no entry. A
+motion that only drives other bundles' models is published into the models the
+game's scripts and code load it onto, never as an animation-only glTF; the scan of
+compiled scripts is in `src/rust/native_scripts.rs`. Each glTF keeps its binary data
+in one `<file>.gltf.bin` beside it. Only ChronicleTwo uses these
+modules; Chronicle's pinned revision does not contain the Rust publisher. Changes
+to the published format bump `data_version.json`.
 
 ## License
 

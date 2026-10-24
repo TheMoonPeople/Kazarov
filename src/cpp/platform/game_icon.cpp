@@ -10,17 +10,23 @@
 #undef RECT
 #endif
 
+#include <fastgltf/core.hpp>
+#include <fastgltf/tools.hpp>
+#include <stb_image.h>
+
 #include <algorithm>
-#include <cctype>
 #include <array>
+#include <cctype>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
 
+#include "kazarov/log.hpp"
 #include "platform/paths.hpp"
 #include "platform/window.hpp"
 
@@ -28,143 +34,185 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kTextureSize = 128;
 constexpr int kSupersample = 4;
 
+/**
+ * One transformed triangle corner and its material texture.
+ */
 struct Vertex {
-    float pos[3];
-    float normal[3];
-    float uv[2];
+    float                pos[3];                /**< Position in the standard glTF scene. */
+    float                normal[3];             /**< Surface normal in the standard glTF scene. */
+    float                uv[2];                 /**< Texture coordinates. */
+    std::size_t          texture = 0;           /**< Texture used by the triangle. */
+    std::array<float, 4> factor = {1, 1, 1, 1}; /**< Standard material base colour. */
 };
 
+/**
+ * An RGBA image used by a glTF material.
+ */
+struct Texture {
+    int                       width = 1;                     /**< Horizontal texel count. */
+    int                       height = 1;                    /**< Vertical texel count. */
+    std::vector<std::uint8_t> pixels = {255, 255, 255, 255}; /**< RGBA texels. */
+};
+
+/**
+ * Expanded standard glTF triangles and material images.
+ */
 struct Model {
-    std::vector<Vertex>        vertices;
-    std::vector<std::uint16_t> texture; // 128x128 RGB555, red in the low bits
+    std::vector<Vertex>  vertices;            /**< Triangle corners in drawing order. */
+    std::vector<Texture> textures{Texture{}}; /**< Material images, starting with white. */
 };
 
-class Reader {
-public:
-    Reader(const std::uint8_t *data, std::size_t size) : data_(data), size_(size) {}
-
-    bool Skip(std::size_t bytes) {
-        if (bytes > size_ - at_) {
+/**
+ * Decodes standard glTF scene geometry and embedded images for icon rendering.
+ */
+bool Decode(const std::uint8_t *data, std::size_t size, Model &model, const fs::path &base = {}) {
+    try {
+        auto input = fastgltf::GltfDataBuffer::FromBytes(reinterpret_cast<const std::byte *>(data), size);
+        if (input.error() != fastgltf::Error::None) {
             return false;
         }
-        at_ += bytes;
-        return true;
-    }
-
-    template <typename T>
-    bool Read(T &out) {
-        if (sizeof(T) > size_ - at_) {
+        fastgltf::Parser parser;
+        const auto       options = base.empty() ? fastgltf::Options::None : fastgltf::Options::LoadExternalBuffers | fastgltf::Options::LoadExternalImages;
+        auto             parsed = parser.loadGltf(input.get(), base, options);
+        if (parsed.error() != fastgltf::Error::None || fastgltf::validate(parsed.get()) != fastgltf::Error::None) {
             return false;
         }
-        std::memcpy(&out, data_ + at_, sizeof(T));
-        at_ += sizeof(T);
-        return true;
-    }
-
-    std::size_t At() const { return at_; }
-
-private:
-    const std::uint8_t *data_;
-    std::size_t         size_;
-    std::size_t         at_ = 0;
-};
-
-// The PS2 icon layout: a header, every vertex with one position per animation shape, its normal, UV and
-// colour, the animation frames and then a 128x128 texture, run-length compressed when bit 3 of the
-// texture type is set.
-bool Decode(const std::uint8_t *data, std::size_t size, Model &model) {
-    Reader        in(data, size);
-    std::uint32_t magic, shapes, texture_type, vertex_count;
-    float         reserved;
-    if (!in.Read(magic) || !in.Read(shapes) || !in.Read(texture_type) || !in.Read(reserved) ||
-        !in.Read(vertex_count) || magic != 0x10000 || shapes == 0 || shapes > 16 || vertex_count == 0 ||
-        vertex_count % 3 != 0 || vertex_count > size / 16) {
-        return false;
-    }
-    model.vertices.resize(vertex_count);
-    for (Vertex &vertex : model.vertices) {
-        std::int16_t position[4], normal[4], uv[2];
-        for (int i = 0; i < 4; ++i) {
-            if (!in.Read(position[i])) {
+        const auto &asset = parsed.get();
+        for (const auto &buffer : asset.buffers) {
+            if (std::holds_alternative<fastgltf::sources::URI>(buffer.data)) {
                 return false;
             }
         }
-        if (!in.Skip(8 * (shapes - 1))) {
-            return false;
-        }
-        for (int i = 0; i < 4; ++i) {
-            if (!in.Read(normal[i])) {
+        Model result;
+        for (const auto &image : asset.images) {
+            std::vector<unsigned char> bytes;
+            std::visit([&](const auto &source) {
+                using T = std::decay_t<decltype(source)>;
+                if constexpr (std::is_same_v<T, fastgltf::sources::Array> || std::is_same_v<T, fastgltf::sources::Vector> || std::is_same_v<T, fastgltf::sources::ByteView>) {
+                    bytes.resize(source.bytes.size());
+                    std::memcpy(bytes.data(), source.bytes.data(), bytes.size());
+                } else if constexpr (std::is_same_v<T, fastgltf::sources::BufferView>) {
+                    const auto view = fastgltf::DefaultBufferDataAdapter{}(asset, source.bufferViewIndex);
+                    bytes.resize(view.size());
+                    std::memcpy(bytes.data(), view.data(), view.size());
+                }
+            },
+                       image.data);
+            Texture texture;
+            int     components = 0;
+            auto   *pixels = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &texture.width, &texture.height, &components, 4);
+            if (!pixels) {
                 return false;
             }
+            texture.pixels.assign(pixels, pixels + std::size_t(texture.width) * texture.height * 4);
+            stbi_image_free(pixels);
+            result.textures.push_back(std::move(texture));
         }
-        if (!in.Read(uv[0]) || !in.Read(uv[1]) || !in.Skip(4)) {
-            return false;
-        }
-        // The icon's y and z point down and away; flip them to a y-up, z-towards-the-viewer frame.
-        constexpr float kOne = 4096.0f;
-        vertex.pos[0] = position[0] / kOne;
-        vertex.pos[1] = -position[1] / kOne;
-        vertex.pos[2] = -position[2] / kOne;
-        vertex.normal[0] = normal[0] / kOne;
-        vertex.normal[1] = -normal[1] / kOne;
-        vertex.normal[2] = -normal[2] / kOne;
-        vertex.uv[0] = uv[0] / kOne;
-        vertex.uv[1] = uv[1] / kOne;
-    }
-    std::uint32_t tag, frame_length, play_offset, frames;
-    float         speed;
-    if (!in.Read(tag) || !in.Read(frame_length) || !in.Read(speed) || !in.Read(play_offset) || !in.Read(frames) ||
-        frames > 1024) {
-        return false;
-    }
-    for (std::uint32_t i = 0; i < frames; ++i) {
-        std::uint32_t shape, keys;
-        if (!in.Read(shape) || !in.Read(keys) || keys > 1024 || !in.Skip(8 * std::size_t(keys))) {
-            return false;
-        }
-    }
-    constexpr std::size_t kTexels = kTextureSize * kTextureSize;
-    model.texture.clear();
-    model.texture.reserve(kTexels);
-    if (texture_type & 8) {
-        std::uint32_t packed;
-        if (!in.Read(packed) || packed > size - in.At()) {
-            return false;
-        }
-        const std::size_t end = in.At() + packed;
-        while (in.At() < end && model.texture.size() < kTexels) {
-            std::uint16_t count, value;
-            if (!in.Read(count)) {
+        std::vector<bool>                                                 active(asset.nodes.size());
+        std::function<bool(std::size_t, const fastgltf::math::fmat4x4 &)> visit;
+        visit = [&](std::size_t index, const fastgltf::math::fmat4x4 &parent) {
+            if (index >= asset.nodes.size() || active[index]) {
                 return false;
             }
-            if (count & 0x8000) {
-                for (int i = 0; i < 0x10000 - count; ++i) {
-                    if (!in.Read(value)) {
+            active[index] = true;
+            const auto &node = asset.nodes[index];
+            const auto  world = parent * fastgltf::getLocalTransformMatrix(node);
+            const auto  normal_matrix = fastgltf::math::transpose(fastgltf::math::inverse(world));
+            if (node.meshIndex) {
+                for (const auto &primitive : asset.meshes.at(*node.meshIndex).primitives) {
+                    const auto positions = primitive.findAttribute("POSITION");
+                    if (positions == primitive.attributes.end()) {
                         return false;
                     }
-                    model.texture.push_back(value);
+                    const auto           normals = primitive.findAttribute("NORMAL");
+                    const auto           uvs = primitive.findAttribute("TEXCOORD_0");
+                    std::size_t          texture = 0;
+                    std::array<float, 4> factor{1, 1, 1, 1};
+                    if (primitive.materialIndex) {
+                        const auto &material = asset.materials.at(*primitive.materialIndex).pbrData;
+                        for (int component = 0; component < 4; ++component) {
+                            factor[component] = material.baseColorFactor[component];
+                        }
+                        if (material.baseColorTexture) {
+                            const auto &source = asset.textures.at(material.baseColorTexture->textureIndex);
+                            if (source.imageIndex) {
+                                texture = *source.imageIndex + 1;
+                            }
+                        }
+                    }
+                    const auto &position_accessor = asset.accessors.at(positions->accessorIndex);
+                    const auto  count = primitive.indicesAccessor ? asset.accessors.at(*primitive.indicesAccessor).count : position_accessor.count;
+                    auto        corner = [&](std::size_t at) {
+                        const auto source = primitive.indicesAccessor ? fastgltf::getAccessorElement<std::uint32_t>(asset, asset.accessors.at(*primitive.indicesAccessor), at) : at;
+                        if (source >= position_accessor.count) {
+                            throw std::runtime_error("invalid glTF icon index");
+                        }
+                        const auto position = fastgltf::getAccessorElement<fastgltf::math::fvec3>(asset, position_accessor, source);
+                        const auto point = world * fastgltf::math::fvec4(position[0], position[1], position[2], 1);
+                        auto       normal = fastgltf::math::fvec4(0, 0, 1, 0);
+                        if (normals != primitive.attributes.end()) {
+                            const auto value = fastgltf::getAccessorElement<fastgltf::math::fvec3>(asset, asset.accessors.at(normals->accessorIndex), source);
+                            normal = fastgltf::math::fvec4(value[0], value[1], value[2], 0);
+                        }
+                        normal = normal_matrix * normal;
+                        Vertex vertex{};
+                        for (int component = 0; component < 3; ++component) {
+                            vertex.pos[component] = point[component];
+                            vertex.normal[component] = normal[component];
+                        }
+                        if (uvs != primitive.attributes.end()) {
+                            const auto uv = fastgltf::getAccessorElement<fastgltf::math::fvec2>(asset, asset.accessors.at(uvs->accessorIndex), source);
+                            vertex.uv[0] = uv[0];
+                            vertex.uv[1] = uv[1];
+                        }
+                        vertex.texture = texture;
+                        vertex.factor = factor;
+                        result.vertices.push_back(vertex);
+                    };
+                    if (primitive.type == fastgltf::PrimitiveType::Triangles) {
+                        if (count % 3) {
+                            return false;
+                        }
+                        for (std::size_t at = 0; at < count; ++at) {
+                            corner(at);
+                        }
+                    } else if (primitive.type == fastgltf::PrimitiveType::TriangleStrip || primitive.type == fastgltf::PrimitiveType::TriangleFan) {
+                        for (std::size_t at = 2; at < count; ++at) {
+                            corner(primitive.type == fastgltf::PrimitiveType::TriangleFan ? 0 : at - 2);
+                            corner(at - 1);
+                            corner(at);
+                        }
+                    } else {
+                        return false;
+                    }
                 }
-            } else {
-                if (!in.Read(value)) {
+            }
+            for (auto child : node.children) {
+                if (!visit(child, world)) {
                     return false;
                 }
-                model.texture.insert(model.texture.end(), count, value);
+            }
+            active[index] = false;
+            return true;
+        };
+        if (asset.scenes.empty()) {
+            return false;
+        }
+        for (auto root : asset.scenes.at(asset.defaultScene.value_or(0)).nodeIndices) {
+            if (!visit(root, fastgltf::math::fmat4x4(1))) {
+                return false;
             }
         }
-    } else {
-        std::uint16_t value;
-        while (model.texture.size() < kTexels && in.Read(value)) {
-            model.texture.push_back(value);
+        if (result.vertices.empty()) {
+            return false;
         }
-    }
-    if (model.texture.size() < kTexels) {
+        model = std::move(result);
+        return true;
+    } catch (const std::exception &) {
         return false;
     }
-    model.texture.resize(kTexels);
-    return true;
 }
 
 // Orthographic, two-sided, with one directional light, turned by yaw and then roll (degrees).
@@ -251,20 +299,20 @@ std::vector<std::uint8_t> Draw(const Model &model, int size, float yaw_degrees, 
                 float         v = w0 * va.uv[1] + w1 * vb.uv[1] + w2 * vc.uv[1];
                 u -= std::floor(u);
                 v -= std::floor(v);
-                const int   tx = std::clamp(int(u * kTextureSize), 0, kTextureSize - 1);
-                const int   ty = std::clamp(int(v * kTextureSize), 0, kTextureSize - 1);
+                const auto &texture = model.textures[va.texture];
+                const int   tx = std::clamp(int(u * texture.width), 0, texture.width - 1);
+                const int   ty = std::clamp(int(v * texture.height), 0, texture.height - 1);
                 float       n[3] = {w0 * nx[a] + w1 * nx[b] + w2 * nx[c], w0 * ny[a] + w1 * ny[b] + w2 * ny[c],
                                     w0 * nz[a] + w1 * nz[b] + w2 * nz[c]};
                 const float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) + 1e-9f;
                 const float lit =
                     0.45f + 0.75f * std::fabs((n[0] * light[0] + n[1] * light[1] + n[2] * light[2]) / nl);
-                const std::uint16_t texel = model.texture[std::size_t(ty) * kTextureSize + tx];
-                const int           rgb[3] = {(texel & 31) << 3, ((texel >> 5) & 31) << 3, ((texel >> 10) & 31) << 3};
-                std::uint8_t       *out = &image[(std::size_t(y) * big + x) * 4];
+                const auto   *texel = &texture.pixels[(std::size_t(ty) * texture.width + tx) * 4];
+                std::uint8_t *out = &image[(std::size_t(y) * big + x) * 4];
                 for (int i = 0; i < 3; ++i) {
-                    out[i] = std::uint8_t(std::clamp(rgb[i] * lit, 0.0f, 255.0f));
+                    out[i] = std::uint8_t(std::clamp(texel[i] * va.factor[i] * lit, 0.0f, 255.0f));
                 }
-                out[3] = 255;
+                out[3] = std::uint8_t(std::clamp(texel[3] * va.factor[3], 0.0f, 255.0f));
             }
         }
     }
@@ -295,76 +343,6 @@ std::vector<std::uint8_t> Draw(const Model &model, int size, float yaw_degrees, 
         }
     }
     return result;
-}
-
-bool ReadFile(const fs::path &path, std::vector<std::uint8_t> &out) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return false;
-    }
-    out.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-    return true;
-}
-
-bool SameName(const char *a, const char *b) {
-    for (; *a != 0 && *b != 0; ++a, ++b) {
-        if (std::tolower(static_cast<unsigned char>(*a)) != std::tolower(static_cast<unsigned char>(*b))) {
-            return false;
-        }
-    }
-    return *a == *b;
-}
-
-// relative under root, each component matched without regard to case: extraction may fold the disc's names.
-bool FindFolded(const fs::path &root, const fs::path &relative, fs::path &out) {
-    fs::path at = root;
-    for (const fs::path &part : relative) {
-        std::error_code error;
-        if (fs::exists(at / part, error)) {
-            at /= part;
-            continue;
-        }
-        const std::string wanted = part.generic_string();
-        bool              found = false;
-        for (fs::directory_iterator it(at, error), end; !error && it != end; it.increment(error)) {
-            if (SameName(it->path().filename().generic_string().c_str(), wanted.c_str())) {
-                at = it->path();
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return false;
-        }
-    }
-    out = at;
-    return true;
-}
-
-// A PACK is a chain of 0x4C-byte entries (name[64], data offset, size, next entry), each offset relative
-// to its own entry; an empty name ends it.
-bool PackMember(const std::vector<std::uint8_t> &pack, const char *wanted, std::vector<std::uint8_t> &out) {
-    std::size_t at = 0;
-    while (at + 0x4C <= pack.size() && pack[at] != 0) {
-        char name[65] = {};
-        std::memcpy(name, &pack[at], 64);
-        std::int32_t offset, size, next;
-        std::memcpy(&offset, &pack[at + 64], 4);
-        std::memcpy(&size, &pack[at + 68], 4);
-        std::memcpy(&next, &pack[at + 72], 4);
-        if (SameName(name, wanted)) {
-            if (offset < 0 || size <= 0 || at + offset > pack.size() || std::size_t(size) > pack.size() - at - offset) {
-                return false;
-            }
-            out.assign(pack.begin() + at + offset, pack.begin() + at + offset + size);
-            return true;
-        }
-        if (next <= 0) {
-            break;
-        }
-        at += next;
-    }
-    return false;
 }
 
 #ifdef _WIN32
@@ -432,7 +410,7 @@ void CreateShortcut(const fs::path &link, const fs::path &target, const std::wst
         IPersistFile *file = nullptr;
         if (SUCCEEDED(shell_link->QueryInterface(IID_IPersistFile, reinterpret_cast<void **>(&file)))) {
             if (FAILED(file->Save(link.c_str(), TRUE))) {
-                std::fprintf(stderr, "icon: could not write %s\n", PathsDisplay(link).c_str());
+                kz::Logf(kz::LogLevel::Warning, "icon", "could not write {}", PathsDisplay(link));
             }
             file->Release();
         }
@@ -480,13 +458,30 @@ void InstallWindowsIcon(const fs::path &data_root, const GameIconSource &source,
 }
 #endif
 
-bool LoadModel(const fs::path &data_root, const GameIconSource &source, Model &model) {
-    for (const fs::path &relative : source.packs) {
-        fs::path                  path;
-        std::vector<std::uint8_t> pack, ico;
-        if (FindFolded(data_root, relative, path) && ReadFile(path, pack) && PackMember(pack, source.member, ico) &&
-            Decode(ico.data(), ico.size(), model)) {
-            return true;
+bool LoadModel(const GameIconSource &source, Model &model) {
+    if (!source.candidates) {
+        return false;
+    }
+    for (const fs::path &directory : source.packs) {
+        const auto relative = directory / source.member;
+        if (relative.is_absolute()) {
+            continue;
+        }
+        bool safe = true;
+        for (const auto &component : relative) {
+            if (component == "..") {
+                safe = false;
+            }
+        }
+        if (!safe) {
+            continue;
+        }
+        for (const auto &file : source.candidates(relative)) {
+            std::vector<std::uint8_t> bytes;
+            const auto                host = vfs::HostPath(file);
+            if (vfs::Read(file, bytes) && Decode(bytes.data(), bytes.size(), model, host ? host->parent_path() : fs::path{})) {
+                return true;
+            }
         }
     }
     return false;
@@ -502,24 +497,24 @@ std::vector<std::uint8_t> GameIconRender(const std::uint8_t *ico, std::size_t ic
     return Draw(model, size, yaw, roll);
 }
 
-std::vector<std::uint8_t> GameIconFromData(const fs::path &data_root, const GameIconSource &source, int size) {
+std::vector<std::uint8_t> GameIconFromData(const GameIconSource &source, int size) {
     Model model;
-    if (size <= 0 || !LoadModel(data_root, source, model)) {
+    if (size <= 0 || !LoadModel(source, model)) {
         return {};
     }
     return Draw(model, size, source.yaw, source.roll);
 }
 
 void GameIconInstall(const fs::path &data_root, const GameIconSource &source) {
-    constexpr int                    kWindowIconSize = 256;
+    constexpr int                    window_icon_size = 256;
     static std::vector<std::uint8_t> window_icon;
     Model                            model;
-    if (!LoadModel(data_root, source, model)) {
+    if (!LoadModel(source, model)) {
         return;
     }
-    window_icon = Draw(model, kWindowIconSize, source.yaw, source.roll);
+    window_icon = Draw(model, window_icon_size, source.yaw, source.roll);
     if (!window_icon.empty()) {
-        WindowSetIcon(window_icon.data(), kWindowIconSize);
+        WindowSetIcon(window_icon.data(), window_icon_size);
     }
 #ifdef _WIN32
     InstallWindowsIcon(data_root, source, model);

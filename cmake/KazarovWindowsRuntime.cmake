@@ -36,7 +36,8 @@ function(kz_windows_runtime target)
     endif()
     set(runtime "$<TARGET_FILE:SDL3::SDL3>" "${KZ_LIBCXX_DLL}" "${KZ_PTHREAD_DLL}"
         "${KZ_UNWIND_DLL}" "${KZ_VULKAN_LOADER}" ${ffmpeg})
-    # A dependency target restores missing DLLs even when the executable needs no relink.
+    # A dependency target restores missing DLLs even when the executable needs no relink. Each copy is a
+    # declared output, so an up-to-date build runs nothing.
     get_target_property(runtime_dir ${target} RUNTIME_OUTPUT_DIRECTORY)
     if(NOT runtime_dir)
         get_target_property(runtime_dir ${target} BINARY_DIR)
@@ -44,10 +45,21 @@ function(kz_windows_runtime target)
     string(MD5 directory_id "${runtime_dir}")
     set(copy_target "kz_runtime_${directory_id}")
     if(NOT TARGET ${copy_target})
-        add_custom_target(${copy_target}
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${runtime_dir}"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${runtime} "${runtime_dir}"
-            COMMAND_EXPAND_LISTS VERBATIM)
+        set(copies "")
+        foreach(path IN LISTS runtime)
+            # OUTPUT cannot name a target's file, so an imported DLL is copied from its configured location.
+            if(path MATCHES "^\\$<TARGET_FILE:(.+)>$")
+                get_target_property(path ${CMAKE_MATCH_1} LOCATION)
+            endif()
+            get_filename_component(name "${path}" NAME)
+            set(copy "${runtime_dir}/${name}")
+            add_custom_command(OUTPUT "${copy}"
+                COMMAND ${CMAKE_COMMAND} -E copy "${path}" "${copy}"
+                DEPENDS "${path}"
+                VERBATIM)
+            list(APPEND copies "${copy}")
+        endforeach()
+        add_custom_target(${copy_target} DEPENDS ${copies})
     endif()
     add_dependencies(${target} ${copy_target})
     if(KZ_RUNTIME_INSTALL)

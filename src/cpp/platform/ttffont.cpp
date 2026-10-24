@@ -1,7 +1,6 @@
 #include "platform/ttffont.hpp"
 
 #include <algorithm>
-#include <cstdio>
 #include <fstream>
 #include <map>
 #include <vector>
@@ -10,6 +9,7 @@
 #define STBTT_STATIC
 #include "stb_truetype.h"
 
+#include "kazarov/log.hpp"
 #include "platform/paths.hpp"
 
 namespace ttffont {
@@ -285,7 +285,7 @@ bool Compose(char32_t ch, float scale, int em_px, Bitmap &out) {
 bool Load(const std::filesystem::path &file) {
     std::ifstream stream(file, std::ios::binary);
     if (!stream) {
-        std::fprintf(stderr, "font: cannot read %s\n", PathsDisplay(file).c_str());
+        kz::Logf(kz::LogLevel::Error, "font", "cannot read {}", PathsDisplay(file));
         return false;
     }
     Font font;
@@ -293,7 +293,7 @@ bool Load(const std::filesystem::path &file) {
     const unsigned char *bytes = font.data.data();
     int                  offset = stbtt_GetFontOffsetForIndex(bytes, 0);
     if (offset < 0 || !stbtt_InitFont(&font.info, bytes, offset)) {
-        std::fprintf(stderr, "font: %s is not a TrueType font\n", PathsDisplay(file).c_str());
+        kz::Logf(kz::LogLevel::Error, "font", "{} is not a TrueType font", PathsDisplay(file));
         return false;
     }
     font.loaded = true;
@@ -346,7 +346,7 @@ bool GetGlyph(char32_t ch, int em_px, Glyph &out) {
         if (g_atlas.y + height + 2 * kPad > kAtlasSize) {
             // Full: start again. Glyphs queued this frame keep their old coordinates, which now
             // show whatever lands there; one frame of it, and the next fills the atlas afresh.
-            std::fprintf(stderr, "font: atlas full, starting again\n");
+            kz::Log(kz::LogLevel::Info, "font", "atlas full, starting again");
             gfx::TextureHandle keep = g_atlas.texture;
             g_atlas = {};
             g_atlas.texture = keep;
@@ -374,7 +374,7 @@ bool GetGlyph(char32_t ch, int em_px, Glyph &out) {
             }
         }
         gfx::UpdateTextureNow(g_atlas.texture, 0, static_cast<uint32_t>(g_atlas.x), static_cast<uint32_t>(g_atlas.y),
-                           static_cast<uint32_t>(w), static_cast<uint32_t>(h), pixels.data());
+                              static_cast<uint32_t>(w), static_cast<uint32_t>(h), pixels.data());
         glyph.u0 = static_cast<float>(g_atlas.x + kPad);
         glyph.v0 = static_cast<float>(g_atlas.y + kPad);
         glyph.u1 = static_cast<float>(g_atlas.x + kPad + width);

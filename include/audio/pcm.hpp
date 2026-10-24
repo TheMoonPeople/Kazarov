@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace audio {
@@ -13,6 +15,7 @@ namespace audio {
 struct PcmTrack {
     std::vector<std::int16_t> samples;
     int                       rate = 48000;
+    int                       source_channels = 2; /**< Channel count before conversion to stereo. */
     std::int64_t              start = 0;
     std::int64_t              loop_start = 0;
     std::int64_t              loop_end = 0;
@@ -25,5 +28,9 @@ struct PcmTrack {
 // Decodes a WAV, FLAC or Ogg Vorbis file (by its extension). Null, with the reason in error, when the
 // file cannot be read or decoded.
 std::shared_ptr<PcmTrack> LoadPcmTrack(const std::filesystem::path &path, std::string &error);
+
+// Decodes WAV, FLAC or Ogg Vorbis bytes chosen by a file extension such as ".wav". Null, with the reason in
+// error, when they cannot be decoded.
+std::shared_ptr<PcmTrack> LoadPcmTrack(std::span<const std::uint8_t> data, std::string_view extension, std::string &error);
 
 } // namespace audio

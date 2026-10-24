@@ -3,10 +3,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <iterator>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -14,6 +12,7 @@
 #include <vector>
 
 #include "gfx/context.hpp"
+#include "kazarov/log.hpp"
 #include "platform/files.hpp"
 #include "platform/paths.hpp"
 #include "shaders/draw.frag.spv.hpp"
@@ -210,8 +209,6 @@ void SaveCache(const std::filesystem::path &path) {
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), error);
     }
-    // FilesWrite writes it aside and moves it into place, so a concurrent reader never sees half a
-    // file, and replaces it where rename cannot (Horizon's never replaces).
     if (FilesWrite(path, data.data(), size, true) != FilesResult::kWritten) {
         Error("cannot write the pipeline cache to %s", PathsDisplay(path).c_str());
     }
@@ -281,15 +278,19 @@ void CreatePipelineLayout() {
     Check(vkCreateDescriptorSetLayout(g.device, &texture_layout, nullptr, &g.texture_set_layout),
           "vkCreateDescriptorSetLayout");
 
-    VkDescriptorSetLayoutBinding constants_binding = {};
-    constants_binding.binding = 0;
-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    constants_binding.descriptorCount = 1;
-    constants_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    // Set 1: the chunk's MeshConstants records at binding 0, Prog0Constants records at binding 1 and
+    // Prog0Palette records at binding 2.
+    VkDescriptorSetLayoutBinding constants_bindings[3] = {};
+    for (uint32_t binding = 0; binding < 3; binding++) {
+        constants_bindings[binding].binding = binding;
+        constants_bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        constants_bindings[binding].descriptorCount = 1;
+        constants_bindings[binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo constants_layout = {};
     constants_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    constants_layout.bindingCount = 1;
-    constants_layout.pBindings = &constants_binding;
+    constants_layout.bindingCount = 3;
+    constants_layout.pBindings = constants_bindings;
     Check(vkCreateDescriptorSetLayout(g.device, &constants_layout, nullptr, &g.constants_set_layout),
           "vkCreateDescriptorSetLayout");
 
@@ -314,7 +315,7 @@ void CreatePipelineLayout() {
     Check(vkAllocateDescriptorSets(g.device, &allocate, &g.texture_set), "vkAllocateDescriptorSets");
 
     constexpr uint32_t         kConstantSets = 256;
-    VkDescriptorPoolSize       constants_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kConstantSets};
+    VkDescriptorPoolSize       constants_size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kConstantSets};
     VkDescriptorPoolCreateInfo constants_pool = {};
     constants_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     constants_pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -334,39 +335,6 @@ void CreatePipelineLayout() {
     info.pushConstantRangeCount = 1;
     info.pPushConstantRanges = &push;
     Check(vkCreatePipelineLayout(g.device, &info, nullptr, &g.pipeline_layout), "vkCreatePipelineLayout");
-
-    if (!g.config.prog0_meshes) {
-        return;
-    }
-
-    VkDescriptorSetLayoutBinding prog0_binding = {};
-    prog0_binding.binding = 0;
-    prog0_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    prog0_binding.descriptorCount = 1;
-    prog0_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    VkDescriptorSetLayoutCreateInfo prog0_layout = {};
-    prog0_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    prog0_layout.bindingCount = 1;
-    prog0_layout.pBindings = &prog0_binding;
-    Check(vkCreateDescriptorSetLayout(g.device, &prog0_layout, nullptr, &g.prog0_set_layout),
-          "vkCreateDescriptorSetLayout");
-
-    VkDescriptorPoolSize       prog0_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kConstantSets};
-    VkDescriptorPoolCreateInfo prog0_pool = {};
-    prog0_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    prog0_pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    prog0_pool.maxSets = kConstantSets;
-    prog0_pool.poolSizeCount = 1;
-    prog0_pool.pPoolSizes = &prog0_size;
-    Check(vkCreateDescriptorPool(g.device, &prog0_pool, nullptr, &g.prog0_descriptor_pool),
-          "vkCreateDescriptorPool");
-
-    // Same push constant range as the plain layout, so pushes made through either stay valid for both.
-    VkDescriptorSetLayout prog0_layouts[3] = {g.texture_set_layout, g.constants_set_layout, g.prog0_set_layout};
-    info.setLayoutCount = 3;
-    info.pSetLayouts = prog0_layouts;
-    Check(vkCreatePipelineLayout(g.device, &info, nullptr, &g.prog0_pipeline_layout),
-          "vkCreatePipelineLayout");
 }
 
 uint32_t PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, bool alpha_test) {
@@ -394,9 +362,8 @@ PipelineFamily MeshFamily(const Prog0Constants *prog0) {
     return (prog0->flags & kProg0Skinned) != 0 ? kFamilyMeshProg0Skinned : kFamilyMeshProg0;
 }
 
-VkPipelineLayout PipelineLayoutOf(PipelineFamily family) {
-    return family > kFamilyMesh ? g.prog0_pipeline_layout : g.pipeline_layout;
-}
+// Every family shares one layout: the chunk's records at set 1 serve plain and prog0 draws alike.
+VkPipelineLayout PipelineLayoutOf(PipelineFamily) { return g.pipeline_layout; }
 
 BlendMapping MapBlend(const GsBlend &blend, bool enable) {
     if (!enable) {
@@ -689,6 +656,7 @@ void CreatePipelines() {
     std::condition_variable progress;
     uint32_t                workers = std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
     {
+        // std::thread rather than std::jthread, which Android's libc++ keeps experimental.
         std::vector<std::thread> threads;
         for (uint32_t i = 0; i < workers; i++) {
             threads.emplace_back([&]() {
@@ -733,7 +701,7 @@ void CreatePipelines() {
     }
     SaveCache(g.config.pipeline_cache);
     g.pipeline_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    std::fprintf(stderr, "gfx: %u pipelines ready in %.2f s\n", total, g.pipeline_seconds);
+    kz::Logf(kz::LogLevel::Info, "gfx", "{} pipelines ready in {:.2f} s", total, g.pipeline_seconds);
 }
 
 void DestroyPipelines() {

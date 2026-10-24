@@ -32,16 +32,18 @@ function(_kz_port_headers_target)
 endfunction()
 
 function(kz_port_host_library target)
+    include(${CMAKE_CURRENT_FUNCTION_LIST_DIR}/KazarovGltf.cmake)
     if(NOT TARGET SDL3::SDL3)
         find_package(SDL3 REQUIRED CONFIG)
     endif()
     if(NOT TARGET Vulkan::Vulkan)
         if(ANDROID)
-            # The Android NDK ships the Vulkan headers and dispatch loader, but not
-            # CMake's Vulkan SDK package or a versioned loader library.
+            # The NDK ships the Vulkan headers and loader but no CMake package for them.
             find_library(KZ_VULKAN_LIBRARY vulkan REQUIRED)
             add_library(Vulkan::Vulkan UNKNOWN IMPORTED GLOBAL)
             set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_LOCATION "${KZ_VULKAN_LIBRARY}")
+        elseif(NINTENDO_SWITCH)
+            find_package(Vulkan 1.3 REQUIRED)
         else()
             find_package(Vulkan 1.4 REQUIRED)
         endif()
@@ -77,6 +79,12 @@ function(kz_port_host_library target)
     list(REMOVE_DUPLICATES vendor_dirs)
 
     set(generated_dir "${CMAKE_BINARY_DIR}/kz_port/generated")
+    # Android targets Vulkan 1.3, the renderer's floor; both environments emit SPIR-V 1.6.
+    if(ANDROID OR NINTENDO_SWITCH)
+        set(shader_env vulkan1.3)
+    else()
+        set(shader_env vulkan1.4)
+    endif()
     file(GLOB shader_sources CONFIGURE_DEPENDS ${KZ_PORT_ROOT}/gfx/shaders/*.vert ${KZ_PORT_ROOT}/gfx/shaders/*.frag)
     set(shader_headers "")
     get_property(shaders_defined GLOBAL PROPERTY KZ_PORT_SHADERS_DEFINED)
@@ -103,7 +111,7 @@ function(kz_port_host_library target)
         list(APPEND shader_headers ${header})
         if(NOT shaders_defined)
             add_custom_command(OUTPUT ${header}
-                COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.3 --quiet --vn ${shader_symbol} ${shader_defines}
+                COMMAND ${GLSLANG_VALIDATOR} -V --target-env ${shader_env} --quiet --vn ${shader_symbol} ${shader_defines}
                     --depfile ${header}.d -o ${header} ${shader}
                 DEPENDS ${shader}
                 DEPFILE ${header}.d
@@ -114,6 +122,7 @@ function(kz_port_host_library target)
     file(GLOB host_sources CONFIGURE_DEPENDS
         ${KZ_PORT_ROOT}/gfx/*.cpp ${KZ_PORT_ROOT}/audio/*.cpp ${KZ_PORT_ROOT}/platform/*.cpp)
     option(KZ_PORT_BUILD_TIM2 "Build the legacy TIM2 decoder into the host library" ON)
+    option(KZ_PORT_TRACY "Instrument the renderer with Tracy zones (needs a Tracy::TracyClient target)" OFF)
     if(NOT KZ_PORT_BUILD_TIM2)
         list(FILTER host_sources EXCLUDE REGEX "/gfx/tim2\\.cpp$")
     endif()
@@ -121,12 +130,19 @@ function(kz_port_host_library target)
     _kz_port_headers_target()
     add_library(${target} OBJECT ${host_sources} ${shader_headers})
     target_include_directories(${target} PRIVATE ${KZ_PORT_INCLUDE_ROOT} ${generated_dir} ${vendor_dirs})
-    target_link_libraries(${target} PRIVATE SDL3::SDL3 Vulkan::Vulkan nlohmann_json::nlohmann_json)
+    target_link_libraries(${target} PRIVATE SDL3::SDL3 Vulkan::Vulkan nlohmann_json::nlohmann_json fastgltf::fastgltf)
     # The game's replacement units include "gfx/gfx.hpp", so the include root is part of this library's interface.
     target_link_libraries(${target} PUBLIC kz_port_headers)
     if(WIN32)
         # platform/game_icon.cpp's shortcut beside the executable (IShellLinkW).
         target_link_libraries(${target} PUBLIC ole32 uuid)
+    elseif(ANDROID)
+        # gfx's errors go to the Android log, where stderr is not shown.
+        target_link_libraries(${target} PUBLIC log)
+    endif()
+    if(KZ_PORT_TRACY)
+        target_link_libraries(${target} PUBLIC Tracy::TracyClient)
+        target_compile_definitions(${target} PUBLIC KZ_PORT_TRACY)
     endif()
     target_compile_options(${target} PRIVATE -Wall -ffunction-sections -fdata-sections)
     # arm64 clang fuses a*b+c into one rounding and x86-64 has no FMA in its baseline. The logical-to-pixel

@@ -7,8 +7,9 @@
 #include <limits>
 #include <string>
 
-#include "sce/libcdvd_extensions.hpp"
 #include "platform/paths.hpp"
+#include "platform/vfs.hpp"
+#include "sce/libcdvd_extensions.hpp"
 
 // The game reads extracted files, not a drive: media selection succeeds and search/seek provide
 // advisory preload hints. Bulk reads belong to the consumer's native file loader.
@@ -31,9 +32,8 @@ int sceCdSearchFile(sceCdlFILE *file, const char *name) {
     if (path.ends_with(";1")) {
         path.resize(path.size() - 2);
     }
-    auto            current = PathsDataRoot();
-    std::error_code error;
-    std::size_t     start = 0;
+    std::string relative;
+    std::size_t start = 0;
     while (start < path.size()) {
         const auto end = path.find('/', start);
         const auto component = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
@@ -41,47 +41,31 @@ int sceCdSearchFile(sceCdlFILE *file, const char *name) {
             return 0;
         }
         if (!component.empty() && component != ".") {
-            auto selected = current / PathsFromUtf8(component);
-            if (!std::filesystem::exists(selected, error)) {
-                auto lower = [](std::string value) {
-                    for (auto &c : value) {
-                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    }
-                    return value;
-                };
-                bool found = false;
-                for (const auto &entry : std::filesystem::directory_iterator(current, error)) {
-                    if (lower(PathsDisplay(entry.path().filename())) == lower(component)) {
-                        selected = entry.path();
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found || error) {
-                    return 0;
-                }
-            }
-            current = selected;
+            relative += (relative.empty() ? "" : "/") + component;
         }
         if (end == std::string::npos) {
             break;
         }
         start = end + 1;
     }
-    if (!std::filesystem::is_regular_file(current, error)) {
+    // Without mounted game data the data root's directory tree stands in.
+    auto mount = vfs::Base();
+    if (!mount) {
+        mount = vfs::OpenDirectory(PathsDataRoot());
+    }
+    const auto found = vfs::Find(mount, relative);
+    const auto size = vfs::Size(found);
+    if (!size || *size > std::numeric_limits<decltype(file->size)>::max()) {
         return 0;
     }
-    const auto size = std::filesystem::file_size(current, error);
-    if (error || size > std::numeric_limits<decltype(file->size)>::max()) {
-        return 0;
-    }
-    file->size = static_cast<decltype(file->size)>(size);
-    auto basename = PathsDisplay(current.filename());
+    file->size = static_cast<decltype(file->size)>(*size);
+    const auto entry_name = found.Name();
+    auto       basename = entry_name.substr(entry_name.rfind('/') + 1);
     for (auto &c : basename) {
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     }
     std::strncpy(file->name, basename.c_str(), sizeof(file->name) - 1);
-    // Directory-backed data has no sector address; search/seek are only advisory preload hints.
+    // Mounted data has no sector address; search/seek are only advisory preload hints.
     file->lsn = 0;
     return 1;
 }

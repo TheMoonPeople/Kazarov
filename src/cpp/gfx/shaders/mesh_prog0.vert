@@ -21,11 +21,16 @@ layout(push_constant, std430) uniform Push {
     uint flags;
     uint alpha;
     uint fog_color;
+    uint face;
+    uint mesh_index;
+    uint prog0_index;
+    uint palette_index;
 }
 pc;
 
-// gfx::MeshConstants, identical to mesh.vert's block.
-layout(set = 1, binding = 0, std140) uniform MeshConstants {
+// gfx::MeshConstants, identical to mesh.vert's records. Each chunk's records form one array;
+// the draw's record is at pc.mesh_index.
+struct MeshConstantsData {
     mat4 mvp;
     mat3 normal_matrix;
     vec4 light_direction[4];
@@ -39,11 +44,16 @@ layout(set = 1, binding = 0, std140) uniform MeshConstants {
     vec4 world_uv[2];
     uint flags;
     uint light_count;
-}
-mc;
+};
 
-// gfx::Prog0Constants in the VU's units (128 is 1.0), the draw's own block at set 2.
-layout(set = 2, binding = 0, std140) uniform Prog0Block {
+layout(set = 1, binding = 0, std430) readonly buffer MeshConstantsArray {
+    MeshConstantsData meshes[];
+};
+
+#define mc meshes[pc.mesh_index]
+
+// gfx::Prog0Constants in the VU's units (128 is 1.0). The draw's record is at pc.prog0_index.
+struct Prog0Data {
     mat4 model_world;
     vec4 light_direction[3];
     vec4 light_color[4];
@@ -57,12 +67,27 @@ layout(set = 2, binding = 0, std140) uniform Prog0Block {
     vec4 point_color[4];
     vec4 fog;
     uint flags;
-    uint face;
+    uint pad0;
     uint specular_power;
     uint pad;
+};
+
+layout(set = 1, binding = 1, std430) readonly buffer Prog0Array {
+    Prog0Data prog0_blocks[];
+};
+
+#define p0 prog0_blocks[pc.prog0_index]
+
+// gfx::Prog0Palette of a skinned draw, at pc.palette_index.
+struct Prog0PaletteData {
     vec4 bones[96];
-}
-p0;
+};
+
+layout(set = 1, binding = 2, std430) readonly buffer Prog0PaletteArray {
+    Prog0PaletteData palettes[];
+};
+
+#define palette palettes[pc.palette_index]
 
 const uint kScissor      = 0x002u;
 const uint kReal         = 0x008u;
@@ -81,7 +106,8 @@ const float kVuMax    = 3.40282347e38;
 
 layout(location = 0) out vec4 v_color;
 layout(location = 1) out vec2 v_uv;
-layout(location = 2) out float v_fog;
+layout(location = 2) out vec4 v_fog;
+layout(location = 3) flat out vec4 v_fog_mode;
 
 out float gl_ClipDistance[6];
 
@@ -100,9 +126,9 @@ void blend(inout vec3 position, inout vec3 normal) {
     for (int i = 0; i < 4; i++) {
         float w = a_skin_weight[i];
         uint b = min(a_skin_bone[i], 31u) * 3u;
-        vec4 r0 = p0.bones[b];
-        vec4 r1 = p0.bones[b + 1u];
-        vec4 r2 = p0.bones[b + 2u];
+        vec4 r0 = palette.bones[b];
+        vec4 r1 = palette.bones[b + 1u];
+        vec4 r2 = palette.bones[b + 2u];
 
         vec4 pw = vec4(position * w, w);
         P += vec3(dot(r0, pw), dot(r1, pw), dot(r2, pw));
@@ -120,7 +146,7 @@ void blend(inout vec3 position, inout vec3 normal) {
 
 void main() {
     uint F = p0.flags;
-    uint T = p0.face;
+    uint T = pc.face;
 
     vec3 position = a_position;
     vec3 normal = a_normal;
@@ -218,11 +244,25 @@ void main() {
         }
     }
 
-    // ftoi0 truncates; the GS fog field is the integer part of F.
+    // ftoi0 truncates the VU's colour channels.
     v_color = floor(clamp(color, 0.0, 255.0)) / 255.0;
     v_uv = uv;
-    // The VU clamps against the near value first and the far value last, so a far value above the
-    // near value fogs nothing; GLSL clamp leaves that order undefined.
-    float f = p0.fog.x + p0.fog.w / clip.w;
-    v_fog = floor(max(max(min(f, p0.fog.y), p0.fog.z), 0.0)) / 255.0;
+    v_fog_mode = vec4(p0.fog.y, p0.fog.z, 1.0, 0.0);
+    if (p0.fog.w == 0.0) {
+        // A constant factor needs no perspective correction; clamp before truncating as VU1 does.
+        float fog = floor(max(max(min(p0.fog.x, p0.fog.y), p0.fog.z), 0.0)) / 255.0;
+        v_fog = vec4(fog, 0.0, 0.0, 0.0);
+        v_fog_mode.z = -2.0;
+        v_fog_mode.w = fog;
+    } else {
+        // Reverse-Z: only near/eye crossings need fresh fog; far-plane vertices retain their F.
+        // The full homogeneous norm keeps the weight continuous at z=w=0 with nonzero x/y.
+        float clip_scale = max(max(abs(clip.x), abs(clip.y)), max(abs(clip.z), abs(clip.w)));
+        float marker = clip.z > clip.w ? min((clip.z - clip.w) / clip_scale, 1.0) : 0.0;
+        float fog = clip.w <= 0.0 ? 0.0 : p0.fog.x + p0.fog.w / clip.w;
+        fog = floor(max(max(min(fog, p0.fog.y), p0.fog.z), 0.0));
+        // Retain weighted vertex F and its weight alongside the unlimited homogeneous numerator.
+        float weight = max(clip.w, 0.0) * (1.0 - marker);
+        v_fog = vec4(fog * weight, p0.fog.x * clip.w + p0.fog.w, marker, weight);
+    }
 }

@@ -1,6 +1,7 @@
 # Builds the dependencies that no package manager ships as needed and publishes them as release assets,
-# so consumers' CI downloads and verifies them instead of compiling. A merge that changes a version publishes
-# deps-ffmpeg-<version>-cxxbridge-<version>; an existing release is never rebuilt, so its digests stay valid.
+# so consumers' CI downloads and verifies them instead of compiling. A merge that changes a version or kz-ffmpeg
+# publishes deps-ffmpeg-<version>-<kz-ffmpeg digest>-cxxbridge-<version>; an existing release is never rebuilt,
+# so its digests stay valid.
 name: Prebuilt dependencies
 
 on:
@@ -29,7 +30,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ffmpeg=$(python3 -c "import runpy; print(runpy.run_path('tools/ffmpeg/kz-ffmpeg')['VERSION'])")
-          tag="deps-ffmpeg-$ffmpeg-cxxbridge-$CXXBRIDGE_VERSION"
+          # kz-ffmpeg holds the configure flags, so its digest gives a changed build a new tag.
+          build=$(sha256sum tools/ffmpeg/kz-ffmpeg | cut -c1-12)
+          tag="deps-ffmpeg-$ffmpeg-$build-cxxbridge-$CXXBRIDGE_VERSION"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "$tag is already published"

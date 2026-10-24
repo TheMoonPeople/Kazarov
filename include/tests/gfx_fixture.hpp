@@ -32,6 +32,7 @@ struct GfxOptions {
     bool prog0_meshes = false;
     uint32_t              texture_slots = 0;
     uint32_t              mesh_slots = 0;
+    gfx::RenderThreadMode render_thread = gfx::RenderThreadMode::Off;
     float                 logical_width = 640.0f;
     float                 logical_height = 480.0f;
     std::filesystem::path pipeline_cache = std::filesystem::temp_directory_path() / "dc_gfx_test" / "pipeline_cache.bin";
@@ -67,6 +68,7 @@ struct GfxFixture {
         config.prog0_meshes = options.prog0_meshes;
         config.texture_slots = options.texture_slots;
         config.mesh_slots = options.mesh_slots;
+        config.render_thread = options.render_thread;
         config.pipeline_cache = options.pipeline_cache;
         config.progress = [this](uint32_t done, uint32_t total) {
             progress_calls++;

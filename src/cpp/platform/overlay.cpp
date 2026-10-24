@@ -98,8 +98,7 @@ int OverlayPixelSize(const gfx::LogicalMapping &mapping) {
     return std::max(1, static_cast<int>(std::lround(std::min(mapping.scale_x, mapping.scale_y))));
 }
 
-void OverlayDrawText(std::string_view text, const gfx::LogicalMapping &mapping, int pixel, int x, int y,
-                     bool draw_backdrop) {
+void OverlayDrawText(std::string_view text, const gfx::LogicalMapping &mapping, int pixel, int x, int y) {
     if (text.empty() || mapping.scale_x <= 0.0f || mapping.scale_y <= 0.0f) {
         return;
     }
@@ -123,10 +122,8 @@ void OverlayDrawText(std::string_view text, const gfx::LogicalMapping &mapping, 
         }
     }
     std::vector<gfx::Vertex2D> backdrop;
-    if (draw_backdrop) {
-        quad(backdrop, x, y, x + (columns + 2 * kOverlayPadding) * pixel,
-             y + (kFontHeight + 2 * kOverlayPadding) * pixel, 0, kBackdropAlpha);
-    }
+    quad(backdrop, x, y, x + (columns + 2 * kOverlayPadding) * pixel,
+         y + (kFontHeight + 2 * kOverlayPadding) * pixel, 0, kBackdropAlpha);
 
     // One quad per run of equal coverage in a glyph row; coverage becomes alpha (0x80 is opaque).
     std::vector<gfx::Vertex2D> glyphs;
@@ -158,9 +155,7 @@ void OverlayDrawText(std::string_view text, const gfx::LogicalMapping &mapping, 
 
     gfx::DrawState blended;
     blended.blend = true;
-    if (!backdrop.empty()) {
-        gfx::Draw2D(gfx::Primitive::Quads, backdrop, {}, blended);
-    }
+    gfx::Draw2D(gfx::Primitive::Quads, backdrop, {}, blended);
     if (!glyphs.empty()) {
         gfx::Draw2D(gfx::Primitive::Quads, glyphs, {}, blended);
     }

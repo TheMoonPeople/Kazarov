@@ -38,7 +38,11 @@ struct Setup {
 impl Setup {
     /// Starts one extraction without blocking the native event loop.
     fn start(&mut self) {
-        let source = PathBuf::from(&self.source);
+        let mut source = PathBuf::from(&self.source);
+        if let Some(image) = lone_disc_image(&source) {
+            self.source = image.to_string_lossy().into_owned();
+            source = image;
+        }
         if !source.is_dir() && !source.is_file() {
             self.error = Some("Choose an existing disc folder or enter a disc image path.".into());
             return;
@@ -47,9 +51,7 @@ impl Setup {
         *self.progress.lock().unwrap() = Progress::default();
         let progress = self.progress.clone();
         let output = self.output.clone();
-        let jobs = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(32);
+        let jobs = std::thread::available_parallelism().map_or(1, usize::from);
         match std::thread::Builder::new()
             .name("game-data-extraction".into())
             .stack_size(16 * 1024 * 1024)
@@ -85,6 +87,31 @@ impl Setup {
     }
 }
 
+/// The disc image a folder stands for: its only `.iso` file, when the folder holds no `DATA.DAT` of its own.
+fn lone_disc_image(folder: &Path) -> Option<PathBuf> {
+    let mut disc_files = false;
+    let mut images = Vec::new();
+    for path in std::fs::read_dir(folder)
+        .ok()?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+    {
+        disc_files |= path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("DATA.DAT"));
+        if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+        {
+            images.push(path);
+        }
+    }
+    match images.as_slice() {
+        [image] if !disc_files => Some(image.clone()),
+        _ => None,
+    }
+}
+
 impl eframe::App for Setup {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -96,14 +123,30 @@ impl eframe::App for Setup {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Set up game data");
             ui.add_space(10.0);
-            ui.label("Choose the folder containing your disc files, or enter a disc image path.");
+            ui.label("Choose the folder containing your disc files, or a disc image.");
             ui.label("The game will start automatically when extraction is complete.");
             ui.add_space(12.0);
             ui.add_enabled_ui(!busy && self.completed_at.is_none(), |ui| {
                 ui.label("Disc folder or image");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.source)
-                        .desired_width((ui.available_width() - 125.0).max(100.0)));
+                        .desired_width((ui.available_width() - 235.0).max(100.0)));
+                    if ui.button("Choose image").clicked() {
+                        let mut dialog = rfd::FileDialog::new()
+                            .set_title("Choose game disc image")
+                            .add_filter("Disc image", &["iso"]);
+                        if let Some(folder) = Path::new(&self.source).parent().filter(|folder| folder.is_dir()) {
+                            dialog = dialog.set_directory(folder);
+                        }
+                        if let Some(path) = dialog.pick_file() {
+                            if let Some(path) = path.to_str() {
+                                self.source = path.into();
+                                self.error = None;
+                            } else {
+                                self.error = Some("This path cannot be displayed as Unicode. Please choose another image.".into());
+                            }
+                        }
+                    }
                     if ui.button("Choose folder").clicked() {
                         let mut dialog = rfd::FileDialog::new().set_title("Choose game disc folder");
                         if Path::new(&self.source).is_dir() {
@@ -160,6 +203,27 @@ impl Drop for Setup {
     }
 }
 
+/// The Moon People's two moons, the setup window's icon in every game: a game's own icon is drawn from its
+/// disc, which is what this window is extracting.
+const ICON_PNG: &[u8] = include_bytes!("../../assets/two-moons-256.png");
+
+fn icon() -> Option<egui::IconData> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(ICON_PNG))
+        .read_info()
+        .ok()?;
+    let mut rgba = vec![0; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut rgba).ok()?;
+    if frame.color_type != png::ColorType::Rgba || frame.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    rgba.truncate(frame.buffer_size());
+    Some(egui::IconData {
+        rgba,
+        width: frame.width,
+        height: frame.height,
+    })
+}
+
 /// Runs on the main thread and returns only after setup closes or succeeds.
 pub fn run(title: &str, output: &Path) -> CoreResult<bool> {
     let succeeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -175,7 +239,8 @@ pub fn run(title: &str, output: &Path) -> CoreResult<bool> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([640.0, 340.0])
-            .with_min_inner_size([520.0, 340.0]),
+            .with_min_inner_size([520.0, 340.0])
+            .with_icon(icon().unwrap_or_default()),
         centered: true,
         run_and_return: true,
         ..Default::default()
@@ -188,6 +253,13 @@ pub fn run(title: &str, output: &Path) -> CoreResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_setup_window_has_the_two_moons_icon() {
+        let icon = icon().expect("the embedded icon decodes");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 
     fn test_setup() -> Setup {
         Setup {
@@ -208,6 +280,20 @@ mod tests {
         assert!(app.worker.is_none());
         assert!(app.error.is_some());
         assert!(app.completed_at.is_none());
+    }
+
+    #[test]
+    fn folder_holding_one_disc_image_stands_for_it() {
+        let temp = tempfile::tempdir().expect("temporary folder");
+        assert_eq!(lone_disc_image(temp.path()), None);
+        let image = temp.path().join("Game (PAL).ISO");
+        std::fs::write(&image, b"").expect("image");
+        assert_eq!(lone_disc_image(temp.path()), Some(image));
+        std::fs::write(temp.path().join("Other.iso"), b"").expect("second image");
+        assert_eq!(lone_disc_image(temp.path()), None);
+        std::fs::remove_file(temp.path().join("Other.iso")).expect("remove second image");
+        std::fs::write(temp.path().join("data.dat"), b"").expect("disc file");
+        assert_eq!(lone_disc_image(temp.path()), None);
     }
 
     #[test]

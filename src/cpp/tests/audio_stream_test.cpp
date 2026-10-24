@@ -55,12 +55,6 @@ bool AllZero(const std::vector<float> &samples) {
     return std::all_of(samples.begin(), samples.end(), [](float s) { return s == 0.0f; });
 }
 
-std::shared_ptr<audio::Bank> MakeBank(const fx::BankSpec &spec) {
-    const auto hd = fx::MakeHd(spec);
-    const auto bd = fx::SquareVag(2);
-    return audio::Bank::Create(hd, bd);
-}
-
 void Prepare(audio::Mixer &mixer, const std::shared_ptr<audio::Bank> &bank) {
     mixer.BindBank(kPort, bank);
     mixer.SetVolume(kPort, audio::kFullPortVolume);
@@ -168,7 +162,7 @@ TEST(AudioStream, AdvanceEndsAStreamWithoutRendering) {
 
 TEST(AudioStream, ResamplesToTheMixerRate) {
     constexpr std::size_t kSourceFrames = 100;
-    audio::StreamChannel channel;
+    audio::StreamChannel  channel;
     channel.Open(Constant(16384, kSourceFrames, 24000));
     channel.Play();
 
@@ -195,7 +189,7 @@ TEST(AudioStream, DetachedChannelIsNotMixed) {
 }
 
 TEST(AudioMixerDc2, PitchMessageBendsAnEffectVoice) {
-    const auto bank = MakeBank(fx::BankSpec{});
+    const auto bank = fx::CreateBankFixture(fx::BankSpec{});
     ASSERT_NE(bank, nullptr);
     const std::array<std::uint8_t, audio::kHsMsgBytes> bend_up{0xFD, 0x02, 0x00, 60, 1, 0x7F, 0x7F};
     const std::array<std::uint8_t, audio::kHsMsgBytes> centre{0xFD, 0x02, 0x00, 60, 1, 0x00, 0x40};
@@ -224,10 +218,10 @@ TEST(AudioMixerDc2, PitchMessageBendsAnEffectVoice) {
 }
 
 TEST(AudioMixerDc2, BankSelectPicksAnExtraBank) {
-    const auto low = MakeBank(fx::BankSpec{});
+    const auto   low = fx::CreateBankFixture(fx::BankSpec{});
     fx::BankSpec octave_down_spec;
     octave_down_spec.base_note = 72;
-    const auto octave_down = MakeBank(octave_down_spec);
+    const auto octave_down = fx::CreateBankFixture(octave_down_spec);
     ASSERT_NE(low, nullptr);
     ASSERT_NE(octave_down, nullptr);
 
@@ -258,7 +252,7 @@ TEST(AudioMixerDc2, BankSelectPicksAnExtraBank) {
 }
 
 TEST(AudioMixerDc2, SelectingAnUnboundBankPlaysBankZero) {
-    const auto bank = MakeBank(fx::BankSpec{});
+    const auto bank = fx::CreateBankFixture(fx::BankSpec{});
     ASSERT_NE(bank, nullptr);
 
     audio::Mixer reference(48000);
@@ -276,7 +270,7 @@ TEST(AudioMixerDc2, SelectingAnUnboundBankPlaysBankZero) {
 }
 
 TEST(AudioMixerDc2, CoreVolumeScalesItsVoices) {
-    const auto bank = MakeBank(fx::BankSpec{});
+    const auto bank = fx::CreateBankFixture(fx::BankSpec{});
     ASSERT_NE(bank, nullptr);
 
     audio::Mixer full(48000);
@@ -303,10 +297,10 @@ TEST(AudioMixerDc2, CoreVolumeScalesItsVoices) {
 }
 
 TEST(AudioMixerDc2, SequenceNotePlays) {
-    const auto bank = MakeBank(fx::BankSpec{});
+    const auto bank = fx::CreateBankFixture(fx::BankSpec{});
     ASSERT_NE(bank, nullptr);
     const auto bytes = fx::MakeSq(60, 100, 480);
-    const auto file = audio::SqFile::Create(bytes);
+    const auto file = audio::SqFile::CreateFromJson(std::string_view(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
     ASSERT_NE(file, nullptr);
 
     audio::Mixer mixer(48000);

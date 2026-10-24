@@ -4,17 +4,17 @@
 
 #include <eekernel.h>
 
-#include "sce/threads.hpp"
-
-#include "platform/clock.hpp"
-
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <format>
 #include <iterator>
 #include <map>
 #include <memory>
+
+#include "kazarov/log.hpp"
+#include "platform/clock.hpp"
+#include "sce/threads.hpp"
 
 // PS2 threads are fibers on the main OS thread. The game's threads are cooperative and the window, SDL and
 // the Vulkan queue must stay on one thread, so no OS thread is ever created.
@@ -37,7 +37,12 @@ namespace {
 constexpr std::size_t kStackSize = 1024 * 1024;
 constexpr int         kMainThreadId = 1;
 
-enum class State { Dormant, Ready, Running, Waiting };
+enum class State {
+    Dormant,
+    Ready,
+    Running,
+    Waiting
+};
 
 void RunEntry();
 
@@ -54,16 +59,14 @@ void FiberStart(void *) {
 void ContextInitMain(Context &c) {
     c.fiber = ConvertThreadToFiber(nullptr);
     if (c.fiber == nullptr) {
-        std::fprintf(stderr, "eekernel: ConvertThreadToFiber failed\n");
-        std::abort();
+        kz::Abort("eekernel", "ConvertThreadToFiber failed");
     }
 }
 
 void ContextCreate(Context &c) {
     c.fiber = CreateFiber(kStackSize, FiberStart, nullptr);
     if (c.fiber == nullptr) {
-        std::fprintf(stderr, "eekernel: CreateFiber failed\n");
-        std::abort();
+        kz::Abort("eekernel", "CreateFiber failed");
     }
 }
 
@@ -90,8 +93,7 @@ void ContextInitMain(Context &) {}
 void ContextCreate(Context &c) {
     c.stack = std::malloc(kStackSize);
     if (c.stack == nullptr) {
-        std::fprintf(stderr, "eekernel: out of memory for a thread stack\n");
-        std::abort();
+        kz::Abort("eekernel", "out of memory for a thread stack");
     }
     getcontext(&c.uc);
     c.uc.uc_stack.ss_sp = c.stack;
@@ -112,13 +114,13 @@ void ContextDestroy(Context &c) {
 #endif
 
 struct Thread {
-    int             id = 0;
-    int             priority = 0;
-    State           state = State::Dormant;
+    int   id = 0;
+    int   priority = 0;
+    State state = State::Dormant;
     void (*entry)(void *) = nullptr;
-    void           *arg = nullptr;
-    int             waiting_on = 0;
-    Context         context;
+    void   *arg = nullptr;
+    int     waiting_on = 0;
+    Context context;
 };
 
 struct Sema {
@@ -128,13 +130,13 @@ struct Sema {
 };
 
 struct Scheduler {
-    std::map<int, std::unique_ptr<Thread>> threads;
+    std::map<int, std::unique_ptr<Thread> > threads;
     // Keyed by priority; a lower number outranks a higher one, so begin() is always the next thread to run.
-    std::map<int, std::deque<Thread *>> ready;
-    std::map<int, Sema>                 semas;
-    Thread                             *running = nullptr;
-    int                                 next_thread_id = kMainThreadId + 1;
-    int                                 next_sema_id = 1;
+    std::map<int, std::deque<Thread *> > ready;
+    std::map<int, Sema>                  semas;
+    Thread                              *running = nullptr;
+    int                                  next_thread_id = kMainThreadId + 1;
+    int                                  next_sema_id = 1;
 };
 
 void EnsureMain(Scheduler &s) {
@@ -207,8 +209,8 @@ void Run(Scheduler &s, Thread *next) {
     if (next != prev) {
         // A switch inside ClockPump would leave its guard set on this stack and run host code on another one.
         if (ClockPumping()) {
-            std::fprintf(stderr, "eekernel_threads: thread switch inside ClockPump (a tick callback or pump hook called a switching kernel call)\n");
-            std::abort();
+            kz::Abort("eekernel_threads", "thread switch inside ClockPump (a tick callback or pump hook called a "
+                                          "switching kernel call)");
         }
         ContextSwitch(prev->context, next->context);
     }
@@ -224,8 +226,7 @@ void RunEntry() {
     self->state = State::Dormant;
     Thread *next = PopHighest(s);
     if (next == nullptr) {
-        std::fprintf(stderr, "eekernel: deadlock: thread %d exited with no ready thread\n", self->id);
-        std::abort();
+        kz::Abort("eekernel", std::format("deadlock: thread {} exited with no ready thread", self->id));
     }
     Run(s, next);
 }
@@ -369,9 +370,8 @@ int WaitSema(int sema_id) {
 
     Thread *next = PopHighest(s);
     if (next == nullptr) {
-        std::fprintf(stderr, "eekernel: deadlock: thread %d waits on semaphore %d with no ready thread\n",
-                     cur->id, sema_id);
-        std::abort();
+        kz::Abort("eekernel",
+                  std::format("deadlock: thread {} waits on semaphore {} with no ready thread", cur->id, sema_id));
     }
     Run(s, next);
     return sema_id;

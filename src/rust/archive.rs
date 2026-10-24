@@ -1,15 +1,45 @@
+use super::progress::Phase;
 use super::{CoreError, CoreResult};
 use gpt_disk_io::{BlockIoAdapter, gpt_disk_types::BlockSize};
 use iso9660::{DirectoryIterator, FileEntry, find_file, mount};
 use rayon::prelude::*;
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const SECTOR: u64 = 2048;
 const CHUNK: usize = 4 << 20;
+
+struct ReadOnlyCursor<'a>(std::io::Cursor<&'a [u8]>);
+
+impl Read for ReadOnlyCursor<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(output)
+    }
+}
+
+impl Seek for ReadOnlyCursor<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(position)
+    }
+}
+
+impl Write for ReadOnlyCursor<'_> {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl gpt_disk_io::ReadWriteSeek for ReadOnlyCursor<'_> {}
 
 fn error(message: impl Into<String>) -> CoreError {
     CoreError(message.into())
@@ -112,6 +142,26 @@ struct Archive {
     sound_dat: Extent,
     sound_hd3: Extent,
     movies: Vec<NamedExtent>,
+    image_bytes: Option<SourceBytes>,
+}
+
+impl Archive {
+    fn extent_bytes(&self, extent: &Extent) -> CoreResult<Vec<u8>> {
+        if let Some(image) = &self.image_bytes {
+            let start =
+                usize::try_from(extent.offset).map_err(|_| error("source offset overflow"))?;
+            let size = usize::try_from(extent.size).map_err(|_| error("source size overflow"))?;
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| error("source range overflow"))?;
+            return Ok(image
+                .bytes()
+                .get(start..end)
+                .ok_or_else(|| error("truncated ISO extent"))?
+                .to_vec());
+        }
+        extent.read()
+    }
 }
 
 fn image_extent(image: &Path, entry: &FileEntry) -> CoreResult<Extent> {
@@ -139,10 +189,10 @@ fn image_extent(image: &Path, entry: &FileEntry) -> CoreResult<Extent> {
     Ok(extent)
 }
 
-fn open_image(image: &Path) -> CoreResult<Archive> {
+fn open_image_bytes(image: &Path, bytes: &[u8]) -> CoreResult<Archive> {
     let block_size =
         BlockSize::new(SECTOR as u32).ok_or_else(|| error("invalid ISO sector size"))?;
-    let mut io = BlockIoAdapter::new(File::open(image)?, block_size);
+    let mut io = BlockIoAdapter::new(ReadOnlyCursor(std::io::Cursor::new(bytes)), block_size);
     let volume = mount(&mut io, 0)
         .map_err(|cause| error(format!("{}: ISO mount: {cause}", image.display())))?;
     if u64::from(volume.logical_block_size) != SECTOR {
@@ -168,15 +218,33 @@ fn open_image(image: &Path) -> CoreResult<Archive> {
     if !movies_dir.flags.directory {
         return Err(error("ISO /MOVIE is not a directory"));
     }
+    // Subdirectories hold the manual's movies (/MOVIE/TUTO and /MOVIE/TUTO2).
     let mut movies = Vec::new();
-    for entry in DirectoryIterator::new(&mut io, movies_dir.extent_lba, movies_dir.data_length) {
-        let entry = entry
-            .map_err(|cause| error(format!("{}: ISO /MOVIE entry: {cause}", image.display())))?;
-        if !entry.flags.directory && entry.name.to_ascii_lowercase().ends_with(".pss") {
-            movies.push(NamedExtent {
-                name: entry.name.as_bytes().to_vec(),
-                extent: image_extent(image, &entry)?,
-            });
+    let mut visited = HashSet::new();
+    let mut pending = vec![(String::new(), movies_dir.extent_lba, movies_dir.data_length)];
+    while let Some((prefix, lba, length)) = pending.pop() {
+        if !visited.insert(lba) {
+            continue;
+        }
+        for entry in DirectoryIterator::new(&mut io, lba, length) {
+            let entry = entry.map_err(|cause| {
+                error(format!(
+                    "{}: ISO /MOVIE/{prefix} entry: {cause}",
+                    image.display()
+                ))
+            })?;
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            let name = format!("{prefix}{}", entry.name);
+            if entry.flags.directory {
+                pending.push((format!("{name}/"), entry.extent_lba, entry.data_length));
+            } else if name.to_ascii_lowercase().ends_with(".pss") {
+                movies.push(NamedExtent {
+                    name: name.into_bytes(),
+                    extent: image_extent(image, &entry)?,
+                });
+            }
         }
     }
     movies.sort_by(|a, b| a.name.cmp(&b.name));
@@ -188,7 +256,12 @@ fn open_image(image: &Path) -> CoreResult<Archive> {
         sound_dat,
         sound_hd3,
         movies,
+        image_bytes: None,
     })
+}
+
+fn open_image(image: &Path) -> CoreResult<Archive> {
+    open_image_bytes(image, &fs::read(image)?)
 }
 
 fn directory_file(root: &Path, name: &str) -> CoreResult<Extent> {
@@ -221,19 +294,26 @@ fn open_directory(root: &Path) -> CoreResult<Archive> {
                     .eq_ignore_ascii_case("MOVIE")
         })
         .ok_or_else(|| error(format!("{} holds no MOVIE directory", root.display())))?;
+    // Subdirectories hold the manual's movies (MOVIE/TUTO and MOVIE/TUTO2).
     let mut movies = Vec::new();
-    for entry in fs::read_dir(movies_dir.path())? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().as_bytes().to_vec();
-        if entry.file_type()?.is_file() && folded(&name).ends_with(b".pss") {
-            movies.push(NamedExtent {
-                name,
-                extent: Extent {
-                    file: entry.path(),
-                    offset: 0,
-                    size: entry.metadata()?.len(),
-                },
-            });
+    let mut pending = vec![(String::new(), movies_dir.path())];
+    while let Some((prefix, directory)) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push((format!("{name}/"), entry.path()));
+            } else if kind.is_file() && folded(name.as_bytes()).ends_with(b".pss") {
+                movies.push(NamedExtent {
+                    name: name.into_bytes(),
+                    extent: Extent {
+                        file: entry.path(),
+                        offset: 0,
+                        size: entry.metadata()?.len(),
+                    },
+                });
+            }
         }
     }
     movies.sort_by(|a, b| a.name.cmp(&b.name));
@@ -245,6 +325,7 @@ fn open_directory(root: &Path) -> CoreResult<Archive> {
         sound_dat: directory_file(root, "SOUND.DAT")?,
         sound_hd3: directory_file(root, "SOUND.HD3")?,
         movies,
+        image_bytes: None,
     })
 }
 
@@ -381,17 +462,295 @@ fn parse_sound_index(hd3: &[u8], dat_size: u64) -> CoreResult<SoundIndex> {
 }
 
 fn read_index(archive: &Archive) -> CoreResult<Vec<DataRecord>> {
-    parse_data_index(&archive.hd4.read()?, archive.dat.size)
+    parse_data_index(&archive.extent_bytes(&archive.hd4)?, archive.dat.size)
 }
 
 fn read_sound_index(archive: &Archive) -> CoreResult<SoundIndex> {
-    parse_sound_index(&archive.sound_hd3.read()?, archive.sound_dat.size)
+    parse_sound_index(
+        &archive.extent_bytes(&archive.sound_hd3)?,
+        archive.sound_dat.size,
+    )
 }
 
 #[derive(Clone)]
 struct Planned {
     rel: String,
     extent: Extent,
+}
+
+/// Indexed retail files read directly from their disc extents during conversion.
+#[derive(Clone)]
+pub struct SourceTree {
+    entries: BTreeMap<String, Extent>,
+    resources: BTreeMap<String, ResourceRef>,
+    files: u64,
+    bytes: u64,
+    image: Option<SourceBytes>,
+}
+
+/// Bytes owned for the lifetime of all references into one source file.
+#[derive(Clone)]
+pub struct SourceBytes(pub Arc<Vec<u8>>);
+
+impl SourceBytes {
+    /// Reads an ISO once and shares its immutable buffer with all converters.
+    pub fn open_iso(path: &Path) -> CoreResult<Self> {
+        Self::open_iso_with_progress(path, &Phase::noop())
+    }
+
+    pub fn open_iso_with_progress(path: &Path, phase: &Phase) -> CoreResult<Self> {
+        let mut file = File::open(path)?;
+        let length = usize::try_from(file.metadata()?.len())
+            .map_err(|_| error("ISO exceeds addressable memory"))?;
+        phase.set_total(length as u64);
+        let mut bytes = Vec::with_capacity(length);
+        let mut chunk = vec![0u8; CHUNK];
+        loop {
+            let count = file.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            phase.inc(count as u64);
+            phase.add_bytes(count as u64);
+        }
+        if bytes.len() != length {
+            return Err(error("ISO changed size while being read"));
+        }
+        Ok(Self(Arc::new(bytes)))
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+/// A checked, immutable byte range of a retail resource.
+#[derive(Clone)]
+pub struct ResourceRef {
+    pub alias: String,
+    source: SourceBytes,
+    range: Range<usize>,
+}
+
+impl ResourceRef {
+    pub fn bytes(&self) -> &[u8] {
+        &self.source.0[self.range.clone()]
+    }
+
+    pub fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+
+    pub fn subrange(&self, alias: impl Into<String>, range: Range<usize>) -> CoreResult<Self> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(error("resource subrange outside source bytes"));
+        }
+        let start = self
+            .range
+            .start
+            .checked_add(range.start)
+            .ok_or_else(|| error("resource offset overflow"))?;
+        let end = self
+            .range
+            .start
+            .checked_add(range.end)
+            .ok_or_else(|| error("resource offset overflow"))?;
+        Ok(Self {
+            alias: alias.into(),
+            source: self.source.clone(),
+            range: start..end,
+        })
+    }
+}
+
+/// Temporary converted PACK buffer, separate from the final asset namespace.
+pub fn compatibility_work_path(published: &Path, name: &str) -> PathBuf {
+    published.join(".work/packs").join(name)
+}
+
+/// Finds a converted PACK buffer or a final standalone retained source file.
+pub fn compatibility_path(published: &Path, name: &str) -> PathBuf {
+    let work = compatibility_work_path(published, name);
+    if work.is_file() {
+        work
+    } else {
+        published.join("data").join(name)
+    }
+}
+
+impl SourceTree {
+    pub fn open(source: &Path) -> CoreResult<Self> {
+        Self::open_with_progress(source, &Phase::noop())
+    }
+
+    /// Reads an ISO once while reporting bytes acquired for its shared resource index.
+    pub fn open_with_progress(source: &Path, phase: &Phase) -> CoreResult<Self> {
+        let image = source
+            .is_file()
+            .then(|| SourceBytes::open_iso_with_progress(source, phase))
+            .transpose()?;
+        let mut archive = if let Some(image) = &image {
+            open_image_bytes(source, image.bytes())?
+        } else {
+            open_archive(source)?
+        };
+        archive.image_bytes = image.clone();
+        let (plan, files, bytes) = plan_archive(&archive)?;
+        let mut resources = BTreeMap::new();
+        for item in &plan {
+            let source_bytes = if let Some(image) = &image {
+                image.clone()
+            } else {
+                SourceBytes(Arc::new(item.extent.read()?))
+            };
+            let start =
+                usize::try_from(item.extent.offset).map_err(|_| error("source offset overflow"))?;
+            let size =
+                usize::try_from(item.extent.size).map_err(|_| error("source size overflow"))?;
+            let range = if image.is_some() {
+                start
+                    ..start
+                        .checked_add(size)
+                        .ok_or_else(|| error("source range overflow"))?
+            } else {
+                0..size
+            };
+            if range.end > source_bytes.bytes().len() {
+                return Err(error(format!("truncated source extent: {}", item.rel)));
+            }
+            resources.insert(
+                item.rel.clone(),
+                ResourceRef {
+                    alias: item.rel.clone(),
+                    source: source_bytes,
+                    range,
+                },
+            );
+        }
+        Ok(Self {
+            entries: plan
+                .into_iter()
+                .map(|item| (item.rel, item.extent))
+                .collect(),
+            resources,
+            files,
+            bytes,
+            image,
+        })
+    }
+
+    /// Opens an already unpacked source tree for standalone converter callers.
+    pub fn directory(root: &Path) -> CoreResult<Self> {
+        fn gather(
+            root: &Path,
+            directory: &Path,
+            entries: &mut BTreeMap<String, Extent>,
+        ) -> CoreResult<()> {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    gather(root, &path, entries)?;
+                } else if path.is_file() {
+                    let name = path
+                        .strip_prefix(root)
+                        .map_err(|e| error(e.to_string()))?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    entries.insert(
+                        name,
+                        Extent {
+                            size: path.metadata()?.len(),
+                            file: path,
+                            offset: 0,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        }
+        let mut entries = BTreeMap::new();
+        gather(root, root, &mut entries)?;
+        let bytes = entries.values().map(|entry| entry.size).sum();
+        let mut resources = BTreeMap::new();
+        for (name, extent) in &entries {
+            let bytes = SourceBytes(Arc::new(extent.read()?));
+            resources.insert(
+                name.clone(),
+                ResourceRef {
+                    alias: name.clone(),
+                    range: 0..bytes.bytes().len(),
+                    source: bytes,
+                },
+            );
+        }
+        Ok(Self {
+            files: entries.len() as u64,
+            bytes,
+            entries,
+            resources,
+            image: None,
+        })
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
+    }
+
+    pub fn len(&self, name: &str) -> CoreResult<u64> {
+        self.entries
+            .get(name)
+            .map(|entry| entry.size)
+            .ok_or_else(|| error(format!("source file missing: {name}")))
+    }
+
+    pub fn read(&self, name: &str) -> CoreResult<Vec<u8>> {
+        Ok(self.resource(name)?.bytes().to_vec())
+    }
+
+    pub fn resource(&self, name: &str) -> CoreResult<ResourceRef> {
+        self.resources
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error(format!("source file missing: {name}")))
+    }
+
+    /// Hashes the same ISO bytes used by the indexed resources.
+    pub fn fingerprint_sha256(&self) -> CoreResult<String> {
+        let image = self
+            .image
+            .as_ref()
+            .ok_or_else(|| error("source is not an ISO"))?;
+        let mut hash = Sha256::new();
+        hash.update(b"kazarov-source-file-v1\0");
+        hash.update((image.bytes().len() as u64).to_le_bytes());
+        hash.update(image.bytes());
+        Ok(hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    pub fn copy(&self, name: &str, destination: &Path) -> CoreResult<()> {
+        let extent = self
+            .entries
+            .get(name)
+            .ok_or_else(|| error(format!("source file missing: {name}")))?;
+        copy_extent(extent, destination)
+    }
+
+    pub fn totals(&self) -> (u64, u64) {
+        (self.files, self.bytes)
+    }
 }
 
 fn plan_archive(archive: &Archive) -> CoreResult<(Vec<Planned>, u64, u64)> {
@@ -550,64 +909,69 @@ fn extent_matches(extent: &Extent, target: &Path) -> CoreResult<bool> {
 }
 
 pub fn extract_raw(source: &Path, raw_out: &Path, jobs: usize) -> CoreResult<(u64, u64)> {
-    extract_raw_with_progress(source, raw_out, jobs, &|_, _| {})
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs.clamp(1, 256))
+        .build()
+        .map_err(|err| error(format!("cannot start extraction workers: {err}")))?
+        .install(|| extract_raw_with_progress(source, raw_out, jobs, &Phase::noop()))
 }
 
 /// Reports each raw file after copying or verifying its cached contents.
+/// Returns the retail data-file totals without copying extraction payloads.
+pub fn extraction_totals(source: &Path) -> CoreResult<(u64, u64)> {
+    let (_, files, bytes) = plan_archive(&open_archive(source)?)?;
+    Ok((files, bytes))
+}
+
 pub fn extract_raw_with_progress(
     source: &Path,
     raw_out: &Path,
     jobs: usize,
-    progress: &(dyn Fn(usize, usize) + Sync),
+    phase: &Phase,
 ) -> CoreResult<(u64, u64)> {
     if jobs == 0 || jobs > 256 {
         return Err(error("jobs must be in 1..=256"));
     }
     let archive = open_archive(source)?;
     let (plan, files, bytes) = plan_archive(&archive)?;
-    eprintln!(
-        "dc2data: extracting {} raw files ({} bytes) with {} workers",
+    let planned: u64 = plan.iter().map(|item| item.extent.size).sum();
+    phase.log(format!(
+        "extracting {} raw files ({}) with {} workers",
         plan.len(),
-        bytes,
+        super::progress::size(planned),
         jobs
-    );
+    ));
+    phase.set_total(planned);
     fs::create_dir_all(raw_out)?;
     let completed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs)
-        .build()
-        .map_err(|err| error(format!("cannot start extraction workers: {err}")))?;
-    pool.install(|| {
-        plan.par_iter().try_for_each(|item| -> CoreResult<()> {
-            let target = raw_out.join(&item.rel);
-            if extent_matches(&item.extent, &target)
-                .map_err(|err| error(format!("{}: resume comparison: {}", item.rel, err.0)))?
-            {
-                skipped.fetch_add(1, Ordering::Relaxed);
-            } else {
-                copy_extent(&item.extent, &target)
-                    .map_err(|err| error(format!("{}: {}", item.rel, err.0)))?;
-            }
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            progress(done, plan.len());
-            if done.is_multiple_of(500) || done == plan.len() {
-                eprintln!(
-                    "dc2data: raw files {done}/{} ({} verified and reused)",
-                    plan.len(),
-                    skipped.load(Ordering::Relaxed)
-                );
-            }
-            Ok(())
-        })
+    plan.par_iter().try_for_each(|item| -> CoreResult<()> {
+        let target = raw_out.join(&item.rel);
+        if item.extent.size >= 8 << 20 {
+            phase.item(&item.rel);
+        }
+        if extent_matches(&item.extent, &target)
+            .map_err(|err| error(format!("{}: resume comparison: {}", item.rel, err.0)))?
+        {
+            skipped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            copy_extent(&item.extent, &target)
+                .map_err(|err| error(format!("{}: {}", item.rel, err.0)))?;
+        }
+        completed.fetch_add(1, Ordering::Relaxed);
+        phase.inc(item.extent.size);
+        phase.add_bytes(item.extent.size);
+        Ok(())
     })?;
     if completed.load(Ordering::Relaxed) != plan.len() {
         return Err(error("incomplete raw extraction"));
     }
-    eprintln!(
-        "dc2data: raw extraction complete; {} files reused after byte verification",
-        skipped.load(Ordering::Relaxed)
-    );
+    let skipped = skipped.load(Ordering::Relaxed);
+    if skipped > 0 {
+        phase.log(format!(
+            "{skipped} raw files reused after byte verification"
+        ));
+    }
     Ok((files, bytes))
 }
 
@@ -729,6 +1093,8 @@ mod tests {
         fs::write(root.join("SOUND.HD3"), sound_index())?;
         fs::write(root.join("SOUND.DAT"), b"SND")?;
         fs::write(root.join("MOVIE/INTRO.PSS"), b"PSS")?;
+        fs::create_dir_all(root.join("MOVIE/TUTO2"))?;
+        fs::write(root.join("MOVIE/TUTO2/VTUTO24.PSS"), b"TUTO")?;
         Ok(())
     }
 
@@ -749,7 +1115,7 @@ mod tests {
     }
 
     fn iso_bytes() -> Vec<u8> {
-        let mut iso = vec![0u8; 25 * SECTOR as usize];
+        let mut iso = vec![0u8; 27 * SECTOR as usize];
         let descriptor = 16 * SECTOR as usize;
         iso[descriptor] = 1;
         iso[descriptor + 1..descriptor + 6].copy_from_slice(b"CD001");
@@ -781,14 +1147,22 @@ mod tests {
         movie_entries.extend_from_slice(&record(&[0], 19, SECTOR as u32, true));
         movie_entries.extend_from_slice(&record(&[1], 18, SECTOR as u32, true));
         movie_entries.extend_from_slice(&record(b"INTRO.PSS;1", 24, 3, false));
+        movie_entries.extend_from_slice(&record(b"TUTO2", 25, SECTOR as u32, true));
         iso[19 * SECTOR as usize..19 * SECTOR as usize + movie_entries.len()]
             .copy_from_slice(&movie_entries);
+        let mut manual_entries = Vec::new();
+        manual_entries.extend_from_slice(&record(&[0], 25, SECTOR as u32, true));
+        manual_entries.extend_from_slice(&record(&[1], 19, SECTOR as u32, true));
+        manual_entries.extend_from_slice(&record(b"VTUTO24.PSS;1", 26, 4, false));
+        iso[25 * SECTOR as usize..25 * SECTOR as usize + manual_entries.len()]
+            .copy_from_slice(&manual_entries);
         for (sector, payload) in [
             (20, index()),
             (21, b"DATA".to_vec()),
             (22, sound_index()),
             (23, b"SND".to_vec()),
             (24, b"PSS".to_vec()),
+            (26, b"TUTO".to_vec()),
         ] {
             let offset = sector * SECTOR as usize;
             iso[offset..offset + payload.len()].copy_from_slice(&payload);
@@ -801,6 +1175,8 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let disc = temp.path().join("disc");
         disc_dir(&disc)?;
+        fs::remove_file(disc.join("MOVIE/INTRO.PSS"))?;
+        fs::remove_dir_all(disc.join("MOVIE/TUTO2"))?;
         let output = temp.path().join("game/data");
         let updates = std::sync::Mutex::new(Vec::new());
         super::super::extract_with_progress(&disc, &output, 2, &|fraction, _| {
@@ -849,6 +1225,7 @@ mod tests {
             "sound/sound.hd3",
             "sound/bgm_a.str",
             "movie/intro.pss",
+            "movie/tuto2/vtuto24.pss",
         ] {
             assert_eq!(
                 fs::read(directory_out.join(rel))?,
@@ -856,6 +1233,7 @@ mod tests {
                 "{rel}"
             );
         }
+        assert_eq!(fs::read(iso_out.join("movie/tuto2/vtuto24.pss"))?, b"TUTO");
         assert!(list_text(&iso)?.contains("1 files"));
         assert!(sound_text(&iso)?.contains("1 entries"));
         Ok(())
@@ -910,7 +1288,14 @@ mod tests {
                 .count(),
             8751
         );
-        assert!(!archive.movies.is_empty());
+        // 9 movies in /MOVIE and the manual's 22 in each of /MOVIE/TUTO and /MOVIE/TUTO2.
+        assert_eq!(archive.movies.len(), 53);
+        assert!(
+            archive
+                .movies
+                .iter()
+                .any(|movie| movie.name == b"TUTO2/VTUTO44.PSS")
+        );
         assert!(!read_sound_index(&archive)?.entries.is_empty());
         Ok(())
     }

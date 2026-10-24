@@ -3,9 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <thread>
 #include <vector>
+
+#include "kazarov/log.hpp"
 
 namespace {
 
@@ -75,7 +76,7 @@ void SleepUntil(SteadyClock::time_point deadline) {
 
 void ClockSetTickRate(double hertz) {
     if (!(hertz > 0.0) || !std::isfinite(hertz)) {
-        std::fprintf(stderr, "clock: ignoring tick rate %g\n", hertz);
+        kz::Logf(kz::LogLevel::Warning, "clock", "ignoring tick rate {}", hertz);
         return;
     }
     g_clock.hertz = hertz;

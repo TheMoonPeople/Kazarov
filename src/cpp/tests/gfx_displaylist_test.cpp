@@ -113,7 +113,7 @@ void Identity(float (&m)[16]) {
     m[0] = m[5] = m[10] = m[15] = 1.0f;
 }
 
-void SetBone(gfx::Prog0Constants &p, uint32_t slot, const Rows &rows) {
+void SetBone(gfx::Prog0Palette &p, uint32_t slot, const Rows &rows) {
     for (uint32_t r = 0; r < 3; r++) {
         for (uint32_t c = 0; c < 4; c++) {
             p.bones[slot][r][c] = rows[r * 4 + c];
@@ -179,7 +179,7 @@ TEST(GfxGpuDisplayList, RecordingReservesPriorSizesWithoutRetainingCommands) {
     gfx::SetInterpKey(17);
     for (int i = 0; i < 129; ++i) {
         constants.diffuse[0] = static_cast<float>(i);
-        gfx::detail::RecordMesh({}, nullptr, &constants);
+        gfx::detail::RecordMesh({}, nullptr, &constants, nullptr);
     }
     gfx::CutInterpolation();
     auto first = gfx::EndRecording();
@@ -217,12 +217,14 @@ TEST(GfxGpuDisplayList, RecordingReservationToleratesSmallGrowthAndResetsWithRen
         gfx::Prog0Constants constants = {};
         gfx::BeginRecording();
         for (int i = 0; i < 129; ++i) {
-            gfx::detail::RecordMesh({}, nullptr, &constants);
+            constants.specular_power = static_cast<uint32_t>(i);
+            gfx::detail::RecordMesh({}, nullptr, &constants, nullptr);
         }
         auto first = gfx::EndRecording();
         gfx::BeginRecording();
         for (int i = 0; i < 130; ++i) {
-            gfx::detail::RecordMesh({}, nullptr, &constants);
+            constants.specular_power = static_cast<uint32_t>(i);
+            gfx::detail::RecordMesh({}, nullptr, &constants, nullptr);
         }
         auto second = gfx::EndRecording();
         EXPECT_EQ(second->entries.capacity(), first->entries.capacity());
@@ -241,12 +243,30 @@ TEST(GfxGpuDisplayList, RecordingReservationToleratesSmallGrowthAndResetsWithRen
     }
 }
 
+TEST(GfxGpuDisplayList, ConsecutiveIdenticalProg0BlocksShareOneRecord) {
+    GfxFixture          fixture(kWidth, kHeight);
+    gfx::Prog0Constants first = {};
+    first.flags = gfx::kProg0Unlit;
+    gfx::Prog0Constants second = first;
+    second.specular_power = 1;
+    gfx::BeginRecording();
+    gfx::detail::RecordMesh({}, nullptr, &first, nullptr);
+    gfx::detail::RecordMesh({}, nullptr, &first, nullptr);
+    gfx::detail::RecordMesh({}, nullptr, &second, nullptr);
+    auto list = gfx::EndRecording();
+    ASSERT_EQ(list->prog0_blocks.size(), 2u);
+    ASSERT_EQ(list->entries.size(), 3u);
+    EXPECT_EQ(std::get<gfx::detail::MeshEntry>(list->entries[0]).prog0, 0);
+    EXPECT_EQ(std::get<gfx::detail::MeshEntry>(list->entries[1]).prog0, 0);
+    EXPECT_EQ(std::get<gfx::detail::MeshEntry>(list->entries[2]).prog0, 1);
+}
+
 TEST(GfxGpuDisplayList, RecordingOverlayKeepsSeparateCapacityHistory) {
     GfxFixture          fixture(kWidth, kHeight, 1.0f, Prog0Options());
     gfx::Prog0Constants constants{};
     gfx::BeginRecording();
     for (int i = 0; i < 129; ++i) {
-        gfx::detail::RecordMesh({}, nullptr, &constants);
+        gfx::detail::RecordMesh({}, nullptr, &constants, nullptr);
     }
     auto game = gfx::EndRecording();
     auto overlay = OverlayRecord("60");
@@ -267,9 +287,8 @@ TEST(GfxGpuDisplayList, RecordingOverlayKeepsSeparateCapacityHistory) {
 }
 
 TEST(GfxDisplayList, BonesBlendPerBoneAtHalf) {
-    gfx::Prog0Constants before = {};
-    gfx::Prog0Constants after = {};
-    before.flags = after.flags = gfx::kProg0Skinned;
+    gfx::Prog0Palette before = {};
+    gfx::Prog0Palette after = {};
     for (uint32_t slot = 0; slot < gfx::kProg0Bones; slot++) {
         SetBone(before, slot, kIdentityRows);
         SetBone(after, slot, kIdentityRows);
@@ -288,12 +307,12 @@ TEST(GfxDisplayList, BonesBlendPerBoneAtHalf) {
     SetBone(before, 4, still);
     SetBone(after, 4, still);
 
-    gfx::Prog0Constants expected = after;
+    gfx::Prog0Palette expected = after;
     SetBone(expected, 0, {1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0});
     SetBone(expected, 1, {root, -root, 0, 0, root, root, 0, 0, 0, 0, 1, 0});
     SetBone(expected, 2, {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0});
 
-    gfx::Prog0Constants out = {};
+    gfx::Prog0Palette out = {};
     gfx::detail::BlendProg0Bones(before, after, 0.5f, 200.0f, out);
     for (uint32_t slot = 0; slot < gfx::kProg0Bones; slot++) {
         for (uint32_t r = 0; r < 3; r++) {
@@ -305,7 +324,6 @@ TEST(GfxDisplayList, BonesBlendPerBoneAtHalf) {
     }
     EXPECT_EQ(std::memcmp(out.bones[3], after.bones[3], sizeof out.bones[3]), 0);
     EXPECT_EQ(std::memcmp(out.bones[4], after.bones[4], sizeof out.bones[4]), 0);
-    EXPECT_EQ(out.flags, after.flags);
 }
 
 TEST(GfxGpuMeshDc2, SkinnedPaletteInterpolatesInDisplayFrame) {
@@ -325,15 +343,15 @@ TEST(GfxGpuMeshDc2, SkinnedPaletteInterpolatesInDisplayFrame) {
     }
 
     auto record = [&](float translation_x, bool cut) {
-        gfx::Prog0Constants posed = block;
-        SetBone(posed, 0, {1, 0, 0, translation_x, 0, 1, 0, 0, 0, 0, 1, 0});
+        gfx::Prog0Palette palette = {};
+        SetBone(palette, 0, {1, 0, 0, translation_x, 0, 1, 0, 0, 0, 0, 1, 0});
         gfx::BeginRecording();
         gfx::SetInterpKey(1, false, 200.0f);
         if (cut) {
             gfx::CutInterpolation();
         }
         gfx::Clear(true, kClear.data(), true, 0.0f);
-        gfx::DrawMeshImmediateProg0(vertices, kTriangle, constants, posed, {}, {}, &transform);
+        gfx::DrawMeshImmediateProg0(vertices, kTriangle, constants, block, {}, {}, &transform, &palette);
         return gfx::EndRecording();
     };
     auto canonical = [&](const gfx::DisplayList &list) {
@@ -366,6 +384,77 @@ TEST(GfxGpuMeshDc2, SkinnedPaletteInterpolatesInDisplayFrame) {
     ASSERT_TRUE(gfx::RenderList(*cut_b, 0.5f, display));
     Coverage after_cut = ReadCoverage(fixture);
     EXPECT_NEAR(after_cut.x, at_b.x, 1.0);
+}
+
+// One mesh drawn by two models, rewritten before each draw: every display frame takes each draw's
+// own rewrite, interpolated with the one its match took.
+TEST(GfxGpuMeshDc2, SharedMeshRewritesInterpolatePerDraw) {
+    GfxFixture fixture(kWidth, kHeight);
+    auto       triangle = [](float x) {
+        return std::vector<gfx::Vertex3D>{Vert({x - 0.1f, -0.1f, 0.5f}, {0, 0, 1}),
+                                          Vert({x + 0.1f, -0.1f, 0.5f}, {0, 0, 1}),
+                                          Vert({x, 0.1f, 0.5f}, {0, 0, 1})};
+    };
+    auto mesh = gfx::CreateMesh(triangle(0), kTriangle);
+    auto record = [&](float left, float right) {
+        gfx::BeginRecording();
+        gfx::Clear(true, kClear.data(), true, 0);
+        uint32_t key = 1;
+        for (float x : {left, right}) {
+            gfx::SetInterpKey(key++, false, 200.0f);
+            EXPECT_TRUE(gfx::UpdateMeshVertices(mesh, 0, triangle(x)));
+            auto               transform = gfx::IdentityMeshTransform();
+            gfx::MeshConstants constants = {};
+            Identity(constants.mvp);
+            constants.diffuse[0] = constants.diffuse[3] = 1;
+            gfx::DrawMesh(mesh, 0, 3, constants, {}, {}, &transform);
+        }
+        return gfx::EndRecording();
+    };
+    // The mean x of the lit pixels in each half of the frame.
+    auto halves = [&]() {
+        EXPECT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+        std::array<Coverage, 2> out;
+        std::array<double, 2>   sum = {};
+        for (uint32_t y = 0; y < fixture.height; y++) {
+            for (uint32_t x = 0; x < fixture.width; x++) {
+                if (fixture.Pixel(x, y)[0] > 100) {
+                    size_t half = x < fixture.width / 2 ? 0 : 1;
+                    sum[half] += x;
+                    out[half].count++;
+                }
+            }
+        }
+        for (size_t half = 0; half < 2; half++) {
+            out[half].x = out[half].count > 0 ? sum[half] / out[half].count : 0.0;
+        }
+        return out;
+    };
+    auto canonical = [&](const gfx::DisplayList &list) {
+        EXPECT_TRUE(gfx::RenderList(list, 1.0f, {.canonical = true}));
+        return halves();
+    };
+
+    gfx::DisplayListRef before = record(-0.6f, 0.4f);
+    gfx::DisplayListRef after = record(-0.4f, 0.6f);
+    std::array<Coverage, 2> at_before = canonical(*before);
+    std::array<Coverage, 2> at_after = canonical(*after);
+    ASSERT_TRUE(gfx::RenderList(*after, 0.5f, {.previous = before.get(), .present = true}));
+    std::array<Coverage, 2> halfway = halves();
+    for (size_t half = 0; half < 2; half++) {
+        ASSERT_GT(at_before[half].count, 0);
+        ASSERT_GT(at_after[half].count, 0);
+        EXPECT_GT(halfway[half].count, 0) << half;
+        EXPECT_NEAR(halfway[half].x, (at_before[half].x + at_after[half].x) / 2.0, 1.0) << half;
+    }
+
+    // Without a previous list each draw still takes its own rewrite.
+    ASSERT_TRUE(gfx::RenderList(*after, 0.5f, {.present = true}));
+    std::array<Coverage, 2> uninterpolated = halves();
+    for (size_t half = 0; half < 2; half++) {
+        EXPECT_NEAR(uninterpolated[half].x, at_after[half].x, 1.0) << half;
+    }
+    gfx::DestroyMesh(mesh);
 }
 
 // A 16:9 window on the 4:3 logical frame leaves a 16 px bar at the right, which the right anchor

@@ -3,8 +3,9 @@
 
     kz-ffmpeg --out DIR [--tarball FILE] [--sha256 HEX] [--jobs N] [--check] [--print-configure]
 
-The build is the mpeg2video decoder and the mpegvideo parser, with static libavcodec.a and
-libavutil.a. The Linux image and macOS hosts use it; Windows takes BtbN's lgpl-shared DLLs.
+The build provides lossless MPEG-2/ALAC MP4 extraction and MP4 playback through
+static codec, format, resampling and scaling libraries plus the FFmpeg command.
+The Linux image and macOS hosts use it; Windows takes BtbN's LGPL-shared bundle.
 scripts/build/kz-ffmpeg launches this shared FFmpeg tool; the image uses it directly.
 """
 
@@ -26,20 +27,27 @@ URL = f'https://ffmpeg.org/releases/ffmpeg-{VERSION}.tar.xz'
 SHA256 = '8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e'
 LICENSE_LINE = 'License: LGPL version 2.1 or later'
 STAMP = 'kz-ffmpeg.json'
-PRODUCTS = ('lib/libavcodec.a', 'lib/libavutil.a', 'include/libavcodec/avcodec.h')
+PRODUCTS = ('lib/libavcodec.a', 'lib/libavformat.a', 'lib/libavutil.a',
+            'lib/libswresample.a', 'lib/libswscale.a', 'include/libavcodec/avcodec.h', 'bin/ffmpeg')
 CONFIGURE_FLAGS = [
     '--disable-everything',
     '--disable-programs',
+    '--enable-ffmpeg',
     '--disable-doc',
     '--disable-network',
     '--disable-autodetect',
-    '--disable-avformat',
-    '--disable-avfilter',
-    '--disable-swscale',
-    '--disable-swresample',
+    '--enable-avformat',
+    '--enable-avfilter',
+    '--enable-swscale',
+    '--enable-swresample',
     '--disable-avdevice',
-    '--enable-decoder=mpeg2video',
-    '--enable-parser=mpegvideo',
+    '--enable-decoder=mpeg2video,h264,alac,aac,pcm_s16le',
+    '--enable-parser=mpegvideo,h264,aac',
+    '--enable-encoder=alac',
+    '--enable-demuxer=mpegps,mov,wav',
+    '--enable-muxer=mp4',
+    '--enable-protocol=file',
+    '--enable-filter=aresample,aformat,anull,abuffer,abuffersink',
     '--enable-pic',
     '--disable-shared',
     '--enable-static',

@@ -3,7 +3,9 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -21,6 +23,7 @@ struct UiSide {
     int8_t x = 0;
     int8_t y = 0;
     bool   scissor = false;
+    float  max_aspect = 0.0f; // UiAnchor::max_aspect
 };
 
 struct Draw2DEntry {
@@ -58,7 +61,8 @@ struct MeshEntry {
     TextureBinding        binding;
     DrawState             state;
     uint32_t              record = 0;
-    int32_t               prog0 = -1; // index into DisplayList::prog0_blocks, or -1 for a plain draw
+    int32_t               prog0 = -1;    // index into DisplayList::prog0_blocks, or -1 for a plain draw
+    int32_t               palette = -1;  // index into DisplayList::palettes, or -1
 };
 
 struct ClearEntry {
@@ -123,6 +127,12 @@ struct MeshRecord {
     Mat4      local = {};
 };
 
+// The last rewrite of each mesh range in a list, and the ranges rewritten more than once.
+struct Rewrites {
+    std::unordered_map<uint64_t, const UpdateMeshEntry *> last;
+    std::unordered_set<uint64_t>                          repeated;
+};
+
 // What a display render of a list against one predecessor reuses from frame to frame.
 struct MatchCache {
     std::vector<std::array<uint32_t, 2> > draws_2d; // matched entry indices, newest then previous
@@ -130,6 +140,7 @@ struct MatchCache {
     std::vector<int32_t> match;   // per record, the previous list's record, or -1
     std::vector<bool>    blend;   // per record, whether its immediate vertices moved since the match's
     std::vector<int32_t> cameras; // per camera, the previous list's, or -1
+    std::optional<Rewrites> rewrites; // of the finished list, built on first display render
 };
 
 } // namespace detail
@@ -142,6 +153,7 @@ struct DisplayList {
     std::vector<detail::Mat4>       cameras;
     std::vector<detail::SpriteScene> scenes;
     std::vector<Prog0Constants>      prog0_blocks;
+    std::vector<Prog0Palette>        palettes;
     // While recording: the scene of the last mesh drawn on the current target, or -1, and on each
     // target drawn into so far (the fire's texture is blended between the map and its sprites).
     int32_t                                    scene = -1;
@@ -150,6 +162,7 @@ struct DisplayList {
     std::vector<MeshHandle>         doomed_meshes;
     bool                            cut = false;
     bool                            camera_cut = false;
+    uint64_t                                   cut_generation = 0; // CutInterpolation calls before this list was finished
     // A draw reaches the main target before a clear covers its logical frame, so whatever the
     // target held shows through; a display render starts from the canonical image.
     bool                                    needs_base = false;
@@ -174,7 +187,8 @@ void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const 
 
 // displaylist.cpp
 void RecordEntry(Entry &&entry);
-void RecordMesh(MeshEntry &&entry, const MeshTransform *transform, const Prog0Constants *prog0);
+void RecordMesh(MeshEntry &&entry, const MeshTransform *transform, const Prog0Constants *prog0,
+                const Prog0Palette *palette);
 void RecordClear(const ClearEntry &entry);
 void RecordDoomedTexture(TextureHandle handle);
 void RecordDoomedMesh(MeshHandle handle);
@@ -190,8 +204,8 @@ bool InterpolateSprite(const Draw2DEntry &before, const SpriteScene &before_scen
                        const Draw2DEntry &after, const SpriteScene &after_scene, const Mat4 &after_view,
                        const Mat4 &display_view, float alpha, std::vector<Vertex2D> &out);
 // A bone that moved past teleport_distance is a cut, not motion, so it keeps after's pose.
-void BlendProg0Bones(const Prog0Constants &before, const Prog0Constants &after, float alpha, float teleport_distance,
-                     Prog0Constants &out);
+void BlendProg0Bones(const Prog0Palette &before, const Prog0Palette &after, float alpha, float teleport_distance,
+                     Prog0Palette &out);
 
 } // namespace detail
 

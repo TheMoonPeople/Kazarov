@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -45,11 +46,14 @@ struct UiAnchor {
     float bottom_from = INFINITY;
     // A piece that clips to its own rectangle must scissor where it is drawn, or the shift clips it away.
     bool scissor = false;
+    // Above zero, the edges a draw moves to are those of a centred area no wider than this aspect (width over
+    // height), so a layout made for that width stays together on wider windows.
+    float max_aspect = 0.0f;
 
     // Every draw to one side: x -1 left, 1 right, y -1 top, 1 bottom, 0 the frame's own place.
-    static constexpr UiAnchor Side(int x, int y, bool follow_scissor = false) {
+    static constexpr UiAnchor Side(int x, int y, bool follow_scissor = false, float max_aspect = 0.0f) {
         return {x < 0 ? INFINITY : -INFINITY, x > 0 ? -INFINITY : INFINITY, y < 0 ? INFINITY : -INFINITY,
-                y > 0 ? -INFINITY : INFINITY, follow_scissor};
+                y > 0 ? -INFINITY : INFINITY, follow_scissor, max_aspect};
     }
 };
 
@@ -60,6 +64,18 @@ enum class PresentMode : uint8_t {
     Immediate,
 };
 
+// Which thread owns device work. Off: the caller, as before. Lockstep: a worker thread runs every device call
+// while the caller waits, so the result is that of Off. Async: the worker also renders display frames from the
+// host's idle hook while the game thread records.
+enum class RenderThreadMode : uint8_t {
+    Off,
+    Lockstep,
+    Async,
+};
+
+// "off", "lockstep" or "async" (any case); nullopt for anything else.
+std::optional<RenderThreadMode> ParseRenderThreadMode(std::string_view text);
+
 struct RendererConfig {
     const char *app_name = "";
     // The game's 2D space. 2D draws, scissors and main-target rectangles are given in it and mapped
@@ -69,12 +85,8 @@ struct RendererConfig {
     float display_aspect = 4.0f / 3.0f; // width / height the logical frame is shown at
     PresentMode           present_mode = PresentMode::Fifo;
     std::filesystem::path pipeline_cache = "save/pipeline_cache.bin";
-    // The main targets' size over the window's, which also multiplies the render targets' scale;
-    // 0 is 1.
+    // Pixels per logical texel of render targets; 0 derives it from the window height at init.
     float       render_scale = 0.0f;
-    // Pixels per logical texel of render targets at a render scale of 1; 0 rounds the window
-    // height over the logical height (720 / 480 to 2).
-    float       target_scale = 0.0f;
     FrameLayout layout;
 #ifdef NDEBUG
     bool validation = false;
@@ -95,15 +107,17 @@ struct RendererConfig {
     // False sets one stencil reference and compare and write masks for both faces, as on a
     // portability-subset device without separateStencilMaskRef.
     bool separate_stencil_masks = true;
-    // Also precompiles the Vu_prog0 pipelines, and the set 2 layout, that DrawMeshProg0 needs (Dark Chronicle).
+    // Also precompiles the Vu_prog0 pipelines that DrawMeshProg0 needs (Dark Chronicle).
     bool prog0_meshes = false;
+    // Lowers the texture and mesh tables for tests; 0 is the build maximum, larger values are clamped to it.
+    uint32_t texture_slots = 0;
+    uint32_t mesh_slots = 0;
+    // KZ_RENDER_THREAD=off|lockstep|async in the environment overrides this.
+    RenderThreadMode render_thread = RenderThreadMode::Off;
     // Draws an index texture from an RGBA expansion of it and its palette, made on the CPU when
     // either changes, so the sampler filters it instead of the shader looking the palette up four
     // times a pixel. For GPUs where that lookup is the frame's cost (the Switch's).
     bool expand_palettes = false;
-    // Lowers the texture and mesh tables for tests; 0 is the build maximum, larger values are clamped to it.
-    uint32_t texture_slots = 0;
-    uint32_t mesh_slots = 0;
 };
 
 // What RendererInit settled on, from the config and the device.
@@ -126,6 +140,30 @@ RendererFeatures ActiveRendererFeatures();
 // Vulkan window; without it a headless run renders offscreen. Callable before RendererInit.
 bool HeadlessSurfaceAvailable();
 void RendererShutdown();
+// The mode RendererInit settled on.
+RenderThreadMode ActiveRenderThreadMode();
+// True on the thread that may touch the device now: any thread in Off, the worker, or the holder of a RenderLease.
+bool OnRenderThread();
+
+// Parks the worker (after the command or idle-hook call it is in) and lets the holding thread run device work
+// inline until the lease is released. A no-op in Off, and when the holder already holds one or is the worker.
+class RenderLease {
+public:
+    RenderLease();
+    ~RenderLease();
+    RenderLease(const RenderLease &) = delete;
+    RenderLease &operator=(const RenderLease &) = delete;
+
+private:
+    bool acquired_ = false;
+};
+
+// Async only: called on the worker whenever its queue is empty and no lease is held or wanted. Returns how long the
+// worker may sleep before calling again; zero calls again at once. Any Dispatch, lease or WakeRenderThread wakes it
+// early. Ignored in Off and Lockstep.
+using RenderIdleHook = std::chrono::steady_clock::duration (*)(void *user);
+void SetRenderIdleHook(RenderIdleHook hook, void *user);
+void WakeRenderThread();
 // The window's pixel size changed; the swapchain and main target follow at the next BeginFrame.
 void RendererResize();
 // The swapchain is recreated with the mode at the next BeginFrame or tick render.
@@ -146,11 +184,12 @@ uint32_t PipelineCount();
 // distinguishable through Vulkan, so this is only the time RendererInit spent creating them.
 double PipelineCompileSeconds();
 float  RenderScale();
-// Selects a fraction of the derived native render scale, from 0.5x to 2x.
+// Recreates every render target at the new scale, carrying its contents over.
 void SetRenderScale(float scale);
 // Outside a frame; frame targets are recreated for the new aspect, carrying their logical frame over.
 void        SetFrameLayout(const FrameLayout &layout);
 FrameLayout CurrentFrameLayout();
+
 // ---- Textures --------------------------------------------------------------------------------
 
 using TextureHandle = uint32_t;
@@ -209,7 +248,8 @@ TextureHandle CreatePalette();
 //
 // A frame target holds copies of the frame (the game's frame grabs). With AspectMode::Fill it is
 // the main target's pixel width and maps its logical width onto the main target's logical frame,
-// so the frame's sides past the logical frame are kept; rows keep the render target's scale.
+// so the frame's sides past the logical frame are kept; rows keep the render target's scale. One as
+// tall as the logical frame is the main target's size and keeps the rows past the frame as well.
 // With AspectMode::Letterbox it is an ordinary render target.
 TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height, bool has_alpha,
                                  bool share_main_depth = false, bool frame_target = false);
@@ -403,6 +443,8 @@ struct DrawState {
     uint8_t color_write_mask = kWriteRgba;
     // A depth-tested screen effect samples the display image; its corners stay in screen space.
     bool screen_space = false;
+    // Prog0Face bits of a prog0 mesh draw, passed to Vu_prog0 in push constants.
+    uint32_t prog0_face = 0;
     // A 2D draw into the main target, or a target sharing its depth, with depth_coverage planes
     // (1 to kCoveragePlanes) reads the main depth buffer instead of testing it: its colour and alpha
     // are scaled by the fraction of coverage_depths[0, depth_coverage) at or nearer than the depth
@@ -498,12 +540,9 @@ struct Prog0Constants {
     float    point_color[4][4];     // per-light colour
     float    fog[4];                // offset, near value, far value, scale
     uint32_t flags = 0;             // Prog0Flags
-    uint32_t face = 0;              // Prog0Face
+    uint32_t pad0 = 0;
     uint32_t specular_power = 0;    // specular exponent
     uint32_t pad = 0;
-    // The draw's palette: kProg0Bones model-space (object-space) affine matrices, rows 0-2 each, not
-    // multiplied with view or projection, so a display frame can interpolate them per bone.
-    float bones[kProg0Bones][3][4];
 };
 
 // A kProg0Skinned mesh is pairs of Vertex3D: each vertex, then its skin in the same bytes.
@@ -525,8 +564,8 @@ inline CullMode Prog0CullMode(const Prog0Constants &constants) {
     return det < 0.0f ? CullMode::Front : CullMode::Back;
 }
 
-// Matches the std140 block of set 1 in shaders/mesh.vert and shaders/mesh_prog0.vert. A prog0 draw's
-// Prog0Constants is its own block at set 2, so Chronicle's draws stay at this size.
+// Matches the MeshConstants record of set 1 in shaders/mesh.vert and shaders/mesh_prog0.vert. A prog0
+// draw's Prog0Constants is a record of its own at set 1, so Chronicle's draws stay at this size.
 // Colours outside prog0 are modulations with 1.0 as GS 0x80.
 struct MeshConstants {
     float    mvp[16];           // column-major, object to Vulkan clip space (y down, reverse-Z)
@@ -545,8 +584,15 @@ struct MeshConstants {
     uint32_t pad[2] = {};
 };
 static_assert(sizeof(MeshConstants) == 400);
-static_assert(offsetof(Prog0Constants, flags) == 464 && offsetof(Prog0Constants, bones) == 480);
-static_assert(sizeof(Prog0Constants) == 2016);
+static_assert(offsetof(Prog0Constants, flags) == 464);
+static_assert(sizeof(Prog0Constants) == 480);
+
+// A skinned prog0 draw's palette: kProg0Bones model-space (object-space) affine matrices, rows 0-2 each, not
+// multiplied with view or projection, so a display frame can interpolate them per bone.
+struct Prog0Palette {
+    float bones[kProg0Bones][3][4];
+};
+static_assert(sizeof(Prog0Palette) == 1536);
 
 // How a mesh draw's mvp was made: projection * view * middle * model * local, column-major. Recorded
 // with the draw so a display frame can interpolate the model and the view (the camera) between two
@@ -583,14 +629,15 @@ void DrawMeshImmediate(std::span<const Vertex3D> vertices, std::span<const uint3
                        const MeshConstants &constants, const TextureBinding &texture, const DrawState &state,
                        const MeshTransform *transform = nullptr);
 // The same draws through Vu_prog0's pipelines, with the game's Prog0Constants for the draw. They need
-// RendererConfig::prog0_meshes; without it they report once and draw as a plain mesh.
+// RendererConfig::prog0_meshes; without it they report once and draw as a plain mesh. A skinned
+// (kProg0Skinned) draw reads its bones from palette; without one it uses identity bones.
 void DrawMeshProg0(MeshHandle mesh, uint32_t first_index, uint32_t index_count, const MeshConstants &constants,
                    const Prog0Constants &prog0, const TextureBinding &texture, const DrawState &state,
-                   const MeshTransform *transform = nullptr);
+                   const MeshTransform *transform = nullptr, const Prog0Palette *palette = nullptr);
 void DrawMeshImmediateProg0(std::span<const Vertex3D> vertices, std::span<const uint32_t> indices,
                             const MeshConstants &constants, const Prog0Constants &prog0,
                             const TextureBinding &texture, const DrawState &state,
-                            const MeshTransform *transform = nullptr);
+                            const MeshTransform *transform = nullptr, const Prog0Palette *palette = nullptr);
 
 // ---- Targets, copies, blits ------------------------------------------------------------------
 
@@ -637,7 +684,7 @@ private:
 };
 // The logical rect the target's pixels show: its logical frame, or with AspectMode::Fill on the main
 // target (and the targets mapped like it) all of the target, past the frame on its wider axis, and
-// on a frame target the main target's horizontal extent.
+// on a frame target the main target's horizontal extent (and vertical, on a full-height one).
 LogicalRect VisibleLogicalRect(TextureHandle target);
 // Clears the current target within rect (logical; null: all of it). color is GS bytes.
 // A presentation rectangle replaces only the recorded display clear's region.
@@ -653,9 +700,9 @@ bool SnapshotFrame(TextureHandle dst);
 // ---- Readback --------------------------------------------------------------------------------
 
 // Queues a read of the main depth buffer over a logical rect, taken at EndFrame. The result is
-// the farthest (smallest) depth in it, 1 near and 0 far, available after EndFrame.
+// the farthest (smallest) depth in it, 1 near and 0 far, available a frame or two later.
 void ReadDepth(uint32_t id, float x, float y, float w = 1.0f, float h = 1.0f);
-// The answer to the last ReadDepth(id); none if the rect was off the target or never asked.
+// The newest answer to ReadDepth(id); none if the rect was off the target or none has landed.
 std::optional<float> DepthResult(uint32_t id);
 // The last presented frame, RGBA8 rows top to bottom. Outside a frame only.
 bool ReadbackFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
