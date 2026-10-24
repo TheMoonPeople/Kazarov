@@ -33,6 +33,13 @@ bool GetGlyph(char32_t ch, int em_px, Glyph &out);
 // the tests look at. False where GetGlyph would say so.
 bool RenderGlyph(char32_t ch, int em_px, std::vector<unsigned char> &alpha, int &w, int &h, int &x0, int &y0);
 
+// RenderGlyph with the em em_x pixels across and em_y pixels down, for text a game stretches out of
+// square, and the pen shift_x and shift_y of a pixel right of and below a pixel corner (each 0 to 1), so
+// the coverage is what the glyph covers where it is drawn rather than resampled afterwards. Ems run
+// from 4 to 512 pixels; outside that, or a shift outside [0, 1), it gives false.
+bool RenderGlyph(char32_t ch, float em_x, float em_y, float shift_x, float shift_y, std::vector<unsigned char> &alpha,
+                 int &w, int &h, int &x0, int &y0);
+
 // The atlas, to draw GetGlyph's coordinates from.
 gfx::TextureBinding Binding();
 

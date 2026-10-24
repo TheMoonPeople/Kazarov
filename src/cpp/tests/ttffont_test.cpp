@@ -97,3 +97,42 @@ TEST(TtfFont, WhatItCannotBuildIsLeftToTheBitmap) {
     EXPECT_FALSE(ttffont::RenderGlyph(U'ß', 40, out.alpha, out.w, out.h, out.x0, out.y0));
     EXPECT_FALSE(ttffont::RenderGlyph(U'~' + 0x1000, 40, out.alpha, out.w, out.h, out.x0, out.y0));
 }
+
+TEST(TtfFont, SeparateScalesStretchTheGlyphAndShiftsMoveIt) {
+    if (!LoadTestFont()) {
+        GTEST_SKIP() << "TEST_FONT is not set";
+    }
+    Rendered square, wide, tall, shifted;
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40.0f, 40.0f, 0.0f, 0.0f, square.alpha, square.w, square.h, square.x0, square.y0));
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 80.0f, 40.0f, 0.0f, 0.0f, wide.alpha, wide.w, wide.h, wide.x0, wide.y0));
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40.0f, 80.0f, 0.0f, 0.0f, tall.alpha, tall.w, tall.h, tall.x0, tall.y0));
+    EXPECT_NEAR(wide.w, 2 * square.w, 2);
+    EXPECT_NEAR(wide.h, square.h, 1);
+    EXPECT_NEAR(tall.h, 2 * square.h, 2);
+    EXPECT_NEAR(tall.w, square.w, 1);
+
+    // The whole-pixel overload is the square one with no shift.
+    Rendered whole;
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40, whole.alpha, whole.w, whole.h, whole.x0, whole.y0));
+    EXPECT_EQ(whole.alpha, square.alpha);
+
+    // Half a pixel right moves the ink half a pixel right: the coverage's centre of mass follows.
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40.0f, 40.0f, 0.5f, 0.0f, shifted.alpha, shifted.w, shifted.h, shifted.x0,
+                                     shifted.y0));
+    auto centre = [](const Rendered &r) {
+        double sum = 0, moment = 0;
+        for (int row = 0; row < r.h; row++) {
+            for (int col = 0; col < r.w; col++) {
+                const double a = r.alpha[static_cast<size_t>(row) * r.w + col];
+                sum += a;
+                moment += a * (r.x0 + col + 0.5);
+            }
+        }
+        return moment / sum;
+    };
+    EXPECT_NEAR(centre(shifted) - centre(square), 0.5, 0.05);
+
+    Rendered out;
+    EXPECT_FALSE(ttffont::RenderGlyph(U'H', 40.0f, 40.0f, 1.0f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
+    EXPECT_FALSE(ttffont::RenderGlyph(U'H', 3.0f, 40.0f, 0.0f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
+}

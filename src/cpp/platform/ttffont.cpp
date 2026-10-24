@@ -74,15 +74,27 @@ int DrawnGlyph(char32_t ch) {
     return index != 0 && !stbtt_IsGlyphEmpty(&g_font.info, index) ? index : 0;
 }
 
-Bitmap Raster(int index, float scale_x, float scale_y) {
+// Pixels per font unit across and down, and where the pen sits inside its pixel (0 to 1, right and down).
+struct Scale {
+    float x = 1.0f;
+    float y = 1.0f;
+    float shift_x = 0.0f;
+    float shift_y = 0.0f;
+
+    Scale Scaled(float kx, float ky) const { return {x * kx, y * ky, shift_x, shift_y}; }
+};
+
+Bitmap Raster(int index, const Scale &scale) {
     Bitmap bitmap;
     int    x1, y1;
-    stbtt_GetGlyphBitmapBox(&g_font.info, index, scale_x, scale_y, &bitmap.x0, &bitmap.y0, &x1, &y1);
+    stbtt_GetGlyphBitmapBoxSubpixel(&g_font.info, index, scale.x, scale.y, scale.shift_x, scale.shift_y, &bitmap.x0,
+                                    &bitmap.y0, &x1, &y1);
     bitmap.w = x1 - bitmap.x0;
     bitmap.h = y1 - bitmap.y0;
     if (bitmap.w > 0 && bitmap.h > 0) {
         bitmap.alpha.assign(static_cast<size_t>(bitmap.w) * bitmap.h, 0);
-        stbtt_MakeGlyphBitmap(&g_font.info, bitmap.alpha.data(), bitmap.w, bitmap.h, bitmap.w, scale_x, scale_y, index);
+        stbtt_MakeGlyphBitmapSubpixel(&g_font.info, bitmap.alpha.data(), bitmap.w, bitmap.h, bitmap.w, scale.x, scale.y,
+                                      scale.shift_x, scale.shift_y, index);
     }
     return bitmap;
 }
@@ -210,8 +222,8 @@ char32_t MarkGlyph(Mark mark) {
 }
 
 // Builds ch from the font's own glyphs when the font draws nothing for it; false for a character this
-// does not know how to build (the caller then draws the game's bitmap). scale is pixels per font unit.
-bool Compose(char32_t ch, float scale, int em_px, Bitmap &out) {
+// does not know how to build (the caller then draws the game's bitmap). em_px is the em down the page.
+bool Compose(char32_t ch, const Scale &scale, int em_px, Bitmap &out) {
     const int gap = std::max(1, em_px / 25);
 
     for (const Accented &accented : kAccented) {
@@ -226,8 +238,8 @@ bool Compose(char32_t ch, float scale, int em_px, Bitmap &out) {
         const bool   upper = accented.base >= U'A' && accented.base <= U'Z';
         const float  k = accented.mark == Mark::Cedilla ? 0.9f : upper ? 0.7f
                                                                        : 0.85f;
-        const Bitmap base = Raster(base_index, scale, scale);
-        const Bitmap mark = Raster(mark_index, scale * k, scale * k);
+        const Bitmap base = Raster(base_index, scale);
+        const Bitmap mark = Raster(mark_index, scale.Scaled(k, k));
         if (base.w <= 0 || mark.w <= 0) {
             return false;
         }
@@ -252,7 +264,7 @@ bool Compose(char32_t ch, float scale, int em_px, Bitmap &out) {
         if (index == 0) {
             return false;
         }
-        out = Raster(index, scale, scale);
+        out = Raster(index, scale);
         // Turned over inside its own box, so it keeps the height and the depth the original had.
         for (int row = 0; row < out.h / 2; row++) {
             std::swap_ranges(out.alpha.begin() + static_cast<size_t>(row) * out.w,
@@ -269,8 +281,8 @@ bool Compose(char32_t ch, float scale, int em_px, Bitmap &out) {
             return false;
         }
         // Two letters, each squeezed to 65% of its width, the second tucked against the first.
-        const Bitmap left = Raster(first, scale * 0.65f, scale);
-        const Bitmap right = Raster(second, scale * 0.65f, scale);
+        const Bitmap left = Raster(first, scale.Scaled(0.65f, 1.0f));
+        const Bitmap right = Raster(second, scale.Scaled(0.65f, 1.0f));
         out = Combine({
             {&left,  0,                               0},
             {&right, left.x0 + left.w - right.x0 - 1, 0}
@@ -329,8 +341,8 @@ bool GetGlyph(char32_t ch, int em_px, Glyph &out) {
     const float scale = stbtt_ScaleForMappingEmToPixels(&g_font.info, static_cast<float>(em_px));
     Bitmap      bitmap;
     if (const int index = DrawnGlyph(ch); index != 0) {
-        bitmap = Raster(index, scale, scale);
-    } else if (!Compose(ch, scale, em_px, bitmap)) {
+        bitmap = Raster(index, {scale, scale});
+    } else if (!Compose(ch, {scale, scale}, em_px, bitmap)) {
         g_atlas.missing[key] = true;
         return false;
     }
@@ -389,14 +401,21 @@ bool GetGlyph(char32_t ch, int em_px, Glyph &out) {
 }
 
 bool RenderGlyph(char32_t ch, int em_px, std::vector<unsigned char> &alpha, int &w, int &h, int &x0, int &y0) {
-    if (!g_font.loaded || em_px < 4 || em_px > 512) {
+    return RenderGlyph(ch, static_cast<float>(em_px), static_cast<float>(em_px), 0.0f, 0.0f, alpha, w, h, x0, y0);
+}
+
+bool RenderGlyph(char32_t ch, float em_x, float em_y, float shift_x, float shift_y, std::vector<unsigned char> &alpha,
+                 int &w, int &h, int &x0, int &y0) {
+    if (!g_font.loaded || !(em_x >= 4.0f && em_x <= 512.0f) || !(em_y >= 4.0f && em_y <= 512.0f) ||
+        !(shift_x >= 0.0f && shift_x < 1.0f) || !(shift_y >= 0.0f && shift_y < 1.0f)) {
         return false;
     }
-    const float scale = stbtt_ScaleForMappingEmToPixels(&g_font.info, static_cast<float>(em_px));
+    const Scale scale{stbtt_ScaleForMappingEmToPixels(&g_font.info, em_x),
+                      stbtt_ScaleForMappingEmToPixels(&g_font.info, em_y), shift_x, shift_y};
     Bitmap      bitmap;
     if (const int index = DrawnGlyph(ch); index != 0) {
-        bitmap = Raster(index, scale, scale);
-    } else if (!Compose(ch, scale, em_px, bitmap)) {
+        bitmap = Raster(index, scale);
+    } else if (!Compose(ch, scale, static_cast<int>(em_y), bitmap)) {
         return false;
     }
     alpha = std::move(bitmap.alpha);
