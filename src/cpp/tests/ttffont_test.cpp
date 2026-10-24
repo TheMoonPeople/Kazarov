@@ -149,3 +149,36 @@ TEST(TtfFont, AdvancesAreTheFontsOwnInEms) {
     EXPECT_LT(m, 2.0f);
     EXPECT_FALSE(ttffont::GetAdvance(char32_t{0x10FFFD}, missing));
 }
+
+TEST(TtfFont, FacesDrawTheirOwnFontBesideTheDefault) {
+    const char *path = SettingsEnv("TEST_FONT");
+    if (path == nullptr || *path == '\0') {
+        GTEST_SKIP() << "TEST_FONT is not set";
+    }
+    ttffont::Face face;
+    Rendered      out;
+    float         em = 0;
+    EXPECT_FALSE(face.Loaded());
+    EXPECT_FALSE(face.RenderGlyph(U'H', 40.0f, 40.0f, 0.0f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
+    EXPECT_FALSE(face.GetAdvance(U'H', em));
+    EXPECT_FALSE(face.Load("/nonexistent/font.ttf"));
+    ASSERT_TRUE(face.Load(path));
+    ASSERT_TRUE(LoadTestFont());
+
+    // The same file draws the same glyph and advance through a face as through the default font.
+    Rendered from_face;
+    ASSERT_TRUE(face.RenderGlyph(U'H', 40.0f, 30.0f, 0.5f, 0.0f, from_face.alpha, from_face.w, from_face.h,
+                                 from_face.x0, from_face.y0));
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40.0f, 30.0f, 0.5f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
+    EXPECT_EQ(from_face.alpha, out.alpha);
+    EXPECT_EQ(from_face.x0, out.x0);
+    float default_em = 0;
+    ASSERT_TRUE(face.GetAdvance(U'm', em));
+    ASSERT_TRUE(ttffont::GetAdvance(U'm', default_em));
+    EXPECT_EQ(em, default_em);
+
+    // A failed load keeps the face's font, and a face's load leaves the default font where it was.
+    EXPECT_FALSE(face.Load("/nonexistent/font.ttf"));
+    EXPECT_TRUE(face.Loaded());
+    EXPECT_TRUE(ttffont::Loaded());
+}
