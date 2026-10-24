@@ -25,13 +25,12 @@ pc;
 
 layout(location = 0) out vec4 v_color;
 layout(location = 1) out vec2 v_uv;
-layout(location = 2) out vec4 v_fog;
-layout(location = 3) flat out vec4 v_fog_mode;
+// draw.frag's v_fog: a 2D draw's F; its mode, -1, comes with the draw (PushConstants::fog_mode).
+layout(location = 2) out vec3 v_fog;
 
 void main() {
     gl_Position = vec4(a_position.xy * pc.xform.xy + pc.xform.zw, a_position.z, 1.0);
     v_color     = a_color;
     v_uv        = a_uv * pc.uv_xform.xy + pc.uv_xform.zw;
-    v_fog       = vec4(a_fog, 0.0, 0.0, 0.0);
-    v_fog_mode  = vec4(0.0, 0.0, -1.0, 0.0);
+    v_fog       = vec3(a_fog, 0.0, 0.0);
 }

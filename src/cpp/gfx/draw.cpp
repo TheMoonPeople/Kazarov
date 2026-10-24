@@ -445,15 +445,31 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     }
     push.alpha = state.alpha_ref | (static_cast<uint32_t>(state.alpha_func) & 7) << 8 |
                  static_cast<uint32_t>(state.alpha.fix) << 16 | static_cast<uint32_t>(state.texa_ta0) << 24;
+    // The alpha test's verdicts on less, equal and greater, in alpha's bits 11 to 13. AlphaFunc's
+    // order: never, always, less, lequal, equal, gequal, greater, notequal.
+    constexpr uint32_t kAlphaPass[8] = {0b000, 0b111, 0b001, 0b011, 0b010, 0b110, 0b100, 0b101};
+    push.alpha |= kAlphaPass[static_cast<uint32_t>(state.alpha_func) & 7] << 11;
     push.fog_color = state.fog_color[0] | state.fog_color[1] << 8 | state.fog_color[2] << 16;
     push.face = state.prog0_face;
+    // PushConstants::per_draw, the values the shader would work out from flags, alpha and fog_color;
+    // the divisions by 0x80 are exact.
+    for (int i = 0; i < 3; i++) {
+        push.per_draw[i] = static_cast<float>(state.fog_color[i]) * (1.0f / 255.0f);
+    }
+    push.per_draw[3] = static_cast<float>(state.alpha.fix) / 128.0f;
+    push.per_draw[4] = blend.fix ? 1.0f : 0.0f;
+    push.per_draw[5] = blend.transform == 1 ? 1.0f : 0.0f;
+    push.per_draw[6] = blend.transform == 2 ? 1.0f : 0.0f;
+    push.per_draw[7] = static_cast<float>(state.texa_ta0) / 128.0f;
+    // A 2D draw's fog is its vertices' F; a mesh draw's terms come with its constants (BindConstants).
+    push.fog_mode[2] = -1.0f;
     if (coverage) {
         // A coverage draw has no palette and no fog: the depth to sample, the plane count and the
         // planes' depths (-1 past the count, which no depth is at or under) take their place.
         push.palette_slot = target.depth == &g.display_depth ? kDisplayDepthSlot : kMainDepthSlot;
         push.fog_color = given.depth_coverage;
         for (uint32_t i = 0; i < kCoveragePlanes; i++) {
-            push.coverage[i] = i < given.depth_coverage ? given.coverage_depths[i] : -1.0f;
+            push.per_draw[i] = i < given.depth_coverage ? given.coverage_depths[i] : -1.0f;
         }
     }
     vkCmdPushConstants(cmd, PipelineLayoutOf(family), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
@@ -625,6 +641,50 @@ const Prog0Palette *SkinnedPalette(PipelineFamily family, const Prog0Palette *pa
 
 static_assert(offsetof(PushConstants, palette_index) == offsetof(PushConstants, mesh_index) + 2 * sizeof(uint32_t));
 
+// PushConstants::fog_mode and fog_line of a mesh draw: what its vertex shader would give at every
+// vertex, as the mesh's F is clamp(fog[0] + fog[1] / w, fog[2], fog[3]) (draw.frag's mode 0) and a
+// prog0 draw's floor(clamp(fog.x + fog.w / w, near fog.y, far fog.z)) (mode 1), constant where the
+// 1 / w term is zero (mode -2).
+struct MeshFogTerms {
+    float mode[4];
+    float line[2];
+};
+static_assert(sizeof(MeshFogTerms) == offsetof(PushConstants, fog_line) + sizeof(PushConstants::fog_line) -
+                                         offsetof(PushConstants, fog_mode));
+
+MeshFogTerms FogTerms(const MeshConstants &constants, const Prog0Constants *prog0) {
+    MeshFogTerms terms = {};
+    if (prog0 != nullptr) {
+        const float *fog = prog0->fog; // offset, near value, far value, scale
+        terms.mode[0] = fog[1];
+        terms.mode[1] = fog[2];
+        if (fog[3] == 0.0f) {
+            // VU1 clamps against the near value first and the far value last, then truncates.
+            terms.mode[2] = -2.0f;
+            terms.mode[3] = std::floor(std::max(std::max(std::min(fog[0], fog[1]), fog[2]), 0.0f)) / 255.0f;
+        } else {
+            terms.mode[2] = 1.0f;
+            terms.line[0] = fog[0];
+            terms.line[1] = fog[3];
+        }
+        return terms;
+    }
+    const float *fog = constants.fog; // F = clamp(fog[0] + fog[1] / w, fog[2], fog[3])
+    terms.mode[0] = fog[3];
+    terms.mode[1] = fog[2];
+    terms.mode[3] = 1.0f;
+    if ((constants.flags & kMeshFog) == 0) {
+        terms.mode[2] = -2.0f;
+    } else if (fog[1] == 0.0f) {
+        terms.mode[2] = -2.0f;
+        terms.mode[3] = std::min(std::max(fog[0], fog[2]), fog[3]) / 255.0f;
+    } else {
+        terms.line[0] = fog[0];
+        terms.line[1] = fog[1];
+    }
+    return terms;
+}
+
 // prog0 is the draw's Vu_prog0 block, or nullptr for a plain draw; palette is its Prog0Palette, or nullptr
 // unless the draw is skinned. Called after Prepare, which pushes the rest.
 void BindConstants(VkPipelineLayout layout, const MeshConstants &constants, const Prog0Constants *prog0,
@@ -675,6 +735,9 @@ void BindConstants(VkPipelineLayout layout, const MeshConstants &constants, cons
                            palette != nullptr ? bound.palette_index : 0};
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        offsetof(PushConstants, mesh_index), sizeof(indices), indices);
+    MeshFogTerms terms = FogTerms(constants, prog0);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       offsetof(PushConstants, fog_mode), sizeof(terms), &terms);
 }
 
 // Pixel rectangle of a logical one on an image, for copies and blits; along the axes in extend it
