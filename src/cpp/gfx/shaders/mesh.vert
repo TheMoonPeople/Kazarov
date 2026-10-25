@@ -14,11 +14,16 @@ layout(push_constant, std430) uniform Push {
     uint flags;
     uint alpha;
     uint fog_color;
+    uint face;
+    uint mesh_index;
+    uint prog0_index;
+    uint palette_index;
 }
 pc;
 
-// gfx::MeshConstants. Colours are modulations with 1.0 as GS 0x80.
-layout(set = 1, binding = 0, std140) uniform MeshConstants {
+// gfx::MeshConstants. Colours are modulations with 1.0 as GS 0x80. Each chunk's records form one array;
+// the draw's record is at pc.mesh_index.
+struct MeshConstantsData {
     mat4 mvp;
     mat3 normal_matrix;
     vec4 light_direction[4];
@@ -32,8 +37,13 @@ layout(set = 1, binding = 0, std140) uniform MeshConstants {
     vec4 world_uv[2];
     uint flags;
     uint light_count;
-}
-mc;
+};
+
+layout(set = 1, binding = 0, std430) readonly buffer MeshConstantsArray {
+    MeshConstantsData meshes[];
+};
+
+#define mc meshes[pc.mesh_index]
 
 const uint kLit         = 1u;
 const uint kVertexColor = 2u;

@@ -4,17 +4,23 @@
 
 #include <eekernel.h>
 
-#include "sce/threads.hpp"
-
-#include "platform/clock.hpp"
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #include <cstddef>
-#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <format>
 #include <iterator>
 #include <map>
 #include <memory>
+
+#include "kazarov/log.hpp"
+#include "platform/clock.hpp"
+#include "sce/threads.hpp"
 
 // PS2 threads are fibers on the main OS thread. The game's threads are cooperative and the window, SDL and
 // the Vulkan queue must stay on one thread, so no OS thread is ever created.
@@ -28,6 +34,53 @@ void *CreateFiber(std::size_t stack_size, void (*start)(void *), void *parameter
 void  SwitchToFiber(void *fiber);
 void  DeleteFiber(void *fiber);
 }
+#elif defined(__APPLE__) && defined(__aarch64__) && TARGET_OS_IPHONE
+// iOS gets its own switch: <ucontext.h> is deprecated on Apple platforms and its swapcontext did not switch there,
+// so the loading thread of a new game never ran and DeleteNowLoading waited for it forever.
+#define KZ_ARM64_FIBERS 1
+extern "C" void kz_fiber_switch(void **save_sp, void *load_sp);
+extern "C" void kz_fiber_trampoline();
+// Saves the callee-saved registers the AAPCS64 asks a call to keep (x19-x30 and d8-d15) on the current stack,
+// stores that stack in *save_sp, and resumes the stack in load_sp the same way.
+asm(R"(
+    .text
+    .p2align 2
+    .globl _kz_fiber_switch
+_kz_fiber_switch:
+    sub sp, sp, #0xa0
+    stp x19, x20, [sp, #0x00]
+    stp x21, x22, [sp, #0x10]
+    stp x23, x24, [sp, #0x20]
+    stp x25, x26, [sp, #0x30]
+    stp x27, x28, [sp, #0x40]
+    stp x29, x30, [sp, #0x50]
+    stp d8, d9, [sp, #0x60]
+    stp d10, d11, [sp, #0x70]
+    stp d12, d13, [sp, #0x80]
+    stp d14, d15, [sp, #0x90]
+    mov x2, sp
+    str x2, [x0]
+    mov sp, x1
+    ldp x19, x20, [sp, #0x00]
+    ldp x21, x22, [sp, #0x10]
+    ldp x23, x24, [sp, #0x20]
+    ldp x25, x26, [sp, #0x30]
+    ldp x27, x28, [sp, #0x40]
+    ldp x29, x30, [sp, #0x50]
+    ldp d8, d9, [sp, #0x60]
+    ldp d10, d11, [sp, #0x70]
+    ldp d12, d13, [sp, #0x80]
+    ldp d14, d15, [sp, #0x90]
+    add sp, sp, #0xa0
+    ret
+
+    .p2align 2
+    .globl _kz_fiber_trampoline
+_kz_fiber_trampoline:
+    mov x29, xzr
+    bl _kz_fiber_entry
+    brk #0
+)");
 #else
 #include <ucontext.h>
 #endif
@@ -37,7 +90,12 @@ namespace {
 constexpr std::size_t kStackSize = 1024 * 1024;
 constexpr int         kMainThreadId = 1;
 
-enum class State { Dormant, Ready, Running, Waiting };
+enum class State {
+    Dormant,
+    Ready,
+    Running,
+    Waiting
+};
 
 void RunEntry();
 
@@ -54,16 +112,14 @@ void FiberStart(void *) {
 void ContextInitMain(Context &c) {
     c.fiber = ConvertThreadToFiber(nullptr);
     if (c.fiber == nullptr) {
-        std::fprintf(stderr, "eekernel: ConvertThreadToFiber failed\n");
-        std::abort();
+        kz::Abort("eekernel", "ConvertThreadToFiber failed");
     }
 }
 
 void ContextCreate(Context &c) {
     c.fiber = CreateFiber(kStackSize, FiberStart, nullptr);
     if (c.fiber == nullptr) {
-        std::fprintf(stderr, "eekernel: CreateFiber failed\n");
-        std::abort();
+        kz::Abort("eekernel", "CreateFiber failed");
     }
 }
 
@@ -78,6 +134,41 @@ void ContextDestroy(Context &c) {
     }
 }
 
+#elif defined(KZ_ARM64_FIBERS)
+
+// A suspended thread is its stack pointer: kz_fiber_switch left the saved registers there.
+struct Context {
+    void *sp = nullptr;
+    void *stack = nullptr;
+};
+
+void ContextInitMain(Context &) {}
+
+void ContextCreate(Context &c) {
+    c.stack = std::malloc(kStackSize);
+    if (c.stack == nullptr) {
+        kz::Abort("eekernel", "out of memory for a thread stack");
+    }
+    // The first switch to the thread restores this frame: zeroed registers, x30 at the trampoline that calls
+    // RunEntry.
+    auto *top = reinterpret_cast<std::uintptr_t *>(
+        (reinterpret_cast<std::uintptr_t>(c.stack) + kStackSize) & ~static_cast<std::uintptr_t>(15));
+    auto *frame = top - 0xa0 / sizeof(std::uintptr_t);
+    std::memset(frame, 0, 0xa0);
+    frame[0x58 / sizeof(std::uintptr_t)] = reinterpret_cast<std::uintptr_t>(&kz_fiber_trampoline);
+    c.sp = frame;
+}
+
+void ContextSwitch(Context &prev, Context &next) {
+    kz_fiber_switch(&prev.sp, next.sp);
+}
+
+void ContextDestroy(Context &c) {
+    std::free(c.stack);
+    c.stack = nullptr;
+    c.sp = nullptr;
+}
+
 #else
 
 struct Context {
@@ -90,8 +181,7 @@ void ContextInitMain(Context &) {}
 void ContextCreate(Context &c) {
     c.stack = std::malloc(kStackSize);
     if (c.stack == nullptr) {
-        std::fprintf(stderr, "eekernel: out of memory for a thread stack\n");
-        std::abort();
+        kz::Abort("eekernel", "out of memory for a thread stack");
     }
     getcontext(&c.uc);
     c.uc.uc_stack.ss_sp = c.stack;
@@ -112,13 +202,13 @@ void ContextDestroy(Context &c) {
 #endif
 
 struct Thread {
-    int             id = 0;
-    int             priority = 0;
-    State           state = State::Dormant;
+    int   id = 0;
+    int   priority = 0;
+    State state = State::Dormant;
     void (*entry)(void *) = nullptr;
-    void           *arg = nullptr;
-    int             waiting_on = 0;
-    Context         context;
+    void   *arg = nullptr;
+    int     waiting_on = 0;
+    Context context;
 };
 
 struct Sema {
@@ -128,13 +218,13 @@ struct Sema {
 };
 
 struct Scheduler {
-    std::map<int, std::unique_ptr<Thread>> threads;
+    std::map<int, std::unique_ptr<Thread> > threads;
     // Keyed by priority; a lower number outranks a higher one, so begin() is always the next thread to run.
-    std::map<int, std::deque<Thread *>> ready;
-    std::map<int, Sema>                 semas;
-    Thread                             *running = nullptr;
-    int                                 next_thread_id = kMainThreadId + 1;
-    int                                 next_sema_id = 1;
+    std::map<int, std::deque<Thread *> > ready;
+    std::map<int, Sema>                  semas;
+    Thread                              *running = nullptr;
+    int                                  next_thread_id = kMainThreadId + 1;
+    int                                  next_sema_id = 1;
 };
 
 void EnsureMain(Scheduler &s) {
@@ -207,8 +297,8 @@ void Run(Scheduler &s, Thread *next) {
     if (next != prev) {
         // A switch inside ClockPump would leave its guard set on this stack and run host code on another one.
         if (ClockPumping()) {
-            std::fprintf(stderr, "eekernel_threads: thread switch inside ClockPump (a tick callback or pump hook called a switching kernel call)\n");
-            std::abort();
+            kz::Abort("eekernel_threads", "thread switch inside ClockPump (a tick callback or pump hook called a "
+                                          "switching kernel call)");
         }
         ContextSwitch(prev->context, next->context);
     }
@@ -224,13 +314,18 @@ void RunEntry() {
     self->state = State::Dormant;
     Thread *next = PopHighest(s);
     if (next == nullptr) {
-        std::fprintf(stderr, "eekernel: deadlock: thread %d exited with no ready thread\n", self->id);
-        std::abort();
+        kz::Abort("eekernel", std::format("deadlock: thread {} exited with no ready thread", self->id));
     }
     Run(s, next);
 }
 
 } // namespace
+
+#if defined(KZ_ARM64_FIBERS)
+extern "C" void kz_fiber_entry() {
+    RunEntry();
+}
+#endif
 
 void KzThreadsSetMainPriority(int priority) {
     Scheduler &s = Sched();
@@ -369,9 +464,8 @@ int WaitSema(int sema_id) {
 
     Thread *next = PopHighest(s);
     if (next == nullptr) {
-        std::fprintf(stderr, "eekernel: deadlock: thread %d waits on semaphore %d with no ready thread\n",
-                     cur->id, sema_id);
-        std::abort();
+        kz::Abort("eekernel",
+                  std::format("deadlock: thread {} waits on semaphore {} with no ready thread", cur->id, sema_id));
     }
     Run(s, next);
     return sema_id;

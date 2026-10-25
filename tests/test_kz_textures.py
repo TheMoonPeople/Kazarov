@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from kazarov_textures import (Converter, TextureError, parse_cfg, parse_img, parse_pack,
-                              parse_tim2, png, publish, verify, document_path)
+                              parse_tim2, png, publish, verify, legacy_document_path as document_path)
 
 
 def documents(output):

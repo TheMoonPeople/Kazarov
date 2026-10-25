@@ -226,3 +226,48 @@ TEST(GfxMisc, TextureWithMorePixelsThanItsLogicalSizeIsAddressedInLogicalTexels)
     EXPECT_EQ(gfx::GetTextureInfo(plain)->width, 4u);
     EXPECT_EQ(gfx::GetTextureInfo(plain)->pixel_width, 4u);
 }
+
+class GfxColorWriteMask : public ::testing::TestWithParam<bool> {};
+
+TEST_P(GfxColorWriteMask, DepthOnlyDrawsKeepTheirDepthAndLeaveColourAlone) {
+    GfxFixture fixture(640, 480, 1.0f, GetParam());
+    fixture.Frame({10, 20, 30, 0x80}, [] {
+        gfx::DrawState depth_only;
+        depth_only.color_write_mask = 0;
+        depth_only.depth_write = true;
+        auto occluder = Quad(0, 0, 200, 480, {255, 0, 0, 0x80}, 0, 0, 0, 0, 0.5f);
+        gfx::Draw2D(gfx::Primitive::Quads, occluder, {}, depth_only);
+
+        gfx::DrawState tested;
+        tested.depth_test = gfx::DepthTest::GEqual;
+        auto behind = Quad(0, 0, 400, 100, {0, 255, 0, 0x80}, 0, 0, 0, 0, 0.25f);
+        gfx::Draw2D(gfx::Primitive::Quads, behind, {}, tested);
+
+        // A colour draw after a colourless one writes again.
+        auto plain = Quad(400, 200, 100, 100, {0, 0, 255, 0x80});
+        gfx::Draw2D(gfx::Primitive::Quads, plain, {}, gfx::DrawState{});
+    });
+    ASSERT_TRUE(fixture.PixelNear(100, 50, 10, 20, 30));
+    ASSERT_TRUE(fixture.PixelNear(300, 50, 0, 255, 0));
+    ASSERT_TRUE(fixture.PixelNear(450, 250, 0, 0, 255));
+}
+
+INSTANTIATE_TEST_SUITE_P(DynamicMask, GfxColorWriteMask, ::testing::Bool());
+
+TEST(GfxMisc, SourceAlphaAndFixBlendsAgree) {
+    GfxFixture fixture;
+    fixture.Frame({100, 100, 100, 0x80}, [] {
+        gfx::DrawState source_alpha;
+        source_alpha.blend = true;
+        source_alpha.alpha = {0, 1, 0, 1, 0x80};
+        auto left = Quad(0, 0, 200, 480, {200, 200, 200, 0x40});
+        gfx::Draw2D(gfx::Primitive::Quads, left, {}, source_alpha);
+
+        gfx::DrawState fix = source_alpha;
+        fix.alpha = {0, 1, 2, 1, 0x40};
+        auto right = Quad(300, 0, 200, 480, {200, 200, 200, 0x80});
+        gfx::Draw2D(gfx::Primitive::Quads, right, {}, fix);
+    });
+    ASSERT_TRUE(fixture.PixelNear(100, 240, 150, 150, 150, 1));
+    ASSERT_TRUE(fixture.PixelNear(400, 240, 150, 150, 150, 1));
+}

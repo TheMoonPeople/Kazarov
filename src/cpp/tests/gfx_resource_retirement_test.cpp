@@ -12,6 +12,8 @@ TEST(GfxGpuMeshDc2, SlotRetirementWaitsEverySubmittedFrameBeforeDeleting) {
     options.offscreen = true;
     options.texture_slots = gfx::detail::kFirstUserSlot + 1;
     GfxFixture    fixture(64, 48, 1.0f, options);
+    // The test drives internal device calls directly, so it holds the device thread in every render-thread mode.
+    gfx::RenderLease lease;
     const uint8_t texel[] = {255, 0, 0, 255};
     const auto    texture = gfx::CreateTexture(gfx::TextureDesc{1, 1});
     ASSERT_NE(texture, gfx::kNullTexture);

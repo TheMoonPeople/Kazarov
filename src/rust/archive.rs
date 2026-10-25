@@ -3,14 +3,43 @@ use super::{CoreError, CoreResult};
 use gpt_disk_io::{BlockIoAdapter, gpt_disk_types::BlockSize};
 use iso9660::{DirectoryIterator, FileEntry, find_file, mount};
 use rayon::prelude::*;
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const SECTOR: u64 = 2048;
 const CHUNK: usize = 4 << 20;
+
+struct ReadOnlyCursor<'a>(std::io::Cursor<&'a [u8]>);
+
+impl Read for ReadOnlyCursor<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(output)
+    }
+}
+
+impl Seek for ReadOnlyCursor<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(position)
+    }
+}
+
+impl Write for ReadOnlyCursor<'_> {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl gpt_disk_io::ReadWriteSeek for ReadOnlyCursor<'_> {}
 
 fn error(message: impl Into<String>) -> CoreError {
     CoreError(message.into())
@@ -113,6 +142,25 @@ struct Archive {
     sound_dat: Extent,
     sound_hd3: Extent,
     movies: Vec<NamedExtent>,
+    image_bytes: Option<SourceBytes>,
+}
+
+impl Archive {
+    fn extent_bytes(&self, extent: &Extent) -> CoreResult<Vec<u8>> {
+        if let Some(image) = &self.image_bytes {
+            let start =
+                usize::try_from(extent.offset).map_err(|_| error("source offset overflow"))?;
+            let size = usize::try_from(extent.size).map_err(|_| error("source size overflow"))?;
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| error("source range overflow"))?;
+            if end > image.len() {
+                return Err(error("truncated ISO extent"));
+            }
+            return Ok(image.slice(start..end)?.to_vec());
+        }
+        extent.read()
+    }
 }
 
 fn image_extent(image: &Path, entry: &FileEntry) -> CoreResult<Extent> {
@@ -140,10 +188,10 @@ fn image_extent(image: &Path, entry: &FileEntry) -> CoreResult<Extent> {
     Ok(extent)
 }
 
-fn open_image(image: &Path) -> CoreResult<Archive> {
+fn open_image_bytes(image: &Path, bytes: &[u8]) -> CoreResult<Archive> {
     let block_size =
         BlockSize::new(SECTOR as u32).ok_or_else(|| error("invalid ISO sector size"))?;
-    let mut io = BlockIoAdapter::new(File::open(image)?, block_size);
+    let mut io = BlockIoAdapter::new(ReadOnlyCursor(std::io::Cursor::new(bytes)), block_size);
     let volume = mount(&mut io, 0)
         .map_err(|cause| error(format!("{}: ISO mount: {cause}", image.display())))?;
     if u64::from(volume.logical_block_size) != SECTOR {
@@ -207,7 +255,12 @@ fn open_image(image: &Path) -> CoreResult<Archive> {
         sound_dat,
         sound_hd3,
         movies,
+        image_bytes: None,
     })
+}
+
+fn open_image(image: &Path) -> CoreResult<Archive> {
+    open_image_bytes(image, &SourceBytes::open_iso(image)?.bytes()?)
 }
 
 fn directory_file(root: &Path, name: &str) -> CoreResult<Extent> {
@@ -271,6 +324,7 @@ fn open_directory(root: &Path) -> CoreResult<Archive> {
         sound_dat: directory_file(root, "SOUND.DAT")?,
         sound_hd3: directory_file(root, "SOUND.HD3")?,
         movies,
+        image_bytes: None,
     })
 }
 
@@ -407,17 +461,425 @@ fn parse_sound_index(hd3: &[u8], dat_size: u64) -> CoreResult<SoundIndex> {
 }
 
 fn read_index(archive: &Archive) -> CoreResult<Vec<DataRecord>> {
-    parse_data_index(&archive.hd4.read()?, archive.dat.size)
+    parse_data_index(&archive.extent_bytes(&archive.hd4)?, archive.dat.size)
 }
 
 fn read_sound_index(archive: &Archive) -> CoreResult<SoundIndex> {
-    parse_sound_index(&archive.sound_hd3.read()?, archive.sound_dat.size)
+    parse_sound_index(
+        &archive.extent_bytes(&archive.sound_hd3)?,
+        archive.sound_dat.size,
+    )
 }
 
 #[derive(Clone)]
 struct Planned {
     rel: String,
     extent: Extent,
+}
+
+/// Indexed retail files read directly from their disc extents during conversion.
+#[derive(Clone)]
+pub struct SourceTree {
+    entries: BTreeMap<String, Extent>,
+    resources: BTreeMap<String, ResourceRef>,
+    files: u64,
+    bytes: u64,
+    image: Option<SourceBytes>,
+}
+
+/// Bytes owned for the lifetime of all references into one source file.
+#[derive(Clone)]
+pub struct SourceBytes(Arc<SourceData>);
+
+enum SourceData {
+    Owned(Vec<u8>),
+    /// iOS gives an app about 7 GB of address space: a 4.7 GB disc image, read or mapped whole, leaves the
+    /// converters too little, and an allocation fails. There each resource maps its own range of the image only
+    /// while it is read.
+    Mapped {
+        file: File,
+        length: usize,
+    },
+}
+
+/// A source's bytes, borrowed from memory or mapped from the disc image for as long as this lives.
+pub enum SourceSlice<'a> {
+    Borrowed(&'a [u8]),
+    Mapped(memmap2::Mmap),
+    Read(Vec<u8>),
+}
+
+impl std::ops::Deref for SourceSlice<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Mapped(map) => map,
+            Self::Read(bytes) => bytes,
+        }
+    }
+}
+
+impl SourceBytes {
+    pub fn owned(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(SourceData::Owned(bytes)))
+    }
+
+    /// Reads an ISO once and shares its immutable buffer with all converters.
+    pub fn open_iso(path: &Path) -> CoreResult<Self> {
+        Self::open_iso_with_progress(path, &Phase::noop())
+    }
+
+    pub fn open_iso_with_progress(path: &Path, phase: &Phase) -> CoreResult<Self> {
+        let mut file = File::open(path)?;
+        let length = usize::try_from(file.metadata()?.len())
+            .map_err(|_| error("ISO exceeds addressable memory"))?;
+        phase.set_total(length as u64);
+        if cfg!(any(target_os = "ios", kazarov_mapped_source)) {
+            phase.inc(length as u64);
+            phase.add_bytes(length as u64);
+            return Ok(Self(Arc::new(SourceData::Mapped { file, length })));
+        }
+        let mut bytes = Vec::with_capacity(length);
+        let mut chunk = vec![0u8; CHUNK];
+        loop {
+            let count = file.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            phase.inc(count as u64);
+            phase.add_bytes(count as u64);
+        }
+        if bytes.len() != length {
+            return Err(error("ISO changed size while being read"));
+        }
+        Ok(Self::owned(bytes))
+    }
+
+    pub fn len(&self) -> usize {
+        match &*self.0 {
+            SourceData::Owned(bytes) => bytes.len(),
+            SourceData::Mapped { length, .. } => *length,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes in range, which must lie inside the source.
+    pub fn slice(&self, range: Range<usize>) -> CoreResult<SourceSlice<'_>> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(error("source range outside the source"));
+        }
+        match &*self.0 {
+            SourceData::Owned(bytes) => Ok(SourceSlice::Borrowed(&bytes[range])),
+            SourceData::Mapped { file, .. } => {
+                if range.is_empty() {
+                    return Ok(SourceSlice::Borrowed(&[]));
+                }
+                // SAFETY: the mapping is read-only, and the disc image is not changed during extraction.
+                let mapped = unsafe {
+                    memmap2::MmapOptions::new()
+                        .offset(range.start as u64)
+                        .len(range.len())
+                        .map(file)
+                };
+                match mapped {
+                    Ok(map) => Ok(SourceSlice::Mapped(map)),
+                    // Without address space for a mapping there may still be memory for a copy.
+                    Err(_) => {
+                        let mut bytes = vec![0; range.len()];
+                        read_at(file, range.start as u64, &mut bytes)?;
+                        Ok(SourceSlice::Read(bytes))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole source: a mapped image is mapped whole only for as long as the result lives.
+    pub fn bytes(&self) -> CoreResult<SourceSlice<'_>> {
+        self.slice(0..self.len())
+    }
+}
+
+#[cfg(unix)]
+fn read_at(file: &File, offset: u64, bytes: &mut [u8]) -> CoreResult<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, bytes, offset)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> CoreResult<()> {
+    while !bytes.is_empty() {
+        let count = std::os::windows::fs::FileExt::seek_read(file, bytes, offset)?;
+        if count == 0 {
+            return Err(error("disc image ended early"));
+        }
+        offset += count as u64;
+        bytes = &mut bytes[count..];
+    }
+    Ok(())
+}
+
+/// A checked, immutable byte range of a retail resource.
+#[derive(Clone)]
+pub struct ResourceRef {
+    pub alias: String,
+    source: SourceBytes,
+    range: Range<usize>,
+}
+
+impl ResourceRef {
+    /// The resource's bytes. From a mapped disc image they stay mapped only while the result lives, so a
+    /// converter holds them for the one resource it is converting.
+    pub fn bytes(&self) -> SourceSlice<'_> {
+        self.source
+            .slice(self.range.clone())
+            .unwrap_or_else(|failure| panic!("{}: cannot read the source: {failure}", self.alias))
+    }
+
+    pub fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+
+    pub fn subrange(&self, alias: impl Into<String>, range: Range<usize>) -> CoreResult<Self> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(error("resource subrange outside source bytes"));
+        }
+        let start = self
+            .range
+            .start
+            .checked_add(range.start)
+            .ok_or_else(|| error("resource offset overflow"))?;
+        let end = self
+            .range
+            .start
+            .checked_add(range.end)
+            .ok_or_else(|| error("resource offset overflow"))?;
+        Ok(Self {
+            alias: alias.into(),
+            source: self.source.clone(),
+            range: start..end,
+        })
+    }
+}
+
+/// Temporary converted PACK buffer, separate from the final asset namespace.
+pub fn compatibility_work_path(published: &Path, name: &str) -> PathBuf {
+    published.join(".work/packs").join(name)
+}
+
+/// Finds a converted PACK buffer or a final standalone retained source file.
+pub fn compatibility_path(published: &Path, name: &str) -> PathBuf {
+    let work = compatibility_work_path(published, name);
+    if work.is_file() {
+        work
+    } else {
+        published.join("data").join(name)
+    }
+}
+
+impl SourceTree {
+    pub fn open(source: &Path) -> CoreResult<Self> {
+        Self::open_with_progress(source, &Phase::noop())
+    }
+
+    /// Reads an ISO once while reporting bytes acquired for its shared resource index.
+    pub fn open_with_progress(source: &Path, phase: &Phase) -> CoreResult<Self> {
+        let image = source
+            .is_file()
+            .then(|| SourceBytes::open_iso_with_progress(source, phase))
+            .transpose()?;
+        let mut archive = if let Some(image) = &image {
+            open_image_bytes(source, &image.bytes()?)?
+        } else {
+            open_archive(source)?
+        };
+        archive.image_bytes = image.clone();
+        let (plan, files, bytes) = plan_archive(&archive)?;
+        let mut resources = BTreeMap::new();
+        for item in &plan {
+            let source_bytes = if let Some(image) = &image {
+                image.clone()
+            } else {
+                SourceBytes::owned(item.extent.read()?)
+            };
+            let start =
+                usize::try_from(item.extent.offset).map_err(|_| error("source offset overflow"))?;
+            let size =
+                usize::try_from(item.extent.size).map_err(|_| error("source size overflow"))?;
+            let range = if image.is_some() {
+                start
+                    ..start
+                        .checked_add(size)
+                        .ok_or_else(|| error("source range overflow"))?
+            } else {
+                0..size
+            };
+            if range.end > source_bytes.len() {
+                return Err(error(format!("truncated source extent: {}", item.rel)));
+            }
+            resources.insert(
+                item.rel.clone(),
+                ResourceRef {
+                    alias: item.rel.clone(),
+                    source: source_bytes,
+                    range,
+                },
+            );
+        }
+        Ok(Self {
+            entries: plan
+                .into_iter()
+                .map(|item| (item.rel, item.extent))
+                .collect(),
+            resources,
+            files,
+            bytes,
+            image,
+        })
+    }
+
+    /// Opens an already unpacked source tree for standalone converter callers.
+    pub fn directory(root: &Path) -> CoreResult<Self> {
+        Self::directory_with_texture_exclusion(root, false)
+    }
+
+    /// Opens an unpacked DC1 source tree while excluding generated texture replacements.
+    pub fn directory_dc1(root: &Path) -> CoreResult<Self> {
+        Self::directory_with_texture_exclusion(root, true)
+    }
+
+    fn directory_with_texture_exclusion(root: &Path, exclude_textures: bool) -> CoreResult<Self> {
+        fn gather(
+            root: &Path,
+            directory: &Path,
+            exclude_textures: bool,
+            entries: &mut BTreeMap<String, Extent>,
+        ) -> CoreResult<()> {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                if exclude_textures
+                    && directory == root
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("textures"))
+                    && path.is_dir()
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    gather(root, &path, exclude_textures, entries)?;
+                } else if path.is_file() {
+                    let name = path
+                        .strip_prefix(root)
+                        .map_err(|e| error(e.to_string()))?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    entries.insert(
+                        name,
+                        Extent {
+                            size: path.metadata()?.len(),
+                            file: path,
+                            offset: 0,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        }
+        let mut entries = BTreeMap::new();
+        gather(root, root, exclude_textures, &mut entries)?;
+        let bytes = entries.values().map(|entry| entry.size).sum();
+        let mut resources = BTreeMap::new();
+        for (name, extent) in &entries {
+            let bytes = SourceBytes::owned(extent.read()?);
+            resources.insert(
+                name.clone(),
+                ResourceRef {
+                    alias: name.clone(),
+                    range: 0..bytes.len(),
+                    source: bytes,
+                },
+            );
+        }
+        Ok(Self {
+            files: entries.len() as u64,
+            bytes,
+            entries,
+            resources,
+            image: None,
+        })
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
+    }
+
+    pub fn len(&self, name: &str) -> CoreResult<u64> {
+        self.entries
+            .get(name)
+            .map(|entry| entry.size)
+            .ok_or_else(|| error(format!("source file missing: {name}")))
+    }
+
+    pub fn read(&self, name: &str) -> CoreResult<Vec<u8>> {
+        Ok(self.resource(name)?.bytes().to_vec())
+    }
+
+    pub fn resource(&self, name: &str) -> CoreResult<ResourceRef> {
+        self.resources
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error(format!("source file missing: {name}")))
+    }
+
+    /// Hashes the same ISO bytes used by the indexed resources.
+    pub fn fingerprint_sha256(&self) -> CoreResult<String> {
+        let image = self
+            .image
+            .as_ref()
+            .ok_or_else(|| error("source is not an ISO"))?;
+        let mut hash = Sha256::new();
+        hash.update(b"kazarov-source-file-v1\0");
+        hash.update((image.len() as u64).to_le_bytes());
+        // A mapped image is hashed in pieces, so the whole of it is never mapped at once.
+        let mut start = 0;
+        while start < image.len() {
+            let end = image.len().min(start + (64 << 20));
+            hash.update(&*image.slice(start..end)?);
+            start = end;
+        }
+        Ok(hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    pub fn copy(&self, name: &str, destination: &Path) -> CoreResult<()> {
+        let extent = self
+            .entries
+            .get(name)
+            .ok_or_else(|| error(format!("source file missing: {name}")))?;
+        copy_extent(extent, destination)
+    }
+
+    pub fn totals(&self) -> (u64, u64) {
+        (self.files, self.bytes)
+    }
 }
 
 fn plan_archive(archive: &Archive) -> CoreResult<(Vec<Planned>, u64, u64)> {
@@ -729,6 +1191,22 @@ pub fn sound_text(source: &Path) -> CoreResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dc1_directory_ignores_generated_texture_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("asset.bin"), b"source").unwrap();
+        fs::create_dir_all(temp.path().join("textures")).unwrap();
+        fs::write(temp.path().join("textures/stale.json"), b"generated").unwrap();
+
+        let dc1 = SourceTree::directory_dc1(temp.path()).unwrap();
+        assert_eq!(dc1.names().collect::<Vec<_>>(), ["asset.bin"]);
+        let default = SourceTree::directory(temp.path()).unwrap();
+        assert_eq!(
+            default.names().collect::<Vec<_>>(),
+            ["asset.bin", "textures/stale.json"]
+        );
+    }
 
     fn index() -> Vec<u8> {
         let mut bytes = Vec::new();

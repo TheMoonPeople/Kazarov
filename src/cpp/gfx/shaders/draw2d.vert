@@ -16,6 +16,10 @@ layout(push_constant, std430) uniform Push {
     uint flags;
     uint alpha;
     uint fog_color;
+    uint face;
+    uint mesh_index;
+    uint prog0_index;
+    uint palette_index;
 }
 pc;
 

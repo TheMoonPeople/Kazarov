@@ -17,3 +17,7 @@ void AudioOutputStop();
 void AudioSetSurround(bool on);
 
 bool AudioOutputRunning();
+
+// Stops pulling the mix while the app is in the background, and starts again where it left off. Nothing
+// without a device.
+void AudioOutputPause(bool paused);

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -20,6 +21,11 @@ constexpr VkAccessFlags2 kWriteAccess =
 constexpr uint32_t kSlotBits = 16;
 constexpr uint32_t kSlotMask = (1u << kSlotBits) - 1;
 
+// Sizes of the texture and mesh tables for lookups on the game thread, which the worker may append to.
+// Published after each append; the tables never reallocate, so an entry below the size is stable.
+std::atomic<uint32_t> g_texture_count{0};
+std::atomic<uint32_t> g_mesh_count{0};
+
 uint32_t MakeHandle(uint16_t generation, uint32_t slot) {
     return (static_cast<uint32_t>(generation) << kSlotBits) | slot;
 }
@@ -33,6 +39,11 @@ VkFormat VulkanFormat(TextureFormat format) {
 }
 
 void WriteTextureDescriptor(uint32_t slot, VkImageView view) {
+    AssertDeviceThread(__func__);
+    g.texture_views[slot] = view;
+    if (!g.bindless) {
+        return;
+    }
     VkDescriptorImageInfo image = {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet  write = {};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -60,8 +71,9 @@ void ClearDepth(VkCommandBuffer cmd, Image &image) {
     ToRest(cmd, image);
 }
 
-uint32_t AllocateTextureSlot() {
-    if (g.free_texture_slots.empty() && g.textures.size() >= g.texture_slot_limit && !g.in_frame && !RecordingCalls()) {
+// recording: whether the caller is recording a list, read on the caller before the call is dispatched.
+uint32_t AllocateTextureSlot(bool recording) {
+    if (g.free_texture_slots.empty() && g.textures.size() >= g.texture_slot_limit && !g.in_frame && !recording) {
         RetireDeletions();
     }
     if (!g.free_texture_slots.empty()) {
@@ -73,6 +85,7 @@ uint32_t AllocateTextureSlot() {
         return 0;
     }
     g.textures.emplace_back();
+    g_texture_count.store(static_cast<uint32_t>(g.textures.size()), std::memory_order_release);
     return static_cast<uint32_t>(g.textures.size() - 1);
 }
 
@@ -105,6 +118,7 @@ constexpr VkPipelineStageFlags2 kVertexInput =
 constexpr VkAccessFlags2 kVertexRead = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
 
 void UploadToBuffer(Mesh &mesh, VkDeviceSize offset, const void *data, VkDeviceSize size) {
+    AssertDeviceThread(__func__);
     TransientSpan staging = AllocateStaging(size);
     std::memcpy(staging.data, data, size);
     VkCommandBuffer cmd = CommandsForWrite(mesh.last_draw_use);
@@ -230,6 +244,7 @@ ImageState TransferDst() {
 }
 
 Image CreateImage(uint32_t width, uint32_t height, uint32_t mips, VkFormat format, VkImageUsageFlags usage) {
+    AssertDeviceThread(__func__);
     Image image;
     image.format = format;
     image.aspect = !IsDepthFormat(format)           ? VK_IMAGE_ASPECT_COLOR_BIT
@@ -270,6 +285,7 @@ Image CreateImage(uint32_t width, uint32_t height, uint32_t mips, VkFormat forma
 }
 
 void DestroyImage(Image &image) {
+    AssertDeviceThread(__func__);
     if (image.view != VK_NULL_HANDLE) {
         vkDestroyImageView(g.device, image.view, nullptr);
     }
@@ -319,10 +335,15 @@ VkCommandBuffer CommandsForWrite(uint64_t &last_draw_use) {
 
 void InitResources() {
     g.textures.clear();
+    // The tables never reallocate, so the worker can look up entries while the game thread appends.
+    g.textures.reserve(g.texture_slot_limit);
+    g.meshes.reserve(g.mesh_slot_limit);
     g.textures.resize(kFirstUserSlot);
+    g_texture_count.store(kFirstUserSlot, std::memory_order_release);
     g.free_texture_slots.clear();
     g.meshes.clear();
     g.meshes.resize(1);
+    g_mesh_count.store(1, std::memory_order_release);
     g.free_mesh_slots.clear();
 
     // Slot 0 backs every draw without a texture so no descriptor the shaders can reach is unset.
@@ -348,16 +369,18 @@ void ShutdownResources() {
     }
     g.textures.clear();
     g.meshes.clear();
+    g_texture_count.store(0, std::memory_order_release);
+    g_mesh_count.store(0, std::memory_order_release);
 }
 
 Texture *LookupTexture(TextureHandle handle) {
     uint32_t slot = handle & kSlotMask;
-    if (slot < kFirstUserSlot || slot >= g.textures.size()) {
+    if (slot < kFirstUserSlot || slot >= g_texture_count.load(std::memory_order_acquire)) {
         return nullptr;
     }
     Texture &texture = g.textures[slot];
     if (!texture.live || texture.generation != handle >> kSlotBits ||
-        (texture.doomed && !g.replaying && texture.doomed != g.list.get())) {
+        (texture.doomed && !tls.replaying && texture.doomed != RecordingList())) {
         return nullptr;
     }
     return &texture;
@@ -365,12 +388,12 @@ Texture *LookupTexture(TextureHandle handle) {
 
 Mesh *LookupMesh(MeshHandle handle) {
     uint32_t slot = handle & kSlotMask;
-    if (slot == 0 || slot >= g.meshes.size()) {
+    if (slot == 0 || slot >= g_mesh_count.load(std::memory_order_acquire)) {
         return nullptr;
     }
     Mesh &mesh = g.meshes[slot];
     if (!mesh.live || mesh.generation != handle >> kSlotBits ||
-        (mesh.doomed && !g.replaying && mesh.doomed != g.list.get())) {
+        (mesh.doomed && !tls.replaying && mesh.doomed != RecordingList())) {
         return nullptr;
     }
     return &mesh;
@@ -393,6 +416,7 @@ uint32_t SamplerIndex(Filter filter, Wrap wrap_u, Wrap wrap_v) {
 }
 
 void RecreateRenderTargets() {
+    AssertDeviceThread(__func__);
     vkDeviceWaitIdle(g.device);
     RunOneShot([](VkCommandBuffer cmd) {
         for (uint32_t slot = kFirstUserSlot; slot < g.textures.size(); slot++) {
@@ -454,6 +478,7 @@ void RecreateRenderTargets() {
 }
 
 void RecreateSharedTargets() {
+    AssertDeviceThread(__func__);
     const Image &main = g.main_color[0];
     RunOneShot([&](VkCommandBuffer cmd) {
         for (uint32_t slot = kFirstUserSlot; slot < g.textures.size(); slot++) {
@@ -475,6 +500,7 @@ void RecreateSharedTargets() {
 }
 
 void DestroyDoomedTexture(TextureHandle handle) {
+    AssertDeviceThread(__func__);
     uint32_t slot = handle & kSlotMask;
     if (slot < kFirstUserSlot || slot >= g.textures.size()) {
         return;
@@ -505,6 +531,7 @@ void DestroyDoomedTexture(TextureHandle handle) {
 }
 
 void DestroyDoomedMesh(MeshHandle handle) {
+    AssertDeviceThread(__func__);
     uint32_t slot = handle & kSlotMask;
     if (slot == 0 || slot >= g.meshes.size()) {
         return;
@@ -528,86 +555,98 @@ void DestroyDoomedMesh(MeshHandle handle) {
 using namespace detail;
 
 TextureHandle CreateTexture(const TextureDesc &desc) {
-    if (!CheckSize(desc.width, desc.height)) {
-        return kNullTexture;
-    }
-    uint32_t max_mips = std::bit_width(std::max(desc.width, desc.height));
-    if (desc.mip_levels == 0 || desc.mip_levels > max_mips) {
-        Error("texture %ux%u cannot have %u mip levels", desc.width, desc.height, desc.mip_levels);
-        return kNullTexture;
-    }
-    uint32_t slot = AllocateTextureSlot();
-    if (slot == 0) {
-        Error("out of texture slots (%u)", g.texture_slot_limit);
-        return kNullTexture;
-    }
-    Texture &texture = g.textures[slot];
-    texture.live = true;
-    texture.generation = NextGeneration(texture.generation);
-    texture.desc = desc;
-    texture.render_target = false;
-    texture.shares_main_depth = false;
-    texture.frame = false;
-    texture.logical_width = desc.logical_width != 0 ? desc.logical_width : desc.width;
-    texture.logical_height = desc.logical_height != 0 ? desc.logical_height : desc.height;
-    texture.last_draw_use = 0;
-    texture.image = CreateImage(desc.width, desc.height, desc.mip_levels, VulkanFormat(desc.format),
-                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    ClearImage(UploadCommands(), texture.image, VkClearColorValue{});
-    WriteTextureDescriptor(slot, texture.image.view);
-    return MakeHandle(texture.generation, slot);
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool    recording = RecordingCalls();
+    TextureHandle handle = kNullTexture;
+    RunOnRenderThread([&] {
+        if (!CheckSize(desc.width, desc.height)) {
+            return;
+        }
+        uint32_t max_mips = std::bit_width(std::max(desc.width, desc.height));
+        if (desc.mip_levels == 0 || desc.mip_levels > max_mips) {
+            Error("texture %ux%u cannot have %u mip levels", desc.width, desc.height, desc.mip_levels);
+            return;
+        }
+        uint32_t slot = AllocateTextureSlot(recording);
+        if (slot == 0) {
+            Error("out of texture slots (%u)", g.texture_slot_limit);
+            return;
+        }
+        Texture &texture = g.textures[slot];
+        texture.live = true;
+        texture.generation = NextGeneration(texture.generation);
+        texture.desc = desc;
+        texture.render_target = false;
+        texture.shares_main_depth = false;
+        texture.frame = false;
+        texture.logical_width = desc.logical_width != 0 ? desc.logical_width : desc.width;
+        texture.logical_height = desc.logical_height != 0 ? desc.logical_height : desc.height;
+        texture.last_draw_use = 0;
+        texture.image = CreateImage(desc.width, desc.height, desc.mip_levels, VulkanFormat(desc.format),
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        ClearImage(UploadCommands(), texture.image, VkClearColorValue{});
+        WriteTextureDescriptor(slot, texture.image.view);
+        handle = MakeHandle(texture.generation, slot);
+    });
+    return handle;
 }
 
 TextureHandle CreatePalette() { return CreateTexture(TextureDesc{256, 1, TextureFormat::Rgba8, 1, true}); }
 
 TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height, bool has_alpha,
                                  bool share_main_depth, bool frame_target) {
-    if (share_main_depth) {
-        logical_width = static_cast<uint32_t>(g.config.logical_width);
-        logical_height = static_cast<uint32_t>(g.config.logical_height);
-        frame_target = false;
-    }
-    Texture shape;
-    shape.shares_main_depth = share_main_depth;
-    shape.frame = frame_target;
-    shape.logical_width = logical_width;
-    shape.logical_height = logical_height;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    if (logical_width != 0 && logical_height != 0) {
-        TargetPixelSize(shape, width, height);
-    }
-    if (logical_width == 0 || logical_height == 0 || !CheckSize(width, height)) {
-        return kNullTexture;
-    }
-    uint32_t slot = AllocateTextureSlot();
-    if (slot == 0) {
-        Error("out of texture slots (%u)", g.texture_slot_limit);
-        return kNullTexture;
-    }
-    Texture &texture = g.textures[slot];
-    texture.live = true;
-    texture.generation = NextGeneration(texture.generation);
-    texture.desc = TextureDesc{logical_width, logical_height, TextureFormat::Rgba8, 1, has_alpha};
-    texture.render_target = true;
-    texture.shares_main_depth = share_main_depth;
-    texture.frame = frame_target;
-    texture.logical_width = logical_width;
-    texture.logical_height = logical_height;
-    texture.last_draw_use = 0;
-    texture.image = CreateTargetImage(width, height);
-    VkCommandBuffer cmd = UploadCommands();
-    ClearImage(cmd, texture.image,
-               VkClearColorValue{
-                   {0.0f, 0.0f, 0.0f, 1.0f}
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool    recording = RecordingCalls();
+    TextureHandle handle = kNullTexture;
+    RunOnRenderThread([&] {
+        if (share_main_depth) {
+            logical_width = static_cast<uint32_t>(g.config.logical_width);
+            logical_height = static_cast<uint32_t>(g.config.logical_height);
+            frame_target = false;
+        }
+        Texture shape;
+        shape.shares_main_depth = share_main_depth;
+        shape.frame = frame_target;
+        shape.logical_width = logical_width;
+        shape.logical_height = logical_height;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        if (logical_width != 0 && logical_height != 0) {
+            TargetPixelSize(shape, width, height);
+        }
+        if (logical_width == 0 || logical_height == 0 || !CheckSize(width, height)) {
+            return;
+        }
+        uint32_t slot = AllocateTextureSlot(recording);
+        if (slot == 0) {
+            Error("out of texture slots (%u)", g.texture_slot_limit);
+            return;
+        }
+        Texture &texture = g.textures[slot];
+        texture.live = true;
+        texture.generation = NextGeneration(texture.generation);
+        texture.desc = TextureDesc{logical_width, logical_height, TextureFormat::Rgba8, 1, has_alpha};
+        texture.render_target = true;
+        texture.shares_main_depth = share_main_depth;
+        texture.frame = frame_target;
+        texture.logical_width = logical_width;
+        texture.logical_height = logical_height;
+        texture.last_draw_use = 0;
+        texture.image = CreateTargetImage(width, height);
+        VkCommandBuffer cmd = UploadCommands();
+        ClearImage(cmd, texture.image,
+                   VkClearColorValue{
+                       {0.0f, 0.0f, 0.0f, 1.0f}
+        });
+        if (!share_main_depth) {
+            texture.depth = CreateTargetDepth(width, height);
+            ClearDepth(cmd, texture.depth);
+        }
+        WriteTextureDescriptor(slot, texture.image.view);
+        handle = MakeHandle(texture.generation, slot);
     });
-    if (!share_main_depth) {
-        texture.depth = CreateTargetDepth(width, height);
-        ClearDepth(cmd, texture.depth);
-    }
-    WriteTextureDescriptor(slot, texture.image.view);
-    return MakeHandle(texture.generation, slot);
+    return handle;
 }
 
 TextureHandle NamedRenderTarget(std::string_view name, uint32_t logical_width, uint32_t logical_height,
@@ -651,10 +690,12 @@ void DestroyTexture(TextureHandle handle) {
         RecordDoomedTexture(handle);
         return;
     }
-    if (g.target == handle) {
-        SetRenderTarget(kMainTarget);
-    }
-    DestroyDoomedTexture(handle);
+    RunOnRenderThread([&] {
+        if (g.target == handle) {
+            SetRenderTarget(kMainTarget);
+        }
+        DestroyDoomedTexture(handle);
+    });
 }
 
 namespace {
@@ -686,22 +727,24 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
         return true;
     }
 
-    TransientSpan staging = AllocateStaging(static_cast<VkDeviceSize>(row) * h);
-    for (uint32_t i = 0; i < h; i++) {
-        std::memcpy(staging.data + static_cast<size_t>(i) * row,
-                    static_cast<const uint8_t *>(pixels) + static_cast<size_t>(i) * stride, row);
-    }
+    RunOnRenderThread([&] {
+        TransientSpan staging = AllocateStaging(static_cast<VkDeviceSize>(row) * h);
+        for (uint32_t i = 0; i < h; i++) {
+            std::memcpy(staging.data + static_cast<size_t>(i) * row,
+                        static_cast<const uint8_t *>(pixels) + static_cast<size_t>(i) * stride, row);
+        }
 
-    VkCommandBuffer cmd = CommandsForWrite(texture->last_draw_use);
-    Transition(cmd, image, TransferDst());
-    VkBufferImageCopy region = {};
-    region.bufferOffset = staging.offset;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
-    region.imageOffset = {static_cast<int32_t>(x), static_cast<int32_t>(y), 0};
-    region.imageExtent = {w, h, 1};
-    vkCmdCopyBufferToImage(cmd, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                           &region);
-    ToRest(cmd, image);
+        VkCommandBuffer cmd = CommandsForWrite(texture->last_draw_use);
+        Transition(cmd, image, TransferDst());
+        VkBufferImageCopy region = {};
+        region.bufferOffset = staging.offset;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+        region.imageOffset = {static_cast<int32_t>(x), static_cast<int32_t>(y), 0};
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cmd, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &region);
+        ToRest(cmd, image);
+    });
     return true;
 }
 
@@ -762,35 +805,42 @@ MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32
         Error("CreateMesh: empty mesh");
         return kNullMesh;
     }
-    if (g.free_mesh_slots.empty() && g.meshes.size() >= g.mesh_slot_limit && !g.in_frame && !RecordingCalls()) {
-        RetireDeletions();
-    }
-    uint32_t slot;
-    if (!g.free_mesh_slots.empty()) {
-        slot = g.free_mesh_slots.back();
-        g.free_mesh_slots.pop_back();
-    } else if (g.meshes.size() < g.mesh_slot_limit) {
-        g.meshes.emplace_back();
-        slot = static_cast<uint32_t>(g.meshes.size() - 1);
-    } else {
-        Error("out of mesh slots (%u)", g.mesh_slot_limit);
-        return kNullMesh;
-    }
-    Mesh        &mesh = g.meshes[slot];
-    VkDeviceSize vertex_bytes = vertices.size_bytes();
-    VkDeviceSize index_bytes = indices.size_bytes();
-    mesh.live = true;
-    mesh.generation = NextGeneration(mesh.generation);
-    mesh.vertex_count = static_cast<uint32_t>(vertices.size());
-    mesh.index_count = static_cast<uint32_t>(indices.size());
-    mesh.last_draw_use = 0;
-    mesh.buffer = CreateBuffer(vertex_bytes + index_bytes,
-                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                               false);
-    UploadToBuffer(mesh, 0, vertices.data(), vertex_bytes);
-    UploadToBuffer(mesh, vertex_bytes, indices.data(), index_bytes);
-    return MakeHandle(mesh.generation, slot);
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    MeshHandle handle = kNullMesh;
+    RunOnRenderThread([&] {
+        if (g.free_mesh_slots.empty() && g.meshes.size() >= g.mesh_slot_limit && !g.in_frame && !recording) {
+            RetireDeletions();
+        }
+        uint32_t slot;
+        if (!g.free_mesh_slots.empty()) {
+            slot = g.free_mesh_slots.back();
+            g.free_mesh_slots.pop_back();
+        } else if (g.meshes.size() < g.mesh_slot_limit) {
+            g.meshes.emplace_back();
+            g_mesh_count.store(static_cast<uint32_t>(g.meshes.size()), std::memory_order_release);
+            slot = static_cast<uint32_t>(g.meshes.size() - 1);
+        } else {
+            Error("out of mesh slots (%u)", g.mesh_slot_limit);
+            return;
+        }
+        Mesh        &mesh = g.meshes[slot];
+        VkDeviceSize vertex_bytes = vertices.size_bytes();
+        VkDeviceSize index_bytes = indices.size_bytes();
+        mesh.live = true;
+        mesh.generation = NextGeneration(mesh.generation);
+        mesh.vertex_count = static_cast<uint32_t>(vertices.size());
+        mesh.index_count = static_cast<uint32_t>(indices.size());
+        mesh.last_draw_use = 0;
+        mesh.buffer = CreateBuffer(vertex_bytes + index_bytes,
+                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   false);
+        UploadToBuffer(mesh, 0, vertices.data(), vertex_bytes);
+        UploadToBuffer(mesh, vertex_bytes, indices.data(), index_bytes);
+        handle = MakeHandle(mesh.generation, slot);
+    });
+    return handle;
 }
 
 bool UpdateMeshVertices(MeshHandle handle, uint32_t first, std::span<const Vertex3D> vertices) {
@@ -806,7 +856,9 @@ bool UpdateMeshVertices(MeshHandle handle, uint32_t first, std::span<const Verte
         RecordEntry(UpdateMeshEntry{handle, first, std::vector<Vertex3D>(vertices.begin(), vertices.end())});
         return true;
     }
-    UploadToBuffer(*mesh, first * sizeof(Vertex3D), vertices.data(), vertices.size_bytes());
+    RunOnRenderThread([&] {
+        UploadToBuffer(*mesh, first * sizeof(Vertex3D), vertices.data(), vertices.size_bytes());
+    });
     return true;
 }
 
@@ -820,7 +872,7 @@ void DestroyMesh(MeshHandle handle) {
         RecordDoomedMesh(handle);
         return;
     }
-    DestroyDoomedMesh(handle);
+    RunOnRenderThread([&] { DestroyDoomedMesh(handle); });
 }
 
 } // namespace gfx

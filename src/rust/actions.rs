@@ -55,7 +55,7 @@ pub(crate) struct KeyAction {
 }
 
 /// The ordered KEY intervals of every motion a character's profiles select.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ProfileActions {
     /// Actions by motion resource alias, in first KEY order.
     pub motions: BTreeMap<String, Vec<KeyAction>>,

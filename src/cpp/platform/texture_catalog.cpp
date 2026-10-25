@@ -131,6 +131,18 @@ void ReadLevels(Entry::Variant &variant, const nlohmann::json &levels, const std
             throw std::runtime_error("texture level is not PNG: " + path);
         }
         auto file = vfs::Find(base, path);
+        if (!file && candidate_resolver) {
+            const auto candidates = candidate_resolver(std::filesystem::path(std::u8string(path.begin(), path.end())));
+            for (const auto &candidate : candidates) {
+                try {
+                    PngExtent({path, candidate});
+                    file = candidate;
+                    break;
+                } catch (const std::exception &) {
+                    // A missing converted original may be supplied by any valid pack candidate.
+                }
+            }
+        }
         variant.levels.push_back({std::move(path), std::move(file)});
     }
 }

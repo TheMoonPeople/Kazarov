@@ -60,6 +60,8 @@ void SetFog(float (&fog)[4], float near_w, float far_w, float near_value, float 
 struct Prog0Draw {
     gfx::MeshConstants  mesh;
     gfx::Prog0Constants prog0;
+    gfx::Prog0Palette   palette; // read only by a kProg0Skinned draw
+    uint32_t            face = 0; // Prog0Face, sent as the DrawState's prog0_face
 };
 
 Prog0Draw Prog0(uint32_t flags, uint32_t face = 0) {
@@ -70,7 +72,7 @@ Prog0Draw Prog0(uint32_t flags, uint32_t face = 0) {
     // Offset 255 with near value 255 and scale 0: no fog.
     Set(c.prog0.fog, {255, 255, 0, 0});
     c.prog0.flags = flags;
-    c.prog0.face = face;
+    c.face = face;
     c.prog0.specular_power = 3;
     return c;
 }
@@ -155,7 +157,7 @@ void SetPoint(gfx::Prog0Constants &p, uint32_t k, std::array<float, 4> position_
 }
 
 // Rows 0-2 of the bone's 4x4, row-major.
-void SetBone(gfx::Prog0Constants &p, uint32_t slot, const std::array<float, 12> &rows) {
+void SetBone(gfx::Prog0Palette &p, uint32_t slot, const std::array<float, 12> &rows) {
     for (uint32_t r = 0; r < 3; r++) {
         for (uint32_t c = 0; c < 4; c++) {
             p.bones[slot][r][c] = rows[r * 4 + c];
@@ -203,8 +205,11 @@ void Render(GfxFixture &fixture, const std::vector<gfx::Vertex3D> &vertices, con
 
 void Render(GfxFixture &fixture, const std::vector<gfx::Vertex3D> &vertices, const std::vector<uint32_t> &indices,
             const Prog0Draw &draw, const gfx::TextureBinding &texture = {}, const gfx::DrawState &state = {}) {
+    gfx::DrawState draw_state = state;
+    draw_state.prog0_face = draw.face;
+    const gfx::Prog0Palette *palette = (draw.prog0.flags & gfx::kProg0Skinned) != 0 ? &draw.palette : nullptr;
     fixture.Frame(kClear, [&] {
-        gfx::DrawMeshImmediateProg0(vertices, indices, draw.mesh, draw.prog0, texture, state);
+        gfx::DrawMeshImmediateProg0(vertices, indices, draw.mesh, draw.prog0, texture, draw_state, nullptr, palette);
     });
 }
 
@@ -404,7 +409,7 @@ TEST(GfxGpuMeshDc2, RefSphereIgnoresSkinning) {
     Prog0Draw c = Prog0(gfx::kProg0Unlit | gfx::kProg0RefSphere | gfx::kProg0Skinned);
     Set(c.prog0.object_color, {128, 128, 128, 128});
     Identity(c.prog0.clip_or_view);
-    SetBone(c.prog0, 0, {0, -1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0});
+    SetBone(c.palette, 0, {0, -1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0});
     // O-9: the env UV is taken from the unblended normal, before the skin is applied.
     Render(fixture, Skinned(ScreenVertices({0.5f, -0.5f, 0.70710678f}), {1, 0, 0, 0}, {0, 0, 0, 0}), kTriangle, c,
            binding);
@@ -416,8 +421,8 @@ TEST(GfxGpuMeshDc2, Skinning) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
     Prog0Draw c = Prog0(gfx::kProg0Unlit | gfx::kProg0Skinned);
     Set(c.prog0.object_color, {200, 200, 200, 128});
-    SetBone(c.prog0, 0, kIdentityBone);
-    SetBone(c.prog0, 1, {1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0});
+    SetBone(c.palette, 0, kIdentityBone);
+    SetBone(c.palette, 1, {1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0});
     Render(fixture, Skinned(QuadVertices(), {0.5f, 0.5f, 0, 0}, {0, 1, 0, 0}), {0, 1, 2, 0, 2, 3}, c);
     EXPECT_TRUE(fixture.PixelNear(fixture.width * 5 / 8, fixture.height / 2, 200, 200, 200));
     EXPECT_TRUE(fixture.PixelNear(fixture.width / 8, fixture.height / 2, 0, 0, 0));
@@ -426,7 +431,7 @@ TEST(GfxGpuMeshDc2, Skinning) {
 TEST(GfxGpuMeshDc2, SkinnedNormals) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
     Prog0Draw c = Prog0(gfx::kProg0Skinned);
-    SetBone(c.prog0, 0, kIdentityBone);
+    SetBone(c.palette, 0, kIdentityBone);
     SetDirectional(c.prog0, 0, {0, 0, 1}, {100, 100, 100, 0});
     Render(fixture, Skinned(ScreenVertices({0, 0, 1}), {1, 0, 0, 0}, {0, 0, 0, 0}), kTriangle, c);
     EXPECT_TRUE(Centre(fixture, 100, 100, 100));
@@ -436,7 +441,7 @@ TEST(GfxGpuMeshDc2, SkinnedNormals) {
 TEST(GfxGpuMeshDc2, SkinnedFourthInfluenceNormal) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
     Prog0Draw c = Prog0(gfx::kProg0Skinned);
-    SetBone(c.prog0, 3, kIdentityBone);
+    SetBone(c.palette, 3, kIdentityBone);
     const std::vector<gfx::Vertex3D> vertices = Skinned(ScreenVertices({0, 0, 1}), {0, 0, 0, 1}, {0, 0, 0, 3});
     // O-8: influence 3's z term reads column 1, so the retail normal is (0, 1, 0).
     SetDirectional(c.prog0, 0, {0, 1, 0}, {100, 100, 100, 0});

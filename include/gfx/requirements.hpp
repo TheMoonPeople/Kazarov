@@ -35,6 +35,10 @@ bool       HasExtension(const DeviceCaps &caps, const char *name);
 // Every requirement the device fails, in words; empty when the renderer can use it. Vulkan 1.3 is
 // enough: nothing the renderer calls was introduced by 1.4.
 std::vector<std::string> MissingRequirements(const DeviceCaps &caps, bool offscreen);
+// Whether the device holds every texture in one update-after-bind array of kMaxTextures. Without
+// it (Metal argument buffers tier 1: Apple A12 and older) the renderer pushes each draw's
+// textures with VK_KHR_push_descriptor; empty means it can, else what the array lacks.
+std::vector<std::string> MissingBindless(const DeviceCaps &caps);
 // Portability-subset features the renderer works around (it does not need them), for the log.
 std::vector<std::string> PortabilityWorkarounds(const DeviceCaps &caps);
 

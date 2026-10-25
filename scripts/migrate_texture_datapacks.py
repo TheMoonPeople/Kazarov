@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 import re
 import sys
 
-from kazarov_textures import document_path
+from kazarov_textures import document_path, legacy_document_path
 
 
 class MigrationError(ValueError):
@@ -223,15 +223,33 @@ def build_mapping(old_catalog: Path, new_location: Path) -> dict[str, str]:
             document = json.loads(path.read_text(encoding="utf-8"))
             options = [(selected, document, {})]
         else:
-            options = [candidates[index] for index in by_path[expected]
-                       if not candidates[index][2]]
+            prefix = PurePosixPath(expected)
+            collision = prefix.stem + "-" + hashlib.sha256(alias.encode()).hexdigest()[:12] + "-"
+            options = [item for item in candidates
+                       if not item[2] and PurePosixPath(item[0]).parent == prefix.parent
+                       and PurePosixPath(item[0]).stem.startswith(collision)]
+            if not options:
+                options = [candidates[index] for path in (expected, legacy_document_path(alias))
+                           for index in by_path[path] if not candidates[index][2]]
             if not options:
                 # Model/CHR embedding or zero-entry PACK compaction may remove or
                 # rename the expected document while preserving its PNG identities.
                 prefix = PurePosixPath(expected)
-                pattern = re.compile(re.escape(prefix.stem) + r"_[0-9]+\.png$", re.IGNORECASE)
                 options = []
-                for index in sorted(by_png_prefix[prefix.with_suffix("").as_posix()]):
+                prefixes = {prefix.with_suffix("").as_posix(),
+                            PurePosixPath(legacy_document_path(alias)).with_suffix("").as_posix()}
+                raw = alias.split("/")
+                owner = next((part.split("#", 1)[0] for part in reversed(raw)
+                              if part.split("#", 1)[0].lower().endswith((".chr", ".chr_"))), None)
+                if owner:
+                    stem = owner.rsplit(".", 1)[0] + ("_" if owner.lower().endswith(".chr_") else "")
+                    prefixes.add((prefix.parent / stem).as_posix())
+                indices = set().union(*(by_png_prefix[value] for value in prefixes))
+                # Collision suffixes preserve the source hash in the document stem.
+                indices.update(index for index, (name, _, _) in enumerate(candidates)
+                               if PurePosixPath(name).parent == prefix.parent
+                               and PurePosixPath(name).stem.startswith(collision))
+                for index in sorted(indices):
                     item = candidates[index]
                     try:
                         proposed = source_mapping(source, *item, old_catalog.parent, new_root)
@@ -239,9 +257,7 @@ def build_mapping(old_catalog: Path, new_location: Path) -> dict[str, str]:
                         if "identity changed" in str(error) or "count changed" in str(error) or "selectors changed" in str(error):
                             continue
                         raise
-                    if proposed and all(PurePosixPath(target).parent == prefix.parent
-                                        and pattern.fullmatch(PurePosixPath(target).name)
-                                        for target in proposed.values()):
+                    if proposed:
                         options.append(item)
         if len(options) > 1:
             signatures = {(normalized_document(new_root, *item),

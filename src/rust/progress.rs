@@ -9,63 +9,75 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const STAGES: usize = 14;
+const STAGES: usize = 18;
 const TICK: Duration = Duration::from_millis(80);
-const WEIGHTS: [u32; STAGES] = [1, 2, 5, 2, 22, 7, 3, 6, 5, 2, 17, 26, 1, 1];
+const WEIGHTS: [u32; STAGES] = [2, 1, 1, 2, 69, 2, 4, 1, 1, 1, 1, 0, 0, 13, 1, 0, 1, 0];
 const READY: &str = "Ready — starting game…";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stage {
     Fingerprint,
     Extract,
+    Planning,
     Textures,
-    Audio,
     Models,
-    Cleanup,
-    Configs,
+    Audio,
+    Movies,
     Scripts,
     Packs,
+    Preserved,
+    Seal,
     VerifyScripts,
     VerifyTrees,
-    Seal,
     VerifyArchive,
     Publish,
+    Cleanup,
+    Configs,
+    CleanupStaging,
 }
 
 impl Stage {
     pub const ALL: [Stage; STAGES] = [
         Stage::Fingerprint,
         Stage::Extract,
+        Stage::Planning,
         Stage::Textures,
-        Stage::Audio,
         Stage::Models,
-        Stage::Cleanup,
-        Stage::Configs,
+        Stage::Audio,
+        Stage::Movies,
         Stage::Scripts,
         Stage::Packs,
+        Stage::Preserved,
+        Stage::Seal,
         Stage::VerifyScripts,
         Stage::VerifyTrees,
-        Stage::Seal,
         Stage::VerifyArchive,
         Stage::Publish,
+        Stage::Cleanup,
+        Stage::Configs,
+        Stage::CleanupStaging,
     ];
 
     /// Caller-facing status message.
     pub fn label(self) -> &'static str {
         match self {
-            Stage::Fingerprint => "Checking source files…",
-            Stage::Extract => "Extracting files…",
+            Stage::Fingerprint => "Reading disc image…",
+            Stage::Extract => "Indexing disc resources…",
+            Stage::Planning => "Planning asset conversion…",
             Stage::Textures => "Converting textures…",
             Stage::Audio => "Converting audio…",
+            Stage::Movies => "Converting movies…",
             Stage::Models => "Converting models and animation…",
             Stage::Cleanup => "Removing converted payloads…",
-            Stage::Configs => "Converting configuration…",
+            Stage::Configs => "Bundling gameplay documents…",
             Stage::Scripts => "Converting scripts…",
             Stage::Packs => "Unpacking archives…",
+            Stage::Preserved => "Preserving game assets…",
             Stage::VerifyScripts => "Verifying scripts…",
             Stage::VerifyTrees => "Verifying converted data…",
-            Stage::Seal => "Packing data…",
+            Stage::Seal => "Streaming data archive…",
             Stage::VerifyArchive => "Verifying packed data…",
+            Stage::CleanupStaging => "Removing temporary data…",
             Stage::Publish => "Publishing data…",
         }
     }
@@ -73,19 +85,23 @@ impl Stage {
     /// Short console title.
     pub fn title(self) -> &'static str {
         match self {
-            Stage::Fingerprint => "Fingerprint",
-            Stage::Extract => "Extract",
+            Stage::Fingerprint => "Read ISO",
+            Stage::Extract => "Index",
+            Stage::Planning => "Plan assets",
             Stage::Textures => "Textures",
             Stage::Audio => "Audio",
+            Stage::Movies => "Movies",
             Stage::Models => "Models",
             Stage::Cleanup => "Cleanup",
-            Stage::Configs => "Configs",
+            Stage::Configs => "Gameplay",
             Stage::Scripts => "Scripts",
             Stage::Packs => "Packs",
+            Stage::Preserved => "Other assets",
             Stage::VerifyScripts => "Verify scripts",
             Stage::VerifyTrees => "Verify trees",
-            Stage::Seal => "Seal",
+            Stage::Seal => "Write archive",
             Stage::VerifyArchive => "Verify archive",
+            Stage::CleanupStaging => "Clean staged data",
             Stage::Publish => "Publish",
         }
     }
@@ -96,7 +112,23 @@ impl Stage {
     }
 
     fn bytes(self) -> bool {
-        matches!(self, Stage::Fingerprint | Stage::Extract | Stage::Seal)
+        matches!(
+            self,
+            Stage::Fingerprint | Stage::Audio | Stage::Movies | Stage::Scripts | Stage::Preserved
+        )
+    }
+
+    fn conversion(self) -> bool {
+        matches!(
+            self,
+            Stage::Textures
+                | Stage::Models
+                | Stage::Audio
+                | Stage::Movies
+                | Stage::Scripts
+                | Stage::Packs
+                | Stage::Preserved
+        )
     }
 }
 
@@ -233,6 +265,21 @@ impl Snapshot {
             .find(|s| s.active())
             .or_else(|| self.stages.iter().rev().find(|s| s.started != 0))
             .map(|s| s.stage)
+    }
+
+    fn label(&self) -> &'static str {
+        if self
+            .stages
+            .iter()
+            .filter(|stage| stage.active() && stage.stage.conversion())
+            .take(2)
+            .count()
+            > 1
+        {
+            "Converting assets in parallel…"
+        } else {
+            self.lead().map_or(Stage::Fingerprint.label(), Stage::label)
+        }
     }
 }
 
@@ -441,10 +488,8 @@ impl<'a> Reporter<'a> {
 
     fn emit(&self) {
         let snapshot = self.shared.snapshot();
-        let fraction = (snapshot.overall() as f32).min(0.995);
-        let message = snapshot
-            .lead()
-            .map_or(Stage::Fingerprint.label(), Stage::label);
+        let fraction = (snapshot.overall() as f32).min(0.99);
+        let message = snapshot.label();
         let Ok(mut emitter) = self.emitter.lock() else {
             return;
         };
@@ -538,34 +583,146 @@ const ASCII: Glyphs = Glyphs {
     dot: "-",
 };
 
-/// Rate of overall progress over a sliding window, for the time-left estimate.
+/// Stable time-left estimate from progress observed within one active stage set.
 #[derive(Default)]
 struct Rate {
     samples: VecDeque<(f64, f64)>,
+    active: u32,
+    estimate: Option<f64>,
+    last_time: f64,
+    last_fraction: f64,
+    last_advance: f64,
+    hidden: bool,
+    critical_fraction: f64,
+    critical_last_advance: f64,
+    critical_seen: bool,
+    model_final_phase: bool,
 }
 
 impl Rate {
-    fn eta(&mut self, elapsed: f64, fraction: f64) -> Option<f64> {
-        self.samples.push_back((elapsed, fraction));
+    #[cfg(test)]
+    fn eta(&mut self, elapsed: f64, fraction: f64, active: u32) -> Option<f64> {
+        self.eta_with_critical(elapsed, fraction, active, None)
+    }
+
+    fn eta_with_critical(
+        &mut self,
+        elapsed: f64,
+        fraction: f64,
+        active: u32,
+        critical: Option<f64>,
+    ) -> Option<f64> {
+        let delta = (elapsed - self.last_time).max(0.0);
+        if fraction > self.last_fraction + 0.0001 {
+            self.last_advance = elapsed;
+            self.last_fraction = fraction;
+        }
+        self.last_time = elapsed;
+        if let Some(critical) = critical {
+            let deferred = super::models::MODEL_DEFERRED_WORK_MULTIPLIER as f64;
+            let preview = super::models::MODEL_PREVIEW_WORK_DIVISOR as f64;
+            let final_boundary = (1.0 + deferred / preview) / (1.0 + deferred);
+            if critical <= final_boundary + 0.0001 {
+                // Analysis and preview finish much faster than final model publication.
+                self.samples.clear();
+                self.estimate = None;
+                self.hidden = true;
+                self.model_final_phase = false;
+                return None;
+            }
+            if !self.model_final_phase {
+                self.samples.clear();
+                self.estimate = None;
+                self.hidden = true;
+                self.model_final_phase = true;
+            }
+            if !self.critical_seen || critical > self.critical_fraction + 0.0001 {
+                self.critical_fraction = critical;
+                self.critical_last_advance = elapsed;
+                self.critical_seen = true;
+            }
+            if elapsed - self.critical_last_advance > 12.0 {
+                self.estimate = None;
+                self.hidden = true;
+                self.samples.clear();
+                return None;
+            }
+        } else {
+            self.critical_seen = false;
+            if self.model_final_phase {
+                self.samples.clear();
+                self.estimate = None;
+                self.hidden = true;
+                self.model_final_phase = false;
+            }
+        }
+        if active != self.active {
+            self.samples.clear();
+            self.active = active;
+        }
+        self.samples
+            .push_back((elapsed, critical.unwrap_or(fraction)));
         while self
             .samples
             .front()
-            .is_some_and(|&(t, _)| elapsed - t > 15.0)
+            .is_some_and(|&(t, _)| elapsed - t > 30.0)
         {
             self.samples.pop_front();
         }
-        let &(t0, f0) = self.samples.front()?;
-        if fraction < 0.03 || elapsed < 5.0 {
+        if elapsed - self.last_advance > 8.0 {
+            if !self.hidden {
+                // Restore the countdown spent waiting for work so the hidden
+                // estimate keeps a moving completion time through the stall.
+                self.estimate = self.estimate.map(|estimate| estimate + 8.0);
+            }
+            self.hidden = true;
+            self.samples.clear();
             return None;
         }
-        let average = fraction / elapsed;
-        let window = if elapsed - t0 >= 2.0 {
-            ((fraction - f0) / (elapsed - t0)).max(0.0)
-        } else {
-            average
+        let Some(&(start, first)) = self.samples.front() else {
+            return self.estimate;
         };
-        let rate = 0.7 * window + 0.3 * average;
-        Some((1.0 - fraction) / rate)
+        // A stage transition can change the bar by a whole weight at once.
+        // Observe a full window after the transition before using its rate.
+        let duration = elapsed - start;
+        let required_duration = if critical.is_some() { 20.0 } else { 8.0 };
+        let progress = critical.unwrap_or(fraction);
+        if fraction < 0.08
+            || elapsed < 15.0
+            || duration < required_duration
+            || progress - first < 0.0005
+        {
+            if self.hidden {
+                return None;
+            }
+            self.estimate = self.estimate.map(|previous| (previous - delta).max(0.0));
+            return self.estimate;
+        }
+        let target = if let Some(critical) = critical {
+            let model_rate = (critical - first) / duration;
+            let overall_rate = model_rate * Stage::Models.weight() as f64 / 100.0;
+            // Final model jobs have a long tail, and archive validation follows them.
+            1.5 * (1.0 - fraction) / overall_rate
+        } else {
+            let lifetime = fraction / elapsed;
+            let local = ((fraction - first) / duration).clamp(lifetime * 0.4, lifetime * 2.5);
+            let rate = 0.55 * local + 0.45 * lifetime;
+            (1.0 - fraction) / rate
+        };
+        let next = match self.estimate {
+            None => target,
+            Some(previous) => {
+                let baseline = (previous - delta).max(0.0);
+                let correction = (target - baseline).clamp(
+                    -delta * (0.5 + previous * 0.01),
+                    delta * (1.25 + previous * 0.01),
+                );
+                baseline + correction
+            }
+        };
+        self.estimate = Some(next);
+        self.hidden = false;
+        self.estimate
     }
 }
 
@@ -665,13 +822,25 @@ impl Console {
         let snapshot = shared.snapshot();
         let overall = snapshot.overall().min(0.999);
         self.best = self.best.max(overall);
-        let eta = self.rate.eta(snapshot.elapsed.as_secs_f64(), self.best);
-        self.eta = match (self.eta, eta) {
-            (Some(previous), Some(next)) => {
-                Some(0.85 * (previous - TICK.as_secs_f64()) + 0.15 * next)
-            }
-            (_, next) => next,
-        };
+        let active = snapshot
+            .stages
+            .iter()
+            .enumerate()
+            .fold(0u32, |mask, (index, stage)| {
+                if stage.active() {
+                    mask | (1 << index)
+                } else {
+                    mask
+                }
+            });
+        self.eta = self.rate.eta_with_critical(
+            snapshot.elapsed.as_secs_f64(),
+            self.best,
+            active,
+            snapshot.stages[Stage::Models as usize]
+                .active()
+                .then(|| snapshot.stages[Stage::Models as usize].fraction()),
+        );
         self.frame += 1;
         let logs = Self::take_logs(shared);
         match self.mode {
@@ -731,31 +900,24 @@ impl Console {
             .stages
             .iter()
             .filter(|s| s.active())
-            .map(|s| {
-                if s.total == 0 {
-                    s.stage.title().to_owned()
-                } else {
-                    format!(
-                        "{} {:.0}% ({})",
-                        s.stage.title(),
-                        s.fraction() * 100.0,
-                        counts(s)
-                    )
-                }
-            })
+            .map(plain_stage)
             .collect();
         let mut line = format!(
             "dc2data: [{:>3.0}%] {} - {} elapsed",
-            self.best * 100.0,
+            self.best.min(0.99) * 100.0,
             parts.join(", "),
             clock(snapshot.elapsed)
         );
-        if let Some(eta) = self.eta {
+        if snapshot.stages[Stage::Publish as usize].active() {
+            line.push_str(", finishing publication");
+        } else if let Some(eta) = self.eta {
             let _ = write!(
                 line,
                 ", ~{} left",
                 clock(Duration::from_secs_f64(eta.max(0.0)))
             );
+        } else {
+            line.push_str(", estimating time left");
         }
         line.push('\n');
         self.write(&line);
@@ -768,15 +930,19 @@ impl Console {
         let mut lines = Vec::new();
         let spinner = glyphs.spinner[self.frame % glyphs.spinner.len()];
         let mut tail = format!("{} elapsed", clock(snapshot.elapsed));
-        if let Some(eta) = self.eta {
+        if snapshot.stages[Stage::Publish as usize].active() {
+            let _ = write!(tail, " {} finishing publication", glyphs.dot);
+        } else if let Some(eta) = self.eta {
             let _ = write!(
                 tail,
                 " {} ~{} left",
                 glyphs.dot,
                 clock(Duration::from_secs_f64(eta.max(0.0)))
             );
+        } else {
+            let _ = write!(tail, " {} estimating time left", glyphs.dot);
         }
-        let percent = format!("{:>3.0}%", self.best * 100.0);
+        let percent = format!("{:>3.0}%", self.best.min(0.99) * 100.0);
         let fixed = 1 + 1 + 1 + 7 + 2 + 2 + percent.len() + 3 + tail.chars().count();
         let bar_width = width.saturating_sub(fixed).clamp(10, 48);
         lines.push(format!(
@@ -788,9 +954,11 @@ impl Console {
             self.paint("2", &tail)
         ));
         let rows: Vec<&StageSnapshot> = snapshot.stages.iter().filter(|s| s.active()).collect();
-        for s in rows.iter().take(4) {
+        for s in &rows {
             let title = format!("{:<14}", s.stage.title());
-            let count = if s.total == 0 {
+            let count = if s.stage == Stage::Seal {
+                format!("{} written", size(s.bytes))
+            } else if s.total == 0 {
                 String::new()
             } else {
                 counts(s)
@@ -802,13 +970,13 @@ impl Console {
                 count
             );
             let mut used = 3 + 2 + 14 + 1 + 15 + 2;
-            if s.total == 0 {
+            if s.total == 0 || s.stage == Stage::Seal {
                 let pulse = self.pulse(14);
                 row.push_str(&pulse);
                 row.push_str("      ");
             } else {
                 row.push_str(&self.bar(s.fraction(), 14, "36"));
-                let _ = write!(row, " {:>4.0}%", s.fraction() * 100.0);
+                let _ = write!(row, " {:>4.0}%", s.fraction().min(0.99) * 100.0);
             }
             used += 14 + 6;
             let item = shared.item(s.stage);
@@ -818,9 +986,6 @@ impl Console {
                 row.push_str(&self.paint("2", &truncate(&item, room, glyphs.ellipsis)));
             }
             lines.push(row);
-        }
-        if rows.len() > 4 {
-            lines.push(format!("     {} and {} more", glyphs.dot, rows.len() - 4));
         }
         let mut text = self.clear();
         for line in logs {
@@ -871,11 +1036,12 @@ impl Console {
                 clock(snapshot.elapsed)
             );
         } else {
-            let at = snapshot
-                .stages
-                .iter()
-                .find(|s| s.active())
-                .map_or("", |s| s.stage.title());
+            let active: Vec<_> = snapshot.stages.iter().filter(|s| s.active()).collect();
+            let at = if active.len() > 1 {
+                "parallel asset conversion"
+            } else {
+                active.first().map_or("", |s| s.stage.title())
+            };
             let _ = writeln!(
                 text,
                 "dc2data: {} stopped after {}{}{}",
@@ -957,10 +1123,38 @@ impl Drop for Console {
 }
 
 fn counts(s: &StageSnapshot) -> String {
+    fn work(value: u64) -> String {
+        if value >= 1_000_000_000 {
+            format!("{:.1}B", value as f64 / 1_000_000_000.0)
+        } else if value >= 1_000_000 {
+            format!("{:.1}M", value as f64 / 1_000_000.0)
+        } else if value >= 1_000 {
+            format!("{:.1}k", value as f64 / 1_000.0)
+        } else {
+            value.to_string()
+        }
+    }
     if s.stage.bytes() {
         format!("{}/{}", size(s.done), size(s.total))
+    } else if s.stage.conversion() || s.stage == Stage::Seal {
+        format!("{}/{} work", work(s.done), work(s.total))
     } else {
         format!("{}/{}", group(s.done), group(s.total))
+    }
+}
+
+fn plain_stage(s: &StageSnapshot) -> String {
+    if s.stage == Stage::Seal {
+        format!("{} {} written", s.stage.title(), size(s.bytes))
+    } else if s.total == 0 {
+        s.stage.title().to_owned()
+    } else {
+        format!(
+            "{} {:.0}% ({})",
+            s.stage.title(),
+            s.fraction().min(0.99) * 100.0,
+            counts(s)
+        )
     }
 }
 
@@ -1092,7 +1286,6 @@ mod terminal {
     unsafe extern "C" {
         fn signal(signum: i32, handler: usize) -> usize;
         fn raise(signum: i32) -> i32;
-        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     }
 
     pub fn enable_vt() -> bool {
@@ -1114,7 +1307,7 @@ mod terminal {
     extern "C" fn interrupted(signum: i32) {
         let show = b"\x1b[?25h\n";
         unsafe {
-            write(2, show.as_ptr(), show.len());
+            libc::write(2, show.as_ptr().cast(), show.len());
             signal(signum, 0);
             raise(signum);
         }
@@ -1205,5 +1398,185 @@ mod tests {
         assert_eq!(size(4_300_000_000), "4.3 GB");
         assert_eq!(clock(Duration::from_secs(401)), "06:41");
         assert_eq!(truncate("chr/ally/max.chr", 8, "…"), "…max.chr");
+    }
+
+    #[test]
+    fn streaming_archive_reports_written_bytes_until_it_finishes() {
+        let stage = StageSnapshot {
+            stage: Stage::Seal,
+            done: 3_100_000_000,
+            total: 3_200_000_000,
+            bytes: 2_500_000_000,
+            started: 1,
+            finished: 0,
+            skipped: false,
+        };
+        assert_eq!(plain_stage(&stage), "Write archive 2.5 GB written");
+    }
+
+    #[test]
+    fn eta_waits_for_a_stable_stage_and_moves_gradually_at_transitions() {
+        let mut rate = Rate::default();
+        for second in 0..=20 {
+            let eta = rate.eta(second as f64, second as f64 * 0.01, 1);
+            if second < 15 {
+                assert!(eta.is_none());
+            }
+        }
+        let before = rate.estimate.unwrap();
+        let after = rate.eta(21.0, 0.45, 2).unwrap();
+        assert!(after <= before + 1.0);
+        assert!(after >= before - 2.0);
+    }
+
+    #[test]
+    fn stalled_stage_withholds_eta_until_work_resumes() {
+        let mut rate = Rate::default();
+        for second in 0..=20 {
+            rate.eta(second as f64, second as f64 * 0.01, 1);
+        }
+        assert!(rate.estimate.is_some());
+        let before = rate.estimate.unwrap();
+        for second in 21..=31 {
+            let displayed = rate.eta(second as f64, 0.2, 1);
+            if second >= 29 {
+                assert!(displayed.is_none());
+            }
+        }
+        assert!(rate.estimate.unwrap() >= before - 1.0);
+        for second in 32..=42 {
+            rate.eta(second as f64, 0.2 + (second - 31) as f64 * 0.01, 1);
+        }
+        assert!(rate.estimate.is_some());
+    }
+
+    #[test]
+    fn slow_tail_can_increase_a_short_eta_without_jumping() {
+        let mut rate = Rate::default();
+        for second in 0..=20 {
+            rate.eta(second as f64, second as f64 * 0.04, 1);
+        }
+        for second in 21..=31 {
+            rate.eta(second as f64, 0.8, 1);
+        }
+        let retained = rate.estimate.unwrap();
+        let mut shown = None;
+        for second in 32..=50 {
+            let next = rate.eta(second as f64, 0.8 + (second - 31) as f64 * 0.0002, 1);
+            if let (Some(previous), Some(current)) = (shown, next) {
+                assert!(current - previous < 2.0);
+            }
+            if next.is_some() {
+                shown = next;
+            }
+        }
+        assert!(shown.unwrap() > retained);
+    }
+
+    #[test]
+    fn model_tail_replay_hides_an_optimistic_parallel_eta() {
+        assert_eq!(WEIGHTS.iter().sum::<u32>(), 100);
+        let mut rate = Rate::default();
+        let mut shown_at_stall = None;
+        for second in 0..=65 {
+            // Completed trace: other assets keep advancing after model analysis
+            // reaches its 10% boundary, while model publication is still busy.
+            let model = if second <= 37 {
+                second as f64 / 37.0 * 0.11
+            } else {
+                0.11
+            };
+            let other = (second as f64 / 65.0).min(1.0) * 0.16;
+            let fraction = 0.70 * model + other;
+            let eta = rate.eta_with_critical(second as f64, fraction, 1, Some(model));
+            if second == 65 {
+                shown_at_stall = Some(eta);
+            }
+        }
+        assert_eq!(shown_at_stall, Some(None));
+    }
+
+    #[test]
+    fn model_analysis_and_preview_cannot_seed_an_optimistic_eta() {
+        let mut rate = Rate::default();
+        let deferred = super::super::models::MODEL_DEFERRED_WORK_MULTIPLIER as f64;
+        let preview = super::super::models::MODEL_PREVIEW_WORK_DIVISOR as f64;
+        let boundary = (1.0 + deferred / preview) / (1.0 + deferred);
+        for second in 0..=30 {
+            let model = boundary * second as f64 / 30.0;
+            let overall = 0.15 + second as f64 * 0.005;
+            assert!(
+                rate.eta_with_critical(second as f64, overall, 1, Some(model))
+                    .is_none()
+            );
+        }
+        let mut after_deferred_progress = None;
+        for second in 31..=55 {
+            let model = boundary + (second - 30) as f64 * 0.005;
+            let overall = 0.30 + (second - 30) as f64 * 0.006;
+            after_deferred_progress =
+                rate.eta_with_critical(second as f64, overall, 1, Some(model));
+        }
+        assert!(after_deferred_progress.is_some());
+    }
+
+    #[test]
+    fn final_model_rate_waits_for_real_work_then_resets_for_verification() {
+        let mut rate = Rate::default();
+        let trace = [
+            (0.0, 0.0, 0.0),
+            (24.0, 0.19, 0.11),
+            (38.0, 0.24, 0.11),
+            (44.0, 0.43, 0.39),
+            (55.0, 0.44, 0.40),
+            (63.0, 0.49, 0.48),
+            (78.0, 0.61, 0.65),
+            (98.0, 0.70, 0.77),
+            (125.0, 0.85, 0.99),
+            (145.0, 0.86, 1.0),
+        ];
+        let mut shown_at_63 = None;
+        let mut shown_at_78 = None;
+        let mut shown_at_125 = None;
+        for pair in trace.windows(2) {
+            let (start, overall_start, model_start) = pair[0];
+            let (end, overall_end, model_end) = pair[1];
+            for second in start as i32..end as i32 {
+                let share = (second as f64 - start) / (end - start);
+                let overall = overall_start + (overall_end - overall_start) * share;
+                let model = model_start + (model_end - model_start) * share;
+                let shown = rate.eta_with_critical(second as f64, overall, 1, Some(model));
+                if second == 63 {
+                    shown_at_63 = Some(shown);
+                }
+                if second == 78 {
+                    shown_at_78 = Some(shown);
+                }
+                if second == 125 {
+                    shown_at_125 = Some(shown);
+                }
+            }
+        }
+        assert_eq!(shown_at_63, Some(None));
+        assert!(
+            shown_at_78
+                .flatten()
+                .is_some_and(|eta| (60.0..=120.0).contains(&eta))
+        );
+        assert!(
+            shown_at_125
+                .flatten()
+                .is_some_and(|eta| (20.0..=75.0).contains(&eta))
+        );
+        assert!(rate.eta_with_critical(145.0, 0.86, 2, None).is_none());
+        let mut verifying = None;
+        for second in 146..=159 {
+            let overall = 0.86 + (second - 145) as f64 * 0.13 / 16.0;
+            verifying = rate.eta_with_critical(second as f64, overall, 2, None);
+            if second == 153 {
+                assert!(verifying.is_some_and(|eta| (5.0..=25.0).contains(&eta)));
+            }
+        }
+        assert!(verifying.is_some_and(|eta| eta <= 15.0));
     }
 }

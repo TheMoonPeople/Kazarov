@@ -11,6 +11,14 @@
 #include "gfx/gfx.hpp"
 #include "gfx/requirements.hpp"
 
+#ifdef KZ_PORT_TRACY
+#include <tracy/TracyVulkan.hpp>
+#endif
+
+#ifndef NDEBUG
+#define KZ_GFX_THREAD_CHECKS 1
+#endif
+
 namespace gfx::detail {
 
 inline constexpr uint32_t kFramesInFlight = 4;
@@ -121,18 +129,23 @@ struct Mesh {
 struct TransientChunk {
     Buffer          buffer;
     VkDeviceSize    used = 0;
-    // The chunk's MeshConstants at set 1, allocated once the chunk first holds a MeshConstants.
+    // Its memory is device-local and counts against the device-local transient cap.
+    bool            device_local = false;
+    // The chunk's constant records at set 1, allocated once the chunk first holds a record.
     VkDescriptorSet constants_set = VK_NULL_HANDLE;
-    // The chunk's Prog0Constants at set 2, likewise; only with RendererConfig::prog0_meshes.
-    VkDescriptorSet prog0_set = VK_NULL_HANDLE;
 };
 
 struct TransientSpan {
-    VkBuffer        buffer;
-    VkDeviceSize    offset;
-    uint8_t        *data;
-    // The chunk's uniform block set; only from AllocateConstants.
+    VkBuffer     buffer;
+    VkDeviceSize offset;
+    uint8_t     *data;
+};
+
+// A record in the current chunk: its set, its index in that chunk's array, and where to write it.
+struct ConstantRecord {
     VkDescriptorSet set;
+    uint32_t        index;
+    uint8_t        *data;
 };
 
 struct DepthQuery {
@@ -189,18 +202,46 @@ struct BoundState {
     int      stencil_compare_mask[2] = {-1, -1};
     int      stencil_write_mask[2] = {-1, -1};
     int      color_write_mask = -1;
+    float    blend_constant_alpha = -1.0f; // unset until a draw needs a constant factor
     VkRect2D scissor = {
         {-1, -1},
         {0,  0 }
     };
     VkBuffer     vertex_buffer = VK_NULL_HANDLE;
     VkDeviceSize vertex_offset = 0;
+    // Without the bindless array: the descriptors last pushed at set 0.
+    VkImageView texture_view = VK_NULL_HANDLE;
+    VkImageView palette_view = VK_NULL_HANDLE;
+    uint32_t    sampler = UINT32_MAX;
+};
+
+// The constant records the draw command buffer has bound at set 1, so an identical next draw skips the upload.
+struct BoundConstants {
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet  set = VK_NULL_HANDLE; // the chunk set bound at set 1
+    bool             mesh_valid = false;
+    bool             prog0_valid = false;
+    bool             palette_valid = false;
+    // Only valid during a display list replay, whose blocks sit still; otherwise the source is a temporary.
+    const void      *mesh_source = nullptr;
+    const void      *prog0_source = nullptr;
+    const void      *palette_source = nullptr;
+    MeshConstants    mesh;
+    Prog0Constants   prog0;
+    Prog0Palette     palette;
+    VkDescriptorSet  mesh_set = VK_NULL_HANDLE;    // chunk set holding the bound mesh record
+    VkDescriptorSet  prog0_set = VK_NULL_HANDLE;   // chunk set holding the bound prog0 record
+    VkDescriptorSet  palette_set = VK_NULL_HANDLE; // chunk set holding the bound palette record
+    uint32_t         mesh_index = 0;
+    uint32_t         prog0_index = 0;
+    uint32_t         palette_index = 0;
 };
 
 struct BlendMapping {
     uint16_t slot;      // index into the precompiled blend states
     uint8_t  transform; // what the shader writes as source colour, kSourceTransform*
     bool     fix;       // C is FIX: the shader writes FIX / 128 as the factor
+    bool     constant;  // the blend reads FIX as the blend constant's alpha
 };
 
 enum SourceTransform : uint8_t {
@@ -219,6 +260,10 @@ struct PushConstants {
     uint32_t flags;
     uint32_t alpha; // ref 0-7, func 8-10, fix 16-23, ta0 24-31
     uint32_t fog_color;
+    uint32_t face; // Prog0Face bits of a prog0 mesh draw
+    uint32_t mesh_index;  // record of the draw's MeshConstants in its chunk's array
+    uint32_t prog0_index; // record of the draw's Prog0Constants, prog0 draws only
+    uint32_t palette_index; // record of a skinned draw's Prog0Palette, skinned draws only
 };
 
 enum PushFlags : uint32_t {
@@ -254,6 +299,16 @@ enum TextureMode : uint32_t {
     kTextureModeCount,
 };
 
+// Per-frame renderer work counts, plotted to the profiler when a frame closes.
+struct FrameCounters {
+    uint32_t mesh_draws = 0;
+    uint32_t draws_2d = 0;
+    uint32_t grab_copies = 0;
+    uint32_t grab_precopies = 0;
+    uint32_t descriptor_binds = 0;
+    uint64_t transient_bytes = 0;
+};
+
 struct Context {
     SDL_Window                      *window = nullptr;
     RendererConfig                   config;
@@ -278,8 +333,11 @@ struct Context {
     bool                          sampler_anisotropy = false;
     uint32_t                      anisotropy_level = 0;
     PFN_vkCmdSetColorWriteMaskEXT cmd_set_color_write_mask = nullptr;
+    // Every texture sits in one update-after-bind array at set 0. Without it (Metal argument
+    // buffers tier 1) each draw pushes its texture, palette and sampler instead.
+    bool                           bindless = true;
+    PFN_vkCmdPushDescriptorSetKHR  cmd_push_descriptor_set = nullptr;
     Swapchain                     swapchain;
-    bool                          resize_pending = false;
 
     std::array<Frame, kFramesInFlight> frames;
     uint32_t                           frame_slot = 0;
@@ -298,17 +356,16 @@ struct Context {
     VkSampler                    samplers[kSamplerCount] = {};
     VkDescriptorSetLayout        texture_set_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout        constants_set_layout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout        prog0_set_layout = VK_NULL_HANDLE;
     VkDescriptorPool             texture_pool = VK_NULL_HANDLE;
     VkDescriptorPool             constants_pool = VK_NULL_HANDLE;
-    VkDescriptorPool             prog0_descriptor_pool = VK_NULL_HANDLE;
-    VkDescriptorSet              texture_set = VK_NULL_HANDLE;
+    VkDescriptorSet              texture_set = VK_NULL_HANDLE; // bindless only
+    // The view at each texture slot, as written to texture_set; what a draw pushes without it.
+    std::vector<VkImageView>     texture_views;
     VkPipelineLayout             pipeline_layout = VK_NULL_HANDLE;
-    VkPipelineLayout             prog0_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineCache              pipeline_cache = VK_NULL_HANDLE;
     std::vector<VkPipeline>      pipelines;
     uint32_t                     blend_slot_count = 0;
-    std::array<BlendMapping, 81> blend_map = {};
+    std::array<BlendMapping, 162> blend_map = {};
     double                       pipeline_seconds = 0.0;
 
     std::vector<Texture>                              textures;
@@ -320,6 +377,8 @@ struct Context {
     TextureHandle target = kMainTarget;
     bool          rendering = false;
     BoundState    bound;
+
+    BoundConstants bound_constants;
 
     std::array<DepthQuery, kDepthQueryCount> depth_queries;
 
@@ -334,23 +393,53 @@ struct Context {
     bool                         interp_no_interpolation = false;
     float                        interp_teleport_distance = INFINITY;
     bool                         interp_blend_vertices = false;
-    bool                         replaying = false;
-    bool                         display_pass = false;
-    // Errors are reported by the canonical render; display renders of the same list stay quiet.
-    uint32_t interpolation_tint = 0; // display replay only, packed into push flags bits 8-10
-    bool  quiet = false;
-    // The list being replayed is the host's own 2D, which the full-frame rule leaves as drawn.
-    bool  host_draws = false;
     Image display_color;
     Image display_depth;
     // The newest main_color image is a canonical render no immediate frame has followed.
     bool canonical_newest = false;
     bool presented_display = false;
 
-    uint32_t validation_messages = 0;
+    FrameCounters counters;
+
+#ifdef KZ_PORT_TRACY
+    tracy::VkCtx                       *tracy_vk = nullptr;      // GPU timestamp context on the graphics queue
+    // Unique pointers rather than optionals: VkCtxScope is not assignable, and Context is assigned in RendererInit.
+    std::unique_ptr<tracy::VkCtxScope> rendering_zone;           // open dynamic-rendering span
+    std::unique_ptr<tracy::VkCtxScope> upload_zone;              // open frame upload command buffer
+#endif
 };
 
 extern Context g;
+
+// Flags a thread sets around its own replay or frame; the other thread must never see them.
+// quiet: errors are reported by the canonical render, so display renders of the same list stay quiet.
+// host_draws: the list being replayed is the host's own 2D, which the full-frame rule leaves as drawn.
+// interpolation_tint: display replay only, packed into push flags bits 8-10.
+struct ThreadFlags {
+    bool     replaying = false;
+    bool     display_pass = false;
+    bool     quiet = false;
+    bool     host_draws = false;
+    bool     in_idle_hook = false;
+    uint32_t interpolation_tint = 0;
+};
+
+extern thread_local ThreadFlags tls;
+
+// thread.cpp
+// Runs fn on the device thread: inline when the caller is one, else queued to the worker and waited for.
+void RunOnRenderThread(const std::function<void()> &fn);
+void Dispatch(std::function<void()> fn);
+// Waits until the worker has run every queued command.
+void Drain();
+// The worker exists and this is it.
+bool OnWorkerThread();
+// OnRenderThread(), also true before StartRenderThread and after StopRenderThread; what device calls assert.
+bool DeviceThreadAllowed();
+void StartRenderThread(RenderThreadMode mode);
+void StopRenderThread();
+// Fatal unless DeviceThreadAllowed(). Compiled to nothing unless KZ_GFX_THREAD_CHECKS.
+void AssertDeviceThread(const char *what);
 
 // renderer.cpp
 // Frames of RenderList: a canonical one draws into main_color and harvests depth queries, a
@@ -359,6 +448,8 @@ extern Context g;
 bool OpenListFrame(bool canonical, bool present, bool base);
 // The main targets take the window's size before a tick records draws laid out for them.
 void            PrepareRecording();
+// PrepareRecording, dispatched only when it has work; callable from the game thread while it records.
+void            PrepareRecordingFromCaller();
 void            CloseListFrame(bool canonical, bool present);
 Frame          &CurrentFrame();
 VkCommandBuffer UploadCommands();
@@ -378,11 +469,13 @@ Image   &PreviousFrameImage();
 uint32_t PreviousFrameSlot();
 void     CreateMainTargets();
 void     DestroyMainTargets();
+// Whether a game frame is open between OpenFrame and its submit or present (not an idle-hook frame).
+bool GameFrameOpen();
 
 // memory.cpp
 TransientSpan AllocateTransient(VkDeviceSize size, VkDeviceSize alignment);
-// A MeshConstants block, or a Prog0Constants one when prog0, with the set that binds it.
-TransientSpan AllocateConstants(bool prog0);
+// A record of MeshConstants or Prog0Constants (stride bytes) in the current chunk.
+ConstantRecord AllocateConstantRecord(VkDeviceSize stride);
 // The source of a copy into a buffer or image.
 TransientSpan AllocateStaging(VkDeviceSize size);
 void          ResetTransients(Frame &frame);
@@ -416,9 +509,11 @@ void     CreatePipelineLayout();
 void     CreatePipelines();
 void     DestroyPipelines();
 uint32_t PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, bool alpha_test);
-// Without a dynamic colour write mask: the pipelines that write no colour, after the others.
-uint32_t     NoColorPipelineIndex(PipelineFamily family, TextureMode mode, bool alpha_test);
-BlendMapping MapBlend(const GsBlend &blend, bool enable);
+// Without a dynamic colour write mask: the alpha-testing pipelines that write no colour, after the others.
+uint32_t NoColorPipelineIndex(PipelineFamily family, TextureMode mode);
+// The depth and stencil only pipelines, which have no fragment stage, last.
+uint32_t     DepthOnlyPipelineIndex(PipelineFamily family);
+BlendMapping MapBlend(const GsBlend &blend, bool enable, bool target_has_alpha);
 // kFamilyMesh for a plain draw (nullptr), else a prog0 family when the renderer has them.
 PipelineFamily MeshFamily(const Prog0Constants *prog0);
 // Sets 0 and 1 are the same in both layouts, so the sets bound for one carry to the other.
@@ -427,6 +522,8 @@ VkPipelineLayout PipelineLayoutOf(PipelineFamily family);
 // displaylist.cpp
 // The public resource calls that record instead of executing while a list is recorded.
 bool RecordingCalls();
+// The list being recorded, or nullptr; readable from the worker while the game thread records.
+const DisplayList *RecordingList();
 
 // draw.cpp
 void           EndRendering();

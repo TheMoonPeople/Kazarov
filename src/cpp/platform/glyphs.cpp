@@ -2,7 +2,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -15,6 +14,7 @@
 #define STBI_NO_STDIO
 #include "stb_image.h"
 
+#include "kazarov/log.hpp"
 #include "platform/input.hpp"
 #include "platform/paths.hpp"
 #include "platform/settings.hpp"
@@ -92,7 +92,7 @@ void Index() {
         }
         nlohmann::json root = nlohmann::json::parse(bytes.begin(), bytes.end(), nullptr, false);
         if (!root.is_object() || !root.contains("styles") || !root["styles"].is_object()) {
-            std::fprintf(stderr, "glyphs: %s is not a glyph index\n", (directory / "glyphs.json").string().c_str());
+            kz::Logf(kz::LogLevel::Warning, "glyphs", "{} is not a glyph index", (directory / "glyphs.json").string());
             continue;
         }
         if (root.contains("targets") && root["targets"].is_object()) {

@@ -1,10 +1,13 @@
 //! Migrates compiled-script resource operands to directly published native files.
+use super::artifacts::{ArtifactBytes, AssetSink, Category, Job};
+use super::inventory::Inventory as ResourceInventory;
 use super::progress::Phase;
 use super::{CoreError, CoreResult};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 fn fail(message: impl Into<String>) -> CoreError {
     CoreError(message.into())
@@ -195,19 +198,84 @@ fn normalize(value: &str) -> String {
         .trim_end_matches(";1")
         .to_owned()
 }
+/// How a bare retail name becomes the name of its converted file.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Rename {
+    /// The converted file keeps the retail stem in the source's directory or PACK; only the extension changes.
+    Extension(String),
+    /// The converted name does not keep the retail stem: a movie's fixed path, or a renamed leaf.
+    Path(String),
+}
 #[derive(Default)]
 struct Inventory {
     paths: BTreeMap<String, String>,
-    leaves: BTreeMap<String, BTreeSet<String>>,
+    /// Lower-case retail leaf name to the renames of its converted sources.
+    leaves: BTreeMap<String, BTreeSet<Rename>>,
+    /// Lower-case retail leaf name to the published paths of its converted sources.
+    counterparts: BTreeMap<String, BTreeSet<String>>,
     profiles: BTreeMap<String, BTreeSet<String>>,
+}
+/// The rename of one converted source published at `path`. A texture's document may sit at another
+/// physical path, but keeps its logical name: in its PACK's `pack.json`, or below `textures/` in the
+/// same directory for a texture outside any PACK.
+fn rename(alias: &str, extension: &str, path: &str) -> Rename {
+    if extension == "mp4" {
+        return Rename::Path(path.to_owned());
+    }
+    let source = alias.rsplit('/').next().unwrap_or(alias);
+    let source = source.split('#').next().unwrap_or(source);
+    let lower = source.to_ascii_lowercase();
+    let logical = if extension == "json" && (lower.ends_with(".img") || lower.ends_with(".tm2")) {
+        super::textures::legacy_document_path(alias).unwrap_or_else(|_| path.to_owned())
+    } else {
+        path.to_owned()
+    };
+    let leaf = logical.rsplit('/').next().unwrap_or(&logical);
+    let stem = source.rsplit_once('.').map_or(source, |(stem, _)| stem);
+    match leaf.get(..stem.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(stem) => {
+            Rename::Extension(leaf[stem.len()..].to_owned())
+        }
+        _ => Rename::Path(leaf.to_owned()),
+    }
 }
 impl Inventory {
     fn merge(&mut self, other: Inventory) {
         self.paths.extend(other.paths);
         self.profiles.extend(other.profiles);
-        for (leaf, targets) in other.leaves {
-            self.leaves.entry(leaf).or_default().extend(targets);
+        for (leaf, renames) in other.leaves {
+            self.leaves.entry(leaf).or_default().extend(renames);
         }
+        for (leaf, paths) in other.counterparts {
+            self.counterparts.entry(leaf).or_default().extend(paths);
+        }
+    }
+    /// Records one converted source and the path its converted file is published at.
+    fn insert(&mut self, alias: &str, extension: &str, path: String) {
+        let leaf = alias
+            .rsplit('/')
+            .next()
+            .unwrap_or(alias)
+            .to_ascii_lowercase();
+        self.leaves
+            .entry(leaf.clone())
+            .or_default()
+            .insert(rename(alias, extension, &path));
+        self.counterparts
+            .entry(leaf)
+            .or_default()
+            .insert(path.clone());
+        self.paths.insert(alias.to_ascii_lowercase(), path);
+    }
+    /// Whether the converted file a migrated name refers to was published: a path directly, and a bare
+    /// name as a converted source of the retail leaf it replaced.
+    fn target_exists(&self, text: &str, target: &str, exists: impl Fn(&str) -> bool) -> bool {
+        exists(target)
+            || (!target.contains('/')
+                && self
+                    .counterparts
+                    .get(&normalize(text))
+                    .is_some_and(|paths| paths.iter().any(|path| exists(path))))
     }
     fn resource(&self, text: &str) -> Option<String> {
         let key = normalize(text);
@@ -226,11 +294,20 @@ impl Inventory {
         if key.contains('/') {
             return None;
         }
-        let candidates = self.leaves.get(&key)?;
-        if candidates.len() != 1 {
+        // The game looks a bare name up in the script's current directory and loaded PACK, which only the
+        // running script decides. Every converted source keeps its stem in that same directory or PACK, so
+        // replacing the extension names the converted file in whichever context the retail name resolved.
+        let renames = self.leaves.get(&key)?;
+        if renames.len() != 1 {
             return None;
         }
-        Some(candidates.first()?.clone())
+        match renames.first()? {
+            Rename::Path(path) => Some(path.clone()),
+            Rename::Extension(extension) => {
+                let stem = text.rsplit_once('.').map_or(text, |(stem, _)| stem);
+                Some(format!("{stem}{extension}"))
+            }
+        }
     }
     fn profile(&self, text: &str, character: Option<&str>) -> Option<String> {
         let key = normalize(text);
@@ -248,6 +325,220 @@ impl Inventory {
         }
         None
     }
+}
+
+fn planned_lookup(
+    resources: &ResourceInventory,
+    converted_aliases: &HashSet<String>,
+    profiles: &BTreeMap<String, BTreeSet<String>>,
+    texture_paths: &BTreeMap<String, String>,
+) -> Inventory {
+    let mut lookup = Inventory {
+        profiles: profiles
+            .iter()
+            .map(|(alias, names)| {
+                (
+                    alias.to_ascii_lowercase(),
+                    names.iter().map(|name| name.to_ascii_lowercase()).collect(),
+                )
+            })
+            .collect(),
+        ..Inventory::default()
+    };
+    for alias in resources.names() {
+        let normalized_alias = alias.to_ascii_lowercase();
+        let character_nested = normalized_alias.split('/').any(|part| {
+            part.split('#')
+                .next()
+                .unwrap_or(part)
+                .trim_end_matches('_')
+                .ends_with(".chr")
+        });
+        let ext = alias
+            .split("#entry:")
+            .next()
+            .unwrap_or(alias)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let extension = match ext.as_str() {
+            "chr" | "mds" | "mdt" | "mot" | "wgt" | "bbp" => Some("gltf"),
+            "cfg" | "map" | "clo" | "img" | "tm2" => Some("json"),
+            "snd" => Some("sound.json"),
+            "pss" => Some("mp4"),
+            "bin" if normalized_alias == "snd2/rev.bin" => Some("json"),
+            "txt" if normalized_alias == "snd2/map_index.txt" => Some("json"),
+            _ => None,
+        };
+        let Some(extension) = extension else { continue };
+        if ext == "clo"
+            || (character_nested
+                && matches!(ext.as_str(), "cfg" | "map" | "img" | "tm2")
+                && !super::configs::is_tracked(alias))
+        {
+            continue;
+        }
+        if !converted_aliases.contains(alias) && !super::configs::is_tracked(alias) {
+            continue;
+        }
+        let path = texture_paths
+            .get(alias)
+            .cloned()
+            .unwrap_or_else(|| super::configs::native_path(alias, extension));
+        lookup.insert(alias, extension, path);
+    }
+    lookup
+}
+
+fn script_output_name(resources: &ResourceInventory, alias: &str) -> String {
+    let normalized_alias = alias.to_ascii_lowercase();
+    let nested_character = normalized_alias
+        .split('/')
+        .any(|part| part.split('#').next().unwrap_or(part).ends_with(".chr"));
+    if nested_character {
+        super::configs::native_path(alias, "stb")
+    } else if alias.contains('/') && resources.roots().iter().all(|root| root.alias != alias) {
+        super::packs::published_leaf_path(alias)
+    } else {
+        alias.to_owned()
+    }
+}
+
+fn is_script_resource_name(alias: &str) -> bool {
+    let lower_alias = alias.to_ascii_lowercase();
+    lower_alias.ends_with(".stb") || lower_alias.ends_with(".stb_")
+}
+
+/// Plans final compiled-script bytes from immutable retail references and native asset names.
+pub fn plan_jobs(
+    resources: &ResourceInventory,
+    converted_aliases: &HashSet<String>,
+    profiles: &BTreeMap<String, BTreeSet<String>>,
+    texture_paths: &BTreeMap<String, String>,
+    publish_scripts: bool,
+) -> CoreResult<(HashSet<String>, Vec<Job>)> {
+    let lookup = Arc::new(planned_lookup(
+        resources,
+        converted_aliases,
+        profiles,
+        texture_paths,
+    ));
+    let mut consumed = HashSet::new();
+    let mut jobs = Vec::new();
+    for resource in resources.leaves() {
+        let alias = resource.alias.clone();
+        let valid_script = is_valid_script(&resource.bytes());
+        if !publish_scripts && valid_script {
+            if !is_script_resource_name(&alias) {
+                return Err(CoreError(format!(
+                    "compiled script resource has an unsupported alias: {alias}"
+                )));
+            }
+            consumed.insert(alias);
+            continue;
+        }
+        if !publish_scripts && is_script_resource_name(&alias) {
+            consumed.insert(alias);
+            continue;
+        }
+        if !valid_script {
+            continue;
+        }
+        let name = script_output_name(resources, &alias);
+        consumed.insert(alias.clone());
+        let resource = resource.clone();
+        let lookup = lookup.clone();
+        jobs.push(Job {
+            category: Category::Script,
+            label: alias,
+            work: resource.len().max(1) as u64,
+            estimated_bytes: resource.len().saturating_mul(2),
+            run: Box::new(move |sink: &AssetSink| {
+                let (bytes, _) = migrate(&resource.bytes(), &lookup)?;
+                sink.submit(name, ArtifactBytes::Owned(bytes), Category::Script)
+            }),
+        });
+    }
+    Ok((consumed, jobs))
+}
+
+pub fn verify_archive_work(resources: &ResourceInventory, publish_scripts: bool) -> u64 {
+    if !publish_scripts {
+        return 0;
+    }
+    resources
+        .leaves()
+        .iter()
+        .filter(|resource| is_valid_script(&resource.bytes()))
+        .count() as u64
+}
+
+/// Recomputes every retained compiled script and checks its final archived bytes.
+pub fn verify_archive(
+    resources: &ResourceInventory,
+    converted_aliases: &HashSet<String>,
+    profiles: &BTreeMap<String, BTreeSet<String>>,
+    texture_paths: &BTreeMap<String, String>,
+    reader: &dyn super::publish::ArchiveReader,
+    phase: &Phase,
+    publish_scripts: bool,
+) -> CoreResult<()> {
+    let lookup = planned_lookup(resources, converted_aliases, profiles, texture_paths);
+    let mut character_scripts = BTreeMap::<String, BTreeSet<String>>::new();
+    for resource in resources.leaves() {
+        if !publish_scripts || !is_valid_script(&resource.bytes()) {
+            continue;
+        }
+        let alias = &resource.alias;
+        let name = script_output_name(resources, alias);
+        let actual = reader.read(&name)?;
+        let (expected, _) = migrate_checked(&resource.bytes(), &lookup, |text, path| {
+            if lookup.target_exists(text, path, |candidate| reader.contains(candidate)) {
+                Ok(())
+            } else {
+                Err(fail(format!(
+                    "script resource target is absent: {alias} -> {path}"
+                )))
+            }
+        })?;
+        if actual != expected || !is_valid_script(&actual) {
+            return Err(fail(format!(
+                "native VM script differs from source migration: {alias}"
+            )));
+        }
+        let parts: Vec<_> = alias.split('/').collect();
+        if let Some(parent) = (0..parts.len().saturating_sub(1)).rev().find(|index| {
+            parts[*index]
+                .to_ascii_lowercase()
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches('_')
+                .ends_with(".chr")
+        }) {
+            let character = parts[..=parent].join("/");
+            if !character_scripts.contains_key(&character) {
+                let game_path = super::configs::native_path(&character, "game.json");
+                let game: serde_json::Value = serde_json::from_slice(&reader.read(&game_path)?)?;
+                let scripts = game["resources"]["scripts"]
+                    .as_array()
+                    .ok_or_else(|| fail(format!("character omits script list: {character}")))?
+                    .iter()
+                    .filter_map(|script| script["path"].as_str().map(str::to_owned))
+                    .collect();
+                character_scripts.insert(character.clone(), scripts);
+            }
+            let native = super::configs::native_path(alias, "stb");
+            if !character_scripts[&character].contains(&native) {
+                return Err(fail(format!(
+                    "character omits native VM script resource: {alias}"
+                )));
+            }
+        }
+        phase.inc(1);
+    }
+    Ok(())
 }
 #[derive(Clone, Copy)]
 enum Token {
@@ -350,6 +641,14 @@ fn profile_arguments(
     Ok(locations)
 }
 fn migrate(b: &[u8], inventory: &Inventory) -> CoreResult<(Vec<u8>, usize)> {
+    migrate_checked(b, inventory, |_, _| Ok(()))
+}
+
+fn migrate_checked(
+    b: &[u8],
+    inventory: &Inventory,
+    mut validate_resource: impl FnMut(&str, &str) -> CoreResult<()>,
+) -> CoreResult<(Vec<u8>, usize)> {
     let (code, functions) = decode(b)?;
     let profile_locations = profile_arguments(b, code, &functions, inventory)?;
     let mut replacements = BTreeMap::new();
@@ -369,12 +668,12 @@ fn migrate(b: &[u8], inventory: &Inventory) -> CoreResult<(Vec<u8>, usize)> {
                 .as_ref()
                 .filter(|(at, _)| *at + 12 == insn.at)
                 .map(|(_, name)| name.as_str());
-            let replacement = if profile_locations.contains(&insn.at) {
-                Some(key.trim_end_matches(".cfg").to_owned())
+            let (replacement, resource_target) = if profile_locations.contains(&insn.at) {
+                (Some(key.trim_end_matches(".cfg").to_owned()), false)
+            } else if let Some(profile) = inventory.profile(text, character) {
+                (Some(profile), false)
             } else {
-                inventory
-                    .profile(text, character)
-                    .or_else(|| inventory.resource(text))
+                (inventory.resource(text), true)
             };
             previous_character = if key.ends_with(".chr") {
                 Some((insn.at, key))
@@ -382,6 +681,9 @@ fn migrate(b: &[u8], inventory: &Inventory) -> CoreResult<(Vec<u8>, usize)> {
                 None
             };
             if let Some(replacement) = replacement.filter(|v| v.as_bytes() != bytes) {
+                if resource_target {
+                    validate_resource(text, &replacement)?;
+                }
                 replacements.insert(insn.at, replacement);
             }
         }
@@ -491,23 +793,8 @@ fn inventory_resource(
     };
     if let Some(extension) = extension {
         let path = super::configs::native_path(alias, extension);
-        if assets.join(&path).is_file() {
-            inventory.paths.insert(alias.to_owned(), path.clone());
-            let leaf = Path::new(alias)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            let target = if ext == "pss" {
-                path.clone()
-            } else {
-                Path::new(&path)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            inventory.leaves.entry(leaf).or_default().insert(target);
+        if assets.join(&path).is_file() || super::configs::is_tracked(alias) {
+            inventory.insert(alias, extension, path);
         }
         if ext == "chr" {
             let sidecar = super::configs::native_path(alias, "game.json");
@@ -580,36 +867,52 @@ fn migrate_container(
 }
 /// Rewrites resource operands in retained bytecode after native assets have been published.
 pub fn convert_tree(raw: &Path, published: &Path, phase: &Phase) -> CoreResult<()> {
-    let assets = published.join("port_data");
-    let mut raw_files = Vec::new();
-    gather(raw, &mut raw_files)?;
+    convert_source(
+        &super::archive::SourceTree::directory(raw)?,
+        published,
+        phase,
+    )
+}
+
+pub fn convert_source(
+    source: &super::archive::SourceTree,
+    published: &Path,
+    phase: &Phase,
+) -> CoreResult<()> {
+    let assets = published.join("data");
+    let mut raw_files: Vec<&str> = source
+        .names()
+        .filter(|name| {
+            !matches!(*name, "sound/sound.dat" | "sound/sound.hd3")
+                && !name.ends_with(".pss")
+                && !name.ends_with(".wav")
+        })
+        .collect();
     raw_files.sort();
     let mut files = Vec::new();
     if published.join("data").is_dir() {
         gather(&published.join("data"), &mut files)?;
     }
-    let mut native = Vec::new();
-    if assets.is_dir() {
-        gather(&assets, &mut native)?;
+    files.retain(|path| {
+        !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("png" | "wav" | "mp4" | "gltf" | "json")
+        ) && !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".gltf.bin"))
+    });
+    let work = super::archive::compatibility_work_path(published, "");
+    if work.is_dir() {
+        gather(&work, &mut files)?;
     }
-    files.extend(
-        native
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|v| v == "stb")),
-    );
     files.sort();
     phase.set_total((raw_files.len() + files.len()) as u64);
     let locals: Vec<CoreResult<Inventory>> = raw_files
         .par_iter()
         .map(|p| -> CoreResult<Inventory> {
-            let alias = p
-                .strip_prefix(raw)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase();
+            let alias = p.to_ascii_lowercase();
             let mut local = Inventory::default();
-            inventory_resource(&fs::read(p)?, &alias, &assets, &mut local, 0)?;
+            inventory_resource(&source.read(p)?, &alias, &assets, &mut local, 0)?;
             phase.inc(1);
             Ok(local)
         })
@@ -678,21 +981,34 @@ fn script_sources(
 
 /// Checks retained VM source coverage and exact deterministic operand migration before cache reuse.
 pub fn verify_tree(raw: &Path, published: &Path, phase: &Phase) -> CoreResult<()> {
-    let assets = published.join("port_data");
-    let mut files = Vec::new();
-    gather(raw, &mut files)?;
+    verify_source(
+        &super::archive::SourceTree::directory(raw)?,
+        published,
+        phase,
+    )
+}
+
+pub fn verify_source(
+    source: &super::archive::SourceTree,
+    published: &Path,
+    phase: &Phase,
+) -> CoreResult<()> {
+    let assets = published.join("data");
+    let mut files: Vec<&str> = source
+        .names()
+        .filter(|name| {
+            !matches!(*name, "sound/sound.dat" | "sound/sound.hd3")
+                && !name.ends_with(".pss")
+                && !name.ends_with(".wav")
+        })
+        .collect();
     files.sort();
     phase.set_total(files.len() as u64);
     let locals = files
         .par_iter()
-        .map(|source| -> CoreResult<_> {
-            let alias = source
-                .strip_prefix(raw)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase();
-            let bytes = fs::read(source)?;
+        .map(|name| -> CoreResult<_> {
+            let alias = name.to_ascii_lowercase();
+            let bytes = source.read(name)?;
             let mut inventory = Inventory::default();
             inventory_resource(&bytes, &alias, &assets, &mut inventory, 0)?;
             let mut local = BTreeMap::new();
@@ -1030,8 +1346,195 @@ pub(crate) fn event_script_fixture(calls: &[(i32, &[ScriptArg])]) -> Vec<u8> {
     bytes
 }
 #[cfg(test)]
+#[path = "script_reference_audit.rs"]
+mod reference_audit;
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn luau_only_rejects_valid_scripts_with_unmapped_aliases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("valid-script.bin"), ambiguous_script_fixture()).unwrap();
+        let source = super::super::archive::SourceTree::directory(&raw).unwrap();
+        let resources = ResourceInventory::build(&source).unwrap();
+        let error = match plan_jobs(
+            &resources,
+            &HashSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        ) {
+            Ok(_) => panic!("valid script with an unmapped alias was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported alias"));
+    }
+
+    #[test]
+    fn luau_only_consumes_nested_pack_scripts_and_keeps_neighbor_resources() {
+        fn pack(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut output = Vec::new();
+            for (name, payload) in entries {
+                let mut header = vec![0; 80];
+                header[..name.len()].copy_from_slice(name.as_bytes());
+                for (at, value) in [
+                    (64, 80),
+                    (68, payload.len() as u32),
+                    (72, 80 + payload.len() as u32),
+                ] {
+                    header[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                output.extend(header);
+                output.extend_from_slice(payload);
+            }
+            output.extend([0; 80]);
+            output
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        let script = ambiguous_script_fixture();
+        let nested = pack(&[("c02.stb_", &script), ("palette.bin", b"keep")]);
+        fs::write(raw.join("scripts.pak"), pack(&[("nested.pak", &nested)])).unwrap();
+        fs::write(raw.join("loose.stb"), &script).unwrap();
+        let source = super::super::archive::SourceTree::directory(&raw).unwrap();
+        let resources = ResourceInventory::build(&source).unwrap();
+        let (consumed, jobs) = plan_jobs(
+            &resources,
+            &HashSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        assert!(jobs.is_empty());
+        assert!(consumed.contains("loose.stb"));
+        assert!(consumed.contains("scripts.pak/nested.pak/c02.stb_"));
+        assert!(!consumed.contains("scripts.pak/nested.pak/palette.bin"));
+        assert_eq!(resources.leaves().len(), 3);
+    }
+
+    #[test]
+    fn script_publication_recognizes_loose_and_trailing_underscore_aliases() {
+        for alias in ["map/evt.stb", "mainchr/c02.stb_", "PACK.PAK/script.STB"] {
+            assert!(is_script_resource_name(alias));
+        }
+        for alias in ["map/evt.stb.bak", "map/evt.stb1", "map/evt"] {
+            assert!(!is_script_resource_name(alias));
+        }
+    }
+
+    #[test]
+    fn bare_migrated_targets_resolve_to_published_source_paths() {
+        let mut inventory = Inventory::default();
+        inventory.insert(
+            "event/e100/e110/e110_mints.chr",
+            "gltf",
+            "event/e100/e110/e110_mints.gltf".into(),
+        );
+        inventory.insert(
+            "event/e100/e110/_e110_data.pak/e110_mints.chr",
+            "gltf",
+            "event/e100/e110/_e110_data.pak/e110_mints.gltf".into(),
+        );
+        let published = BTreeSet::from(["event/e100/e110/e110_mints.gltf".to_owned()]);
+        let exists = |path: &str| published.contains(path);
+        assert!(inventory.target_exists("e110_mints.chr", "e110_mints.gltf", exists));
+        assert!(!inventory.target_exists("missing.chr", "missing.gltf", exists));
+        assert!(!inventory.target_exists(
+            "elsewhere/e110_mints.chr",
+            "elsewhere/e110_mints.gltf",
+            exists
+        ));
+    }
+
+    #[test]
+    fn bare_names_keep_their_spelling_and_change_only_the_extension() {
+        // Underground Channel's boss scene loads "e110_Halloween.chr" in event/e100/e110/, which holds a
+        // loose e110_halloween.chr and the _e110_data.pak member e110_Halloween.chr.
+        let mut inventory = Inventory::default();
+        for (alias, extension, path) in [
+            (
+                "event/e100/e110/e110_halloween.chr",
+                "gltf",
+                "event/e100/e110/e110_halloween.gltf",
+            ),
+            (
+                "event/e100/e110/_e110_data.pak/e110_Halloween.chr",
+                "gltf",
+                "event/e100/e110/_e110_data.pak/e110_Halloween.gltf",
+            ),
+            // The loose image keeps its name below textures/; the PACK member's document takes a hash
+            // suffix, and its pack.json names it e110telop01.json.
+            (
+                "event/e100/e110/e110telop01.img",
+                "json",
+                "textures/event/e100/e110/e110telop01.json",
+            ),
+            (
+                "event/e100/e110/_e110_data.pak/e110telop01.img",
+                "json",
+                "textures/event/e100/e110/e110telop01-60b3624cea5e-0.json",
+            ),
+            (
+                "dungeon/sphida/sphida_bar_1.img",
+                "json",
+                "textures/dungeon/sphida/sphida_bar_1.json",
+            ),
+            (
+                "snd2/sp/SP_001.snd",
+                "sound.json",
+                "snd2/sp/SP_001.sound.json",
+            ),
+            (
+                "menu/0/inv0_bg.pac/sp_001.snd",
+                "sound.json",
+                "menu/0/inv0_bg.pac/sp_001.sound.json",
+            ),
+            ("movie/OPEN.pss", "mp4", "movie/OPEN.mp4"),
+            ("chara/a.mds", "gltf", "chara/a.gltf"),
+            ("etc/gsys.pak/a.mds", "gltf", "etc/gsys.pak/a.model.gltf"),
+        ] {
+            inventory.insert(alias, extension, path.into());
+        }
+        for (text, converted) in [
+            ("e110_Halloween.chr", Some("e110_Halloween.gltf")),
+            ("E110_HALLOWEEN.CHR", Some("E110_HALLOWEEN.gltf")),
+            ("e110telop01.img", Some("e110telop01.json")),
+            ("sphida_bar_1.img", Some("sphida_bar_1.json")),
+            ("sp_001.snd", Some("sp_001.sound.json")),
+            ("open.pss", Some("movie/OPEN.mp4")),
+            // Sources converted to different extensions stay unconverted.
+            ("a.mds", None),
+            ("missing.chr", None),
+            (
+                "event/e100/e110/e110telop01.img",
+                Some("textures/event/e100/e110/e110telop01.json"),
+            ),
+        ] {
+            assert_eq!(inventory.resource(text).as_deref(), converted, "{text}");
+        }
+        let mut bytes = fixture();
+        bytes.truncate(84);
+        bytes.resize(84 + 2 * 12, 0);
+        let relative = (bytes.len() - 28) as i32;
+        put(&mut bytes, 84, 3);
+        put(&mut bytes, 88, 3);
+        put(&mut bytes, 92, relative);
+        bytes.extend(b"e110_Halloween.chr\0");
+        put(&mut bytes, 84 + 12, 15);
+        let (converted, count) = migrate(&bytes, &inventory).unwrap();
+        assert_eq!(count, 1);
+        let (code, functions) = decode(&converted).unwrap();
+        assert_eq!(
+            literal(&converted, code, &functions[0][0]).unwrap(),
+            b"e110_Halloween.gltf"
+        );
+    }
+
     #[test]
     fn actor_loads_follow_constant_actors_and_globals_set_only_to_constants() {
         let load = |ext: i32, path: &'static str, actor: ScriptArg<'static>| {
@@ -1122,10 +1625,9 @@ mod tests {
         super::super::packs::convert_tree(&raw, &published, &Phase::noop()).unwrap();
         verify_tree(&raw, &published, &Phase::noop()).unwrap();
         assert_eq!(fs::read(published.join("data/test.stb")).unwrap(), script);
-        let game: serde_json::Value = serde_json::from_slice(
-            &fs::read(published.join("port_data/effects.game.json")).unwrap(),
-        )
-        .unwrap();
+        let game: serde_json::Value =
+            serde_json::from_slice(&fs::read(published.join("data/effects.game.json")).unwrap())
+                .unwrap();
         assert_eq!(game["resources"]["scripts"].as_array().unwrap().len(), 23);
         assert_eq!(
             game["profiles"]["info"]["commands"][0]["args"][0]["kind"],
@@ -1133,9 +1635,9 @@ mod tests {
         );
         assert!(!game["profiles"]["info"]["commands"][0]["args"][0]["index"].is_null());
         fs::remove_file(published.join("data/test.stb")).unwrap();
-        fs::create_dir_all(published.join("port_data/test.stb")).unwrap();
+        fs::create_dir_all(published.join("data/test.stb")).unwrap();
         fs::write(
-            published.join("port_data/test.stb/pack.json"),
+            published.join("data/test.stb/pack.json"),
             b"{\"schema_version\":1,\"kind\":\"asset_directory\"}",
         )
         .unwrap();
@@ -1218,6 +1720,7 @@ mod tests {
         Inventory {
             paths: BTreeMap::from([("chara/hero.chr".into(), "chara/hero.gltf".into())]),
             leaves: BTreeMap::new(),
+            counterparts: BTreeMap::new(),
             profiles: BTreeMap::from([("chara/hero.chr".into(), BTreeSet::from(["info".into()]))]),
         }
     }

@@ -113,7 +113,7 @@ void Identity(float (&m)[16]) {
     m[0] = m[5] = m[10] = m[15] = 1.0f;
 }
 
-void SetBone(gfx::Prog0Constants &p, uint32_t slot, const Rows &rows) {
+void SetBone(gfx::Prog0Palette &p, uint32_t slot, const Rows &rows) {
     for (uint32_t r = 0; r < 3; r++) {
         for (uint32_t c = 0; c < 4; c++) {
             p.bones[slot][r][c] = rows[r * 4 + c];
@@ -179,7 +179,7 @@ TEST(GfxGpuDisplayList, RecordingReservesPriorSizesWithoutRetainingCommands) {
     gfx::SetInterpKey(17);
     for (int i = 0; i < 129; ++i) {
         constants.diffuse[0] = static_cast<float>(i);
-        gfx::detail::RecordMesh({}, nullptr, &constants);
+        gfx::detail::RecordMesh({}, nullptr, &constants, nullptr);
     }
     gfx::CutInterpolation();
     auto first = gfx::EndRecording();
@@ -217,12 +217,14 @@ TEST(GfxGpuDisplayList, RecordingReservationToleratesSmallGrowthAndResetsWithRen
         gfx::Prog0Constants constants = {};
         gfx::BeginRecording();
         for (int i = 0; i < 129; ++i) {
-            gfx::detail::RecordMesh({}, nullptr, &constants);
+            constants.specular_power = static_cast<uint32_t>(i);
+            gfx::detail::RecordMesh({}, nullptr, &constants, nullptr);
         }
         auto first = gfx::EndRecording();
         gfx::BeginRecording();
         for (int i = 0; i < 130; ++i) {
-            gfx::detail::RecordMesh({}, nullptr, &constants);
+            constants.specular_power = static_cast<uint32_t>(i);
+            gfx::detail::RecordMesh({}, nullptr, &constants, nullptr);
         }
         auto second = gfx::EndRecording();
         EXPECT_EQ(second->entries.capacity(), first->entries.capacity());
@@ -241,12 +243,30 @@ TEST(GfxGpuDisplayList, RecordingReservationToleratesSmallGrowthAndResetsWithRen
     }
 }
 
+TEST(GfxGpuDisplayList, ConsecutiveIdenticalProg0BlocksShareOneRecord) {
+    GfxFixture          fixture(kWidth, kHeight);
+    gfx::Prog0Constants first = {};
+    first.flags = gfx::kProg0Unlit;
+    gfx::Prog0Constants second = first;
+    second.specular_power = 1;
+    gfx::BeginRecording();
+    gfx::detail::RecordMesh({}, nullptr, &first, nullptr);
+    gfx::detail::RecordMesh({}, nullptr, &first, nullptr);
+    gfx::detail::RecordMesh({}, nullptr, &second, nullptr);
+    auto list = gfx::EndRecording();
+    ASSERT_EQ(list->prog0_blocks.size(), 2u);
+    ASSERT_EQ(list->entries.size(), 3u);
+    EXPECT_EQ(std::get<gfx::detail::MeshEntry>(list->entries[0]).prog0, 0);
+    EXPECT_EQ(std::get<gfx::detail::MeshEntry>(list->entries[1]).prog0, 0);
+    EXPECT_EQ(std::get<gfx::detail::MeshEntry>(list->entries[2]).prog0, 1);
+}
+
 TEST(GfxGpuDisplayList, RecordingOverlayKeepsSeparateCapacityHistory) {
     GfxFixture          fixture(kWidth, kHeight, 1.0f, Prog0Options());
     gfx::Prog0Constants constants{};
     gfx::BeginRecording();
     for (int i = 0; i < 129; ++i) {
-        gfx::detail::RecordMesh({}, nullptr, &constants);
+        gfx::detail::RecordMesh({}, nullptr, &constants, nullptr);
     }
     auto game = gfx::EndRecording();
     auto overlay = OverlayRecord("60");
@@ -267,9 +287,8 @@ TEST(GfxGpuDisplayList, RecordingOverlayKeepsSeparateCapacityHistory) {
 }
 
 TEST(GfxDisplayList, BonesBlendPerBoneAtHalf) {
-    gfx::Prog0Constants before = {};
-    gfx::Prog0Constants after = {};
-    before.flags = after.flags = gfx::kProg0Skinned;
+    gfx::Prog0Palette before = {};
+    gfx::Prog0Palette after = {};
     for (uint32_t slot = 0; slot < gfx::kProg0Bones; slot++) {
         SetBone(before, slot, kIdentityRows);
         SetBone(after, slot, kIdentityRows);
@@ -288,12 +307,12 @@ TEST(GfxDisplayList, BonesBlendPerBoneAtHalf) {
     SetBone(before, 4, still);
     SetBone(after, 4, still);
 
-    gfx::Prog0Constants expected = after;
+    gfx::Prog0Palette expected = after;
     SetBone(expected, 0, {1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0});
     SetBone(expected, 1, {root, -root, 0, 0, root, root, 0, 0, 0, 0, 1, 0});
     SetBone(expected, 2, {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0});
 
-    gfx::Prog0Constants out = {};
+    gfx::Prog0Palette out = {};
     gfx::detail::BlendProg0Bones(before, after, 0.5f, 200.0f, out);
     for (uint32_t slot = 0; slot < gfx::kProg0Bones; slot++) {
         for (uint32_t r = 0; r < 3; r++) {
@@ -305,7 +324,6 @@ TEST(GfxDisplayList, BonesBlendPerBoneAtHalf) {
     }
     EXPECT_EQ(std::memcmp(out.bones[3], after.bones[3], sizeof out.bones[3]), 0);
     EXPECT_EQ(std::memcmp(out.bones[4], after.bones[4], sizeof out.bones[4]), 0);
-    EXPECT_EQ(out.flags, after.flags);
 }
 
 TEST(GfxGpuMeshDc2, SkinnedPaletteInterpolatesInDisplayFrame) {
@@ -325,15 +343,15 @@ TEST(GfxGpuMeshDc2, SkinnedPaletteInterpolatesInDisplayFrame) {
     }
 
     auto record = [&](float translation_x, bool cut) {
-        gfx::Prog0Constants posed = block;
-        SetBone(posed, 0, {1, 0, 0, translation_x, 0, 1, 0, 0, 0, 0, 1, 0});
+        gfx::Prog0Palette palette = {};
+        SetBone(palette, 0, {1, 0, 0, translation_x, 0, 1, 0, 0, 0, 0, 1, 0});
         gfx::BeginRecording();
         gfx::SetInterpKey(1, false, 200.0f);
         if (cut) {
             gfx::CutInterpolation();
         }
         gfx::Clear(true, kClear.data(), true, 0.0f);
-        gfx::DrawMeshImmediateProg0(vertices, kTriangle, constants, posed, {}, {}, &transform);
+        gfx::DrawMeshImmediateProg0(vertices, kTriangle, constants, block, {}, {}, &transform, &palette);
         return gfx::EndRecording();
     };
     auto canonical = [&](const gfx::DisplayList &list) {

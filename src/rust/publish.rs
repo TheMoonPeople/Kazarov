@@ -1,15 +1,61 @@
+use super::artifacts::AssetSink;
+use super::inventory::Inventory;
 use super::progress::Phase;
-use super::zip_archive::{self, Archive, Input, content_digest};
+use super::zip_archive::{self, Archive, Input, ProgressiveWriter, content_digest};
 use super::{CoreError, CoreResult, textures};
 use rayon::prelude::*;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn fail(message: impl Into<String>) -> CoreError {
     CoreError(message.into())
+}
+
+/// Read-only named asset access used by final cross-document validators.
+pub trait ArchiveReader: Sync {
+    fn names(&self) -> Vec<String>;
+    fn contains(&self, name: &str) -> bool;
+    fn read(&self, name: &str) -> CoreResult<Vec<u8>>;
+}
+
+/// Indexed view of one complete ZIP archive without a staged asset tree.
+pub struct ArchiveView<'a> {
+    archive: &'a Archive,
+    names: BTreeMap<String, usize>,
+}
+
+impl<'a> ArchiveView<'a> {
+    pub fn new(archive: &'a Archive) -> Self {
+        Self {
+            archive,
+            names: (0..archive.len())
+                .map(|index| (archive.name(index).to_owned(), index))
+                .collect(),
+        }
+    }
+}
+
+impl ArchiveReader for ArchiveView<'_> {
+    fn names(&self) -> Vec<String> {
+        self.names.keys().cloned().collect()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names.contains_key(name)
+    }
+
+    fn read(&self, name: &str) -> CoreResult<Vec<u8>> {
+        let index = self
+            .names
+            .get(name)
+            .ok_or_else(|| fail(format!("archive asset missing: {name}")))?;
+        self.archive.read(*index)
+    }
 }
 fn files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) -> CoreResult<()> {
     for entry in fs::read_dir(dir)? {
@@ -48,11 +94,10 @@ fn files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) -> CoreResult<()> 
 pub fn finalize_assets(root: &Path) -> CoreResult<()> {
     for name in [
         "data/manifest.json",
-        "port_data/manifest.json",
-        "port_data/catalog.json",
-        "port_data/audio_catalog.json",
-        "port_data/model_catalog.json",
-        "port_data/cfg_catalog.json",
+        "data/catalog.json",
+        "data/audio_catalog.json",
+        "data/model_catalog.json",
+        "data/cfg_catalog.json",
     ] {
         let path = root.join(name);
         if path.is_file() {
@@ -62,8 +107,38 @@ pub fn finalize_assets(root: &Path) -> CoreResult<()> {
     Ok(())
 }
 
+/// Starts the normal archive stream without creating a staged asset directory.
+pub fn begin_stream(
+    root: &Path,
+    budget_bytes: usize,
+    phase: Phase,
+    total_work: u64,
+) -> CoreResult<AssetSink> {
+    if root.join("data").exists() || root.join("port_data").exists() {
+        return Err(fail("streaming publication cannot use a staged asset tree"));
+    }
+    AssetSink::start_with_progress(root, budget_bytes, phase, total_work)
+}
+
+/// Completes a streamed ZIP and records its content identity beside the archive.
+pub fn seal_stream(
+    sink: AssetSink,
+    root: &Path,
+    mut marker: Value,
+) -> CoreResult<zip_archive::Written> {
+    let written = sink.finish()?;
+    marker["layout"] = LAYOUT.into();
+    marker["archive_size"] = written.size.into();
+    marker["archive_entries"] = written.entries.into();
+    marker["output_sha256"] = written.content_sha256.clone().into();
+    let mut bytes = serde_json::to_vec_pretty(&marker)?;
+    bytes.push(b'\n');
+    fs::write(root.join(MARKER), bytes)?;
+    Ok(written)
+}
+
 fn check_asset(
-    port: &Path,
+    exists: &dyn Fn(&str) -> bool,
     document: &str,
     reference: &str,
     expected: &BTreeSet<String>,
@@ -84,7 +159,7 @@ fn check_asset(
             Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
             Component::ParentDir => {
                 if parts.pop().is_none() {
-                    return Err(fail("texture asset escapes port_data"));
+                    return Err(fail("texture asset escapes data"));
                 }
             }
             Component::CurDir => {}
@@ -92,14 +167,31 @@ fn check_asset(
         }
     }
     let normalized = parts.join("/");
-    if !expected.contains(&normalized) || !port.join(&normalized).is_file() {
+    if !expected.contains(&normalized) || !exists(&normalized) {
         return Err(fail(format!(
             "missing texture asset: {document} -> {reference}"
         )));
     }
     Ok(())
 }
+#[cfg(test)]
 fn verify_catalog(port: &Path, catalog: &Value, expected: &BTreeSet<String>) -> CoreResult<()> {
+    verify_catalog_with_document(
+        &|name| Ok(fs::read(port.join(name))?),
+        &|name| port.join(name).is_file(),
+        catalog,
+        expected,
+        None,
+    )
+}
+
+fn verify_catalog_with_document(
+    read: &dyn Fn(&str) -> CoreResult<Vec<u8>>,
+    exists: &dyn Fn(&str) -> bool,
+    catalog: &Value,
+    expected: &BTreeSet<String>,
+    loaded: Option<&Value>,
+) -> CoreResult<()> {
     if catalog["schema_version"] != 3 || !keys(catalog, &["schema_version", "sources"]) {
         return Err(fail("unsupported texture catalog version"));
     }
@@ -114,7 +206,7 @@ fn verify_catalog(port: &Path, catalog: &Value, expected: &BTreeSet<String>) -> 
             .ok_or_else(|| fail("catalog document path missing"))?;
         if !aliases.insert(alias.to_ascii_lowercase())
             || !paths.insert(path.to_ascii_lowercase())
-            || textures::document_path(alias)? != path
+            || !path.starts_with("textures/")
             || !path.ends_with(".json")
             || !expected.contains(path)
         {
@@ -122,9 +214,15 @@ fn verify_catalog(port: &Path, catalog: &Value, expected: &BTreeSet<String>) -> 
                 "invalid or colliding texture document: {alias} -> {path}"
             )));
         }
-        let document: Value = serde_json::from_slice(&fs::read(port.join(path))?)?;
+        let owned;
+        let document = if let Some(document) = loaded {
+            document
+        } else {
+            owned = serde_json::from_slice::<Value>(&read(path)?)?;
+            &owned
+        };
         if document["schema_version"] != 3
-            || !keys(&document, &["schema_version", "groups", "entries"])
+            || !keys(document, &["schema_version", "groups", "entries"])
         {
             return Err(fail(format!("invalid texture document: {path}")));
         }
@@ -204,7 +302,7 @@ fn verify_catalog(port: &Path, catalog: &Value, expected: &BTreeSet<String>) -> 
                     return Err(fail("invalid texture picture"));
                 }
                 if let Some(levels) = picture.get("levels") {
-                    check_levels(port, path, levels, expected)?;
+                    check_levels(exists, path, levels, expected)?;
                 }
                 if let Some(canvas) = picture.get("canvas")
                     && (!keys(canvas, &["width", "height"])
@@ -258,7 +356,7 @@ fn verify_catalog(port: &Path, catalog: &Value, expected: &BTreeSet<String>) -> 
                         {
                             return Err(fail("duplicate texture selector"));
                         }
-                        check_levels(port, path, &variant["levels"], expected)?;
+                        check_levels(exists, path, &variant["levels"], expected)?;
                     }
                 }
             }
@@ -267,16 +365,33 @@ fn verify_catalog(port: &Path, catalog: &Value, expected: &BTreeSet<String>) -> 
     Ok(())
 }
 
-/// Validates one directly addressed texture document and its PNG dependencies.
-pub(crate) fn verify_texture_document(
+fn verify_texture_value(
     port: &Path,
     path: &str,
+    document: &Value,
     expected: &BTreeSet<String>,
 ) -> CoreResult<()> {
-    verify_catalog(
-        port,
+    verify_catalog_with_document(
+        &|name| Ok(fs::read(port.join(name))?),
+        &|name| port.join(name).is_file(),
         &serde_json::json!({"schema_version":3,"sources":{(path):path}}),
         expected,
+        Some(document),
+    )
+}
+
+fn verify_texture_archive_value(
+    reader: &dyn ArchiveReader,
+    path: &str,
+    document: &Value,
+    expected: &BTreeSet<String>,
+) -> CoreResult<()> {
+    verify_catalog_with_document(
+        &|name| reader.read(name),
+        &|name| reader.contains(name),
+        &serde_json::json!({"schema_version":3,"sources":{(path):path}}),
+        expected,
+        Some(document),
     )
 }
 
@@ -292,7 +407,7 @@ fn keys_optional(value: &Value, required: &[&str], optional: &[&str]) -> bool {
     })
 }
 fn check_levels(
-    port: &Path,
+    exists: &dyn Fn(&str) -> bool,
     document: &str,
     value: &Value,
     expected: &BTreeSet<String>,
@@ -308,100 +423,79 @@ fn check_levels(
         if !reference.to_ascii_lowercase().ends_with(".png") {
             return Err(fail("texture level is not PNG"));
         }
-        check_asset(port, document, reference, expected)?;
+        check_asset(exists, document, reference, expected)?;
     }
     Ok(())
 }
-/// Validates staged `data` and `port_data` trees before they are packed.
+/// Validates the unified staged `data` tree before it is archived.
 pub fn verify_trees(root: &Path, phase: &Phase) -> CoreResult<u64> {
-    let port = root.join("port_data");
     let data = root.join("data");
-    let mut port_files = BTreeSet::new();
-    files(&port, &port, &mut port_files)?;
     let mut data_files = BTreeSet::new();
     files(&data, &data, &mut data_files)?;
-    phase.set_total((data_files.len() + port_files.len() + 4) as u64);
+    phase.set_total(
+        data_files.len() as u64
+            + super::models::verify_work(&data_files)
+            + super::audio::verify_work(&data_files)
+            + 1,
+    );
     let data_checks = data_files
         .par_iter()
         .map(|relative| -> CoreResult<()> {
             let path = data.join(relative);
-            if relative.to_ascii_lowercase().ends_with(".chr") {
-                return Err(fail(format!(
-                    "legacy character container remains: {relative}"
-                )));
-            }
             if fs::metadata(&path)?.len() <= 128 << 20 {
-                textures::audit_payload(&fs::read(path)?, relative)?;
-            } else if !textures::large_known_non_texture(relative) {
-                return Err(fail(format!("unrecognized large data file: {relative}")));
+                let bytes = fs::read(path)?;
+                audit_entry(relative, &bytes)?;
+                if relative.ends_with(".json") {
+                    let document: Value = serde_json::from_slice(&bytes)?;
+                    if document["schema_version"] == 3
+                        && document.get("groups").is_some()
+                        && document.get("entries").is_some()
+                    {
+                        verify_texture_value(&data, relative, &document, &data_files)?;
+                    }
+                    if relative.ends_with("/pack.json") {
+                        verify_pack_textures(&document, &|path| Ok(fs::read(data.join(path))?))?;
+                    }
+                }
+            } else {
+                let lower = relative.to_ascii_lowercase();
+                if external_config_document(relative)
+                    || lower.ends_with(".chr")
+                    || OBSOLETE_INDEXES.contains(&relative.as_str())
+                    || matches!(lower.as_str(), "snd2/rev.bin" | "snd2/map_index.txt")
+                {
+                    return Err(fail(format!("obsolete asset remains: {relative}")));
+                }
+                if !CONVERTED_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+                    && !textures::large_known_non_texture(relative)
+                {
+                    return Err(fail(format!("unrecognized large data file: {relative}")));
+                }
+                // Large converted assets can still carry proprietary containers.
+                audit_entry(relative, &fs::read(&path)?)?;
             }
             phase.inc(1);
             Ok(())
         })
         .collect::<Vec<CoreResult<()>>>();
     data_checks.into_iter().collect::<CoreResult<()>>()?;
-    let port_checks = port_files
-        .par_iter()
-        .map(|relative| -> CoreResult<()> {
-            if matches!(
-                relative.as_str(),
-                "catalog.json"
-                    | "audio_catalog.json"
-                    | "model_catalog.json"
-                    | "cfg_catalog.json"
-                    | "manifest.json"
-            ) {
-                return Err(fail(format!("obsolete runtime index remains: {relative}")));
-            }
-            if relative.ends_with(".json") {
-                let document: Value = serde_json::from_slice(&fs::read(port.join(relative))?)?;
-                if document["schema_version"] == 3
-                    && document.get("groups").is_some()
-                    && document.get("entries").is_some()
-                {
-                    verify_texture_document(&port, relative, &port_files)?;
-                }
-            }
-            phase.inc(1);
-            Ok(())
-        })
-        .collect::<Vec<CoreResult<()>>>();
-    port_checks.into_iter().collect::<CoreResult<()>>()?;
-    let ((models, audio), (configs, packs)) = rayon::join(
+    let ((models, audio), configs) = rayon::join(
         || {
             rayon::join(
-                || {
-                    let result = super::models::verify(root);
-                    phase.inc(1);
-                    result
-                },
-                || {
-                    let result = super::audio::verify(root);
-                    phase.inc(1);
-                    result
-                },
+                || super::models::verify_files(root, &data_files, phase),
+                || super::audio::verify_files(root, &data_files, phase),
             )
         },
         || {
-            rayon::join(
-                || {
-                    let result = super::configs::verify(root);
-                    phase.inc(1);
-                    result
-                },
-                || {
-                    let result = super::packs::verify(root);
-                    phase.inc(1);
-                    result
-                },
-            )
+            let result = super::configs::verify_loose(root);
+            phase.inc(1);
+            result
         },
     );
     models?;
     audio?;
     configs?;
-    packs?;
-    Ok(port_files
+    Ok(data_files
         .iter()
         .filter(|name| name.ends_with(".png"))
         .count() as u64)
@@ -441,6 +535,30 @@ fn lock_stage(path: &Path) -> CoreResult<StageGuard> {
     })
 }
 
+fn stage_metadata_matches(prior: &Value, current: &Value) -> bool {
+    if prior == current {
+        return true;
+    }
+    let Some(current_policy) = current
+        .get("script_publication_policy")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    if current_policy != "Retain" || prior.get("script_publication_policy").is_some() {
+        return false;
+    }
+    let Some(prior_object) = prior.as_object() else {
+        return false;
+    };
+    let mut normalized = prior_object.clone();
+    normalized.insert(
+        "script_publication_policy".into(),
+        Value::String("Retain".into()),
+    );
+    Value::Object(normalized) == *current
+}
+
 pub fn acquire_stage(root: &Path, metadata: &Value) -> CoreResult<StageGuard> {
     fs::create_dir_all(root)?;
     // Directory order is unspecified (APFS differs from ext4 and NTFS); try
@@ -464,7 +582,7 @@ pub fn acquire_stage(root: &Path, metadata: &Value) -> CoreResult<StageGuard> {
             Some(prior) => prior,
             None => continue,
         };
-        if &prior != metadata {
+        if !stage_metadata_matches(&prior, metadata) {
             continue;
         }
         if let Ok(stage) = lock_stage(&path) {
@@ -558,55 +676,242 @@ const OBSOLETE_INDEXES: [&str; 5] = [
 /// Converted formats that cannot carry proprietary texture payloads.
 const CONVERTED_EXTENSIONS: [&str; 5] = [".png", ".mp4", ".wav", ".gltf", ".json"];
 
-/// Lists the staged `data` and `port_data` files as one merged archive namespace.
+/// Lists files in the unified staged `data` tree.
 pub fn tree_inputs(root: &Path) -> CoreResult<Vec<Input>> {
-    let mut inputs = Vec::new();
-    for tree in ["data", "port_data"] {
-        let base = root.join(tree);
-        if base.is_dir() {
-            inputs.extend(zip_archive::directory_inputs(&base)?);
+    let inputs = zip_archive::directory_inputs(&root.join("data"))?;
+    for input in &inputs {
+        if external_config_document(&input.name) {
+            return Err(fail(format!(
+                "external config document staged inside data: {}",
+                input.name
+            )));
         }
     }
     Ok(inputs)
 }
 
-/// Packs verified staged trees into `data.zip`, deleting each file once it is written.
-pub fn pack_trees(root: &Path, phase: &Phase) -> CoreResult<zip_archive::Written> {
-    let written = zip_archive::write(
-        tree_inputs(root)?,
-        &root.join(ARCHIVE),
-        true,
-        &|done, total| {
-            phase.set_total(total);
-            phase.set_done(done);
-        },
-    )?;
-    for tree in ["data", "port_data"] {
-        let base = root.join(tree);
-        if base.is_dir() {
-            fs::remove_dir_all(base)?;
-        }
+fn external_config_document(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if super::configs::gameplay_digest(&lower).is_some() {
+        return false;
     }
-    Ok(written)
+    lower.starts_with("gameplay/")
+        || super::configs::is_tracked_gameplay(&lower)
+        || lower.ends_with(".cfg.json")
+        || lower.ends_with(".map.json")
+        || lower.ends_with(".character.json")
+        || lower.ends_with(".sound/config.json")
+        || lower.ends_with(".sound/volume.json")
+        || matches!(lower.as_str(), "snd2/rev.json" | "snd2/map_index.json")
 }
 
-/// Packs staged trees and writes the marker describing the archive.
-pub fn seal(root: &Path, mut marker: Value, phase: &Phase) -> CoreResult<zip_archive::Written> {
-    let written = pack_trees(root, phase)?;
-    phase.add_bytes(written.size);
-    marker["layout"] = LAYOUT.into();
-    marker["archive_size"] = written.size.into();
-    marker["archive_entries"] = written.entries.into();
-    marker["output_sha256"] = written.content_sha256.clone().into();
-    let mut bytes = serde_json::to_vec_pretty(&marker)?;
-    bytes.push(b'\n');
-    fs::write(root.join(MARKER), bytes)?;
-    Ok(written)
+/// Builds an archive from finished files while conversion continues elsewhere.
+pub struct ProgressiveArchive {
+    writer: ProgressiveWriter,
+    appended_sources: Vec<(PathBuf, u64, SystemTime)>,
+    progress_units: u64,
+}
+
+const ARCHIVE_PROGRESS_UNITS: u64 = 10_000;
+
+fn archive_progress(start: u64, end: u64, done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return end;
+    }
+    start + ((end - start) as u128 * done.min(total) as u128 / total as u128) as u64
+}
+
+impl ProgressiveArchive {
+    /// Creates an unpublished partial archive in the stage directory.
+    pub fn begin(root: &Path) -> CoreResult<Self> {
+        fs::create_dir_all(root)?;
+        Ok(Self {
+            writer: ProgressiveWriter::new(&root.join(ARCHIVE))?,
+            appended_sources: Vec::new(),
+            progress_units: 0,
+        })
+    }
+
+    /// Adds only caller-confirmed immutable files from the staged data tree.
+    pub fn append_inputs(
+        &mut self,
+        inputs: Vec<Input>,
+        phase: &Phase,
+        progress_end: u64,
+    ) -> CoreResult<()> {
+        let progress_start = self.progress_units;
+        if progress_end < progress_start || progress_end > ARCHIVE_PROGRESS_UNITS {
+            return Err(fail("archive progress batch is out of order"));
+        }
+        phase.set_total(ARCHIVE_PROGRESS_UNITS);
+        for input in &inputs {
+            if external_config_document(&input.name) {
+                return Err(fail(format!(
+                    "external config document staged inside data: {}",
+                    input.name
+                )));
+            }
+        }
+        let sources = inputs
+            .iter()
+            .map(|input| input.source.clone())
+            .collect::<Vec<_>>();
+        self.writer.append(inputs, &|done, total| {
+            phase.set_done(archive_progress(progress_start, progress_end, done, total));
+        })?;
+        self.progress_units = progress_end;
+        for source in sources {
+            let metadata = fs::metadata(&source)?;
+            self.appended_sources
+                .push((source, metadata.len(), metadata.modified()?));
+        }
+        Ok(())
+    }
+
+    /// Appends all remaining files, completes the archive and writes its marker.
+    /// Call this only after conversion and staged-tree verification have finished.
+    pub fn seal(
+        mut self,
+        root: &Path,
+        mut marker: Value,
+        phase: &Phase,
+    ) -> CoreResult<zip_archive::Written> {
+        for (source, size, modified) in &self.appended_sources {
+            let metadata = fs::metadata(source)?;
+            if metadata.len() != *size || metadata.modified()? != *modified {
+                return Err(fail(format!(
+                    "source changed after progressive archive append: {}",
+                    source.display()
+                )));
+            }
+        }
+        let remaining: Vec<Input> = tree_inputs(root)?
+            .into_iter()
+            .filter(|input| !self.writer.contains_exact_name(&input.name))
+            .collect();
+        self.append_inputs(remaining, phase, ARCHIVE_PROGRESS_UNITS)?;
+        let written = self.writer.finish()?;
+        phase.add_bytes(written.size);
+        marker["layout"] = LAYOUT.into();
+        marker["archive_size"] = written.size.into();
+        marker["archive_entries"] = written.entries.into();
+        marker["output_sha256"] = written.content_sha256.clone().into();
+        let mut bytes = serde_json::to_vec_pretty(&marker)?;
+        bytes.push(b'\n');
+        fs::write(root.join(MARKER), bytes)?;
+        Ok(written)
+    }
+}
+
+/// Removes the verified asset tree after the completed archive no longer needs its sources.
+pub fn remove_staged_data(stage: &Path, published: &Path, phase: &Phase) -> CoreResult<()> {
+    phase.item("data");
+    let stage_name = stage
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !stage_name.starts_with(".dc2data-stage-") {
+        return Err(fail(
+            "staged data cleanup requires a dc2data stage directory",
+        ));
+    }
+    let stage = fs::canonicalize(stage)?;
+    let published = fs::canonicalize(published)?;
+    if published != stage.join("published") {
+        return Err(fail("staged data cleanup target is outside its stage"));
+    }
+    let data = published.join("data");
+    let metadata = match fs::symlink_metadata(&data) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            phase.set_total(1);
+            phase.inc(1);
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || fs::canonicalize(&data)? != data {
+        return Err(fail("staged data cleanup target is not a direct directory"));
+    }
+    let mut children = Vec::new();
+    let mut parents = Vec::new();
+    for entry in fs::read_dir(&data)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || fs::canonicalize(&path)?.parent() != Some(data.as_path())
+        {
+            return Err(fail(format!(
+                "staged data cleanup child escapes data: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                let child_path = child.path();
+                let child_metadata = fs::symlink_metadata(&child_path)?;
+                if child_metadata.file_type().is_symlink()
+                    || fs::canonicalize(&child_path)?.parent() != Some(path.as_path())
+                {
+                    return Err(fail(format!(
+                        "staged data cleanup child escapes data: {}",
+                        child_path.display()
+                    )));
+                }
+                children.push((child_path, child_metadata.is_dir()));
+            }
+            parents.push(path);
+        } else {
+            children.push((path, false));
+        }
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .map_err(|error| fail(format!("cannot start staged data cleanup: {error}")))?;
+    phase.set_total((children.len() + parents.len() + 1) as u64);
+    let removed: Vec<CoreResult<()>> = pool.install(|| {
+        children
+            .par_iter()
+            .map(|(path, directory)| {
+                if *directory {
+                    fs::remove_dir_all(path)?;
+                } else {
+                    fs::remove_file(path)?;
+                }
+                phase.inc(1);
+                Ok(())
+            })
+            .collect()
+    });
+    removed.into_iter().collect::<CoreResult<()>>()?;
+    for parent in parents {
+        fs::remove_dir(parent)?;
+        phase.inc(1);
+    }
+    fs::remove_dir(data)?;
+    phase.inc(1);
+    Ok(())
+}
+
+/// Packs a verified staged tree in one pass when no progressive writer exists.
+pub fn seal(root: &Path, marker: Value, phase: &Phase) -> CoreResult<zip_archive::Written> {
+    ProgressiveArchive::begin(root)?.seal(root, marker, phase)
 }
 
 /// Applies the published-asset rules that need only one entry's name and bytes.
 fn audit_entry(name: &str, bytes: &[u8]) -> CoreResult<()> {
     let lower = name.to_ascii_lowercase();
+    if super::configs::gameplay_digest(&lower).is_some() {
+        return super::configs::verify_gameplay_document(&lower, bytes);
+    }
+    if external_config_document(name) {
+        return Err(fail(format!(
+            "external config document in data archive: {name}"
+        )));
+    }
     if lower.split('/').any(|part| part.ends_with(".img")) {
         return Err(fail(format!("legacy .img path remains: {name}")));
     }
@@ -621,7 +926,30 @@ fn audit_entry(name: &str, bytes: &[u8]) -> CoreResult<()> {
             "proprietary scene audio table published: {name}"
         )));
     }
+    let texture_document = lower.ends_with(".json")
+        && serde_json::from_slice::<Value>(bytes).is_ok_and(|value| {
+            value["schema_version"] == 3
+                && value.get("groups").is_some()
+                && value.get("entries").is_some()
+        });
+    if (lower.ends_with(".png") || texture_document)
+        && (!name.starts_with("textures/")
+            || name
+                .rsplit_once('/')
+                .unwrap()
+                .0
+                .split('/')
+                .any(|part| part.contains('.')))
+    {
+        return Err(fail(format!(
+            "texture outside flattened texture hierarchy: {name}"
+        )));
+    }
     super::packs::audit_entry(name, bytes)?;
+    super::models::audit_payload(name, bytes)?;
+    if bytes.len() as u64 <= 128 << 20 {
+        super::configs::audit_payload(bytes, name, 0)?;
+    }
     if !CONVERTED_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
         if bytes.len() as u64 <= 128 << 20 {
             textures::audit_payload(bytes, name)?;
@@ -640,6 +968,13 @@ pub fn read_marker(root: &Path) -> CoreResult<Value> {
     }
     if marker["layout"] != LAYOUT {
         return Err(fail("data.json does not describe a data.zip layout"));
+    }
+    if marker["gameplay_source_fingerprint"].as_str()
+        != Some(super::configs::source_fingerprint().as_str())
+    {
+        return Err(fail(
+            "data.json gameplay source fingerprint does not match the extractor",
+        ));
     }
     Ok(marker)
 }
@@ -666,7 +1001,59 @@ pub fn verify_with_progress(root: &Path, phase: &Phase) -> CoreResult<u64> {
     }
     let archive = Archive::open(&root.join(ARCHIVE))?;
     phase.set_total(archive.len() as u64);
-    let mut records = archive.verify_entries_with_progress(&audit_entry, &|n| phase.inc(n))?;
+    verify_open_archive(&archive, &marker, phase)
+}
+
+fn verify_pack_textures(
+    document: &Value,
+    read: &dyn Fn(&str) -> CoreResult<Vec<u8>>,
+) -> CoreResult<()> {
+    if let Some(members) = document["texture_members"].as_array() {
+        for member in members {
+            let path = member["path"]
+                .as_str()
+                .ok_or_else(|| fail("invalid PACK texture path"))?;
+            let texture: Value = serde_json::from_slice(&read(path)?)?;
+            if texture["schema_version"] != 3
+                || !texture["groups"].is_array()
+                || !texture["entries"].is_array()
+            {
+                return Err(fail(format!(
+                    "PACK member is not a texture document: {path}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_open_archive(archive: &Archive, marker: &Value, phase: &Phase) -> CoreResult<u64> {
+    let view = ArchiveView::new(archive);
+    let names: BTreeSet<String> = view.names().into_iter().collect();
+    for &(name, _) in super::configs::gameplay_manifest() {
+        if !names.contains(name) {
+            return Err(fail(format!("gameplay document missing: {name}")));
+        }
+    }
+    let mut records = archive.verify_entries_with_progress(
+        &|name, bytes| {
+            audit_entry(name, bytes)?;
+            if name.ends_with(".json") && bytes.len() <= 128 << 20 {
+                let document: Value = serde_json::from_slice(bytes)?;
+                if document["schema_version"] == 3
+                    && document.get("groups").is_some()
+                    && document.get("entries").is_some()
+                {
+                    verify_texture_archive_value(&view, name, &document, &names)?;
+                }
+                if name.ends_with("/pack.json") {
+                    verify_pack_textures(&document, &|path| view.read(path))?;
+                }
+            }
+            Ok(())
+        },
+        &|n| phase.inc(n),
+    )?;
     if marker["archive_entries"].as_u64() != Some(records.len() as u64) {
         return Err(fail("data.zip entry count does not match data.json"));
     }
@@ -677,6 +1064,61 @@ pub fn verify_with_progress(root: &Path, phase: &Phase) -> CoreResult<u64> {
         .iter()
         .filter(|record| record.name.ends_with(".png"))
         .count() as u64)
+}
+
+/// Verifies a completed stream and its source-derived scripts without a staged asset tree.
+pub fn verify_stream_with_progress(
+    root: &Path,
+    resources: &Inventory,
+    converted_aliases: &HashSet<String>,
+    profiles: &BTreeMap<String, BTreeSet<String>>,
+    texture_paths: &BTreeMap<String, String>,
+    phase: &Phase,
+    publish_scripts: bool,
+) -> CoreResult<u64> {
+    let marker = read_marker(root)?;
+    if !archive_present(root, &marker) {
+        return Err(fail(
+            "data.zip is missing or its size does not match data.json",
+        ));
+    }
+    let archive = Archive::open(&root.join(ARCHIVE))?;
+    let view = ArchiveView::new(&archive);
+    let archive_names = view.names();
+    let names: BTreeSet<String> = archive_names.iter().cloned().collect();
+    phase.set_total(
+        archive.len() as u64
+            + super::models::verify_archive_work(&archive_names)
+            + super::audio::verify_work(&names)
+            + super::native_scripts::verify_archive_work(resources, publish_scripts)
+            + 1,
+    );
+    let pngs = verify_open_archive(&archive, &marker, phase)?;
+    let ((models, audio), scripts) = rayon::join(
+        || {
+            rayon::join(
+                || super::models::verify_archive_with_script_policy(&view, phase, publish_scripts),
+                || super::audio::verify_archive(&view, phase),
+            )
+        },
+        || {
+            super::native_scripts::verify_archive(
+                resources,
+                converted_aliases,
+                profiles,
+                texture_paths,
+                &view,
+                phase,
+                publish_scripts,
+            )
+        },
+    );
+    models?;
+    audio?;
+    scripts?;
+    super::configs::verify_inventory_paths(resources)?;
+    phase.inc(1);
+    Ok(pngs)
 }
 
 /// Verifies a staged archive and publishes it.
@@ -750,26 +1192,72 @@ pub fn publish_verified(staged: &Path, root: &Path) -> CoreResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_stage_metadata_defaults_to_retain_but_not_luau_only() {
+        let old = serde_json::json!({"schema_version": 1, "jobs": 2});
+        let retain = serde_json::json!({
+            "schema_version": 1,
+            "jobs": 2,
+            "script_publication_policy": "Retain"
+        });
+        let luau_only = serde_json::json!({
+            "schema_version": 1,
+            "jobs": 2,
+            "script_publication_policy": "LuauOnly"
+        });
+        assert!(super::stage_metadata_matches(&old, &retain));
+        assert!(!super::stage_metadata_matches(&old, &luau_only));
+    }
     use super::*;
+
+    #[test]
+    fn archive_batch_progress_has_a_fixed_monotone_total() {
+        let mut reported = Vec::new();
+        for (start, end, total) in [(0, 3_800, 101), (3_800, 9_600, 53), (9_600, 10_000, 7)] {
+            for done in 0..=total {
+                reported.push(archive_progress(start, end, done, total));
+            }
+        }
+        assert_eq!(reported.first(), Some(&0));
+        assert_eq!(reported.last(), Some(&ARCHIVE_PROGRESS_UNITS));
+        assert!(reported.windows(2).all(|window| window[0] <= window[1]));
+    }
 
     #[test]
     fn texture_verifier_rejects_old_fields_and_missing_png() {
         let temp = tempfile::tempdir().unwrap();
         let port = temp.path();
-        let catalog = serde_json::json!({"schema_version":3,"sources":{"foo.img":"foo.json"}});
-        let assets = BTreeSet::from(["foo.json".to_owned(), "foo_0.png".to_owned()]);
-        fs::write(port.join("foo_0.png"), b"png").unwrap();
+        fs::create_dir_all(port.join("textures")).unwrap();
+        let catalog =
+            serde_json::json!({"schema_version":3,"sources":{"foo.img":"textures/foo.json"}});
+        let assets = BTreeSet::from([
+            "textures/foo.json".to_owned(),
+            "textures/foo_0.png".to_owned(),
+        ]);
+        fs::write(port.join("textures/foo_0.png"), b"png").unwrap();
         let mut doc = serde_json::json!({"schema_version":3,"groups":[0],"entries":[
             {"name":"foo","pictures":[{"levels":["foo_0.png"]}]}
         ]});
-        fs::write(port.join("foo.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+        fs::write(
+            port.join("textures/foo.json"),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
         verify_catalog(port, &catalog, &assets).unwrap();
         doc["original"] = serde_json::json!({"bytes":"00"});
-        fs::write(port.join("foo.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+        fs::write(
+            port.join("textures/foo.json"),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
         assert!(verify_catalog(port, &catalog, &assets).is_err());
         doc.as_object_mut().unwrap().remove("original");
         doc["entries"][0]["pictures"][0]["levels"][0] = "missing.png".into();
-        fs::write(port.join("foo.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+        fs::write(
+            port.join("textures/foo.json"),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
         assert!(verify_catalog(port, &catalog, &assets).is_err());
     }
 
@@ -777,55 +1265,127 @@ mod tests {
     fn texture_verifier_accepts_script_only_empty_groups() {
         let temp = tempfile::tempdir().unwrap();
         let port = temp.path();
-        let catalog = serde_json::json!({"schema_version":3,"sources":{"cfg.img":"cfg.json"}});
-        let assets = BTreeSet::from(["cfg.json".to_owned()]);
+        fs::create_dir_all(port.join("textures")).unwrap();
+        let catalog =
+            serde_json::json!({"schema_version":3,"sources":{"cfg.img":"textures/cfg.json"}});
+        let assets = BTreeSet::from(["textures/cfg.json".to_owned()]);
         let doc = serde_json::json!({"schema_version":3,"groups":[],"entries":[
             {"name":"#texanime","script":[{"command":"TEX_ANIME_DATA_END","args":[]}]}
         ]});
-        fs::write(port.join("cfg.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+        fs::write(
+            port.join("textures/cfg.json"),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
         verify_catalog(port, &catalog, &assets).unwrap();
     }
 
-    fn staged_trees(root: &Path) {
+    fn staged_tree(root: &Path) {
         let data = root.join("data");
-        let port = root.join("port_data");
-        fs::create_dir_all(&data).unwrap();
-        fs::create_dir_all(port.join("audio")).unwrap();
+        fs::create_dir_all(data.join("audio")).unwrap();
         fs::write(data.join("script.stb"), b"unrelated script").unwrap();
-        fs::write(port.join("audio/sample.wav"), b"RIFF converted PCM").unwrap();
-        fs::write(port.join("audio/sample.png"), b"png").unwrap();
-        fs::write(port.join("manifest.json"), b"stale manifest").unwrap();
+        fs::write(data.join("audio/sample.wav"), b"RIFF converted PCM").unwrap();
+        fs::create_dir_all(data.join("textures/audio")).unwrap();
+        fs::write(data.join("textures/audio/sample.png"), b"png").unwrap();
+        fs::write(data.join("manifest.json"), b"stale manifest").unwrap();
+        for (name, bytes) in super::super::configs::gameplay_documents(None).unwrap() {
+            let path = data.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
     }
 
     fn marker() -> Value {
-        serde_json::json!({"schema_version":1,"data_version":super::super::data_version()})
+        serde_json::json!({"schema_version":1,"data_version":super::super::data_version(),
+            "gameplay_source_fingerprint":super::super::configs::source_fingerprint()})
     }
 
     #[test]
-    fn sealed_archive_merges_trees_and_detects_changes() {
+    fn sealed_archive_contains_unified_tree_and_detects_changes() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        staged_trees(root);
-        finalize_assets(root).unwrap();
-        assert!(!root.join("port_data/manifest.json").exists());
-        let written = seal(root, marker(), &Phase::noop()).unwrap();
-        assert!(!root.join("data").exists() && !root.join("port_data").exists());
-        assert_eq!(written.entries, 3);
-        assert_eq!(verify(root).unwrap(), 1);
+        let stage = temp.path().join(".dc2data-stage-test");
+        let root = stage.join("published");
+        staged_tree(&root);
+        finalize_assets(&root).unwrap();
+        assert!(!root.join("data/manifest.json").exists());
+        let written = seal(&root, marker(), &Phase::noop()).unwrap();
+        assert!(root.join("data").exists());
+        assert_eq!(
+            written.entries,
+            3 + super::super::configs::gameplay_manifest().len() as u64
+        );
+        assert_eq!(verify(&root).unwrap(), 1);
+        assert!(remove_staged_data(temp.path(), &root, &Phase::noop()).is_err());
+        assert!(root.join("data").exists());
+        remove_staged_data(&stage, &root, &Phase::noop()).unwrap();
+        assert!(!root.join("data").exists());
         let archive = Archive::open(&root.join(ARCHIVE)).unwrap();
-        let names: Vec<&str> = (0..archive.len()).map(|i| archive.name(i)).collect();
+        let names: Vec<&str> = (0..archive.len())
+            .map(|i| archive.name(i))
+            .filter(|name| super::super::configs::gameplay_digest(name).is_none())
+            .collect();
         assert_eq!(
             names,
-            ["audio/sample.png", "audio/sample.wav", "script.stb"]
+            [
+                "audio/sample.wav",
+                "script.stb",
+                "textures/audio/sample.png"
+            ]
         );
         drop(archive);
-        let mut changed = read_marker(root).unwrap();
+        let mut changed = read_marker(&root).unwrap();
+        changed
+            .as_object_mut()
+            .unwrap()
+            .remove("gameplay_source_fingerprint");
+        fs::write(root.join(MARKER), serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(
+            verify(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("gameplay source fingerprint")
+        );
+        changed["gameplay_source_fingerprint"] = super::super::configs::source_fingerprint().into();
         changed["output_sha256"] = "0".repeat(64).into();
         fs::write(root.join(MARKER), serde_json::to_vec(&changed).unwrap()).unwrap();
-        assert!(verify(root).unwrap_err().to_string().contains("changed"));
+        assert!(verify(&root).unwrap_err().to_string().contains("changed"));
         changed["data_version"] = 8.into();
         fs::write(root.join(MARKER), serde_json::to_vec(&changed).unwrap()).unwrap();
-        assert!(verify(root).is_err());
+        assert!(verify(&root).is_err());
+    }
+
+    #[test]
+    fn gameplay_documents_are_required_and_match_content_digests() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("published");
+        staged_tree(&root);
+        finalize_assets(&root).unwrap();
+        let Some((name, bytes)) = super::super::configs::gameplay_documents(None)
+            .unwrap()
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let document = root.join("data").join(name);
+        let mut changed = bytes.to_vec();
+        changed.push(b' ');
+        fs::write(&document, changed).unwrap();
+        seal(&root, marker(), &Phase::noop()).unwrap();
+        assert!(
+            verify(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("gameplay document changed")
+        );
+        fs::remove_file(&document).unwrap();
+        seal(&root, marker(), &Phase::noop()).unwrap();
+        assert!(
+            verify(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("gameplay document missing")
+        );
     }
 
     #[test]
@@ -833,15 +1393,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("run");
         let staged = temp.path().join("stage");
-        staged_trees(&staged);
+        staged_tree(&staged);
         finalize_assets(&staged).unwrap();
         seal(&staged, marker(), &Phase::noop()).unwrap();
         fs::create_dir_all(root.join("data")).unwrap();
-        fs::create_dir_all(root.join("port_data/old")).unwrap();
-        fs::write(root.join("port_data/old/file.bin"), b"old").unwrap();
+        fs::create_dir_all(root.join("data/old")).unwrap();
+        fs::write(root.join("data/old/file.bin"), b"old").unwrap();
         fs::write(root.join(MARKER), b"{\"data_version\":8}").unwrap();
         publish(&staged, &root).unwrap();
-        assert!(!root.join("data").exists() && !root.join("port_data").exists());
+        assert!(!root.join("data").exists());
         assert!(root.join(ARCHIVE).is_file());
         assert!(!staged.join(ARCHIVE).exists());
         assert_eq!(verify(&root).unwrap(), 1);
@@ -871,8 +1431,8 @@ mod tests {
     #[test]
     fn rename_existing_nonempty_directory_to_absent_backup() {
         let temp = tempfile::tempdir().unwrap();
-        let original = temp.path().join("port_data");
-        let backup = temp.path().join(".dc2data-port-data-backup-test");
+        let original = temp.path().join("data");
+        let backup = temp.path().join(".dc2data-data-backup-test");
         fs::create_dir(&original).unwrap();
         fs::write(original.join("catalog.json"), b"test").unwrap();
         rename_retry(&original, &backup).unwrap();
@@ -884,8 +1444,8 @@ mod tests {
     #[test]
     fn rename_staged_directory_to_ancestor_sibling() {
         let temp = tempfile::tempdir().unwrap();
-        let staged = temp.path().join(".dc2data-stage-test/published/port_data");
-        let destination = temp.path().join("port_data");
+        let staged = temp.path().join(".dc2data-stage-test/published/data");
+        let destination = temp.path().join("data");
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("catalog.json"), b"staged").unwrap();
         rename_no_replace(&staged, &destination).unwrap();

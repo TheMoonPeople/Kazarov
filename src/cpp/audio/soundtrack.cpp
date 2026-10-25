@@ -3,27 +3,27 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
-#include <cstdio>
 #include <fstream>
 #include <map>
 #include <string>
 #include <system_error>
 
-#include "platform/settings.hpp"
-#include "platform/paths.hpp"
 #include "audio/trace.hpp"
+#include "kazarov/log.hpp"
+#include "platform/paths.hpp"
+#include "platform/settings.hpp"
 
 namespace audio {
 
 namespace {
 
 struct Entry {
-    std::filesystem::path           file;
-    float                           gain = 1.0f;
-    bool                            loop = true;
-    bool                            has_loop_start = false;
-    double                          loop_start = 0.0;
-    double                          loop_end = 0.0;
+    std::filesystem::path file;
+    float                 gain = 1.0f;
+    bool                  loop = true;
+    bool                  has_loop_start = false;
+    double                loop_start = 0.0;
+    double                loop_end = 0.0;
 };
 
 struct Mapping {
@@ -44,13 +44,13 @@ void ReadMapping(Mapping &mapping) {
     if (root.is_discarded() || !root.is_object() || !root.contains("version") ||
         !root["version"].is_number_integer() || root["version"] != 1 || !root.contains("overrides") ||
         !root["overrides"].is_object()) {
-        std::fprintf(stderr, "soundtrack: %s needs version 1 and an overrides object\n",
-                     (mapping.folder / "soundtrack.json").string().c_str());
+        kz::Logf(kz::LogLevel::Warning, "soundtrack", "{} needs version 1 and an overrides object",
+                 (mapping.folder / "soundtrack.json").string());
         return;
     }
     for (const auto &[name, value] : root["overrides"].items()) {
         if (!value.is_object() || !value.contains("file") || !value["file"].is_string()) {
-            std::fprintf(stderr, "soundtrack: %s needs a \"file\"\n", name.c_str());
+            kz::Logf(kz::LogLevel::Warning, "soundtrack", "{} needs a \"file\"", name);
             continue;
         }
         if ((value.contains("gain") && (!value["gain"].is_number() ||
@@ -60,7 +60,7 @@ void ReadMapping(Mapping &mapping) {
                                               !std::isfinite(value["loop_start"].get<double>()))) ||
             (value.contains("loop_end") && (!value["loop_end"].is_number() ||
                                             !std::isfinite(value["loop_end"].get<double>())))) {
-            std::fprintf(stderr, "soundtrack: %s has invalid playback settings\n", name.c_str());
+            kz::Logf(kz::LogLevel::Warning, "soundtrack", "{} has invalid playback settings", name);
             continue;
         }
         Entry entry;
@@ -89,7 +89,7 @@ TrackCache::Loader MakeLoader() {
         std::string  error;
         auto         track = LoadPcmTrack(entry.file, error);
         if (!track) {
-            std::fprintf(stderr, "soundtrack: %s: %s\n", entry.file.string().c_str(), error.c_str());
+            kz::Logf(kz::LogLevel::Warning, "soundtrack", "{}: {}", entry.file.string(), error);
             return nullptr;
         }
         track->gain = entry.gain;
@@ -113,21 +113,21 @@ bool SoundtrackEnsure() {
     std::error_code error;
     std::filesystem::create_directories(folder, error);
     if (error) {
-        std::fprintf(stderr, "soundtrack: cannot create %s: %s\n", folder.string().c_str(), error.message().c_str());
+        kz::Logf(kz::LogLevel::Error, "soundtrack", "cannot create {}: {}", folder.string(), error.message());
         return false;
     }
     if (std::filesystem::exists(path, error)) {
         return true;
     }
     if (error) {
-        std::fprintf(stderr, "soundtrack: cannot check %s: %s\n", path.string().c_str(), error.message().c_str());
+        kz::Logf(kz::LogLevel::Error, "soundtrack", "cannot check {}: {}", path.string(), error.message());
         return false;
     }
     std::ofstream file(path);
     file << "{\n  \"version\": 1,\n  \"overrides\": {}\n}\n";
     file.close();
     if (!file) {
-        std::fprintf(stderr, "soundtrack: cannot write %s\n", path.string().c_str());
+        kz::Logf(kz::LogLevel::Error, "soundtrack", "cannot write {}", path.string());
         return false;
     }
     return true;

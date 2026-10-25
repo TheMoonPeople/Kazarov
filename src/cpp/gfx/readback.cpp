@@ -182,42 +182,59 @@ void ReadDepth(uint32_t id, float x, float y, float w, float h) {
         });
         return;
     }
-    DepthQuery &query = g.depth_queries[id];
-    query.rect = LogicalRect{x, y, w, h};
-    query.queued = true;
+    RunOnRenderThread([&] {
+        DepthQuery &query = g.depth_queries[id];
+        query.rect = LogicalRect{x, y, w, h};
+        query.queued = true;
+    });
 }
 
 std::optional<float> DepthResult(uint32_t id) {
-    if (id >= kDepthQueryCount || !g.depth_queries[id].valid) {
-        return std::nullopt;
-    }
-    return g.depth_queries[id].result;
+    std::optional<float> result;
+    RunOnRenderThread([&] {
+        if (id < kDepthQueryCount && g.depth_queries[id].valid) {
+            result = g.depth_queries[id].result;
+        }
+    });
+    return result;
 }
 
 bool ReadbackFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) {
-    if (g.in_frame || RecordingCalls()) {
-        Error("ReadbackFrame inside a frame");
-        return false;
-    }
-    Image &image = g.presented_display ? g.display_color : PreviousMainColor();
-    width = image.width;
-    height = image.height;
-    return ReadImage(image, 4, rgba);
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    bool       read = false;
+    RunOnRenderThread([&] {
+        if (g.in_frame || recording) {
+            Error("ReadbackFrame inside a frame");
+            return;
+        }
+        Image &image = g.presented_display ? g.display_color : PreviousMainColor();
+        width = image.width;
+        height = image.height;
+        read = ReadImage(image, 4, rgba);
+    });
+    return read;
 }
 
 bool ReadbackTexture(TextureHandle handle, std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height) {
-    if (g.in_frame || RecordingCalls()) {
-        Error("ReadbackTexture inside a frame");
-        return false;
-    }
-    Image *image = ColorImageOf(handle);
-    if (image == nullptr) {
-        Error("ReadbackTexture: no texture %#x", handle);
-        return false;
-    }
-    width = image->width;
-    height = image->height;
-    return ReadImage(*image, image->format == kColorFormat ? 4 : 1, pixels);
+    // Read on the game thread: the worker must not look at the list the game thread records.
+    const bool recording = RecordingCalls();
+    bool       read = false;
+    RunOnRenderThread([&] {
+        if (g.in_frame || recording) {
+            Error("ReadbackTexture inside a frame");
+            return;
+        }
+        Image *image = ColorImageOf(handle);
+        if (image == nullptr) {
+            Error("ReadbackTexture: no texture %#x", handle);
+            return;
+        }
+        width = image->width;
+        height = image->height;
+        read = ReadImage(*image, image->format == kColorFormat ? 4 : 1, pixels);
+    });
+    return read;
 }
 
 bool WritePng(const std::filesystem::path &path, const uint8_t *rgba, uint32_t width, uint32_t height) {

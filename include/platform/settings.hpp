@@ -51,16 +51,17 @@ struct HostSettings {
     ConfigPresentMode present_mode = ConfigPresentMode::Fifo;
     double            max_fps = 0.0;
     // 0: the monitor's (WindowConfig).
-    int                           window_width = 0;
-    int                           window_height = 0;
-    bool                          fullscreen = false;
-    bool                          show_fps = true;
-    ConfigFpsDetail               fps_detail = ConfigFpsDetail::All;
-    float                         master_volume = 1.0f;
-    bool                          surround = false;
+    int             window_width = 0;
+    int             window_height = 0;
+    bool            fullscreen = false;
+    bool            show_fps = true;
+    ConfigFpsDetail fps_detail = ConfigFpsDetail::All;
+    float           master_volume = 1.0f;
+    bool            surround = false;
     // audio.soundtrack "custom": play recordings from soundtrack/ beside save/ and data/.
     bool                          soundtrack = false;
     std::vector<ConfigKeyBinding> key_bindings;
+    std::vector<ConfigKeyBinding> pad_bindings; /**< Overrides controller buttons per action while omitted actions retain their defaults. */
     float                         mouse_sensitivity = 0.1f;
     float                         stick_sensitivity = 1.33f;
     bool                          stick_invert_x = false;
@@ -72,24 +73,25 @@ struct HostSettings {
     bool                          mouse_invert_y = false;
     bool                          mouse_capture = true;
     bool                          mouse_zoom = false;
+    bool                          keyboard_walk = false; /**< Makes keyboard movement walk by default and the walk binding run instead. */
     // A DualSense's touchpad as the menus' mouse, at this speed (1 is a swipe across the pad for 1500
     // window pixels), and its lightbar showing the active character's life.
-    bool                          touchpad = true;
-    float                         touchpad_sensitivity = 1.0f;
-    bool                          lightbar = true;
+    bool  touchpad = true;
+    float touchpad_sensitivity = 1.0f;
+    bool  lightbar = true;
     // Scales a gamepad's rumble motors, 0 to 1.
-    float                         rumble_strength = 1.0f;
+    float rumble_strength = 1.0f;
     // input.glyphs "new": the button symbols of glyphs/ (see glyphs.hpp); "original": the game's own.
-    bool                          glyphs_new = true;
-    ConfigGlyphDevice             glyph_device = ConfigGlyphDevice::Auto;
-    std::vector<std::string>      mouse_release_keys;
+    bool                     glyphs_new = true;
+    ConfigGlyphDevice        glyph_device = ConfigGlyphDevice::Auto;
+    std::vector<std::string> mouse_release_keys;
 
     bool operator==(const HostSettings &) const = default;
 };
 
 // The game's environment variables are <prefix>_<name>.
 void        SettingsSetEnvPrefix(std::string_view prefix);
-const char *SettingsEnv(std::string_view name);   // std::getenv("<prefix>_<name>"), nullptr if unset or no prefix was set
+const char *SettingsEnv(std::string_view name); // std::getenv("<prefix>_<name>"), nullptr if unset or no prefix was set
 
 // Provided by the game: its settings, and a change that applies the host fields while keeping the
 // game's own.

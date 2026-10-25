@@ -18,7 +18,6 @@
 #include <array>
 #include <cctype>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -27,6 +26,7 @@
 #include <system_error>
 #include <type_traits>
 
+#include "kazarov/log.hpp"
 #include "platform/paths.hpp"
 #include "platform/window.hpp"
 
@@ -410,7 +410,7 @@ void CreateShortcut(const fs::path &link, const fs::path &target, const std::wst
         IPersistFile *file = nullptr;
         if (SUCCEEDED(shell_link->QueryInterface(IID_IPersistFile, reinterpret_cast<void **>(&file)))) {
             if (FAILED(file->Save(link.c_str(), TRUE))) {
-                std::fprintf(stderr, "icon: could not write %s\n", PathsDisplay(link).c_str());
+                kz::Logf(kz::LogLevel::Warning, "icon", "could not write {}", PathsDisplay(link));
             }
             file->Release();
         }

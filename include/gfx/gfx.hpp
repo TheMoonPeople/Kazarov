@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -63,6 +64,18 @@ enum class PresentMode : uint8_t {
     Immediate,
 };
 
+// Which thread owns device work. Off: the caller, as before. Lockstep: a worker thread runs every device call
+// while the caller waits, so the result is that of Off. Async: the worker also renders display frames from the
+// host's idle hook while the game thread records.
+enum class RenderThreadMode : uint8_t {
+    Off,
+    Lockstep,
+    Async,
+};
+
+// "off", "lockstep" or "async" (any case); nullopt for anything else.
+std::optional<RenderThreadMode> ParseRenderThreadMode(std::string_view text);
+
 struct RendererConfig {
     const char *app_name = "";
     // The game's 2D space. 2D draws, scissors and main-target rectangles are given in it and mapped
@@ -94,11 +107,18 @@ struct RendererConfig {
     // False sets one stencil reference and compare and write masks for both faces, as on a
     // portability-subset device without separateStencilMaskRef.
     bool separate_stencil_masks = true;
-    // Also precompiles the Vu_prog0 pipelines, and the set 2 layout, that DrawMeshProg0 needs (Dark Chronicle).
+    // False pushes each draw's texture, palette and sampler, as on a device without the bindless
+    // texture array (Apple A12 and older), so that path can be exercised on any device.
+    // KZ_BINDLESS=0 in the environment sets it false. A portability-subset device (MoltenVK) pushes
+    // them whatever this says, unless KZ_BINDLESS=1.
+    bool bindless_textures = true;
+    // Also precompiles the Vu_prog0 pipelines that DrawMeshProg0 needs (Dark Chronicle).
     bool prog0_meshes = false;
     // Lowers the texture and mesh tables for tests; 0 is the build maximum, larger values are clamped to it.
     uint32_t texture_slots = 0;
     uint32_t mesh_slots = 0;
+    // KZ_RENDER_THREAD=off|lockstep|async in the environment overrides this.
+    RenderThreadMode render_thread = RenderThreadMode::Off;
 };
 
 // What RendererInit settled on, from the config and the device.
@@ -109,6 +129,7 @@ struct RendererFeatures {
     bool     separate_stencil_masks;
     bool     dynamic_color_write_mask;
     bool     portability_subset;
+    bool     bindless_textures;
 };
 
 // Exits the process with a message, naming what each device lacks, if no Vulkan 1.3 or later device
@@ -119,8 +140,38 @@ RendererFeatures ActiveRendererFeatures();
 // Vulkan window; without it a headless run renders offscreen. Callable before RendererInit.
 bool HeadlessSurfaceAvailable();
 void RendererShutdown();
+// The mode RendererInit settled on.
+RenderThreadMode ActiveRenderThreadMode();
+// True on the thread that may touch the device now: any thread in Off, the worker, or the holder of a RenderLease.
+bool OnRenderThread();
+
+// Parks the worker (after the command or idle-hook call it is in) and lets the holding thread run device work
+// inline until the lease is released. A no-op in Off, and when the holder already holds one or is the worker.
+class RenderLease {
+public:
+    RenderLease();
+    ~RenderLease();
+    RenderLease(const RenderLease &) = delete;
+    RenderLease &operator=(const RenderLease &) = delete;
+
+private:
+    bool acquired_ = false;
+};
+
+// Async only: called on the worker whenever its queue is empty and no lease is held or wanted. Returns how long the
+// worker may sleep before calling again; zero calls again at once. Any Dispatch, lease or WakeRenderThread wakes it
+// early. Ignored in Off and Lockstep.
+using RenderIdleHook = std::chrono::steady_clock::duration (*)(void *user);
+void SetRenderIdleHook(RenderIdleHook hook, void *user);
+void WakeRenderThread();
 // The window's pixel size changed; the swapchain and main target follow at the next BeginFrame.
 void RendererResize();
+// For an app sent to the background, where iOS refuses GPU work and ends an app that submits it: on the thread
+// that pumps the window's events, parks the render thread and waits for the GPU to finish everything submitted.
+// Until RendererResume, called on the same thread, nothing else may record or present. Resuming recreates the
+// swapchain at the next BeginFrame. Without a device, or already suspended, nothing happens.
+void RendererSuspend();
+void RendererResume();
 // The swapchain is recreated with the mode at the next BeginFrame or tick render.
 void SetPresentMode(PresentMode mode);
 
@@ -395,6 +446,8 @@ struct DrawState {
     uint8_t color_write_mask = kWriteRgba;
     // A depth-tested screen effect samples the display image; its corners stay in screen space.
     bool screen_space = false;
+    // Prog0Face bits of a prog0 mesh draw, passed to Vu_prog0 in push constants.
+    uint32_t prog0_face = 0;
 };
 
 // ---- Drawing ---------------------------------------------------------------------------------
@@ -479,12 +532,9 @@ struct Prog0Constants {
     float    point_color[4][4];     // per-light colour
     float    fog[4];                // offset, near value, far value, scale
     uint32_t flags = 0;             // Prog0Flags
-    uint32_t face = 0;              // Prog0Face
+    uint32_t pad0 = 0;
     uint32_t specular_power = 0;    // specular exponent
     uint32_t pad = 0;
-    // The draw's palette: kProg0Bones model-space (object-space) affine matrices, rows 0-2 each, not
-    // multiplied with view or projection, so a display frame can interpolate them per bone.
-    float bones[kProg0Bones][3][4];
 };
 
 // A kProg0Skinned mesh is pairs of Vertex3D: each vertex, then its skin in the same bytes.
@@ -506,8 +556,8 @@ inline CullMode Prog0CullMode(const Prog0Constants &constants) {
     return det < 0.0f ? CullMode::Front : CullMode::Back;
 }
 
-// Matches the std140 block of set 1 in shaders/mesh.vert and shaders/mesh_prog0.vert. A prog0 draw's
-// Prog0Constants is its own block at set 2, so Chronicle's draws stay at this size.
+// Matches the MeshConstants record of set 1 in shaders/mesh.vert and shaders/mesh_prog0.vert. A prog0
+// draw's Prog0Constants is a record of its own at set 1, so Chronicle's draws stay at this size.
 // Colours outside prog0 are modulations with 1.0 as GS 0x80.
 struct MeshConstants {
     float    mvp[16];           // column-major, object to Vulkan clip space (y down, reverse-Z)
@@ -526,8 +576,15 @@ struct MeshConstants {
     uint32_t pad[2] = {};
 };
 static_assert(sizeof(MeshConstants) == 400);
-static_assert(offsetof(Prog0Constants, flags) == 464 && offsetof(Prog0Constants, bones) == 480);
-static_assert(sizeof(Prog0Constants) == 2016);
+static_assert(offsetof(Prog0Constants, flags) == 464);
+static_assert(sizeof(Prog0Constants) == 480);
+
+// A skinned prog0 draw's palette: kProg0Bones model-space (object-space) affine matrices, rows 0-2 each, not
+// multiplied with view or projection, so a display frame can interpolate them per bone.
+struct Prog0Palette {
+    float bones[kProg0Bones][3][4];
+};
+static_assert(sizeof(Prog0Palette) == 1536);
 
 // How a mesh draw's mvp was made: projection * view * middle * model * local, column-major. Recorded
 // with the draw so a display frame can interpolate the model and the view (the camera) between two
@@ -564,14 +621,15 @@ void DrawMeshImmediate(std::span<const Vertex3D> vertices, std::span<const uint3
                        const MeshConstants &constants, const TextureBinding &texture, const DrawState &state,
                        const MeshTransform *transform = nullptr);
 // The same draws through Vu_prog0's pipelines, with the game's Prog0Constants for the draw. They need
-// RendererConfig::prog0_meshes; without it they report once and draw as a plain mesh.
+// RendererConfig::prog0_meshes; without it they report once and draw as a plain mesh. A skinned
+// (kProg0Skinned) draw reads its bones from palette; without one it uses identity bones.
 void DrawMeshProg0(MeshHandle mesh, uint32_t first_index, uint32_t index_count, const MeshConstants &constants,
                    const Prog0Constants &prog0, const TextureBinding &texture, const DrawState &state,
-                   const MeshTransform *transform = nullptr);
+                   const MeshTransform *transform = nullptr, const Prog0Palette *palette = nullptr);
 void DrawMeshImmediateProg0(std::span<const Vertex3D> vertices, std::span<const uint32_t> indices,
                             const MeshConstants &constants, const Prog0Constants &prog0,
                             const TextureBinding &texture, const DrawState &state,
-                            const MeshTransform *transform = nullptr);
+                            const MeshTransform *transform = nullptr, const Prog0Palette *palette = nullptr);
 
 // ---- Targets, copies, blits ------------------------------------------------------------------
 

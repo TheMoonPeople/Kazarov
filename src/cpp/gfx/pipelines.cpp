@@ -3,20 +3,22 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <iterator>
 #include <mutex>
-#include <random>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <vector>
 
 #include "gfx/context.hpp"
+#include "kazarov/log.hpp"
+#include "platform/files.hpp"
 #include "platform/paths.hpp"
 #include "shaders/draw.frag.spv.hpp"
+#include "shaders/draw_bound.frag.spv.hpp"
+#include "shaders/draw_bound_single.frag.spv.hpp"
+#include "shaders/draw_single.frag.spv.hpp"
 #include "shaders/draw2d.vert.spv.hpp"
 #include "shaders/mesh.vert.spv.hpp"
 #include "shaders/mesh_prog0.vert.spv.hpp"
@@ -44,9 +46,9 @@ struct Equation {
 
 constexpr Equation kPassThrough = {VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, kSourceColor};
 
-// ((A - B) * C) + D as Vulkan's src * Fs (op) dst * Fd. The shader writes C to the second
-// dual-source output whenever it can compute it (source alpha, FIX), so those share one set of
-// pipelines; destination alpha is the attachment's. README.md tabulates the result.
+// ((A - B) * C) + D as Vulkan's src * Fs (op) dst * Fd, with C taken from the second dual-source
+// output wherever it is source alpha or FIX; destination alpha is the attachment's. BuildBlendTable
+// replaces the second source where another one carries the same value. README.md tabulates the result.
 Equation Solve(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     bool          dest = c == 1;
     VkBlendFactor f = dest ? VK_BLEND_FACTOR_DST_ALPHA : VK_BLEND_FACTOR_SRC1_ALPHA;
@@ -136,27 +138,56 @@ Equation Solve(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     }
 }
 
+bool IsSecondSource(VkBlendFactor factor) {
+    return factor == VK_BLEND_FACTOR_SRC1_ALPHA || factor == VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+}
+
+bool UsesSecondSource(const Equation &equation) {
+    return IsSecondSource(equation.src) || IsSecondSource(equation.dst);
+}
+
+// The second source is the shader's factor: FIX / 128 or the fragment's alpha in GS units. Both
+// reach the blend clamped to [0, 1], as does the first output's alpha, which is that same value
+// whenever the target keeps it (it is forced to 1 on an opaque target). The constant is clamped
+// on the CPU the same way, and FIX / 128 divides exactly in float.
+VkBlendFactor SingleSource(VkBlendFactor factor, bool fix) {
+    if (factor == VK_BLEND_FACTOR_SRC1_ALPHA) {
+        return fix ? VK_BLEND_FACTOR_CONSTANT_ALPHA : VK_BLEND_FACTOR_SRC_ALPHA;
+    }
+    if (factor == VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) {
+        return fix ? VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    }
+    return factor;
+}
+
 std::vector<Equation> g_equations;
 
 void BuildBlendTable() {
     g_equations.clear();
     g_equations.push_back(kPassThrough);
-    for (uint8_t a = 0; a < 3; a++) {
-        for (uint8_t b = 0; b < 3; b++) {
-            for (uint8_t c = 0; c < 3; c++) {
-                for (uint8_t d = 0; d < 3; d++) {
-                    Equation equation = Solve(a, b, c, d);
-                    auto     it = std::find(g_equations.begin(), g_equations.end(),
-                                            Equation{equation.src, equation.dst, equation.op, kSourceColor});
-                    uint16_t slot = 0;
-                    if (it == g_equations.end()) {
-                        g_equations.push_back(
-                            Equation{equation.src, equation.dst, equation.op, kSourceColor});
-                        slot = static_cast<uint16_t>(g_equations.size() - 1);
-                    } else {
-                        slot = static_cast<uint16_t>(it - g_equations.begin());
+    for (uint8_t opaque = 0; opaque < 2; opaque++) {
+        for (uint8_t a = 0; a < 3; a++) {
+            for (uint8_t b = 0; b < 3; b++) {
+                for (uint8_t c = 0; c < 3; c++) {
+                    for (uint8_t d = 0; d < 3; d++) {
+                        Equation equation = Solve(a, b, c, d);
+                        bool     fix = c == 2;
+                        bool     constant = false;
+                        if (UsesSecondSource(equation) && (fix || opaque == 0)) {
+                            equation.src = SingleSource(equation.src, fix);
+                            equation.dst = SingleSource(equation.dst, fix);
+                            constant = fix;
+                        }
+                        Equation key{equation.src, equation.dst, equation.op, kSourceColor};
+                        auto     it = std::find(g_equations.begin(), g_equations.end(), key);
+                        if (it == g_equations.end()) {
+                            g_equations.push_back(key);
+                            it = g_equations.end() - 1;
+                        }
+                        uint16_t slot = static_cast<uint16_t>(it - g_equations.begin());
+                        g.blend_map[opaque * 81 + a * 27 + b * 9 + c * 3 + d] =
+                            BlendMapping{slot, equation.transform, fix, constant};
                     }
-                    g.blend_map[a * 27 + b * 9 + c * 3 + d] = BlendMapping{slot, equation.transform, c == 2};
                 }
             }
         }
@@ -207,21 +238,8 @@ void SaveCache(const std::filesystem::path &path) {
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), error);
     }
-    // Written aside and renamed so a concurrent reader never sees half a file.
-    std::filesystem::path temporary = path;
-    temporary += ".tmp" + std::to_string(std::random_device{}());
-    {
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        if (!file ||
-            !file.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(size))) {
-            Error("cannot write the pipeline cache to %s", PathsDisplay(temporary).c_str());
-            return;
-        }
-    }
-    std::filesystem::rename(temporary, path, error);
-    if (error) {
-        Error("cannot write the pipeline cache to %s: %s", PathsDisplay(path).c_str(), error.message().c_str());
-        std::filesystem::remove(temporary, error);
+    if (FilesWrite(path, data.data(), size, true) != FilesResult::kWritten) {
+        Error("cannot write the pipeline cache to %s", PathsDisplay(path).c_str());
     }
 }
 
@@ -236,29 +254,8 @@ struct PipelineDesc {
 // their indices are the ones it always had.
 uint32_t FamilyCount() { return g.config.prog0_meshes ? kFamilyCount : kFamilyMesh + 1; }
 
-} // namespace
-
-void CreatePipelineLayout() {
-    for (uint32_t i = 0; i < kSamplerCount; i++) {
-        bool                anisotropic = i >= kBaseSamplerCount;
-        bool                linear = anisotropic || (i & 4);
-        VkSamplerCreateInfo info = {};
-        info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        info.magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        info.minFilter = info.magFilter;
-        info.mipmapMode = linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        info.addressModeU = (i & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        info.addressModeV = (i & 1) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        if (anisotropic && g.sampler_anisotropy) {
-            float samples = static_cast<float>(2u << ((i - kBaseSamplerCount) / 4));
-            info.anisotropyEnable = VK_TRUE;
-            info.maxAnisotropy = std::min(samples, g.properties.limits.maxSamplerAnisotropy);
-        }
-        info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        info.maxLod = VK_LOD_CLAMP_NONE;
-        Check(vkCreateSampler(g.device, &info, nullptr, &g.samplers[i]), "vkCreateSampler");
-    }
-
+// Set 0 of the bindless path: every texture slot in one update-after-bind array, and the samplers.
+void CreateBindlessTextureSet() {
     VkDescriptorSetLayoutBinding texture_bindings[2] = {};
     texture_bindings[0].binding = 0;
     texture_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -289,18 +286,6 @@ void CreatePipelineLayout() {
     Check(vkCreateDescriptorSetLayout(g.device, &texture_layout, nullptr, &g.texture_set_layout),
           "vkCreateDescriptorSetLayout");
 
-    VkDescriptorSetLayoutBinding constants_binding = {};
-    constants_binding.binding = 0;
-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    constants_binding.descriptorCount = 1;
-    constants_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    VkDescriptorSetLayoutCreateInfo constants_layout = {};
-    constants_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    constants_layout.bindingCount = 1;
-    constants_layout.pBindings = &constants_binding;
-    Check(vkCreateDescriptorSetLayout(g.device, &constants_layout, nullptr, &g.constants_set_layout),
-          "vkCreateDescriptorSetLayout");
-
     VkDescriptorPoolSize texture_sizes[2] = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxTextures },
         {VK_DESCRIPTOR_TYPE_SAMPLER,       kSamplerCount}
@@ -320,9 +305,77 @@ void CreatePipelineLayout() {
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &g.texture_set_layout;
     Check(vkAllocateDescriptorSets(g.device, &allocate, &g.texture_set), "vkAllocateDescriptorSets");
+}
+
+// Set 0 without the bindless array, pushed by each draw: its texture, its palette, its sampler and
+// the palette's sampler, which never changes.
+void CreatePushedTextureLayout() {
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (uint32_t binding = 0; binding < 4; binding++) {
+        bindings[binding].binding = binding;
+        bindings[binding].descriptorType = binding < 2 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
+        bindings[binding].descriptorCount = 1;
+        bindings[binding].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    bindings[3].pImmutableSamplers = &g.samplers[0];
+
+    VkDescriptorSetLayoutCreateInfo layout = {};
+    layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layout.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    layout.bindingCount = 4;
+    layout.pBindings = bindings;
+    Check(vkCreateDescriptorSetLayout(g.device, &layout, nullptr, &g.texture_set_layout),
+          "vkCreateDescriptorSetLayout");
+}
+
+} // namespace
+
+void CreatePipelineLayout() {
+    for (uint32_t i = 0; i < kSamplerCount; i++) {
+        bool                anisotropic = i >= kBaseSamplerCount;
+        bool                linear = anisotropic || (i & 4);
+        VkSamplerCreateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        info.magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        info.minFilter = info.magFilter;
+        info.mipmapMode = linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        info.addressModeU = (i & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        info.addressModeV = (i & 1) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (anisotropic && g.sampler_anisotropy) {
+            float samples = static_cast<float>(2u << ((i - kBaseSamplerCount) / 4));
+            info.anisotropyEnable = VK_TRUE;
+            info.maxAnisotropy = std::min(samples, g.properties.limits.maxSamplerAnisotropy);
+        }
+        info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        info.maxLod = VK_LOD_CLAMP_NONE;
+        Check(vkCreateSampler(g.device, &info, nullptr, &g.samplers[i]), "vkCreateSampler");
+    }
+
+    if (g.bindless) {
+        CreateBindlessTextureSet();
+    } else {
+        CreatePushedTextureLayout();
+    }
+
+    // Set 1: the chunk's MeshConstants records at binding 0, Prog0Constants records at binding 1 and
+    // Prog0Palette records at binding 2.
+    VkDescriptorSetLayoutBinding constants_bindings[3] = {};
+    for (uint32_t binding = 0; binding < 3; binding++) {
+        constants_bindings[binding].binding = binding;
+        constants_bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        constants_bindings[binding].descriptorCount = 1;
+        constants_bindings[binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo constants_layout = {};
+    constants_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    constants_layout.bindingCount = 3;
+    constants_layout.pBindings = constants_bindings;
+    Check(vkCreateDescriptorSetLayout(g.device, &constants_layout, nullptr, &g.constants_set_layout),
+          "vkCreateDescriptorSetLayout");
+
 
     constexpr uint32_t         kConstantSets = 256;
-    VkDescriptorPoolSize       constants_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kConstantSets};
+    VkDescriptorPoolSize       constants_size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kConstantSets};
     VkDescriptorPoolCreateInfo constants_pool = {};
     constants_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     constants_pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -342,49 +395,21 @@ void CreatePipelineLayout() {
     info.pushConstantRangeCount = 1;
     info.pPushConstantRanges = &push;
     Check(vkCreatePipelineLayout(g.device, &info, nullptr, &g.pipeline_layout), "vkCreatePipelineLayout");
-
-    if (!g.config.prog0_meshes) {
-        return;
-    }
-
-    VkDescriptorSetLayoutBinding prog0_binding = {};
-    prog0_binding.binding = 0;
-    prog0_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    prog0_binding.descriptorCount = 1;
-    prog0_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    VkDescriptorSetLayoutCreateInfo prog0_layout = {};
-    prog0_layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    prog0_layout.bindingCount = 1;
-    prog0_layout.pBindings = &prog0_binding;
-    Check(vkCreateDescriptorSetLayout(g.device, &prog0_layout, nullptr, &g.prog0_set_layout),
-          "vkCreateDescriptorSetLayout");
-
-    VkDescriptorPoolSize       prog0_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kConstantSets};
-    VkDescriptorPoolCreateInfo prog0_pool = {};
-    prog0_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    prog0_pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    prog0_pool.maxSets = kConstantSets;
-    prog0_pool.poolSizeCount = 1;
-    prog0_pool.pPoolSizes = &prog0_size;
-    Check(vkCreateDescriptorPool(g.device, &prog0_pool, nullptr, &g.prog0_descriptor_pool),
-          "vkCreateDescriptorPool");
-
-    // Same push constant range as the plain layout, so pushes made through either stay valid for both.
-    VkDescriptorSetLayout prog0_layouts[3] = {g.texture_set_layout, g.constants_set_layout, g.prog0_set_layout};
-    info.setLayoutCount = 3;
-    info.pSetLayouts = prog0_layouts;
-    Check(vkCreatePipelineLayout(g.device, &info, nullptr, &g.prog0_pipeline_layout),
-          "vkCreatePipelineLayout");
 }
 
 uint32_t PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, bool alpha_test) {
     return ((family * g.blend_slot_count + blend_slot) * kTextureModeCount + mode) * 2 + (alpha_test ? 1 : 0);
 }
 
-uint32_t NoColorPipelineIndex(PipelineFamily family, TextureMode mode, bool alpha_test) {
+uint32_t NoColorPipelineIndex(PipelineFamily family, TextureMode mode) {
+    return FamilyCount() * g.blend_slot_count * kTextureModeCount * 2 +
+           static_cast<uint32_t>(family) * kTextureModeCount + mode;
+}
+
+uint32_t DepthOnlyPipelineIndex(PipelineFamily family) {
     uint32_t families = FamilyCount();
-    uint32_t modes = kTextureModeCount;
-    return families * g.blend_slot_count * modes * 2 + (family * modes + mode) * 2 + (alpha_test ? 1 : 0);
+    uint32_t no_color = g.dynamic_color_write_mask ? 0 : families * kTextureModeCount;
+    return families * g.blend_slot_count * kTextureModeCount * 2 + no_color + family;
 }
 
 PipelineFamily MeshFamily(const Prog0Constants *prog0) {
@@ -402,20 +427,19 @@ PipelineFamily MeshFamily(const Prog0Constants *prog0) {
     return (prog0->flags & kProg0Skinned) != 0 ? kFamilyMeshProg0Skinned : kFamilyMeshProg0;
 }
 
-VkPipelineLayout PipelineLayoutOf(PipelineFamily family) {
-    return family > kFamilyMesh ? g.prog0_pipeline_layout : g.pipeline_layout;
-}
+// Every family shares one layout: the chunk's records at set 1 serve plain and prog0 draws alike.
+VkPipelineLayout PipelineLayoutOf(PipelineFamily) { return g.pipeline_layout; }
 
-BlendMapping MapBlend(const GsBlend &blend, bool enable) {
+BlendMapping MapBlend(const GsBlend &blend, bool enable, bool target_has_alpha) {
     if (!enable) {
-        return BlendMapping{0, kSourceColor, false};
+        return BlendMapping{0, kSourceColor, false, false};
     }
     // Field value 3 is reserved for A, B and D (taken as zero) and for C (taken as FIX).
     uint32_t a = std::min<uint32_t>(blend.a, 2);
     uint32_t b = std::min<uint32_t>(blend.b, 2);
     uint32_t c = std::min<uint32_t>(blend.c, 2);
     uint32_t d = std::min<uint32_t>(blend.d, 2);
-    return g.blend_map[a * 27 + b * 9 + c * 3 + d];
+    return g.blend_map[(target_has_alpha ? 0 : 81) + a * 27 + b * 9 + c * 3 + d];
 }
 
 void CreatePipelines() {
@@ -431,7 +455,11 @@ void CreatePipelines() {
 
     VkShaderModule draw2d_module = CreateShader(draw2d_vert, sizeof(draw2d_vert));
     VkShaderModule mesh_module = CreateShader(mesh_vert, sizeof(mesh_vert));
-    VkShaderModule frag_module = CreateShader(draw_frag, sizeof(draw_frag));
+    VkShaderModule frag_module = g.bindless ? CreateShader(draw_frag, sizeof(draw_frag))
+                                            : CreateShader(draw_bound_frag, sizeof(draw_bound_frag));
+    VkShaderModule frag_single_module = g.bindless
+                                            ? CreateShader(draw_single_frag, sizeof(draw_single_frag))
+                                            : CreateShader(draw_bound_single_frag, sizeof(draw_bound_single_frag));
     VkShaderModule prog0_module =
         g.config.prog0_meshes ? CreateShader(mesh_prog0_vert, sizeof(mesh_prog0_vert)) : VK_NULL_HANDLE;
 
@@ -462,14 +490,20 @@ void CreatePipelines() {
     // mesh_prog0.vert always reads the skin at locations 4 and 5. Unskinned, they alias bytes of the
     // vertex itself, which the shader then never uses.
     VkVertexInputAttributeDescription attributes_prog0[6] = {
-        attributes_mesh[0], attributes_mesh[1], attributes_mesh[2], attributes_mesh[3],
+        attributes_mesh[0],
+        attributes_mesh[1],
+        attributes_mesh[2],
+        attributes_mesh[3],
         {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex3D, position)},
         {5, 0, VK_FORMAT_R8G8B8A8_UINT,       offsetof(Vertex3D, color)   },
     };
     VkVertexInputBindingDescription   binding_skinned = {0, 2 * sizeof(Vertex3D),
                                                          VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes_skinned[6] = {
-        attributes_mesh[0], attributes_mesh[1], attributes_mesh[2], attributes_mesh[3],
+        attributes_mesh[0],
+        attributes_mesh[1],
+        attributes_mesh[2],
+        attributes_mesh[3],
         {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, sizeof(Vertex3D) + offsetof(Prog0Skin, weight)},
         {5, 0, VK_FORMAT_R8G8B8A8_UINT,       sizeof(Vertex3D) + offsetof(Prog0Skin, bone)  },
     };
@@ -521,12 +555,18 @@ void CreatePipelines() {
         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
         VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_BLEND_CONSTANTS,
     };
+    // The pipelines that write no colour keep a fixed empty mask instead of the dynamic one.
+    const std::vector<VkDynamicState> no_mask_states = dynamic_states;
+    VkPipelineDynamicStateCreateInfo  dynamic_no_mask = {};
+    dynamic_no_mask.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic_no_mask.dynamicStateCount = static_cast<uint32_t>(no_mask_states.size());
+    dynamic_no_mask.pDynamicStates = no_mask_states.data();
     if (g.dynamic_color_write_mask) {
         dynamic_states.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
     }
-    VkPipelineDynamicStateCreateInfo dynamic = {};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    VkPipelineDynamicStateCreateInfo dynamic = dynamic_no_mask;
     dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
     dynamic.pDynamicStates = dynamic_states.data();
 
@@ -584,8 +624,9 @@ void CreatePipelines() {
         {1, &skinned_entry, sizeof(VkBool32), &skinned_data[1]},
     };
 
-    // Without a dynamic mask, writing no colour is a pipeline of its own: blending is moot then,
-    // so one per family, texture mode and alpha test (the test still discards).
+    // Writing no colour never blends. With nothing to discard, the fragment stage is dropped too and
+    // one pipeline per family does for every such draw, with or without a dynamic mask. An alpha
+    // test still needs the shader; without a dynamic mask that is a pipeline per family and mode.
     VkPipelineColorBlendAttachmentState no_color_attachment = {};
     VkPipelineColorBlendStateCreateInfo no_color = {};
     no_color.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -593,61 +634,64 @@ void CreatePipelines() {
     no_color.pAttachments = &no_color_attachment;
 
     uint32_t family_count = FamilyCount();
-    uint32_t blended = family_count * g.blend_slot_count * kTextureModeCount * 2;
-    uint32_t families = family_count;
-    uint32_t modes = kTextureModeCount;
-    uint32_t total = blended + (g.dynamic_color_write_mask ? 0 : families * modes * 2);
+    uint32_t total = DepthOnlyPipelineIndex(static_cast<PipelineFamily>(family_count - 1)) + 1;
 
     std::vector<VkPipelineShaderStageCreateInfo> stages(total * 2);
     std::vector<VkGraphicsPipelineCreateInfo>    infos(total);
-    uint32_t                                     blend_variants = g.blend_slot_count + (g.dynamic_color_write_mask ? 0 : 1);
+    auto describe = [&](uint32_t index, uint32_t family, VkShaderModule fragment,
+                        const VkSpecializationInfo *fragment_spec,
+                        const VkPipelineColorBlendStateCreateInfo *blend_state,
+                        const VkPipelineDynamicStateCreateInfo *dynamic_state) {
+        VkPipelineShaderStageCreateInfo *stage = &stages[index * 2];
+        stage[0] = {};
+        stage[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stage[0].module = family == kFamilyMesh ? mesh_module : family > kFamilyMesh ? prog0_module : draw2d_module;
+        stage[0].pSpecializationInfo =
+            family > kFamilyMesh ? &skinned_info[family == kFamilyMeshProg0Skinned] : nullptr;
+        stage[0].pName = "main";
+        stage[1] = stage[0];
+        stage[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stage[1].module = fragment;
+        stage[1].pSpecializationInfo = fragment_spec;
+
+        VkGraphicsPipelineCreateInfo &info = infos[index];
+        info = {};
+        info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        info.pNext = &rendering;
+        info.stageCount = fragment == VK_NULL_HANDLE ? 1 : 2;
+        info.pStages = stage;
+        info.pVertexInputState = family == kFamilyMesh               ? &vertex_mesh
+                                 : family == kFamilyMeshProg0        ? &vertex_prog0
+                                 : family == kFamilyMeshProg0Skinned ? &vertex_skinned
+                                                                     : &vertex_2d;
+        info.pInputAssemblyState = family == kFamily2DLines ? &lines : &triangles;
+        info.pViewportState = &viewport;
+        info.pRasterizationState = &raster;
+        info.pMultisampleState = &multisample;
+        info.pDepthStencilState = &depth;
+        info.pColorBlendState = blend_state;
+        info.pDynamicState = dynamic_state;
+        info.layout = PipelineLayoutOf(static_cast<PipelineFamily>(family));
+    };
     for (uint32_t family = 0; family < family_count; family++) {
-        for (uint32_t blend = 0; blend < blend_variants; blend++) {
-            bool writes_color = blend < g.blend_slot_count;
+        auto kind = static_cast<PipelineFamily>(family);
+        for (uint32_t blend = 0; blend < g.blend_slot_count; blend++) {
+            VkShaderModule fragment = UsesSecondSource(g_equations[blend]) ? frag_module : frag_single_module;
             for (uint32_t mode = 0; mode < kTextureModeCount; mode++) {
                 for (uint32_t test = 0; test < 2; test++) {
-                    uint32_t index = writes_color
-                                         ? PipelineIndex(static_cast<PipelineFamily>(family), blend,
-                                                         static_cast<TextureMode>(mode), test != 0)
-                                         : NoColorPipelineIndex(static_cast<PipelineFamily>(family),
-                                                                static_cast<TextureMode>(mode), test != 0);
-
-                    VkPipelineShaderStageCreateInfo *stage = &stages[index * 2];
-                    stage[0] = {};
-                    stage[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-                    stage[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-                    stage[0].module = family == kFamilyMesh ? mesh_module
-                                      : family > kFamilyMesh ? prog0_module
-                                                             : draw2d_module;
-                    stage[0].pSpecializationInfo =
-                        family > kFamilyMesh ? &skinned_info[family == kFamilyMeshProg0Skinned] : nullptr;
-                    stage[0].pName = "main";
-                    stage[1] = stage[0];
-                    stage[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-                    stage[1].module = frag_module;
-                    stage[1].pSpecializationInfo = &spec_info[mode][test];
-
-                    VkGraphicsPipelineCreateInfo &info = infos[index];
-                    info = {};
-                    info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-                    info.pNext = &rendering;
-                    info.stageCount = 2;
-                    info.pStages = stage;
-                    info.pVertexInputState = family == kFamilyMesh               ? &vertex_mesh
-                                             : family == kFamilyMeshProg0        ? &vertex_prog0
-                                             : family == kFamilyMeshProg0Skinned ? &vertex_skinned
-                                             : &vertex_2d;
-                    info.pInputAssemblyState = family == kFamily2DLines ? &lines : &triangles;
-                    info.pViewportState = &viewport;
-                    info.pRasterizationState = &raster;
-                    info.pMultisampleState = &multisample;
-                    info.pDepthStencilState = &depth;
-                    info.pColorBlendState = writes_color ? &blends[blend] : &no_color;
-                    info.pDynamicState = &dynamic;
-                    info.layout = PipelineLayoutOf(static_cast<PipelineFamily>(family));
+                    describe(PipelineIndex(kind, blend, static_cast<TextureMode>(mode), test != 0), family,
+                             fragment, &spec_info[mode][test], &blends[blend], &dynamic);
                 }
             }
         }
+        if (!g.dynamic_color_write_mask) {
+            for (uint32_t mode = 0; mode < kTextureModeCount; mode++) {
+                describe(NoColorPipelineIndex(kind, static_cast<TextureMode>(mode)), family, frag_single_module,
+                         &spec_info[mode][1], &no_color, &dynamic_no_mask);
+            }
+        }
+        describe(DepthOnlyPipelineIndex(kind), family, VK_NULL_HANDLE, nullptr, &no_color, &dynamic_no_mask);
     }
 
     // Pipeline creation is thread-safe against one cache, and on a cold cache it is the whole
@@ -700,12 +744,13 @@ void CreatePipelines() {
     vkDestroyShaderModule(g.device, draw2d_module, nullptr);
     vkDestroyShaderModule(g.device, mesh_module, nullptr);
     vkDestroyShaderModule(g.device, frag_module, nullptr);
+    vkDestroyShaderModule(g.device, frag_single_module, nullptr);
     if (prog0_module != VK_NULL_HANDLE) {
         vkDestroyShaderModule(g.device, prog0_module, nullptr);
     }
     SaveCache(g.config.pipeline_cache);
     g.pipeline_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    std::fprintf(stderr, "gfx: %u pipelines ready in %.2f s\n", total, g.pipeline_seconds);
+    kz::Logf(kz::LogLevel::Info, "gfx", "{} pipelines ready in {:.2f} s", total, g.pipeline_seconds);
 }
 
 void DestroyPipelines() {

@@ -129,11 +129,16 @@ def test_object_commands_carry_the_image_id(tmp_path):
     assert all("KZ_IMAGE_ID=" in line for line in commands)
 
 
+def rerun_edges(build):
+    # CMake 4 lists the generator's other outputs before the colon: "build build.ninja <more>: RERUN_CMAKE".
+    return [line for line in (build / "build.ninja").read_text().splitlines()
+            if line.startswith("build build.ninja") and ": RERUN_CMAKE" in line]
+
+
 def test_iso_directory_reconfigures_when_the_disc_is_added(tmp_path):
     # rom/ holds no disc in the fixture; its directory must still be a configure dependency.
     build = configure(tmp_path)
-    rerun = [line for line in (build / "build.ninja").read_text().splitlines()
-             if line.startswith("build build.ninja: RERUN_CMAKE")]
+    rerun = rerun_edges(build)
     assert len(rerun) == 1
     assert str(FIXTURE / "rom") in rerun[0]
 
@@ -142,8 +147,7 @@ def test_missing_iso_directory_watches_its_nearest_ancestor(tmp_path):
     ancestor = tmp_path / "discs"
     ancestor.mkdir()
     build = configure(tmp_path, "-DFIXTURE_ISO=%s" % (ancestor / "new" / "game.iso"))
-    rerun = [line for line in (build / "build.ninja").read_text().splitlines()
-             if line.startswith("build build.ninja: RERUN_CMAKE")]
+    rerun = rerun_edges(build)
     assert len(rerun) == 1
     assert str(ancestor) in rerun[0]
     assert str(ancestor / "new") not in rerun[0]

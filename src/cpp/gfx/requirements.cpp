@@ -102,6 +102,31 @@ std::vector<std::string> MissingRequirements(const DeviceCaps &caps, bool offscr
     }
     need(caps.features.dualSrcBlend, "dualSrcBlend");
     need(caps.features.shaderClipDistance, "shaderClipDistance");
+    if (!MissingBindless(caps).empty()) {
+        need(HasExtension(caps, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
+             "the bindless texture array or " VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    }
+    need(caps.features13.dynamicRendering, "dynamicRendering");
+    need(caps.features13.synchronization2, "synchronization2");
+    need(caps.limits.maxPushConstantsSize >= sizeof(PushConstants), "maxPushConstantsSize");
+    need(caps.limits.maxStorageBufferRange >= (8u << 20), "maxStorageBufferRange of 8 MiB for constant records");
+    need(caps.limits.maxPerStageDescriptorStorageBuffers >= 3, "maxPerStageDescriptorStorageBuffers");
+    need(caps.depth_stencil_format, "a D32_SFLOAT_S8_UINT or D24_UNORM_S8_UINT attachment");
+    if (caps.portability_subset) {
+        uint32_t alignment = std::max(caps.portability_properties.minVertexInputBindingStrideAlignment, 1u);
+        need(sizeof(Vertex2D) % alignment == 0 && sizeof(Vertex3D) % alignment == 0,
+             "vertex strides of 28 and 36 bytes (minVertexInputBindingStrideAlignment)");
+    }
+    return missing;
+}
+
+std::vector<std::string> MissingBindless(const DeviceCaps &caps) {
+    std::vector<std::string> missing;
+    auto                     need = [&](bool present, const char *what) {
+        if (!present) {
+            missing.emplace_back(what);
+        }
+    };
     need(caps.features.shaderSampledImageArrayDynamicIndexing, "shaderSampledImageArrayDynamicIndexing");
     need(caps.features12.descriptorBindingPartiallyBound, "descriptorBindingPartiallyBound");
     need(caps.features12.descriptorBindingSampledImageUpdateAfterBind, "descriptorBindingSampledImageUpdateAfterBind");
@@ -112,15 +137,6 @@ std::vector<std::string> MissingRequirements(const DeviceCaps &caps, bool offscr
          "maxDescriptorSetUpdateAfterBindSampledImages)");
     need(caps.properties12.maxPerStageUpdateAfterBindResources >= kMaxTextures + kSamplerCount + 1,
          "maxPerStageUpdateAfterBindResources for the texture array");
-    need(caps.features13.dynamicRendering, "dynamicRendering");
-    need(caps.features13.synchronization2, "synchronization2");
-    need(caps.limits.maxPushConstantsSize >= sizeof(PushConstants), "maxPushConstantsSize");
-    need(caps.depth_stencil_format, "a D32_SFLOAT_S8_UINT or D24_UNORM_S8_UINT attachment");
-    if (caps.portability_subset) {
-        uint32_t alignment = std::max(caps.portability_properties.minVertexInputBindingStrideAlignment, 1u);
-        need(sizeof(Vertex2D) % alignment == 0 && sizeof(Vertex3D) % alignment == 0,
-             "vertex strides of 28 and 36 bytes (minVertexInputBindingStrideAlignment)");
-    }
     return missing;
 }
 
