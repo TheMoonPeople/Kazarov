@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <format>
+#include <limits>
 
 #include "kazarov/log.hpp"
 
@@ -22,7 +23,17 @@ constexpr int kReserve = MAP_NORESERVE;
 constexpr int kReserve = 0;
 #endif
 
-std::size_t RoundUp(std::size_t value, std::size_t to) { return (value + to - 1) / to * to; }
+kz::size_t CheckedAdd(kz::size_t left, kz::size_t right) {
+    if (right > std::numeric_limits<kz::size_t>::max() - left) {
+        kz::Abort("arena", "requested mapping size overflows native size");
+    }
+    return left + right;
+}
+
+kz::size_t RoundUp(kz::size_t value, kz::size_t to) {
+    const kz::size_t remainder = value % to;
+    return CheckedAdd(value, remainder == 0 ? 0 : to - remainder);
+}
 
 void *Map(void *at, std::size_t size, int extra) {
 #ifdef _WIN32
@@ -35,24 +46,30 @@ void *Map(void *at, std::size_t size, int extra) {
 
 } // namespace
 
-std::size_t ArenaMemoryPageSize() {
+kz::size_t ArenaMemoryPageSize() {
 #ifdef _WIN32
-    static const std::size_t size = [] {
+    static const kz::size_t size = [] {
         SYSTEM_INFO info;
         GetSystemInfo(&info);
-        return static_cast<std::size_t>(info.dwPageSize);
+        return static_cast<kz::size_t>(info.dwPageSize);
     }();
 #else
-    static const std::size_t size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    static const kz::size_t size = [] {
+        const long result = sysconf(_SC_PAGESIZE);
+        if (result <= 0) {
+            kz::Abort("arena", "cannot determine system page size");
+        }
+        return static_cast<kz::size_t>(result);
+    }();
 #endif
     return size;
 }
 
-ArenaMemory ArenaMemoryMap(std::size_t bytes, std::size_t lead) {
-    std::size_t page = ArenaMemoryPageSize();
-    std::size_t capacity = RoundUp(bytes == 0 ? 64 : bytes, 64);
-    std::size_t map_size = RoundUp(lead + capacity, page) + page;
-    void       *map = Map(nullptr, map_size, 0);
+ArenaMemory ArenaMemoryMap(kz::size_t bytes, kz::size_t lead) {
+    const kz::size_t page = ArenaMemoryPageSize();
+    const kz::size_t capacity = RoundUp(bytes == 0 ? 64 : bytes, 64);
+    const kz::size_t map_size = CheckedAdd(RoundUp(CheckedAdd(lead, capacity), page), page);
+    void            *map = Map(nullptr, map_size, 0);
     if (map == nullptr) {
         kz::Abort("arena", std::format("cannot map {} bytes", map_size));
     }
@@ -63,7 +80,10 @@ ArenaMemory ArenaMemoryMap(std::size_t bytes, std::size_t lead) {
         kz::Abort("arena", "cannot protect guard page");
     }
 #else
-    mprotect(bytes_map + map_size - page, page, PROT_NONE);
+    if (mprotect(bytes_map + map_size - page, page, PROT_NONE) != 0) {
+        munmap(bytes_map, map_size);
+        kz::Abort("arena", "cannot protect guard page");
+    }
 #endif
     return {bytes_map, map_size, bytes_map + map_size - page - capacity, capacity, lead};
 }
@@ -71,7 +91,9 @@ ArenaMemory ArenaMemoryMap(std::size_t bytes, std::size_t lead) {
 void ArenaMemoryZero(const ArenaMemory &memory) {
 #if defined(__linux__)
     // Private anonymous pages read back as zero after MADV_DONTNEED; elsewhere it only hints.
-    madvise(memory.map, memory.map_size - ArenaMemoryPageSize(), MADV_DONTNEED);
+    if (madvise(memory.map, memory.map_size - ArenaMemoryPageSize(), MADV_DONTNEED) != 0) {
+        ArenaMemoryZeroByRemap(memory);
+    }
 #else
     ArenaMemoryZeroByRemap(memory);
 #endif

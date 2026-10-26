@@ -23,10 +23,10 @@ Block MapBlock(const void *owner, std::size_t bytes, std::size_t lead) {
     return {owner, ArenaMemoryMap(bytes, lead)};
 }
 
-bool MapHolds(const std::vector<Block> &blocks, std::uintptr_t address) {
+bool MapHolds(const std::vector<Block> &blocks, kz::uptr address) {
     for (const Block &block : blocks) {
-        const auto start = reinterpret_cast<std::uintptr_t>(block.memory.map);
-        if (address - start < block.memory.map_size) {
+        const auto start = reinterpret_cast<kz::uptr>(block.memory.map);
+        if (address >= start && address - start < block.memory.map_size) {
             return true;
         }
     }
@@ -74,7 +74,7 @@ void ArenaClearAll() {
 }
 
 bool ArenaContains(const void *pointer) {
-    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    const auto address = reinterpret_cast<kz::uptr>(pointer);
     return MapHolds(g_blocks, address) || MapHolds(g_retired, address);
 }
 

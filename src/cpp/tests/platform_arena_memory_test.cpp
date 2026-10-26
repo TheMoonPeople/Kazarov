@@ -3,11 +3,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <type_traits>
 
 #include "platform/memory.hpp"
 #include "tests/platform_fixture.hpp"
 
 namespace {
+
+static_assert(std::is_same_v<kz::uptr, std::uintptr_t>);
+static_assert(std::is_same_v<kz::sptr, std::intptr_t>);
+static_assert(std::is_same_v<kz::size_t, std::size_t>);
+static_assert(sizeof(kz::uptr) == sizeof(void *));
+static_assert(sizeof(kz::sptr) == sizeof(void *));
+static_assert(sizeof(kz::size_t) == sizeof(void *));
 
 bool Above4GiB(const void *pointer) { return reinterpret_cast<std::uintptr_t>(pointer) >> 32 != 0; }
 
@@ -32,6 +41,13 @@ TEST(PlatformArenaMemory, MapsAbove4gib) {
         CheckLayout(memory, bytes, 0x180000);
         ArenaMemoryUnmap(memory);
     }
+}
+
+TEST(PlatformArenaMemory, RejectsMappingSizeOverflow) {
+    constexpr kz::size_t limit = std::numeric_limits<kz::size_t>::max();
+    KZ_ASSERT_ABORT([&] { ArenaMemoryMap(limit); });
+    KZ_ASSERT_ABORT([&] { ArenaMemoryMap(64, limit); });
+    KZ_ASSERT_ABORT([&] { ArenaMemoryMap(limit - 63); });
 }
 
 TEST(PlatformArenaMemory, GuardPageFaults) {
