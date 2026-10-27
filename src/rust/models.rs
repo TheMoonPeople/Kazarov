@@ -6493,7 +6493,9 @@ fn validate_game_names(metadata: &Value) -> CoreResult<BTreeSet<String>> {
             .rsplit_once("_v")
             .filter(|(_, n)| n.parse::<u32>().is_ok())
             .map_or(name.as_str(), |p| p.0);
-        if super::actions::english(text)? != base {
+        // A name an ASCII original gives itself may end like a uniqueness suffix.
+        let english = super::actions::english(text)?;
+        if english != name.as_str() && english != base {
             return Err(fail(format!("{name} does not translate {text}")));
         }
         names.insert(name.clone());
@@ -8122,6 +8124,40 @@ mod tests {
         let (_temp, report) = convert_packs(&[("hero.chr", pack)]);
         let error = report.err().unwrap();
         assert!(error.0.contains("no English translation"), "{}", error.0);
+    }
+
+    #[test]
+    fn ascii_motion_names_the_table_lacks_name_their_actions() {
+        let motion = test_motion(&[(1, 2, &[(0, [0., 0., 0., 1.]), (30, [30., 0., 0., 1.])])]);
+        // "attack v2" names itself attack_v2, which reads like a uniqueness suffix of attack.
+        let cfg = b"MODEL \"hero.mds\";MOTION 0,\"hero.mot\",\"\",\"\";KEY_START;\
+            KEY \"stagger and fall\",0,10,0.5;KEY \"attack v2\",10,20,0.5;KEY_END;MOTION_END;";
+        let pack = test_pack(&[
+            ("hero.mds", &test_model(2)),
+            ("hero.mot", &motion),
+            ("info.cfg", cfg),
+        ]);
+        let (temp, report) = convert_packs(&[("hero.chr", pack)]);
+        report.unwrap();
+        let published = temp.path().join("published");
+        verify(&published).unwrap();
+        let doc = read_json(published.join("data/hero.gltf"));
+        let game = read_json(published.join("data/hero.game.json"));
+        let names: Vec<_> = doc["animations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["stagger_and_fall", "attack_v2"]);
+        assert_eq!(
+            game["game_names"]["stagger_and_fall"]["value"],
+            "stagger and fall"
+        );
+        assert_eq!(game["game_names"]["attack_v2"]["value"], "attack v2");
+        let commands = game["profiles"]["info"]["commands"].as_array().unwrap();
+        let key = commands.iter().find(|c| c["command"] == "KEY").unwrap();
+        assert_eq!(key["args"][0]["value"], "stagger_and_fall");
     }
 
     #[test]

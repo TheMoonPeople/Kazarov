@@ -1,6 +1,7 @@
 //! Names the game's motion actions in English and samples retail motion keys at action boundaries.
 use super::{CoreError, CoreResult};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -17,25 +18,40 @@ pub(crate) fn motion_names() -> &'static BTreeMap<String, String> {
     })
 }
 
-/// Translates one original motion name, failing when the table lacks it.
-pub(crate) fn english(game: &str) -> CoreResult<&'static str> {
-    motion_names()
-        .get(game)
-        .map(String::as_str)
-        .ok_or_else(|| fail(format!("motion name has no English translation: {game}")))
+/// Translates one original motion name.
+///
+/// A name the table lacks names itself when it is already written in ASCII, as modded or
+/// hand-written configs name new motions. Any other name the table lacks fails, so every
+/// Japanese name on the disc keeps a reviewed translation.
+pub(crate) fn english(game: &str) -> CoreResult<Cow<'static, str>> {
+    if let Some(name) = motion_names().get(game) {
+        return Ok(Cow::Borrowed(name.as_str()));
+    }
+    let name = snake_case(game);
+    if !game.is_ascii() || name.is_empty() {
+        return Err(fail(format!(
+            "motion name has no English translation: {game}"
+        )));
+    }
+    Ok(Cow::Owned(name))
 }
 
-/// Builds the English fallback action name for a motion without KEY intervals.
-pub(crate) fn stem_name(stem: &str) -> String {
+/// Lowercases ASCII alphanumerics and joins the runs between them with single underscores.
+fn snake_case(text: &str) -> String {
     let mut name = String::new();
-    for c in stem.chars() {
+    for c in text.chars() {
         if c.is_ascii_alphanumeric() {
             name.push(c.to_ascii_lowercase());
         } else if !name.ends_with('_') && !name.is_empty() {
             name.push('_');
         }
     }
-    let name = name.trim_end_matches('_').to_owned();
+    name.trim_end_matches('_').to_owned()
+}
+
+/// Builds the English fallback action name for a motion without KEY intervals.
+pub(crate) fn stem_name(stem: &str) -> String {
+    let name = snake_case(stem);
     if name.is_empty() {
         "motion".into()
     } else {
@@ -183,7 +199,7 @@ impl NameBook {
             self.names.insert(name.clone(), Value::Null);
             name
         } else {
-            self.allocate(english(&text)?, &action.game, false)
+            self.allocate(&english(&text)?, &action.game, false)
         };
         self.actions.insert(key, name.clone());
         Ok(name)
@@ -194,7 +210,7 @@ impl NameBook {
         let text = game["value"]
             .as_str()
             .ok_or_else(|| fail("motion reference is not a string"))?;
-        Ok(self.allocate(english(text)?, game, true))
+        Ok(self.allocate(&english(text)?, game, true))
     }
 }
 
@@ -393,6 +409,19 @@ mod tests {
         assert_eq!(english("立ち").unwrap(), "idle");
         assert_eq!(english("攻撃１").unwrap(), "attack_1");
         assert!(english("未知の動き").is_err());
+    }
+
+    #[test]
+    fn ascii_names_the_table_lacks_name_themselves() {
+        assert_eq!(english("stagger and fall").unwrap(), "stagger_and_fall");
+        assert_eq!(english("64 cat stand").unwrap(), "64_cat_stand");
+        assert_eq!(english("door(pat)").unwrap(), "door_pat");
+        assert_eq!(english("idle").unwrap(), "idle");
+        // The table still translates the names it has, ASCII ones included.
+        assert_eq!(english("立ち").unwrap(), "idle");
+        assert_eq!(english("3ren").unwrap(), "triple_combo");
+        assert!(english("--").is_err());
+        assert!(english("").is_err());
     }
 
     #[test]
