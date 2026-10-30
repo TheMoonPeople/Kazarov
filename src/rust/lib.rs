@@ -46,6 +46,13 @@ mod ffi {
         /// extract, also publishing its progress for extract_status, for a host that draws its own
         /// progress while it runs on another thread.
         fn extract_tracked(source: &str, data_out: &str, jobs: usize) -> Result<ExtractReport>;
+        /// extract_tracked under an explicit compiled-script publication policy.
+        fn extract_tracked_with_script_policy(
+            source: &str,
+            data_out: &str,
+            jobs: usize,
+            policy: ScriptPublicationPolicy,
+        ) -> Result<ExtractReport>;
         fn extract_status() -> ExtractStatus;
         fn extract_with_script_policy(
             source: &str,
@@ -154,10 +161,26 @@ fn extract_tracked(
     data_out: &str,
     jobs: usize,
 ) -> Result<ffi::ExtractReport, core::CoreError> {
+    extract_tracked_with_script_policy(source, data_out, jobs, ffi::ScriptPublicationPolicy::Retain)
+}
+
+fn extract_tracked_with_script_policy(
+    source: &str,
+    data_out: &str,
+    jobs: usize,
+    policy: ffi::ScriptPublicationPolicy,
+) -> Result<ffi::ExtractReport, core::CoreError> {
+    let policy = core_script_publication_policy(policy)?;
     *EXTRACT_STATUS.lock().unwrap() = (0.0, "");
-    let report = core::extract_with_progress(source.as_ref(), data_out.as_ref(), jobs, &|fraction, stage| {
-        *EXTRACT_STATUS.lock().unwrap() = (fraction, stage);
-    })?;
+    let report = core::extract_with_progress_policy(
+        source.as_ref(),
+        data_out.as_ref(),
+        jobs,
+        &|fraction, stage| {
+            *EXTRACT_STATUS.lock().unwrap() = (fraction, stage);
+        },
+        policy,
+    )?;
     Ok(ffi::ExtractReport {
         files: report.files,
         bytes: report.bytes,
