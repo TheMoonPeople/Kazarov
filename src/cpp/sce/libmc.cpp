@@ -2,18 +2,23 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <limits>
+#include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
-#include "sce/libmc_extensions.hpp"
 #include "platform/paths.hpp"
+#include "sce/libmc_extensions.hpp"
 #include "sce/sdk_params.hpp"
 
 // Each card is a directory, <save root>/mc0 and mc1, and every command
@@ -34,6 +39,12 @@ constexpr int kFreeClusters = 8000;
 
 constexpr int kResultNoCard = -10;
 
+using McReadBuffer = SdkParams<decltype(sceMcRead)>::At<1>;
+using McChdirCurrent = SdkParams<decltype(sceMcChdir)>::At<3>;
+using McWriteBuffer = SdkParams<decltype(sceMcWrite)>::At<1>;
+using McDeleteName = SdkParams<decltype(sceMcDelete)>::At<2>;
+using McRenameOldName = SdkParams<decltype(sceMcRename)>::At<2>;
+using McRenameNewName = SdkParams<decltype(sceMcRename)>::At<3>;
 using McOpenName = SdkParams<decltype(sceMcOpen)>::At<2>;
 using McChdirName = SdkParams<decltype(sceMcChdir)>::At<2>;
 using McMkdirName = SdkParams<decltype(sceMcMkdir)>::At<2>;
@@ -92,7 +103,7 @@ struct McDirEntry {
     std::uint16_t reserved1;
     std::uint32_t reserved2;
     std::uint32_t pda_application;
-    char          name[32];
+    std::array<char, 32> name;
 };
 
 static_assert(sizeof(McDirEntry) == 0x40);
@@ -106,20 +117,41 @@ struct Card {
 struct OpenFile {
     std::FILE *file = nullptr;
     int        flags = 0;
+    std::uint64_t generation = 0; /**< Unique successful open represented by this record. */
 };
 
 struct Pending {
     bool active = false;
     int  function;
     int  result;
+    std::uint64_t generation = 0; /**< Unique successful open represented by this record. */
 };
 
 std::array<Card, kPortCount>    g_cards;
 std::array<OpenFile, kMaxFiles> g_files;
 Pending                         g_pending;
+/**
+ * Records the exact synchronized completion available for one native ownership claim.
+ */
+Pending g_completed;
+/**
+ * Supplies non-repeating successful open identities across SDK resets.
+ */
+std::uint64_t g_next_file_generation = 1;
+
+/**
+ * Releases an open file record without scheduling a new SDK completion.
+ */
+void ReleaseFile(OpenFile &open) {
+    std::fclose(open.file);
+    open = {};
+}
 
 int Finish(int function, int result) {
-    g_pending = {true, function, result};
+    const auto generation = function == kFuncOpen && result >= 0 && result < kMaxFiles
+                                ? g_files[static_cast<std::size_t>(result)].generation
+                                : 0;
+    g_pending = {.active = true, .function = function, .result = result, .generation = generation};
     return 0;
 }
 
@@ -143,7 +175,7 @@ int CardStatus(int port) {
     if (!CardPresent(port)) {
         return kResultNoCard;
     }
-    if (g_cards[port].unformatted) {
+    if (g_cards[static_cast<std::size_t>(port)].unformatted) {
         return sceMcResNoFormat;
     }
     std::error_code error;
@@ -155,7 +187,7 @@ int CardStatus(int port) {
 // components below the card's root; ".." stops at the root.
 std::vector<std::string> Components(int port, std::string_view name) {
     std::vector<std::string> parts;
-    std::string              path = name.starts_with('/') ? std::string(name) : g_cards[port].cwd + "/" + std::string(name);
+    std::string              path = name.starts_with('/') ? std::string(name) : g_cards[static_cast<std::size_t>(port)].cwd + "/" + std::string(name);
     std::size_t              start = 0;
     while (start <= path.size()) {
         std::size_t end = path.find('/', start);
@@ -221,37 +253,76 @@ std::string CardPath(const std::vector<std::string> &parts) {
 }
 
 OpenFile *FileFor(int fd) {
-    if (fd < 0 || fd >= kMaxFiles || g_files[fd].file == nullptr) {
+    if (fd < 0 || fd >= kMaxFiles || g_files[static_cast<std::size_t>(fd)].file == nullptr) {
         return nullptr;
     }
-    return &g_files[fd];
+    return &g_files[static_cast<std::size_t>(fd)];
 }
 
-bool Matches(const char *pattern, const char *name) {
-    if (*pattern == '\0') {
-        return *name == '\0';
+bool Matches(std::string_view pattern, std::string_view name) {
+    if (pattern.empty()) {
+        return name.empty();
     }
-    if (*pattern == '*') {
-        // IOP libmc treats a wildcard run beginning with '*' as a single star.
-        do {
-            ++pattern;
-        } while (*pattern == '*' || *pattern == '?');
-        if (*pattern == '\0') {
+    if (pattern.front() == '*') {
+        // A run beginning with a star absorbs adjacent question marks, as the card protocol does.
+        const auto suffix = pattern.find_first_not_of("*?");
+        if (suffix == std::string_view::npos) {
             return true;
         }
-        for (; *name != '\0'; ++name) {
-            if (Matches(pattern, name)) {
+        pattern.remove_prefix(suffix);
+        for (std::size_t index = 0; index < name.size(); ++index) {
+            if (Matches(pattern, name.substr(index))) {
                 return true;
             }
         }
         return false;
     }
-    // A question consumes one byte, or accepts immediately at the end of a name,
-    // including when the pattern still has a suffix. It cannot skip a present byte.
-    if (*pattern == '?') {
-        return *name == '\0' || Matches(pattern + 1, name + 1);
+    if (pattern.front() == '?') {
+        return name.empty() || Matches(pattern.substr(1), name.substr(1));
     }
-    return *name != '\0' && *pattern == *name && Matches(pattern + 1, name + 1);
+    return !name.empty() && pattern.front() == name.front() && Matches(pattern.substr(1), name.substr(1));
+}
+
+/**
+ * Adapts a legacy SDK's caller-promised transfer extent while native headers carry the actual view.
+ */
+template <class Buffer>
+std::span<std::byte> ReadView(Buffer buffer [[clang::lifetimebound]], int size) {
+    if constexpr (std::is_pointer_v<Buffer>) {
+        if (buffer == nullptr || size <= 0) {
+            return {};
+        }
+        return {reinterpret_cast<std::byte *>(buffer), static_cast<std::size_t>(size)};
+    } else {
+        return buffer;
+    }
+}
+
+/**
+ * Adapts read-only legacy SDK transfer buffers without changing native bounded input views.
+ */
+template <class Buffer>
+std::span<const std::byte> WriteView(Buffer buffer [[clang::lifetimebound]], int size) {
+    if constexpr (std::is_pointer_v<Buffer>) {
+        if (buffer == nullptr || size <= 0) {
+            return {};
+        }
+        return {reinterpret_cast<const std::byte *>(buffer), static_cast<std::size_t>(size)};
+    } else {
+        return buffer;
+    }
+}
+
+/**
+ * Uses legacy SDK output-capacity promises only when that game's header provides a pointer.
+ */
+template <class Output>
+std::span<char> DirectoryOutput(Output output [[clang::lifetimebound]], std::size_t required) {
+    if constexpr (std::is_pointer_v<Output>) {
+        return output == nullptr ? std::span<char>{} : std::span(output, required);
+    } else {
+        return output;
+    }
 }
 
 McDateTime DateTime(const fs::path &path) {
@@ -279,20 +350,50 @@ McDirEntry Entry(const fs::path &path, const std::string &name, bool directory) 
     entry.created = DateTime(path);
     entry.modified = entry.created;
     std::error_code error;
-    entry.size = directory ? 0 : static_cast<std::uint32_t>(fs::file_size(path, error));
+    const auto      size = directory ? 0 : fs::file_size(path, error);
+    entry.size = error ? 0 : static_cast<std::uint32_t>(std::min(size, static_cast<std::uintmax_t>(std::numeric_limits<std::uint32_t>::max())));
     entry.attributes = kAttrExists | kAttrReadable | kAttrWriteable | kAttrExecutable | (directory ? kAttrSubdir : kAttrFile | kAttrClosed);
-    std::strncpy(entry.name, name.c_str(), sizeof(entry.name) - 1);
+    std::ranges::copy(std::string_view(name).substr(0, entry.name.size() - 1), entry.name.begin());
     return entry;
+}
+
+/**
+ * Reports native directory-table capacity or the extent promised by a legacy SDK caller.
+ */
+template <class Table>
+std::size_t DirectoryCapacity(Table table, std::size_t requested) {
+    if constexpr (std::is_pointer_v<Table>) {
+        return table == nullptr ? 0 : requested;
+    } else {
+        return table.size();
+    }
+}
+
+/**
+ * Writes the fixed memory-card directory record into the caller's checked table entry.
+ */
+template <class Table>
+void WriteDirectoryEntry(Table table, std::size_t count, std::size_t index, const McDirEntry &entry) {
+    if constexpr (std::is_pointer_v<Table>) {
+        const auto output = std::span(reinterpret_cast<std::byte *>(table), count * sizeof(McDirEntry));
+        std::ranges::copy(std::as_bytes(std::span(&entry, 1)), output.subspan(index * sizeof(McDirEntry), sizeof(McDirEntry)).begin());
+    } else {
+        using Output = Table::element_type;
+        static_assert(sizeof(Output) == sizeof(McDirEntry));
+        static_assert(std::is_trivially_copyable_v<Output> && std::is_trivially_copyable_v<McDirEntry>);
+        table[index] = std::bit_cast<Output>(entry);
+    }
 }
 
 } // namespace
 
 int sceMcInit() {
     g_pending = {};
+    g_completed = {};
     return sceMcIniSucceed;
 }
 
-int sceMcSync(int mode, int *cmd, int *result) {
+int sceMcSync(int /*mode*/, int *cmd, int *result) {
     if (!g_pending.active) {
         return -1;
     }
@@ -302,36 +403,43 @@ int sceMcSync(int mode, int *cmd, int *result) {
     if (result != nullptr) {
         *result = g_pending.result;
     }
+    g_completed = g_pending;
     g_pending.active = false;
     return 1;
 }
 
-int sceMcGetInfo(int port, int slot, int *type, int *free_size, int *formatted) {
+int sceMcGetInfo(int port, int /*slot*/, int *type, int *free_size, int *formatted) {
     if (!ValidPort(port)) {
         return -1;
     }
     bool present = CardPresent(port);
     *type = present ? sceMcTypePS2 : sceMcTypeNoCard;
     *free_size = present ? kFreeClusters : 0;
-    *formatted = present && !g_cards[port].unformatted;
+    *formatted = present && !g_cards[static_cast<std::size_t>(port)].unformatted;
     if (!present) {
         return Finish(kFuncGetInfo, kResultNoCard);
     }
-    return Finish(kFuncGetInfo, g_cards[port].unformatted ? sceMcResNoFormat : sceMcResSucceed);
+    return Finish(kFuncGetInfo, g_cards[static_cast<std::size_t>(port)].unformatted ? sceMcResNoFormat : sceMcResSucceed);
 }
 
-int sceMcOpen(int port, int slot, McOpenName name, int flag) {
+int sceMcOpen(int port, int /*slot*/, McOpenName name, int flag) {
     if (!ValidPort(port)) {
         return -1;
     }
     if (int status = CardStatus(port); status != 0) {
         return Finish(kFuncOpen, status);
     }
+    if (name == nullptr) {
+        return Finish(kFuncOpen, sceMcResDeniedPermit);
+    }
     int fd = 0;
-    while (fd < kMaxFiles && g_files[fd].file != nullptr) {
+    while (fd < kMaxFiles && g_files[static_cast<std::size_t>(fd)].file != nullptr) {
         ++fd;
     }
     if (fd == kMaxFiles) {
+        return Finish(kFuncOpen, sceMcResDeniedPermit);
+    }
+    if (g_next_file_generation == std::numeric_limits<std::uint64_t>::max()) {
         return Finish(kFuncOpen, sceMcResDeniedPermit);
     }
     fs::path        path = HostPath(port, Components(port, name));
@@ -362,7 +470,7 @@ int sceMcOpen(int port, int slot, McOpenName name, int flag) {
     if (file == nullptr) {
         return Finish(kFuncOpen, sceMcResNoEntry);
     }
-    g_files[fd] = {file, flag};
+    g_files[static_cast<std::size_t>(fd)] = {.file = file, .flags = flag, .generation = g_next_file_generation++};
     return Finish(kFuncOpen, fd);
 }
 
@@ -371,33 +479,66 @@ int sceMcClose(int fd) {
     if (open == nullptr) {
         return Finish(kFuncClose, sceMcResNoEntry);
     }
-    std::fclose(open->file);
-    *open = {};
+    ReleaseFile(*open);
     return Finish(kFuncClose, sceMcResSucceed);
 }
 
-int sceMcRead(int fd, void *buffer, int size) {
+int sceMcRead(int fd, McReadBuffer buffer, int size) {
     OpenFile *open = FileFor(fd);
     if (open == nullptr) {
         return Finish(kFuncRead, sceMcResNoEntry);
     }
-    if ((open->flags & kOpenRead) == 0) {
+    const auto bytes = ReadView(buffer, size);
+    if ((open->flags & kOpenRead) == 0 || size < 0 || static_cast<std::size_t>(size) > bytes.size()) {
         return Finish(kFuncRead, sceMcResDeniedPermit);
     }
-    std::fseek(open->file, 0, SEEK_CUR);
-    return Finish(kFuncRead, static_cast<int>(std::fread(buffer, 1, size, open->file)));
+    if (size == 0) {
+        return Finish(kFuncRead, 0);
+    }
+    const long position = std::ftell(open->file);
+    if (position < 0 || position > std::numeric_limits<int>::max() - size ||
+        std::fseek(open->file, 0, SEEK_CUR) != 0) {
+        return Finish(kFuncRead, sceMcResDeniedPermit);
+    }
+    const auto transfer = bytes.first(static_cast<std::size_t>(size));
+    int        transferred = 0;
+    for (auto &byte : transfer) {
+        const int value = std::fgetc(open->file);
+        if (value == EOF) {
+            break;
+        }
+        byte = static_cast<std::byte>(value);
+        ++transferred;
+    }
+    return Finish(kFuncRead, transferred);
 }
 
-int sceMcWrite(int fd, void *buffer, int size) {
+int sceMcWrite(int fd, McWriteBuffer buffer, int size) {
     OpenFile *open = FileFor(fd);
     if (open == nullptr) {
         return Finish(kFuncWrite, sceMcResNoEntry);
     }
-    if ((open->flags & kOpenWrite) == 0) {
+    const auto bytes = WriteView(buffer, size);
+    if ((open->flags & kOpenWrite) == 0 || size < 0 || static_cast<std::size_t>(size) > bytes.size()) {
         return Finish(kFuncWrite, sceMcResDeniedPermit);
     }
-    std::fseek(open->file, 0, SEEK_CUR);
-    return Finish(kFuncWrite, static_cast<int>(std::fwrite(buffer, 1, size, open->file)));
+    if (size == 0) {
+        return Finish(kFuncWrite, 0);
+    }
+    const long position = std::ftell(open->file);
+    if (position < 0 || position > std::numeric_limits<int>::max() - size ||
+        std::fseek(open->file, 0, SEEK_CUR) != 0) {
+        return Finish(kFuncWrite, sceMcResDeniedPermit);
+    }
+    const auto transfer = bytes.first(static_cast<std::size_t>(size));
+    int        transferred = 0;
+    for (const auto byte : transfer) {
+        if (std::fputc(std::to_integer<unsigned char>(byte), open->file) == EOF) {
+            break;
+        }
+        ++transferred;
+    }
+    return Finish(kFuncWrite, transferred);
 }
 
 int sceMcFlush(int fd) {
@@ -408,12 +549,15 @@ int sceMcFlush(int fd) {
     return Finish(kFuncFlush, std::fflush(open->file) == 0 ? sceMcResSucceed : sceMcResFailReplace);
 }
 
-int sceMcChdir(int port, int slot, McChdirName name, char *current) {
+int sceMcChdir(int port, int /*slot*/, McChdirName name, McChdirCurrent current) {
     if (!ValidPort(port)) {
         return -1;
     }
     if (int status = CardStatus(port); status != 0) {
         return Finish(kFuncChdir, status);
+    }
+    if (name == nullptr) {
+        return Finish(kFuncChdir, sceMcResDeniedPermit);
     }
     std::vector<std::string> parts = Components(port, name);
     std::error_code          error;
@@ -426,19 +570,28 @@ int sceMcChdir(int port, int slot, McChdirName name, char *current) {
     if (!fs::is_directory(path, error)) {
         return Finish(kFuncChdir, sceMcResNoEntry);
     }
-    if (current != nullptr) {
-        std::strcpy(current, g_cards[port].cwd.c_str());
+    auto      &cwd = g_cards[static_cast<std::size_t>(port)].cwd;
+    const auto output = DirectoryOutput(current, cwd.size() + 1);
+    if (!output.empty()) {
+        if (cwd.size() >= output.size()) {
+            return Finish(kFuncChdir, sceMcResDeniedPermit);
+        }
+        std::ranges::copy(cwd, output.begin());
+        output[cwd.size()] = char{};
     }
-    g_cards[port].cwd = CardPath(parts);
+    cwd = CardPath(parts);
     return Finish(kFuncChdir, sceMcResSucceed);
 }
 
-int sceMcMkdir(int port, int slot, McMkdirName name) {
+int sceMcMkdir(int port, int /*slot*/, McMkdirName name) {
     if (!ValidPort(port)) {
         return -1;
     }
     if (int status = CardStatus(port); status != 0) {
         return Finish(kFuncMkdir, status);
+    }
+    if (name == nullptr) {
+        return Finish(kFuncMkdir, sceMcResDeniedPermit);
     }
     std::vector<std::string> parts = Components(port, name);
     fs::path                 path = HostPath(port, parts);
@@ -457,12 +610,15 @@ int sceMcMkdir(int port, int slot, McMkdirName name) {
     return Finish(kFuncMkdir, sceMcResSucceed);
 }
 
-int sceMcDelete(int port, int slot, char *name) {
+int sceMcDelete(int port, int /*slot*/, McDeleteName name) {
     if (!ValidPort(port)) {
         return -1;
     }
     if (int status = CardStatus(port); status != 0) {
         return Finish(kFuncDelete, status);
+    }
+    if (name == nullptr) {
+        return Finish(kFuncDelete, sceMcResDeniedPermit);
     }
     std::vector<std::string> parts = Components(port, name);
     std::error_code          error;
@@ -478,12 +634,19 @@ int sceMcDelete(int port, int slot, char *name) {
     return Finish(kFuncDelete, sceMcResSucceed);
 }
 
-int sceMcGetDir(int port, int slot, McGetDirName name, McGetDirMode mode, int count, McGetDirTable table) {
+int sceMcGetDir(int port, int /*slot*/, McGetDirName name, McGetDirMode mode, int count, McGetDirTable table) {
     if (!ValidPort(port)) {
         return -1;
     }
     if (int status = CardStatus(port); status != 0) {
         return Finish(kFuncGetDir, status);
+    }
+    if (name == nullptr) {
+        return Finish(kFuncGetDir, sceMcResDeniedPermit);
+    }
+    if (count < 0 || static_cast<std::size_t>(count) > DirectoryCapacity(table, static_cast<std::size_t>(count)) ||
+        static_cast<std::size_t>(count) > std::numeric_limits<std::size_t>::max() / sizeof(McDirEntry)) {
+        return Finish(kFuncGetDir, sceMcResDeniedPermit);
     }
     std::string_view         spec(name);
     std::size_t              slash = spec.rfind('/');
@@ -503,18 +666,14 @@ int sceMcGetDir(int port, int slot, McGetDirName name, McGetDirMode mode, int co
     std::vector<McDirEntry> entries;
     if (!parts.empty()) {
         for (const char *special : {".", ".."}) {
-            if (Matches(pattern.c_str(), special)) {
+            if (Matches(pattern, special)) {
                 entries.push_back(Entry(dir, special, true));
             }
         }
     }
     std::vector<fs::directory_entry> found;
     for (const fs::directory_entry &entry : fs::directory_iterator(dir, error)) {
-#ifdef _WIN32
-        if (Matches(pattern.c_str(), entry.path().filename().string().c_str())) {
-#else
-        if (Matches(pattern.c_str(), entry.path().filename().c_str())) {
-#endif
+        if (Matches(pattern, entry.path().filename().string())) {
             found.push_back(entry);
         }
     }
@@ -523,40 +682,41 @@ int sceMcGetDir(int port, int slot, McGetDirName name, McGetDirMode mode, int co
         entries.push_back(Entry(entry.path(), entry.path().filename().string(), entry.is_directory(error)));
     }
 
-    Card &card = g_cards[port];
+    Card &card = g_cards[static_cast<std::size_t>(port)];
     if (mode == 0) {
         card.listed = 0;
     }
-    int written = 0;
-    for (; card.listed < entries.size() && written < count; ++card.listed, ++written) {
-        std::memcpy(static_cast<McDirEntry *>(static_cast<void *>(table)) + written, &entries[card.listed], sizeof(McDirEntry));
+    const auto  requested = static_cast<std::size_t>(count);
+    std::size_t written = 0;
+    for (; card.listed < entries.size() && written < requested; ++card.listed, ++written) {
+        WriteDirectoryEntry(table, requested, written, entries[card.listed]);
     }
-    return Finish(kFuncGetDir, written);
+    return Finish(kFuncGetDir, static_cast<int>(written));
 }
 
 // Formatting and unformatting only change what the card reports: the port
 // never erases a save directory on the game's say-so.
-int sceMcFormat(int port, int slot) {
+int sceMcFormat(int port, int /*slot*/) {
     if (!ValidPort(port)) {
         return -1;
     }
     if (!CardPresent(port)) {
         return Finish(kFuncFormat, kResultNoCard);
     }
-    g_cards[port].unformatted = false;
-    g_cards[port].cwd = "/";
+    g_cards[static_cast<std::size_t>(port)].unformatted = false;
+    g_cards[static_cast<std::size_t>(port)].cwd = "/";
     return Finish(kFuncFormat, sceMcResSucceed);
 }
 
-int sceMcUnformat(int port, int slot) {
+int sceMcUnformat(int port, int /*slot*/) {
     if (!ValidPort(port)) {
         return -1;
     }
     if (!CardPresent(port)) {
         return Finish(kFuncUnformat, kResultNoCard);
     }
-    g_cards[port].unformatted = true;
-    g_cards[port].cwd = "/";
+    g_cards[static_cast<std::size_t>(port)].unformatted = true;
+    g_cards[static_cast<std::size_t>(port)].cwd = "/";
     return Finish(kFuncUnformat, sceMcResSucceed);
 }
 
@@ -569,23 +729,48 @@ int sceMcSeek(int fd, int offset, int origin) {
     if (open == nullptr) {
         return Finish(kFuncSeek, sceMcResNoEntry);
     }
-    constexpr std::array<int, 3> kWhence = {SEEK_SET, SEEK_CUR, SEEK_END};
-    if (origin < 0 || origin >= static_cast<int>(kWhence.size()) || std::fseek(open->file, offset, kWhence[origin]) != 0) {
+    if (origin != SEEK_SET && origin != SEEK_CUR && origin != SEEK_END) {
         return Finish(kFuncSeek, sceMcResDeniedPermit);
     }
-    return Finish(kFuncSeek, static_cast<int>(std::ftell(open->file)));
+    const long previous = std::ftell(open->file);
+    if (previous < 0) {
+        return Finish(kFuncSeek, sceMcResDeniedPermit);
+    }
+    long base = origin == SEEK_SET ? 0 : previous;
+    if (origin == SEEK_END) {
+        if (std::fseek(open->file, 0, SEEK_END) != 0) {
+            return Finish(kFuncSeek, sceMcResDeniedPermit);
+        }
+        base = std::ftell(open->file);
+        if (std::fseek(open->file, previous, SEEK_SET) != 0) {
+            return Finish(kFuncSeek, sceMcResDeniedPermit);
+        }
+    }
+    const auto displacement = static_cast<long long>(offset);
+    if (base < 0 || static_cast<long long>(base) < -displacement ||
+        static_cast<long long>(base) > static_cast<long long>(std::numeric_limits<int>::max()) - displacement) {
+        return Finish(kFuncSeek, sceMcResDeniedPermit);
+    }
+    const auto position = static_cast<long>(static_cast<long long>(base) + displacement);
+    if (std::fseek(open->file, position, SEEK_SET) != 0) {
+        return Finish(kFuncSeek, sceMcResDeniedPermit);
+    }
+    return Finish(kFuncSeek, static_cast<int>(position));
 }
 
-int sceMcRename(int port, int slot, char *old_name, char *new_name) {
+int sceMcRename(int port, int /*slot*/, McRenameOldName old_name, McRenameNewName new_name) {
     if (!ValidPort(port)) {
         return -1;
     }
     if (int status = CardStatus(port); status != 0) {
         return Finish(kFuncRename, status);
     }
-    if (!old_name || !new_name || !*new_name || std::strlen(new_name) >= 32 ||
-        std::strchr(new_name, '/') || std::strchr(new_name, '\\') ||
-        std::strcmp(new_name, ".") == 0 || std::strcmp(new_name, "..") == 0) {
+    if (old_name == nullptr || new_name == nullptr) {
+        return Finish(kFuncRename, sceMcResDeniedPermit);
+    }
+    const std::string_view replacement(new_name);
+    if (replacement.empty() || replacement.size() >= 32 || replacement.contains('/') ||
+        replacement.contains('\\') || replacement == "." || replacement == "..") {
         return Finish(kFuncRename, sceMcResDeniedPermit);
     }
     auto parts = Components(port, old_name);
@@ -594,7 +779,7 @@ int sceMcRename(int port, int slot, char *old_name, char *new_name) {
     }
     const auto        source = HostPath(port, parts);
     const std::string old_card_path = CardPath(parts);
-    parts.back() = new_name;
+    parts.back() = replacement;
     const auto destination = HostPath(port, parts);
     if (source.empty() || destination.empty()) {
         return Finish(kFuncRename, sceMcResDeniedPermit);
@@ -613,9 +798,66 @@ int sceMcRename(int port, int slot, char *old_name, char *new_name) {
     if (error) {
         return Finish(kFuncRename, sceMcResDeniedPermit);
     }
-    auto &cwd = g_cards[port].cwd;
+    auto &cwd = g_cards[static_cast<std::size_t>(port)].cwd;
     if (cwd == old_card_path || cwd.starts_with(old_card_path + "/")) {
         cwd = CardPath(parts) + cwd.substr(old_card_path.size());
     }
     return Finish(kFuncRename, sceMcResSucceed);
 }
+
+#ifdef KZ_LIBMC_BOUNDED_API
+std::optional<dc2::mc::Descriptor> dc2::mc::TakeCompletedOpen(int command, int result) {
+    if (!g_completed.active || command != kFuncOpen || g_completed.function != command ||
+        g_completed.result != result || result < 0) {
+        return std::nullopt;
+    }
+    const auto *open = FileFor(result);
+    if (open == nullptr || open->generation != g_completed.generation) {
+        return std::nullopt;
+    }
+    Descriptor descriptor;
+    descriptor.id = result;
+    descriptor.generation = open->generation;
+    g_completed.active = false;
+    return descriptor;
+}
+
+bool dc2::mc::Descriptor::IsLive() const {
+    const auto *open = FileFor(id);
+    return open != nullptr && generation != 0 && open->generation == generation;
+}
+
+int dc2::mc::Descriptor::Close() {
+    if (!IsLive()) {
+        return -1;
+    }
+    const int issued = sceMcClose(id);
+    id = -1;
+    generation = 0;
+    return issued;
+}
+
+void dc2::mc::Descriptor::Release() {
+    if (IsLive()) {
+        ReleaseFile(*FileFor(id));
+    }
+    id = -1;
+    generation = 0;
+}
+
+int dc2::mc::Descriptor::Read(std::span<std::byte> destination, int count) const {
+    return IsLive() ? sceMcRead(id, destination, count) : Finish(kFuncRead, sceMcResNoEntry);
+}
+
+int dc2::mc::Descriptor::Write(std::span<const std::byte> source, int count) const {
+    return IsLive() ? sceMcWrite(id, source, count) : Finish(kFuncWrite, sceMcResNoEntry);
+}
+
+int dc2::mc::Descriptor::Seek(int offset, int origin) const {
+    return IsLive() ? sceMcSeek(id, offset, origin) : Finish(kFuncSeek, sceMcResNoEntry);
+}
+
+int dc2::mc::Descriptor::Flush() const {
+    return IsLive() ? sceMcFlush(id) : Finish(kFuncFlush, sceMcResNoEntry);
+}
+#endif

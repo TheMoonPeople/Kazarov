@@ -21,7 +21,7 @@ function(kz_windows_runtime target)
         FetchContent_Declare(kz_vulkan_runtime
             URL https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/VulkanRT-X64-1.4.363.0-Components.zip
             URL_HASH SHA256=a25a927aa8b9f0371048f1861cf88ac3b9bc9b1fb332c42d897c8ab32695769a
-            DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
         FetchContent_MakeAvailable(kz_vulkan_runtime)
         find_file(KZ_VULKAN_LOADER vulkan-1.dll
             PATHS "${kz_vulkan_runtime_SOURCE_DIR}/x64"

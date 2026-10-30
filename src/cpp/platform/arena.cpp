@@ -1,7 +1,8 @@
 #include "platform/arena.hpp"
 
-#include <cstdio>
 #include <format>
+#include <limits>
+#include <mutex>
 #include <vector>
 
 #include "kazarov/log.hpp"
@@ -9,18 +10,38 @@
 
 namespace {
 
+/**
+ * Keeps one physical root mapping and its authorized logical extent.
+ */
 struct Block {
-    const void *owner;
-    ArenaMemory memory;
+    const void   *owner;           /**< Caller identity retaining this mapping. */
+    ArenaMemory   memory;          /**< Physical pages, prefix, and guard. */
+    std::uint64_t generation;      /**< Current mapping-content identity. */
+    std::size_t   requested_bytes; /**< Maximum explicitly requested payload bytes. */
 };
 
 std::vector<Block> g_blocks;
+std::mutex         blocks_mutex;
+std::uint64_t      next_generation = 1;
+
+/**
+ *
+ * Allocates a mapping identity without allowing generation reuse.
+ *
+ */
+std::uint64_t NewGeneration() {
+    if (next_generation == std::numeric_limits<std::uint64_t>::max()) {
+        kz::Abort("arena", "mapping generation is exhausted");
+    }
+    return next_generation++;
+}
+
 // Blocks an owner outgrew stay mapped: retail's memory never went away, and a
 // pointer the game kept into an old arena reads zeroes rather than faulting.
 std::vector<Block> g_retired;
 
 Block MapBlock(const void *owner, std::size_t bytes, std::size_t lead) {
-    return {owner, ArenaMemoryMap(bytes, lead)};
+    return {owner, ArenaMemoryMap(bytes, lead), NewGeneration(), bytes};
 }
 
 bool MapHolds(const std::vector<Block> &blocks, kz::uptr address) {
@@ -49,11 +70,16 @@ void CheckSomeBlockHigh() {
 } // namespace
 
 unsigned char *ArenaBlock(const void *owner, std::size_t bytes, std::size_t lead) {
+    const std::lock_guard<std::mutex> lock(blocks_mutex);
     for (Block &block : g_blocks) {
         if (block.owner != owner) {
             continue;
         }
         if (block.memory.capacity >= bytes && block.memory.lead >= lead) {
+            if (bytes > block.requested_bytes) {
+                block.requested_bytes = bytes;
+                block.generation = NewGeneration();
+            }
             return block.memory.base;
         }
         ArenaMemoryZero(block.memory);
@@ -68,14 +94,49 @@ unsigned char *ArenaBlock(const void *owner, std::size_t bytes, std::size_t lead
 }
 
 void ArenaClearAll() {
-    for (const Block &block : g_blocks) {
+    const std::lock_guard<std::mutex> lock(blocks_mutex);
+    for (Block &block : g_blocks) {
         ArenaMemoryZero(block.memory);
+        block.generation = NewGeneration();
     }
 }
 
 bool ArenaContains(const void *pointer) {
-    const auto address = reinterpret_cast<kz::uptr>(pointer);
+    const std::lock_guard<std::mutex> lock(blocks_mutex);
+    const auto                        address = reinterpret_cast<kz::uptr>(pointer);
     return MapHolds(g_blocks, address) || MapHolds(g_retired, address);
+}
+
+std::optional<kz::arena::Region> kz::arena::RegionFor(const void *pointer) {
+    if (pointer == nullptr) {
+        return std::nullopt;
+    }
+    const auto                        address = reinterpret_cast<std::uintptr_t>(pointer);
+    const std::lock_guard<std::mutex> lock(blocks_mutex);
+    for (const auto &block : g_blocks) {
+        const auto begin = reinterpret_cast<std::uintptr_t>(block.memory.base) - block.memory.lead;
+        const auto bytes = block.requested_bytes + block.memory.lead;
+        if (address >= begin && address - begin < bytes) {
+            return Region{
+                .root = block.memory.base,
+                .writable = {block.memory.base - block.memory.lead, bytes},
+                .generation = block.generation
+            };
+        }
+    }
+    return std::nullopt;
+}
+
+bool kz::arena::IsLive(const Region &region) {
+    const std::lock_guard<std::mutex> lock(blocks_mutex);
+    for (const auto &block : g_blocks) {
+        if (block.memory.base == region.root) {
+            return block.generation == region.generation &&
+                   block.memory.base - block.memory.lead == region.writable.data() &&
+                   block.requested_bytes + block.memory.lead == region.writable.size();
+        }
+    }
+    return false;
 }
 
 void ArenaRequireOneAbove4GiB(const void *const *bases, std::size_t count) {
@@ -98,10 +159,7 @@ void *PortImagePointer(std::int32_t truncated) {
 }
 
 void ArenaOverflow(const void *arena, int used, int limit) {
-    // %p, not std::format's {}, so the address reads as the platform's printf spells it.
-    char address[32];
-    std::snprintf(address, sizeof(address), "%p", arena);
-    kz::Abort(std::format("arena {}", address), std::format("allocation overflow, {} of {} quadwords", used, limit));
+    kz::Abort(std::format("arena {:p}", arena), std::format("allocation overflow, {} of {} quadwords", used, limit));
 }
 
 void ArenaOverflow(const char *name, int used, int limit) {

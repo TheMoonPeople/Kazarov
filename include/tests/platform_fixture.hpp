@@ -106,6 +106,18 @@ int ChildStatus(F body) {
     }
     return status;
 }
+
+/**
+ * Runs a deliberate guard-page access with the kernel's hardware-fault disposition.
+ */
+template <class F>
+int FaultStatus(F body) {
+    return ChildStatus([&] {
+        std::signal(SIGSEGV, SIG_DFL);
+        std::signal(SIGBUS, SIG_DFL);
+        body();
+    });
+}
 #endif
 
 } // namespace dc::test
@@ -128,7 +140,7 @@ int ChildStatus(F body) {
     } while (false)
 #define KZ_ASSERT_FAULT(body)                                                                            \
     do {                                                                                                 \
-        int status = ::dc::test::ChildStatus(body);                                                      \
+        int status = ::dc::test::FaultStatus(body);                                                      \
         ASSERT_TRUE(WIFSIGNALED(status) && (WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS)); \
     } while (false)
 #endif

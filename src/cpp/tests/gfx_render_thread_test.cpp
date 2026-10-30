@@ -219,9 +219,17 @@ bool WaitFor(Predicate pred) {
     return true;
 }
 
-// Clears the idle hook when a test ends, before the probe it points at is destroyed.
+/**
+ * Retires the idle hook and its in-flight callback before borrowed probe storage leaves scope.
+ */
 struct HookGuard {
-    ~HookGuard() { gfx::SetRenderIdleHook(nullptr, nullptr); }
+    /**
+     * Clears future callbacks and waits for any callback already using the probe.
+     */
+    ~HookGuard() {
+        gfx::SetRenderIdleHook(nullptr, nullptr);
+        gfx::RenderLease quiet;
+    }
 };
 
 struct IdleProbe {

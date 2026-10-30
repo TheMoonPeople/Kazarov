@@ -899,10 +899,12 @@ bool TakesPad(std::size_t i) {
 
 void InputInit() {
     EnsureBindings();
-    if (SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
-        g_gamepad_subsystem = true;
-    } else {
-        kz::Logf(kz::LogLevel::Warning, "input", "no gamepads: {}", SDL_GetError());
+    if (!g_gamepad_subsystem) {
+        if (SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+            g_gamepad_subsystem = true;
+        } else {
+            kz::Logf(kz::LogLevel::Warning, "input", "no gamepads: {}", SDL_GetError());
+        }
     }
     InputApplyConfig(SettingsGet());
     WindowAddEventHook(InputHandleEvent);
@@ -986,6 +988,10 @@ void InputShutdown() {
     g_touch_held = g_touch_tap = 0;
     g_mouse_look = {0.0f, 0.0f, g_mouse_look.read};
     g_keys.fill(false);
+    g_override.fill(std::nullopt);
+    g_device.fill(InputPadState{});
+    g_state.fill(InputPadState{});
+    g_view.fill(InputPadState{});
     g_scripted = {};
     g_scripted_wheel = 0.0f;
     g_host_presses.fill(0);

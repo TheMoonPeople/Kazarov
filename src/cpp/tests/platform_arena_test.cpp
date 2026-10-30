@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
+#include <format>
 #include <string>
 
 #include "platform/arena.hpp"
@@ -20,13 +20,13 @@ bool AllZero(const unsigned char *bytes, std::size_t count) {
 } // namespace
 
 TEST(PlatformArenaBlock, HandsOutAZeroedAlignedBlock) {
-    static char key;
+    static char    key;
     unsigned char *base = ArenaBlock(&key, 1000);
     ASSERT_TRUE((reinterpret_cast<std::uintptr_t>(base) & 63) == 0);
     ASSERT_TRUE(AllZero(base, 1000));
     base[999] = 1;
 
-    static char leaded_key;
+    static char    leaded_key;
     unsigned char *leaded = ArenaBlock(&leaded_key, 1000, 0x1000);
     ASSERT_TRUE((reinterpret_cast<std::uintptr_t>(leaded) & 63) == 0);
     leaded[-static_cast<std::ptrdiff_t>(0x1000)] = 1;
@@ -35,7 +35,7 @@ TEST(PlatformArenaBlock, HandsOutAZeroedAlignedBlock) {
 }
 
 TEST(PlatformArenaBlock, ReusesTheBlockOfAnOwner) {
-    static char key;
+    static char    key;
     unsigned char *first = ArenaBlock(&key, 1000);
     first[0] = 0x77;
     ASSERT_TRUE(ArenaBlock(&key, 500) == first);
@@ -43,9 +43,9 @@ TEST(PlatformArenaBlock, ReusesTheBlockOfAnOwner) {
 }
 
 TEST(PlatformArenaBlock, RemapsAnOwnerThatOutgrowsItsBlock) {
-    static char key;
+    static char           key;
     constexpr std::size_t kGrown = std::size_t{1} << 20;
-    unsigned char *small = ArenaBlock(&key, 1000);
+    unsigned char        *small = ArenaBlock(&key, 1000);
     std::memset(small, 0x5A, 1000);
     unsigned char *grown = ArenaBlock(&key, kGrown);
     grown[kGrown - 1] = 1;
@@ -54,8 +54,8 @@ TEST(PlatformArenaBlock, RemapsAnOwnerThatOutgrowsItsBlock) {
 }
 
 TEST(PlatformArenaBlock, ClearAllZeroesEveryBlock) {
-    static char first_key;
-    static char second_key;
+    static char    first_key;
+    static char    second_key;
     unsigned char *first = ArenaBlock(&first_key, 1000);
     unsigned char *second = ArenaBlock(&second_key, 1000);
     std::memset(first, 0xA5, 1000);
@@ -68,9 +68,9 @@ TEST(PlatformArenaBlock, ClearAllZeroesEveryBlock) {
 }
 
 TEST(PlatformArenaBlock, GuardPageFollowsTheBlock) {
-    static char key;
+    static char           key;
     constexpr std::size_t kBytes = std::size_t{4096} * 16;
-    unsigned char *base = ArenaBlock(&key, kBytes);
+    unsigned char        *base = ArenaBlock(&key, kBytes);
     base[kBytes - 1] = 1;
     KZ_ASSERT_FAULT([&] { base[kBytes] = 1; });
 }
@@ -83,17 +83,15 @@ TEST(PlatformArenaBlock, OverflowOfAnUnnamedArenaGivesItsAddress) {
     // A fixed address rather than one of this process's: a death test's child may be a fresh process with its own
     // layout. ArenaOverflow only prints it.
     // NOLINTNEXTLINE(performance-no-int-to-ptr): never dereferenced
-    const void *arena = reinterpret_cast<const void *>(std::uintptr_t{0x12345678});
-    char        address[64];
-    std::snprintf(address, sizeof address, "%p", arena);
-    const std::string expected = std::string("arena ") + address + ": allocation overflow, 9 of 8 quadwords";
+    const void       *arena = reinterpret_cast<const void *>(std::uintptr_t{0x12345678});
+    const std::string expected = std::format("arena {:p}: allocation overflow, 9 of 8 quadwords", arena);
     EXPECT_DEATH(ArenaOverflow(arena, 9, 8), expected.c_str());
 }
 
 TEST(PlatformArenaBlock, ContainsOnlyItsBlocks) {
-    static char key;
-    static char lead_key;
-    static char other;
+    static char    key;
+    static char    lead_key;
+    static char    other;
     unsigned char *base = ArenaBlock(&key, 1000);
     unsigned char *leaded = ArenaBlock(&lead_key, 1000, 0x1000);
     int            local = 0;

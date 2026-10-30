@@ -64,9 +64,14 @@ function(kz_port_host_library target)
     endif()
     if(NOT TARGET nlohmann_json::nlohmann_json)
         include(FetchContent)
+        set(kz_json_extract_options)
+        if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+            set(kz_json_extract_options DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+        endif()
         FetchContent_Declare(nlohmann_json
             URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
             URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+            ${kz_json_extract_options}
             FIND_PACKAGE_ARGS CONFIG)
         FetchContent_MakeAvailable(nlohmann_json)
     endif()

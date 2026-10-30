@@ -9,7 +9,6 @@
 #include <unistd.h>
 #endif
 
-#include <cstdio>
 #include <format>
 #include <limits>
 
@@ -111,9 +110,7 @@ void ArenaMemoryZeroByRemap(const ArenaMemory &memory) {
 #else
     if (Map(memory.map, usable, MAP_FIXED) != memory.map) {
 #endif
-        char address[32];
-        std::snprintf(address, sizeof(address), "%p", static_cast<void *>(memory.map));
-        kz::Abort("arena", std::format("cannot re-map {} bytes at {} to zero them", usable, address));
+        kz::Abort("arena", std::format("cannot re-map {} bytes at {:p} to zero them", usable, static_cast<void *>(memory.map)));
     }
 }
 

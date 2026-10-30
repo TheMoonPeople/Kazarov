@@ -12,7 +12,7 @@ endif()
 FetchContent_Declare(corrosion
     URL https://github.com/corrosion-rs/corrosion/archive/refs/tags/v0.6.1.zip
     URL_HASH SHA256=5c1c5c6ab7196fe4466321c14e9698ec2d0a977c89fd9f1639a37fcffdf604f2
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
 set(CORROSION_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(corrosion)
 

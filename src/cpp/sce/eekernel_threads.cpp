@@ -15,6 +15,7 @@
 #include <deque>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 
@@ -183,7 +184,9 @@ void ContextCreate(Context &c) {
     if (c.stack == nullptr) {
         kz::Abort("eekernel", "out of memory for a thread stack");
     }
-    getcontext(&c.uc);
+    if (getcontext(&c.uc) != 0) {
+        kz::Abort("eekernel", "cannot initialize a thread context");
+    }
     c.uc.uc_stack.ss_sp = c.stack;
     c.uc.uc_stack.ss_size = kStackSize;
     c.uc.uc_link = nullptr;
@@ -191,7 +194,9 @@ void ContextCreate(Context &c) {
 }
 
 void ContextSwitch(Context &prev, Context &next) {
-    swapcontext(&prev.uc, &next.uc);
+    if (swapcontext(&prev.uc, &next.uc) != 0) {
+        kz::Abort("eekernel", "cannot switch thread contexts");
+    }
 }
 
 void ContextDestroy(Context &c) {
@@ -201,6 +206,9 @@ void ContextDestroy(Context &c) {
 
 #endif
 
+/**
+ * Owns one cooperative worker context and its scheduling state.
+ */
 struct Thread {
     int   id = 0;
     int   priority = 0;
@@ -209,6 +217,21 @@ struct Thread {
     void   *arg = nullptr;
     int     waiting_on = 0;
     Context context;
+
+    Thread() = default;
+    Thread(const Thread &) = delete;
+    Thread &operator=(const Thread &) = delete;
+    Thread(Thread &&) = delete;
+    Thread &operator=(Thread &&) = delete;
+
+    /**
+     * Releases a worker's suspended context when its scheduler entry retires.
+     */
+    ~Thread() {
+        if (id != kMainThreadId && state != State::Running) {
+            ContextDestroy(context);
+        }
+    }
 };
 
 struct Sema {
@@ -218,13 +241,13 @@ struct Sema {
 };
 
 struct Scheduler {
-    std::map<int, std::unique_ptr<Thread> > threads;
+    std::map<int, std::unique_ptr<Thread>> threads;
     // Keyed by priority; a lower number outranks a higher one, so begin() is always the next thread to run.
-    std::map<int, std::deque<Thread *> > ready;
-    std::map<int, Sema>                  semas;
-    Thread                              *running = nullptr;
-    int                                  next_thread_id = kMainThreadId + 1;
-    int                                  next_sema_id = 1;
+    std::map<int, std::deque<Thread *>> ready;
+    std::map<int, Sema>                 semas;
+    Thread                             *running = nullptr;
+    int                                 next_thread_id = kMainThreadId + 1;
+    int                                 next_sema_id = 1;
 };
 
 void EnsureMain(Scheduler &s) {
@@ -342,7 +365,7 @@ void KzThreadsSetMainPriority(int priority) {
 
 int CreateThread(struct ThreadParam *param) {
     Scheduler &s = Sched();
-    if (param == nullptr || param->entry == nullptr) {
+    if (param == nullptr || param->entry == nullptr || s.next_thread_id == std::numeric_limits<int>::max()) {
         return -1;
     }
     auto t = std::make_unique<Thread>();
@@ -418,14 +441,14 @@ int DeleteThread(int thread_id) {
     if (t == nullptr || t->state != State::Dormant) {
         return -1;
     }
-    ContextDestroy(t->context);
     s.threads.erase(thread_id);
     return 0;
 }
 
 int CreateSema(struct SemaParam *param) {
     Scheduler &s = Sched();
-    if (param == nullptr || param->maxCount < 1 || param->initCount < 0 || param->initCount > param->maxCount) {
+    if (param == nullptr || param->maxCount < 1 || param->initCount < 0 || param->initCount > param->maxCount ||
+        s.next_sema_id == std::numeric_limits<int>::max()) {
         return -1;
     }
     Sema sema;
