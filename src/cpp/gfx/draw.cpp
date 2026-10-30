@@ -1,10 +1,18 @@
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <optional>
 
 #include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
 #include "gfx/profile.hpp"
+#include "kazarov/log.hpp"
 
 namespace gfx {
 
@@ -13,6 +21,206 @@ namespace detail {
 namespace {
 
 constexpr uint32_t kSlotMask = 0xFFFF;
+
+bool InlineMeshDispatchEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_INLINE_MESH_DISPATCH");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+template <typename Work>
+void DispatchMeshWork(Work &work) {
+    if (InlineMeshDispatchEnabled() && DeviceThreadAllowed()) {
+        work();
+    } else {
+        RunOnRenderThread(work);
+    }
+}
+
+enum class MeshPhaseClass : size_t {
+    RetainedPlain,
+    RetainedProg0,
+    Immediate,
+    Count,
+};
+
+enum class MeshPhase : size_t {
+    Prepare,
+    Upload,
+    Constants,
+    Emit,
+    Total,
+};
+
+enum class MeshApiEvent : size_t {
+    PipelineBind,
+    VertexBind,
+    IndexBind,
+    DescriptorSetBind,
+    DescriptorPush,
+    DrawIndexed,
+    Count,
+};
+
+constexpr size_t                                         kMeshPhaseClassCount = static_cast<size_t>(MeshPhaseClass::Count);
+constexpr size_t                                         kMeshPhaseCount = static_cast<size_t>(MeshPhase::Total) + 1;
+constexpr size_t                                         kMeshApiEventCount = static_cast<size_t>(MeshApiEvent::Count);
+constexpr std::array<const char *, kMeshPhaseClassCount> kMeshPhaseClassNames = {
+    "retained_plain", "retained_prog0", "immediate"};
+
+struct MeshPhaseMetrics {
+    std::array<double, kMeshPhaseCount>       milliseconds = {};
+    std::array<uint64_t, kMeshPhaseCount - 1> requested_bytes = {};
+    std::array<uint64_t, kMeshApiEventCount>  api_calls = {};
+    uint64_t                                  attempts = 0;
+    uint64_t                                  prepared = 0;
+    uint64_t                                  nested_attempts = 0;
+    uint64_t                                  payload_bytes = 0;
+    uint64_t                                  constant_copy_bytes = 0;
+};
+
+struct MeshPhaseDiagnostic {
+    bool                                                                  active = false;
+    MeshPhaseClass                                                        current_class = MeshPhaseClass::Count;
+    uint64_t                                                              instance = 0;
+    uint64_t                                                              canonical_replays = 0;
+    uint32_t                                                              count = 0;
+    std::array<MeshPhaseMetrics, kMeshPhaseClassCount>                    frame = {};
+    std::array<MeshPhaseMetrics, kMeshPhaseClassCount>                    sums = {};
+    std::array<std::array<double, kMeshPhaseCount>, kMeshPhaseClassCount> maxima = {};
+};
+
+MeshPhaseDiagnostic mesh_phase_diagnostic;
+
+bool MeshPhasesEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_PERF_MESH_PHASES");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool MeshPhaseContextActive() {
+    return mesh_phase_diagnostic.active && tls.replaying && !tls.quiet && !tls.in_idle_hook;
+}
+
+bool MeasureMeshPhaseCall() {
+    if (!MeshPhaseContextActive()) {
+        return false;
+    }
+    if (mesh_phase_diagnostic.current_class != MeshPhaseClass::Count) {
+        ++mesh_phase_diagnostic.frame[static_cast<size_t>(mesh_phase_diagnostic.current_class)].nested_attempts;
+        return false;
+    }
+    return true;
+}
+
+void RecordMeshApiEvent(MeshApiEvent event) {
+    if (MeshPhaseContextActive() && mesh_phase_diagnostic.current_class != MeshPhaseClass::Count) {
+        ++mesh_phase_diagnostic.frame[static_cast<size_t>(mesh_phase_diagnostic.current_class)].api_calls[static_cast<size_t>(event)];
+    }
+}
+
+void RecordMeshConstantCopy(size_t bytes) {
+    if (MeshPhaseContextActive() && mesh_phase_diagnostic.current_class != MeshPhaseClass::Count) {
+        mesh_phase_diagnostic.frame[static_cast<size_t>(mesh_phase_diagnostic.current_class)].constant_copy_bytes += bytes;
+    }
+}
+
+class MeshPhaseCall {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    explicit MeshPhaseCall(MeshPhaseClass family)
+        : family_(family), previous_(mesh_phase_diagnostic.current_class), start_(Clock::now()), boundary_(start_),
+          requested_before_(g.counters.transient_bytes) {
+        mesh_phase_diagnostic.current_class = family;
+        ++Metrics().attempts;
+    }
+
+    ~MeshPhaseCall() {
+        const auto end = Clock::now();
+        ClosePhase(end);
+        Metrics().milliseconds[static_cast<size_t>(MeshPhase::Total)] +=
+            std::chrono::duration<double, std::milli>(end - start_).count();
+        mesh_phase_diagnostic.current_class = previous_;
+    }
+
+    MeshPhaseCall(const MeshPhaseCall &) = delete;
+    MeshPhaseCall &operator=(const MeshPhaseCall &) = delete;
+
+    void Advance(MeshPhase phase) {
+        const auto end = Clock::now();
+        ClosePhase(end);
+        boundary_ = end;
+        phase_ = phase;
+    }
+
+    void Prepared() { ++Metrics().prepared; }
+
+    void PayloadCopied(size_t bytes) { Metrics().payload_bytes += bytes; }
+
+private:
+    MeshPhaseMetrics &Metrics() { return mesh_phase_diagnostic.frame[static_cast<size_t>(family_)]; }
+
+    void ClosePhase(Clock::time_point end) {
+        const size_t phase = static_cast<size_t>(phase_);
+        Metrics().milliseconds[phase] += std::chrono::duration<double, std::milli>(end - boundary_).count();
+        Metrics().requested_bytes[phase] += g.counters.transient_bytes - requested_before_;
+        requested_before_ = g.counters.transient_bytes;
+    }
+
+    MeshPhaseClass    family_;
+    MeshPhaseClass    previous_;
+    MeshPhase         phase_ = MeshPhase::Prepare;
+    Clock::time_point start_;
+    Clock::time_point boundary_;
+    uint64_t          requested_before_;
+};
+
+bool MeshAlphaDiagnosticEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_PERF_MESH_ALPHA");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+enum class AlphaExclusion : uint32_t {
+    NotTested,
+    Elided,
+    NotGEqual,
+    UnsupportedFamily,
+    TextureMode,
+    TextureSource,
+    UnknownMips,
+    Reference,
+    Diffuse,
+    VertexColor,
+};
+
+constexpr std::array<const char *, 10> kAlphaExclusionNames = {
+    "not-tested", "elided", "not-gequal", "family", "mode-texa", "texture-source",
+    "unknown-mips", "reference", "diffuse", "vertex-color"};
+
+struct MeshAlphaDiagnostic {
+    uint64_t                                                                    instance = 0;
+    uint64_t                                                                    canonical_replays = 0;
+    bool                                                                        sampling = false;
+    std::map<std::pair<uint64_t, TextureHandle>, std::pair<uint64_t, uint64_t>> counts;
+};
+
+MeshAlphaDiagnostic mesh_alpha_diagnostic;
+
+bool SpecializeGEqual() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_ALPHA_GEQUAL");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 struct Target {
     Image         *color = nullptr;
@@ -78,6 +286,13 @@ void EnsureRendering(Target &target) {
     VkRenderingAttachmentInfo depth = color;
     depth.imageView = target.depth->view;
     depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    g.counters.passes++;
+    if (GpuScopes(1)) {
+        MarkGpuScope(cmd, GpuScopeKind::Setup, g.target);
+        g.scope_target = g.target;
+        g.scope_pipeline = UINT32_MAX;
+    }
 
     VkRenderingInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -304,6 +519,7 @@ void PushTextures(VkCommandBuffer cmd, VkPipelineLayout layout, const PushConsta
         writes[i].pImageInfo = &images[i];
     }
     g.cmd_push_descriptor_set(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 3, writes);
+    RecordMeshApiEvent(MeshApiEvent::DescriptorPush);
     g.counters.descriptor_binds++;
 }
 
@@ -312,7 +528,8 @@ void PushTextures(VkCommandBuffer cmd, VkPipelineLayout layout, const PushConsta
 // stays where the frame has it unless the side follows it. False when the draw must be dropped.
 bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureBinding &binding,
              const DrawState &state, PushConstants &push, bool ui = false, UiSide side = {},
-             std::span<const Vertex2D> vertices = {}) {
+             std::span<const Vertex2D> vertices = {}, const MeshConstants *mesh_constants = nullptr,
+             const Mesh *static_mesh = nullptr, uint32_t index_count = 0) {
     if (!g.in_frame) {
         return false;
     }
@@ -323,6 +540,7 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
 
     TextureMode mode = kTextureNone;
     bool        texa = false;
+    Texture    *sampled_texture = nullptr;
     if (binding.texture != kNullTexture) {
         if (binding.texture == kMainTarget || binding.texture == g.target) {
             Error("a draw samples the target it renders to; snapshot it first");
@@ -344,6 +562,7 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
             }
         } else {
             Texture *texture = LookupTexture(binding.texture);
+            sampled_texture = texture;
             if (texture == nullptr) {
                 Error("a draw names texture %#x, which does not exist", binding.texture);
                 return false;
@@ -381,15 +600,125 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     VkCommandBuffer cmd = DrawCommands();
 
     BlendMapping blend = MapBlend(state.alpha, state.blend, target.has_alpha);
-    bool         alpha_test = state.alpha_test && state.alpha_func != AlphaFunc::Always;
-    bool         writes_color = (state.color_write_mask & kWriteRgba) != 0;
-    uint32_t     pipeline = writes_color ? PipelineIndex(family, blend.slot, mode, alpha_test)
-                            : !alpha_test ? DepthOnlyPipelineIndex(family)
-                            : g.dynamic_color_write_mask ? PipelineIndex(family, blend.slot, mode, true)
+    // All shader alpha inputs are non-negative; GEQUAL against zero cannot discard.
+    bool alpha_test = state.alpha_test && state.alpha_func != AlphaFunc::Always &&
+                      !(state.alpha_func == AlphaFunc::GEqual && state.alpha_ref == 0);
+    if (alpha_test && family == kFamilyMesh && mesh_constants != nullptr && mode == kTextureRgba &&
+        !texa && sampled_texture != nullptr && !sampled_texture->render_target &&
+        sampled_texture->image.mips > 0 && sampled_texture->image.mips <= 32 &&
+        sampled_texture->opaque_alpha_mips == ((uint64_t{1} << sampled_texture->image.mips) - 1) &&
+        state.alpha_func == AlphaFunc::GEqual &&
+        (mesh_constants->flags & kMeshVertexColor) == 0 &&
+        std::isfinite(mesh_constants->diffuse[3]) &&
+        mesh_constants->diffuse[3] >= static_cast<float>(state.alpha_ref) / 128.0f &&
+        mesh_constants->diffuse[3] <= 1.0f) {
+        // The shader preserves material alpha here; rounding leaves half a GS alpha unit of margin.
+        alpha_test = false;
+    }
+    bool writes_color = (state.color_write_mask & kWriteRgba) != 0;
+    // Fog in bit 0 and the TEXA mode above it, as the specialised pipelines index them.
+    uint32_t features = (state.fog ? 1 : 0) + (texa ? (state.texa_aem ? 4 : 2) : 0);
+    if (blend.transform == kSourceColor && tls.interpolation_tint == 0) {
+        features += kColorFeatureCount;
+    }
+    AlphaVariant alpha = !alpha_test ? kAlphaVariantNone
+                         : state.alpha_func == AlphaFunc::GEqual && (SpecializeGEqual() || state.alpha_ref == 1)
+                             ? kAlphaVariantGEqual
+                             : kAlphaVariantGeneric;
+    uint32_t     pipeline = writes_color                 ? PipelineIndex(family, blend.slot, mode, alpha, features)
+                            : !alpha_test                ? DepthOnlyPipelineIndex(family)
+                            : g.dynamic_color_write_mask ? PipelineIndex(family, blend.slot, mode, alpha, features)
                                                          : NoColorPipelineIndex(family, mode);
-    if (g.bound.pipeline != g.pipelines[pipeline]) {
-        g.bound.pipeline = g.pipelines[pipeline];
+    uint32_t     scope_pipeline = pipeline;
+    VkPipeline   selected_pipeline = g.pipelines[pipeline];
+    if (g.near_safe_fog_pipelines[0] != VK_NULL_HANDLE && family == kFamilyMesh &&
+        static_mesh != nullptr && mesh_constants != nullptr) {
+        for (uint32_t variant = 0; variant < g.near_safe_fog_pipelines.size(); variant++) {
+            if (g.near_safe_fog_pipelines[variant] != VK_NULL_HANDLE &&
+                pipeline == g.near_safe_fog_bases[variant] && MeshFogIsNearSafe(*static_mesh, *mesh_constants)) {
+                selected_pipeline = g.near_safe_fog_pipelines[variant];
+                scope_pipeline = variant == 0 ? kNearSafeFogScope : kNearSafeFogAlphaScope;
+                break;
+            }
+        }
+    }
+    const auto unorm_rgba = [](VkFormat format) {
+        return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM;
+    };
+    if (g.zero_alpha_noop_pipeline != VK_NULL_HANDLE && pipeline == g.zero_alpha_noop_base &&
+        g.dynamic_color_write_mask && !state.depth_write && !state.stencil_test &&
+        (state.color_write_mask & kWriteRgba) == (kWriteRgba & ~kWriteAlpha) &&
+        state.blend && state.alpha.a == 0 && state.alpha.b == 1 && state.alpha.c == 0 && state.alpha.d == 1 &&
+        sampled_texture != nullptr && unorm_rgba(sampled_texture->image.format) && unorm_rgba(target.color->format)) {
+        selected_pipeline = g.zero_alpha_noop_pipeline;
+        scope_pipeline = kZeroAlphaNoopScope;
+    }
+    if (tls.plane_draw != nullptr) {
+        selected_pipeline = g.depth_planes_pipeline;
+        scope_pipeline = kDepthPlanesScope;
+    }
+    if (MeshAlphaDiagnosticEnabled() && mesh_alpha_diagnostic.sampling && family >= kFamilyMesh &&
+        tls.replaying && !tls.quiet && !tls.in_idle_hook) {
+        const bool     known_opaque = sampled_texture != nullptr && sampled_texture->image.mips > 0 &&
+                                      sampled_texture->image.mips <= 32 &&
+                                      sampled_texture->opaque_alpha_mips ==
+                                          ((uint64_t{1} << sampled_texture->image.mips) - 1);
+        const bool     vertex_color = mesh_constants != nullptr && (mesh_constants->flags & kMeshVertexColor) != 0;
+        const bool     shadow = mesh_constants != nullptr && (mesh_constants->flags & kMeshShadow) != 0;
+        const bool     near_safe = scope_pipeline == kNearSafeFogScope || scope_pipeline == kNearSafeFogAlphaScope;
+        AlphaExclusion reason = AlphaExclusion::NotTested;
+        if (state.alpha_test && state.alpha_func != AlphaFunc::Always &&
+            !(state.alpha_func == AlphaFunc::GEqual && state.alpha_ref == 0)) {
+            if (!alpha_test) {
+                reason = AlphaExclusion::Elided;
+            } else if (state.alpha_func != AlphaFunc::GEqual) {
+                reason = AlphaExclusion::NotGEqual;
+            } else if (family != kFamilyMesh || mesh_constants == nullptr) {
+                reason = AlphaExclusion::UnsupportedFamily;
+            } else if (mode != kTextureRgba || texa) {
+                reason = AlphaExclusion::TextureMode;
+            } else if (sampled_texture == nullptr || sampled_texture->render_target) {
+                reason = AlphaExclusion::TextureSource;
+            } else if (!known_opaque) {
+                reason = AlphaExclusion::UnknownMips;
+            } else if (state.alpha_ref > 128) {
+                reason = AlphaExclusion::Reference;
+            } else if (!std::isfinite(mesh_constants->diffuse[3]) ||
+                       mesh_constants->diffuse[3] < static_cast<float>(state.alpha_ref) / 128.0f ||
+                       mesh_constants->diffuse[3] > 1.0f) {
+                reason = AlphaExclusion::Diffuse;
+            } else if (vertex_color) {
+                reason = AlphaExclusion::VertexColor;
+            }
+        }
+        const uint64_t key = state.alpha_ref | (static_cast<uint64_t>(state.alpha_func) << 8) |
+                             (static_cast<uint64_t>(state.fog) << 11) |
+                             (static_cast<uint64_t>(texa) << 12) |
+                             (static_cast<uint64_t>(state.texa_aem) << 13) |
+                             (static_cast<uint64_t>(mode) << 14) |
+                             (static_cast<uint64_t>(family) << 16) |
+                             (static_cast<uint64_t>(alpha_test) << 19) |
+                             (static_cast<uint64_t>(near_safe) << 20) |
+                             (static_cast<uint64_t>(vertex_color) << 21) |
+                             (static_cast<uint64_t>(static_mesh != nullptr) << 22) |
+                             (static_cast<uint64_t>(shadow) << 23) |
+                             (static_cast<uint64_t>(reason) << 24) |
+                             (static_cast<uint64_t>(known_opaque) << 28) |
+                             (static_cast<uint64_t>(scope_pipeline) << 32);
+        auto          &count = mesh_alpha_diagnostic.counts[{key, g.target}];
+        ++count.first;
+        count.second += index_count;
+    }
+    if (GpuScopes(2) && scope_pipeline != g.scope_pipeline) {
+        if (g.scope_pipeline != UINT32_MAX) {
+            MarkGpuScope(cmd, GpuScopeKind::Run, g.scope_target, g.scope_pipeline);
+        }
+        g.scope_pipeline = scope_pipeline;
+    }
+    if (g.bound.pipeline != selected_pipeline) {
+        g.bound.pipeline = selected_pipeline;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.bound.pipeline);
+        RecordMeshApiEvent(MeshApiEvent::PipelineBind);
         // A pipeline with a fixed mask overwrites the dynamic one.
         if (!writes_color && !alpha_test) {
             g.bound.color_write_mask = -1;
@@ -444,6 +773,17 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
                  static_cast<uint32_t>(state.alpha.fix) << 16 | static_cast<uint32_t>(state.texa_ta0) << 24;
     push.fog_color = state.fog_color[0] | state.fog_color[1] << 8 | state.fog_color[2] << 16;
     push.face = state.prog0_face;
+    if (const PlaneDraw *plane = tls.plane_draw) {
+        // depth_planes.frag reads the colour table and its row where a 2D draw has no palette or mesh record.
+        push.palette_slot = plane->table_slot;
+        push.mesh_index = std::bit_cast<uint32_t>(plane->table_scale_x);
+        push.prog0_index = plane->row;
+        push.palette_index = std::bit_cast<uint32_t>(plane->table_scale_y);
+    }
+    if (family == kFamilyMesh && mesh_constants != nullptr && (mesh_constants->flags & kMeshFog) != 0 &&
+        mesh_constants->fog[1] != 0.0f) {
+        push.flags |= kPushVariableMeshFog;
+    }
     vkCmdPushConstants(cmd, PipelineLayoutOf(family), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(push), &push);
     if (!g.bindless) {
@@ -459,6 +799,10 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     }
     // An always-passing test that writes nothing is the same as no test, and cheaper.
     int test = state.depth_test == DepthTest::Always && !state.depth_write ? 0 : 1;
+    // A depth-planes draw selects its pixels by the bounds alone and leaves the depth untouched.
+    if (tls.plane_draw != nullptr) {
+        test = 0;
+    }
     int write = state.depth_write ? 1 : 0;
     int op = static_cast<int>(DepthOp(state.depth_test));
     if (g.bound.depth_test != test) {
@@ -472,6 +816,9 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     if (g.bound.depth_op != op) {
         g.bound.depth_op = op;
         vkCmdSetDepthCompareOp(cmd, static_cast<VkCompareOp>(op));
+    }
+    if (const PlaneDraw *plane = tls.plane_draw) {
+        vkCmdSetDepthBounds(cmd, plane->min_depth, plane->max_depth);
     }
     int stencil = state.stencil_test ? 1 : 0;
     if (g.bound.stencil_test != stencil) {
@@ -537,6 +884,7 @@ void BindVertices(VkBuffer buffer, VkDeviceSize offset) {
         g.bound.vertex_buffer = buffer;
         g.bound.vertex_offset = offset;
         vkCmdBindVertexBuffers(DrawCommands(), 0, 1, &buffer, &offset);
+        RecordMeshApiEvent(MeshApiEvent::VertexBind);
     }
 }
 
@@ -563,6 +911,7 @@ void PlaceMesh(const MeshConstants &constants) {
     BoundConstants &bound = g.bound_constants;
     ConstantRecord  record = AllocateConstantRecord(sizeof(MeshConstants));
     std::memcpy(record.data, &constants, sizeof(MeshConstants));
+    RecordMeshConstantCopy(sizeof(MeshConstants));
     bound.mesh = constants;
     bound.mesh_source = tls.replaying ? &constants : nullptr;
     bound.mesh_valid = true;
@@ -575,6 +924,7 @@ void PlaceProg0(const Prog0Constants &prog0) {
     BoundConstants &bound = g.bound_constants;
     ConstantRecord  record = AllocateConstantRecord(sizeof(Prog0Constants));
     std::memcpy(record.data, &prog0, sizeof(Prog0Constants));
+    RecordMeshConstantCopy(sizeof(Prog0Constants));
     bound.prog0 = prog0;
     bound.prog0_source = tls.replaying ? &prog0 : nullptr;
     bound.prog0_valid = true;
@@ -587,6 +937,7 @@ void PlacePalette(const Prog0Palette &palette) {
     BoundConstants &bound = g.bound_constants;
     ConstantRecord  record = AllocateConstantRecord(sizeof(Prog0Palette));
     std::memcpy(record.data, &palette, sizeof(Prog0Palette));
+    RecordMeshConstantCopy(sizeof(Prog0Palette));
     bound.palette = palette;
     bound.palette_source = tls.replaying ? &palette : nullptr;
     bound.palette_valid = true;
@@ -616,6 +967,36 @@ const Prog0Palette *SkinnedPalette(PipelineFamily family, const Prog0Palette *pa
 }
 
 static_assert(offsetof(PushConstants, palette_index) == offsetof(PushConstants, mesh_index) + 2 * sizeof(uint32_t));
+
+void TraceMeshVertex(const MeshConstants &constants, uint32_t index_count) {
+    static const bool enabled = std::getenv("KZ_PERF_MESH_VERTEX") != nullptr;
+    if (!enabled || g.target != kMainTarget) {
+        return;
+    }
+    static uint64_t                                          selected = 0;
+    static bool                                              printed = false;
+    static std::map<uint64_t, std::pair<uint32_t, uint64_t>> counts;
+    if (selected == 0 && g.frame_serial >= 600) {
+        selected = g.frame_serial;
+    }
+    if (selected != 0 && g.frame_serial != selected && !printed) {
+        for (const auto &[key, count] : counts) {
+            kz::Logf(kz::LogLevel::Info, "gfx", "meshvertex flags0x{:x} lights{} fogConstant{} pipeline{} draws{} indices{}",
+                     key & 0xFFFFu, (key >> 16) & 255u, (key >> 24) & 1u,
+                     key >> 32, count.first, count.second);
+        }
+        printed = true;
+    }
+    if (selected != 0 && g.frame_serial == selected) {
+        const uint64_t key = (constants.flags & 0xFFFFu) |
+                             (static_cast<uint64_t>(std::min(constants.light_count, 255u)) << 16) |
+                             (static_cast<uint64_t>(constants.fog[1] == 0.0f) << 24) |
+                             (static_cast<uint64_t>(g.scope_pipeline) << 32);
+        auto          &count = counts[key];
+        ++count.first;
+        count.second += index_count;
+    }
+}
 
 // prog0 is the draw's Vu_prog0 block, or nullptr for a plain draw; palette is its Prog0Palette, or nullptr
 // unless the draw is skinned. Called after Prepare, which pushes the rest.
@@ -660,6 +1041,7 @@ void BindConstants(VkPipelineLayout layout, const MeshConstants &constants, cons
     VkCommandBuffer cmd = DrawCommands();
     if (bound.set != bound.mesh_set) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &bound.mesh_set, 0, nullptr);
+        RecordMeshApiEvent(MeshApiEvent::DescriptorSetBind);
         g.counters.descriptor_binds++;
         bound.set = bound.mesh_set;
     }
@@ -922,8 +1304,10 @@ UiSide AnchoredSide(std::span<const Vertex2D> vertices) {
     float  x = (low_x + high_x) * 0.5f;
     float  y = (low_y + high_y) * 0.5f;
     UiSide side;
-    side.x = x < anchor.left_until ? -1 : x >= anchor.right_from ? 1 : 0;
-    side.y = y < anchor.top_until ? -1 : y >= anchor.bottom_from ? 1 : 0;
+    side.x = x < anchor.left_until ? -1 : x >= anchor.right_from ? 1
+                                                                 : 0;
+    side.y = y < anchor.top_until ? -1 : y >= anchor.bottom_from ? 1
+                                                                 : 0;
     side.scissor = (side.x != 0 || side.y != 0) && anchor.scissor;
     side.max_aspect = anchor.max_aspect;
     return side;
@@ -1008,13 +1392,128 @@ void Transfer(VkCommandBuffer cmd, Image &src, const VkOffset3D src_offsets[2], 
     g.counters.grab_copies++;
     ToRest(cmd, src);
     ToRest(cmd, dst);
+    MarkGpuScope(cmd, GpuScopeKind::Copy, dst.width << 16 | dst.height);
 }
 
 } // namespace
 
+void BeginMeshPhaseDiagnosticCanonicalReplay() {
+    if (!MeshPhasesEnabled()) {
+        return;
+    }
+    auto &diagnostic = mesh_phase_diagnostic;
+    if (diagnostic.instance != g.renderer_instance) {
+        diagnostic = {};
+        diagnostic.instance = g.renderer_instance;
+    }
+    ++diagnostic.canonical_replays;
+    diagnostic.frame = {};
+    diagnostic.current_class = MeshPhaseClass::Count;
+    diagnostic.active = true;
+}
+
+void EndMeshPhaseDiagnosticCanonicalReplay() {
+    auto &diagnostic = mesh_phase_diagnostic;
+    if (!diagnostic.active) {
+        return;
+    }
+    diagnostic.active = false;
+    diagnostic.current_class = MeshPhaseClass::Count;
+    ++diagnostic.count;
+    for (size_t family = 0; family < kMeshPhaseClassCount; ++family) {
+        const auto &frame = diagnostic.frame[family];
+        auto       &sum = diagnostic.sums[family];
+        for (size_t phase = 0; phase < kMeshPhaseCount; ++phase) {
+            sum.milliseconds[phase] += frame.milliseconds[phase];
+            diagnostic.maxima[family][phase] = std::max(diagnostic.maxima[family][phase], frame.milliseconds[phase]);
+        }
+        for (size_t phase = 0; phase < frame.requested_bytes.size(); ++phase) {
+            sum.requested_bytes[phase] += frame.requested_bytes[phase];
+        }
+        for (size_t event = 0; event < kMeshApiEventCount; ++event) {
+            sum.api_calls[event] += frame.api_calls[event];
+        }
+        sum.attempts += frame.attempts;
+        sum.prepared += frame.prepared;
+        sum.nested_attempts += frame.nested_attempts;
+        sum.payload_bytes += frame.payload_bytes;
+        sum.constant_copy_bytes += frame.constant_copy_bytes;
+    }
+    if (diagnostic.count == 120) {
+        const uint64_t first = diagnostic.canonical_replays - diagnostic.count + 1;
+        kz::Logf(kz::LogLevel::Info, "gfx", "cpu meshphases canonical_replay_count{}-{} instance{} n{} nested_replay_mesh_calls ms_wall_mean/max_frame",
+                 first, diagnostic.canonical_replays, diagnostic.instance, diagnostic.count);
+        for (size_t family = 0; family < kMeshPhaseClassCount; ++family) {
+            const auto &sum = diagnostic.sums[family];
+            const auto &maximum = diagnostic.maxima[family];
+            kz::Logf(kz::LogLevel::Info, "gfx",
+                     "cpu meshphase canonical_replay_count{}-{} class{} prepare {:.3f}/{:.3f} upload {:.3f}/{:.3f} constants {:.3f}/{:.3f} emit {:.3f}/{:.3f} total {:.3f}/{:.3f}",
+                     first, diagnostic.canonical_replays, kMeshPhaseClassNames[family],
+                     sum.milliseconds[0] / diagnostic.count, maximum[0], sum.milliseconds[1] / diagnostic.count, maximum[1],
+                     sum.milliseconds[2] / diagnostic.count, maximum[2], sum.milliseconds[3] / diagnostic.count, maximum[3],
+                     sum.milliseconds[4] / diagnostic.count, maximum[4]);
+            kz::Logf(kz::LogLevel::Info, "gfx",
+                     "cpu meshcalls canonical_replay_count{}-{} class{} attempts{} prepared{} nested{} pipeline_bind{} vertex_bind{} index_bind{} descriptor_set_bind{} descriptor_push{} draw_indexed{}",
+                     first, diagnostic.canonical_replays, kMeshPhaseClassNames[family], sum.attempts, sum.prepared, sum.nested_attempts,
+                     sum.api_calls[0], sum.api_calls[1], sum.api_calls[2], sum.api_calls[3], sum.api_calls[4], sum.api_calls[5]);
+            kz::Logf(kz::LogLevel::Info, "gfx",
+                     "cpu meshbytes canonical_replay_count{}-{} class{} requested_prepare{} requested_upload{} requested_constants{} requested_emit{} payload_memcpy{} constants_memcpy{}",
+                     first, diagnostic.canonical_replays, kMeshPhaseClassNames[family], sum.requested_bytes[0], sum.requested_bytes[1],
+                     sum.requested_bytes[2], sum.requested_bytes[3], sum.payload_bytes, sum.constant_copy_bytes);
+        }
+        diagnostic.count = 0;
+        diagnostic.sums = {};
+        diagnostic.maxima = {};
+    }
+}
+
+void BeginMeshAlphaDiagnosticCanonicalReplay() {
+    if (!MeshAlphaDiagnosticEnabled()) {
+        return;
+    }
+    auto &diagnostic = mesh_alpha_diagnostic;
+    if (diagnostic.instance != g.renderer_instance) {
+        diagnostic.instance = g.renderer_instance;
+        diagnostic.canonical_replays = 0;
+        diagnostic.counts.clear();
+    }
+    ++diagnostic.canonical_replays;
+    diagnostic.sampling = diagnostic.canonical_replays == 300 || diagnostic.canonical_replays == 720;
+    if (diagnostic.sampling) {
+        diagnostic.counts.clear();
+        kz::Logf(kz::LogLevel::Info, "gfx",
+                 "meshalpha begin canonical_replay_count{} instance{} raw_serial{} schedule300,720 source_tick_unknown",
+                 diagnostic.canonical_replays, diagnostic.instance, g.frame_serial);
+    }
+}
+
+void EndMeshAlphaDiagnosticCanonicalReplay() {
+    if (!MeshAlphaDiagnosticEnabled() || !mesh_alpha_diagnostic.sampling) {
+        return;
+    }
+    auto &diagnostic = mesh_alpha_diagnostic;
+    diagnostic.sampling = false;
+    uint64_t draws = 0;
+    uint64_t indices = 0;
+    for (const auto &[draw_key, count] : diagnostic.counts) {
+        const uint64_t key = draw_key.first;
+        const uint32_t reason = static_cast<uint32_t>((key >> 24) & 15);
+        kz::Logf(kz::LogLevel::Info, "gfx",
+                 "meshalpha canonical_replay_count{} key0x{:x} ref{} tested{} near{} vc{} static{} shadow{} opaque{} reason{} scope{} target0x{:x} draws{} indices{}",
+                 diagnostic.canonical_replays, key, key & 255, (key >> 19) & 1, (key >> 20) & 1,
+                 (key >> 21) & 1, (key >> 22) & 1, (key >> 23) & 1, (key >> 28) & 1,
+                 kAlphaExclusionNames[reason], key >> 32, draw_key.second, count.first, count.second);
+        draws += count.first;
+        indices += count.second;
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx", "meshalpha end canonical_replay_count{} groups{} draws{} indices{}",
+             diagnostic.canonical_replays, diagnostic.counts.size(), draws, indices);
+    diagnostic.counts.clear();
+}
+
 LogicalMapping MainMapping(uint32_t width, uint32_t height) {
-    float w = static_cast<float>(width);
-    float h = static_cast<float>(height);
+    float       w = static_cast<float>(width);
+    float       h = static_cast<float>(height);
     const float logical_w = g.config.logical_width;
     const float logical_h = g.config.logical_height;
     const float aspect = g.config.display_aspect;
@@ -1120,6 +1619,11 @@ void EndRendering() {
     if (g.rendering) {
         vkCmdEndRendering(DrawCommands());
         KZ_PROFILE_GPU_END(rendering_zone);
+        if (GpuScopes(1)) {
+            const bool runs = g.gpu_scopes >= 2;
+            MarkGpuScope(DrawCommands(), runs ? GpuScopeKind::Run : GpuScopeKind::Pass, g.scope_target,
+                         runs ? g.scope_pipeline : UINT32_MAX);
+        }
         g.rendering = false;
     }
 }
@@ -1193,6 +1697,11 @@ LogicalMapping GetUiMapping(TextureHandle handle) {
     return handle == kMainTarget ? UiMapping(mapping) : mapping;
 }
 
+LogicalMapping GetPresentationMapping(bool ui) {
+    LogicalMapping mapping = MainMapping(g.swapchain.extent.width, g.swapchain.extent.height);
+    return ui ? UiMapping(mapping) : mapping;
+}
+
 LogicalRect VisibleLogicalRect(TextureHandle handle) {
     LogicalRect frame = LogicalFrame(handle);
     uint32_t    axes = ExtentAxes(handle);
@@ -1219,7 +1728,7 @@ namespace detail {
 void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &binding,
                  const DrawState &state, UiSide side, const Presentation2D *presentation) {
     if (RecordingCalls()) {
-        Draw2DEntry entry{primitive, std::vector<Vertex2D>(vertices.begin(), vertices.end()), binding,
+        Draw2DEntry entry{primitive, std::pmr::vector<Vertex2D>(vertices.begin(), vertices.end(), RecordingResource()), binding,
                           state, side};
         if (presentation != nullptr) {
             entry.presentation_vertices.assign(presentation->vertices.begin(), presentation->vertices.end());
@@ -1293,6 +1802,43 @@ void DrawPrepared(Primitive primitive, std::span<const Vertex2D> vertices, const
         return;
     }
     g.counters.draws_2d++;
+    static const bool trace_2d = std::getenv("KZ_PERF_2D_TRACE") != nullptr;
+    static uint64_t   trace_frame = 0;
+    if (trace_2d && !tls.in_idle_hook && g.frame_serial >= 600 && trace_frame == 0) {
+        trace_frame = g.frame_serial;
+    }
+    if (trace_2d && g.frame_serial == trace_frame && primitive == Primitive::Quads && !vertices.empty()) {
+        Target      trace_target = ResolveTarget(g.target);
+        const float width = static_cast<float>(trace_target.color->width);
+        const float height = static_cast<float>(trace_target.color->height);
+        double      pixels = 0.0;
+        uint32_t    alpha_min = 255;
+        uint32_t    alpha_max = 0;
+        for (size_t quad = 0; quad + 3 < vertices.size(); quad += 4) {
+            float x0 = width, y0 = height, x1 = 0.0f, y1 = 0.0f;
+            for (size_t corner = 0; corner < 4; ++corner) {
+                const Vertex2D &v = vertices[quad + corner];
+                const float     x = (v.x * push.xform[0] + push.xform[2] + 1.0f) * width * 0.5f;
+                const float     y = (v.y * push.xform[1] + push.xform[3] + 1.0f) * height * 0.5f;
+                x0 = std::min(x0, x);
+                x1 = std::max(x1, x);
+                y0 = std::min(y0, y);
+                y1 = std::max(y1, y);
+                alpha_min = std::min(alpha_min, static_cast<uint32_t>(v.color[3]));
+                alpha_max = std::max(alpha_max, static_cast<uint32_t>(v.color[3]));
+            }
+            const VkRect2D &scissor = g.bound.scissor;
+            x0 = std::max(x0, static_cast<float>(std::max(0, scissor.offset.x)));
+            y0 = std::max(y0, static_cast<float>(std::max(0, scissor.offset.y)));
+            x1 = std::min(x1, std::min(width, static_cast<float>(scissor.offset.x + scissor.extent.width)));
+            y1 = std::min(y1, std::min(height, static_cast<float>(scissor.offset.y + scissor.extent.height)));
+            pixels += std::max(0.0f, x1 - x0) * std::max(0.0f, y1 - y0);
+        }
+        std::fprintf(stderr, "perf 2d: frame %llu target %#x texture %#x quads %zu bbox_pixels %.0f alpha %u..%u depth %u/%u mask %#x flags %#x pipeline %u\n",
+                     static_cast<unsigned long long>(g.frame_serial), g.target, binding.texture, vertices.size() / 4,
+                     pixels, alpha_min, alpha_max, static_cast<unsigned>(state.depth_test), state.depth_write,
+                     state.color_write_mask, push.flags, g.scope_pipeline);
+    }
     VkCommandBuffer cmd = DrawCommands();
     TransientSpan   data = AllocateTransient(vertices.size_bytes(), sizeof(float));
     std::memcpy(data.data, vertices.data(), vertices.size_bytes());
@@ -1341,6 +1887,271 @@ void DrawPrepared(Primitive primitive, std::span<const Vertex2D> vertices, const
 }
 
 } // namespace
+
+namespace {
+
+// The state DrawDepthPlanes2D is exact for: the feathered haze blend (A = source, B = zero, C = FIX 0x80,
+// D = destination) under a greater-or-equal depth test that writes nothing, with no alpha test, fog or stencil,
+// writing every channel, and with TEXA alpha taken without AEM.
+bool IsDepthPlanesState(const DrawState &state) {
+    return state.blend && state.alpha == GsBlend{0, 2, 2, 1, 0x80} && state.depth_test == DepthTest::GEqual &&
+           !state.depth_write && !state.alpha_test && !state.fog && !state.stencil_test && !state.texa_aem &&
+           !state.screen_space && state.color_write_mask == kWriteRgba;
+}
+
+// The colour table is a 256-texel grey ramp drawn once per plane count through the blend the planes themselves
+// use, so it holds this device's own result for every value and coverage.
+constexpr uint32_t kTableColumns = 256;
+constexpr uint32_t kTableRows = kMaxDepthPlanes;
+constexpr uint8_t  kPlaneColor = 0x10;
+
+// Builds the colour table, or finds it still good, and fills the table fields of draw. False when this renderer
+// cannot hold it (a render scale below one, an unavailable target); the planes are then drawn one by one.
+bool EnsurePlaneTable(PlaneDraw &draw) {
+    PlaneTable &table = g.plane_table;
+    auto        fill = [&](const Texture &image) {
+        draw.table_slot = table.table & kSlotMask;
+        draw.table_scale_x = static_cast<float>(image.image.width) / static_cast<float>(kTableColumns);
+        draw.table_scale_y = static_cast<float>(image.image.height) / static_cast<float>(kTableRows);
+    };
+    Texture *current = table.table != kNullTexture ? LookupTexture(table.table) : nullptr;
+    if (table.ready && current != nullptr && current->image.image == table.image && table.scale == g.render_scale) {
+        current->last_draw_use = g.frame_serial;
+        fill(*current);
+        return true;
+    }
+    if (table.failed && table.scale == g.render_scale) {
+        return false;
+    }
+    table.ready = false;
+    table.failed = true;
+    table.scale = g.render_scale;
+
+    if (table.ramp == kNullTexture || LookupTexture(table.ramp) == nullptr) {
+        table.ramp = CreateTexture(TextureDesc{kTableColumns, 1, TextureFormat::Rgba8, 1, false});
+        std::array<uint8_t, kTableColumns * 4> grey;
+        for (uint32_t value = 0; value < kTableColumns; value++) {
+            grey[value * 4 + 0] = grey[value * 4 + 1] = grey[value * 4 + 2] = static_cast<uint8_t>(value);
+            grey[value * 4 + 3] = 0xFF;
+        }
+        if (table.ramp == kNullTexture || !UpdateTextureNow(table.ramp, 0, 0, 0, kTableColumns, 1, grey.data())) {
+            return false;
+        }
+    }
+    table.table = NamedRenderTarget("kazarov depth plane table", kTableColumns, kTableRows, true);
+    Texture *target = table.table != kNullTexture ? LookupTexture(table.table) : nullptr;
+    if (target == nullptr || target->image.width < kTableColumns || target->image.height < kTableRows) {
+        return false;
+    }
+
+    // The draws below are the planes' own: the same blend, a texture without alpha and the same vertex colour.
+    DrawState state;
+    state.blend = true;
+    state.alpha = {0, 2, 2, 1, 0x80};
+    state.texa_aem = false;
+    state.texa_ta0 = 0x80;
+    TextureBinding binding;
+    binding.texture = table.ramp;
+    binding.filter = Filter::Nearest;
+
+    const TextureHandle previous = g.target;
+    SetRenderTarget(table.table);
+    const uint8_t black[4] = {0, 0, 0, 0};
+    Clear(true, black, false, 0.0f);
+    for (uint32_t row = 0; row < kTableRows; row++) {
+        Vertex2D    quad[4] = {};
+        const float top = static_cast<float>(row);
+        const float edges[4][2] = {
+            {0.0f,                              top       },
+            {static_cast<float>(kTableColumns), top       },
+            {static_cast<float>(kTableColumns), top + 1.0f},
+            {0.0f,                              top + 1.0f}
+        };
+        for (uint32_t corner = 0; corner < 4; corner++) {
+            quad[corner].x = edges[corner][0];
+            quad[corner].y = edges[corner][1];
+            quad[corner].z = 0.5f;
+            quad[corner].u = edges[corner][0];
+            quad[corner].v = corner < 2 ? 0.0f : 1.0f;
+            quad[corner].color[0] = quad[corner].color[1] = quad[corner].color[2] = kPlaneColor;
+            quad[corner].color[3] = 0x80;
+            quad[corner].fog = 0xFF;
+        }
+        // Row r holds r + 1 planes: one draw per plane, accumulated the way the planes are.
+        for (uint32_t plane = 0; plane <= row; plane++) {
+            DrawPrepared(Primitive::Quads, quad, binding, state, false);
+        }
+    }
+    SetRenderTarget(previous);
+
+    target = LookupTexture(table.table);
+    if (target == nullptr) {
+        return false;
+    }
+    table.image = target->image.image;
+    table.ready = true;
+    table.failed = false;
+    fill(*target);
+    return true;
+}
+
+// Whether the planes can take the depth-bounds pass: what it reproduces by construction, and nothing else.
+bool CanDrawPlanesInOnePass(const DepthPlanes2D &planes, std::span<const Vertex2D, 4> quad,
+                            const TextureBinding &binding, const DrawState &state) {
+    if (g.depth_planes_pipeline == VK_NULL_HANDLE || !g.in_frame || tls.interpolation_tint != 0) {
+        return false;
+    }
+    if (planes.count == 0 || planes.count > kMaxDepthPlanes || !IsDepthPlanesState(state)) {
+        return false;
+    }
+    float previous = 1.0f;
+    for (uint32_t i = 0; i < planes.count; i++) {
+        const float depth = planes.depth[i];
+        // NaN fails the first test. Each plane lies at or behind the one before it, so the planes a pixel passes
+        // are a prefix.
+        if (!(depth >= 0.0f && depth <= previous)) {
+            return false;
+        }
+        previous = depth;
+    }
+    for (const Vertex2D &vertex : quad) {
+        if (vertex.color[0] != kPlaneColor || vertex.color[1] != kPlaneColor || vertex.color[2] != kPlaneColor ||
+            !std::isfinite(vertex.x) || !std::isfinite(vertex.y)) {
+            return false;
+        }
+    }
+    // Overlapping quad triangles would accumulate more than one contribution per plane.
+    if (quad[0].x != quad[3].x || quad[1].x != quad[2].x || quad[0].y != quad[1].y || quad[2].y != quad[3].y) {
+        return false;
+    }
+    if (binding.filter != Filter::Nearest || binding.texture == kNullTexture || binding.texture == kPreviousFrame ||
+        binding.texture == kMainTarget || binding.texture == g.target) {
+        return false;
+    }
+    const Texture *texture = LookupTexture(binding.texture);
+    if (texture == nullptr || texture->desc.format != TextureFormat::Rgba8 ||
+        !(!texture->desc.has_alpha || binding.ignore_alpha)) {
+        return false;
+    }
+    const Target target = ResolveTarget(g.target);
+    return target.color != nullptr && target.has_alpha;
+}
+
+// Makes the depth of an owned render target a transfer destination the first time it is copied into. The old image
+// is dropped (its depth is overwritten by the copy), the new one starts with zero stencil, and the capability stays
+// with the texture through RecreateRenderTargets.
+void MakeDepthCopyDestination(Texture &texture, VkCommandBuffer cmd) {
+    if (texture.depth_copy_dst) {
+        return;
+    }
+    Image old = texture.depth;
+    texture.depth = CreateImage(old.width, old.height, 1, g.depth_format,
+                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    InitializeDepth(cmd, texture.depth);
+    texture.depth_copy_dst = true;
+    DeferDestroy([old]() mutable { DestroyImage(old); });
+}
+
+int32_t RoundToPixel(double logical, float scale, float offset, uint32_t limit) {
+    const double pixel = std::clamp(logical * scale + offset, 0.0, static_cast<double>(limit));
+    return static_cast<int32_t>(std::lround(pixel));
+}
+
+bool DepthCopyOffsets(const LogicalRect &source, VkOffset3D &low, VkOffset3D &high) {
+    if (!std::isfinite(source.x) || !std::isfinite(source.y) || !std::isfinite(source.w) ||
+        !std::isfinite(source.h) || source.w <= 0.0f || source.h <= 0.0f) {
+        return false;
+    }
+    const Image         &main = MainDepth();
+    const LogicalMapping mapping = MainMapping(main.width, main.height);
+    low = {RoundToPixel(source.x, mapping.scale_x, mapping.offset_x, main.width),
+           RoundToPixel(source.y, mapping.scale_y, mapping.offset_y, main.height), 0};
+    high = {RoundToPixel(static_cast<double>(source.x) + source.w, mapping.scale_x, mapping.offset_x, main.width),
+            RoundToPixel(static_cast<double>(source.y) + source.h, mapping.scale_y, mapping.offset_y, main.height), 1};
+    return high.x > low.x && high.y > low.y;
+}
+
+} // namespace
+
+bool ExecuteDepthCopy(const LogicalRect &source) {
+    AssertDeviceThread(__func__);
+    const Target target = ResolveTarget(g.target);
+    Texture     *texture = target.texture;
+    if (!g.in_frame || !g.depth_blit || texture == nullptr || texture->shares_main_depth || !texture->render_target ||
+        texture->depth.image == VK_NULL_HANDLE) {
+        Error("CopyMainDepthToTarget: target %#x cannot take a depth copy", g.target);
+        return false;
+    }
+    Image     &main = MainDepth();
+    VkOffset3D low;
+    VkOffset3D high;
+    if (!DepthCopyOffsets(source, low, high)) {
+        Error("CopyMainDepthToTarget: the rectangle lies outside the main target");
+        return false;
+    }
+
+    // After the draws that made the depth: a copy placed in the upload stream would run before them.
+    EndRendering();
+    VkCommandBuffer cmd = DrawCommands();
+    MakeDepthCopyDestination(*texture, cmd);
+    texture->last_draw_use = g.frame_serial;
+    Image &destination = texture->depth;
+    Transition(cmd, main, TransferSrc());
+    Transition(cmd, destination, TransferDst());
+    VkImageBlit region = {};
+    region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    region.srcOffsets[0] = low;
+    region.srcOffsets[1] = high;
+    region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    region.dstOffsets[0] = {0, 0, 0};
+    region.dstOffsets[1] = {static_cast<int32_t>(destination.width), static_cast<int32_t>(destination.height), 1};
+    vkCmdBlitImage(cmd, main.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination.image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+    ToRest(cmd, main);
+    ToRest(cmd, destination);
+    MarkGpuScope(cmd, GpuScopeKind::Copy, destination.width << 16 | destination.height);
+    return true;
+}
+
+void ExecuteDepthPlanes(const DepthPlanes2D &planes, std::span<const Vertex2D, 4> quad, const TextureBinding &binding,
+                        const DrawState &state) {
+    AssertDeviceThread(__func__);
+    if (!g.in_frame || planes.count == 0 || planes.count > kMaxDepthPlanes) {
+        return;
+    }
+    PlaneDraw  table;
+    const bool one_pass = CanDrawPlanesInOnePass(planes, quad, binding, state) && EnsurePlaneTable(table);
+
+    std::array<Vertex2D, 4> vertices;
+    std::copy(quad.begin(), quad.end(), vertices.begin());
+    // Ascending coverage: a pixel that two intervals both claim (a flushed denormal bound) keeps the larger count,
+    // which is the one the planes give it.
+    for (uint32_t index = 0; index < planes.count; index++) {
+        for (Vertex2D &vertex : vertices) {
+            vertex.z = planes.depth[index];
+            vertex.color[3] = planes.alpha[index];
+        }
+        if (!one_pass) {
+            // Plane by plane, as Draw2D would draw them.
+            Draw2DSided(Primitive::Quads, vertices, binding, state, AnchoredSide(vertices));
+            continue;
+        }
+        // The pixels exactly index + 1 planes reach: stored depth at or below this plane and above the next one
+        // back. The last plane's draw takes everything behind it.
+        PlaneDraw draw = table;
+        draw.row = index;
+        draw.max_depth = planes.depth[index];
+        draw.min_depth = index + 1 == planes.count ? 0.0f : std::nextafter(planes.depth[index + 1], 2.0f);
+        if (draw.min_depth > draw.max_depth) {
+            continue;
+        }
+        tls.plane_draw = &draw;
+        Draw2DSided(Primitive::Quads, vertices, binding, state, AnchoredSide(vertices));
+        tls.plane_draw = nullptr;
+    }
+}
+
 } // namespace detail
 
 namespace {
@@ -1366,27 +2177,52 @@ void DrawIndexedMesh(MeshHandle handle, uint32_t first_index, uint32_t index_cou
     }
     if (RecordingCalls()) {
         if (index_count != 0) {
-            RecordMesh(MeshEntry{handle, first_index, index_count, {}, {}, constants, binding, state, 0},
-                       transform, prog0, palette);
+            MeshEntry entry;
+            entry.mesh = handle;
+            entry.first_index = first_index;
+            entry.index_count = index_count;
+            entry.constants = constants;
+            entry.binding = binding;
+            entry.state = state;
+            RecordMesh(std::move(entry), transform, prog0, palette);
         }
         return;
     }
-    RunOnRenderThread([&] {
+    auto work = [&] {
         PipelineFamily family = MeshFamily(prog0);
         PushConstants  push;
-        if (index_count == 0 || !Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push)) {
+        if (index_count == 0) {
             return;
+        }
+        std::optional<MeshPhaseCall> phases;
+        if (MeasureMeshPhaseCall()) {
+            phases.emplace(family == kFamilyMesh ? MeshPhaseClass::RetainedPlain : MeshPhaseClass::RetainedProg0);
+        }
+        if (!Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push,
+                     false, {}, {}, &constants, mesh, index_count)) {
+            return;
+        }
+        if (phases) {
+            phases->Advance(MeshPhase::Constants);
+            phases->Prepared();
         }
         mesh->last_draw_use = g.frame_serial;
         VkCommandBuffer cmd = DrawCommands();
         BindConstants(PipelineLayoutOf(family), constants, family > kFamilyMesh ? prog0 : nullptr,
                       SkinnedPalette(family, palette));
+        if (phases) {
+            phases->Advance(MeshPhase::Emit);
+        }
+        TraceMeshVertex(constants, index_count);
         BindVertices(mesh->buffer.buffer, 0);
         vkCmdBindIndexBuffer(cmd, mesh->buffer.buffer, mesh->vertex_count * sizeof(Vertex3D),
                              VK_INDEX_TYPE_UINT32);
+        RecordMeshApiEvent(MeshApiEvent::IndexBind);
         g.counters.mesh_draws++;
         vkCmdDrawIndexed(cmd, index_count, 1, first_index, 0, 0);
-    });
+        RecordMeshApiEvent(MeshApiEvent::DrawIndexed);
+    };
+    DispatchMeshWork(work);
 }
 
 } // namespace
@@ -1411,7 +2247,10 @@ void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint3
                        const TextureBinding &binding, const DrawState &state, const MeshTransform *transform) {
     if (RecordingCalls()) {
         if (!vertices.empty() && !indices.empty()) {
-            MeshEntry entry{kNullMesh, 0, 0, {}, {}, constants, binding, state, 0};
+            MeshEntry entry;
+            entry.constants = constants;
+            entry.binding = binding;
+            entry.state = state;
             entry.index_count = static_cast<uint32_t>(indices.size());
             entry.vertices.assign(vertices.begin(), vertices.end());
             entry.indices.assign(indices.begin(), indices.end());
@@ -1419,25 +2258,47 @@ void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint3
         }
         return;
     }
-    RunOnRenderThread([&] {
+    auto work = [&] {
         PipelineFamily family = MeshFamily(prog0);
         PushConstants  push;
-        if (vertices.empty() || indices.empty() ||
-            !Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push)) {
+        if (vertices.empty() || indices.empty()) {
             return;
+        }
+        std::optional<MeshPhaseCall> phases;
+        if (MeasureMeshPhaseCall()) {
+            phases.emplace(MeshPhaseClass::Immediate);
+        }
+        if (!Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push, false, {}, {}, &constants, nullptr,
+                     static_cast<uint32_t>(indices.size()))) {
+            return;
+        }
+        if (phases) {
+            phases->Advance(MeshPhase::Upload);
+            phases->Prepared();
         }
         VkCommandBuffer cmd = DrawCommands();
         TransientSpan   vertex_data = AllocateTransient(vertices.size_bytes(), sizeof(float));
         std::memcpy(vertex_data.data, vertices.data(), vertices.size_bytes());
         TransientSpan index_data = AllocateTransient(indices.size_bytes(), sizeof(uint32_t));
         std::memcpy(index_data.data, indices.data(), indices.size_bytes());
+        if (phases) {
+            phases->PayloadCopied(vertices.size_bytes() + indices.size_bytes());
+            phases->Advance(MeshPhase::Constants);
+        }
         BindConstants(PipelineLayoutOf(family), constants, family > kFamilyMesh ? prog0 : nullptr,
                       SkinnedPalette(family, palette));
+        if (phases) {
+            phases->Advance(MeshPhase::Emit);
+        }
+        TraceMeshVertex(constants, static_cast<uint32_t>(indices.size()));
         BindVertices(vertex_data.buffer, vertex_data.offset);
         vkCmdBindIndexBuffer(cmd, index_data.buffer, index_data.offset, VK_INDEX_TYPE_UINT32);
+        RecordMeshApiEvent(MeshApiEvent::IndexBind);
         g.counters.mesh_draws++;
         vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
-    });
+        RecordMeshApiEvent(MeshApiEvent::DrawIndexed);
+    };
+    DispatchMeshWork(work);
 }
 
 } // namespace
@@ -1569,6 +2430,9 @@ bool CopyTexture(TextureHandle src, Rect src_rect, TextureHandle dst, int32_t ds
         VkCommandBuffer cmd = CopyCommands();
         MarkUsed(src_texture);
         MarkUsed(dst_texture);
+        if (dst_texture != nullptr) {
+            dst_texture->opaque_alpha_mips = 0;
+        }
         Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, VK_FILTER_NEAREST);
     });
     return true;
@@ -1600,9 +2464,54 @@ bool BlitTexture(TextureHandle src, Rect src_rect, TextureHandle dst, Rect dst_r
         VkCommandBuffer cmd = CopyCommands();
         MarkUsed(src_texture);
         MarkUsed(dst_texture);
+        if (dst_texture != nullptr) {
+            dst_texture->opaque_alpha_mips = 0;
+        }
         Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, vk_filter);
     });
     return true;
+}
+
+bool DepthPlanesAvailable() { return g.depth_planes_pipeline != VK_NULL_HANDLE; }
+
+bool CanCopyMainDepth(TextureHandle target) {
+    if (!g.depth_blit || target == kMainTarget || target == kPreviousFrame) {
+        return false;
+    }
+    const Texture *texture = LookupTexture(target);
+    return texture != nullptr && texture->render_target && !texture->shares_main_depth &&
+           texture->depth.image != VK_NULL_HANDLE;
+}
+
+bool CopyMainDepthToTarget(const LogicalRect &source) {
+    VkOffset3D low;
+    VkOffset3D high;
+    if (!CanCopyMainDepth(CurrentRenderTarget()) || !DepthCopyOffsets(source, low, high)) {
+        return false;
+    }
+    if (RecordingCalls()) {
+        RecordEntry(DepthCopyEntry{source});
+        return true;
+    }
+    bool copied = false;
+    RunOnRenderThread([&] { copied = ExecuteDepthCopy(source); });
+    return copied;
+}
+
+void DrawDepthPlanes2D(const DepthPlanes2D &planes, std::span<const Vertex2D, 4> quad, const TextureBinding &binding,
+                       const DrawState &state) {
+    if (planes.count == 0 || planes.count > kMaxDepthPlanes) {
+        Error("DrawDepthPlanes2D: %u planes, expected 1 to %u", planes.count, kMaxDepthPlanes);
+        return;
+    }
+    if (RecordingCalls()) {
+        RecordEntry(DepthPlanesEntry{
+            planes, {quad[0], quad[1], quad[2], quad[3]},
+             binding, state
+        });
+        return;
+    }
+    RunOnRenderThread([&] { ExecuteDepthPlanes(planes, quad, binding, state); });
 }
 
 bool SnapshotFrame(TextureHandle dst) {

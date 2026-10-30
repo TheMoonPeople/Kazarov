@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 inline std::filesystem::path PathsFromUtf8(std::string_view path) {
 #ifdef _WIN32
@@ -43,6 +44,11 @@ int PathsConsumeArgs(int argc, const char **argv);
 // The running executable, symlinks resolved; empty when the system cannot say and argv[0] (seen by
 // PathsConsumeArgs) is unknown.
 std::filesystem::path PathsExecutable();
+
+/**
+ * Resolves existing path components while preserving absolute device roots on filesystems without symlinks.
+ */
+std::filesystem::path PathsWeaklyCanonical(const std::filesystem::path &path, std::error_code &error);
 
 void PathsSetDataRoot(const std::filesystem::path &root);
 

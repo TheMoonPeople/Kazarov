@@ -92,6 +92,66 @@ def test_configure_line_is_lgpl():
         assert flag not in tokens
 
 
+def test_switch_configure_is_lgpl_libraries_only():
+    result = _ff('--target', 'switch-arm64', '--print-configure')
+    assert result.returncode == 0, result.stderr
+    tokens = shlex.split(result.stdout)
+    assert '--enable-ffmpeg' not in tokens
+    assert '--enable-cross-compile' in tokens
+    assert '--target-os=none' in tokens
+    assert '--arch=aarch64' in tokens
+    assert '--cross-prefix=aarch64-none-elf-' in tokens
+    assert all(flag not in tokens for flag in GPL_FLAGS)
+    assert any(flag.startswith('--extra-cflags=') and '-D__SWITCH__' in flag for flag in tokens)
+
+
+@needs_make
+@pytest.mark.skipif(shutil.which('cmake') is None, reason='needs CMake')
+def test_switch_headers_precede_toolchain_ffmpeg(tmp_path):
+    selected = tmp_path / 'selected'
+    foreign = tmp_path / 'toolchain'
+    for prefix, content in [(selected, '#define KZ_TEST_SELECTED_FFMPEG 1\n'),
+                            (foreign, '#error Incompatible toolchain FFmpeg headers selected\n')]:
+        header = prefix / 'include/libavcodec/avcodec.h'
+        header.parent.mkdir(parents=True)
+        header.write_text(content)
+    (selected / 'lib').mkdir()
+    for library in ['avutil', 'swresample', 'swscale', 'avcodec', 'avformat']:
+        (selected / f'lib/lib{library}.a').write_bytes(b'!<arch>\n')
+    (selected / 'kz-ffmpeg.json').write_text(json.dumps({'license': LICENSE_LINE, 'configure': []}))
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'main.cpp').write_text('#include <libavcodec/avcodec.h>\n'
+                                     '#ifndef KZ_TEST_SELECTED_FFMPEG\n#error Missing selected headers\n#endif\n'
+                                     'int main() { return 0; }\n')
+    module = KZ_FFMPEG.parents[2] / 'cmake/KazarovFfmpeg.cmake'
+    (source / 'CMakeLists.txt').write_text(
+        'cmake_minimum_required(VERSION 3.25)\nproject(ffmpeg_header_order LANGUAGES CXX)\n'
+        'set(NINTENDO_SWITCH TRUE)\n'
+        f'include_directories(SYSTEM "{(foreign / "include").as_posix()}")\n'
+        f'include("{module.as_posix()}")\n'
+        'add_library(game_options INTERFACE)\nkz_ffmpeg(game_options INTERFACE)\n'
+        'add_executable(check_headers main.cpp)\ntarget_link_libraries(check_headers PRIVATE game_options)\n')
+    build = tmp_path / 'build'
+    configured = subprocess.run(['cmake', '-S', str(source), '-B', str(build),
+                                 f'-DKZ_FFMPEG_DIR={selected}'], capture_output=True, text=True)
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    compiled = subprocess.run(['cmake', '--build', str(build), '--parallel', '1'], capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+
+
+@needs_make
+@requires_make
+def test_switch_stamp_does_not_require_an_executable(tmp_path):
+    tarball, sha = _fake_tarball(tmp_path, LICENSE_LINE)
+    out, log = tmp_path / 'ff', tmp_path / 'fake.log'
+    built = _ff('--target', 'switch-arm64', '--out', out, '--tarball', tarball, '--sha256', sha, log=log)
+    assert built.returncode == 0, built.stderr
+    (out / 'bin/ffmpeg').unlink()
+    assert _ff('--target', 'switch-arm64', '--out', out, '--sha256', sha, '--check').returncode == 0
+    assert _ff('--out', out, '--sha256', sha, '--check').returncode != 0
+
+
 def test_the_launcher_runs_the_image_script():
     launched = subprocess.run([sys.executable, str(KZ_FFMPEG_LAUNCHER), '--print-configure'],
                               capture_output=True, text=True)

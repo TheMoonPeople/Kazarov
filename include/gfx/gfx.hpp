@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -80,9 +81,9 @@ struct RendererConfig {
     const char *app_name = "";
     // The game's 2D space. 2D draws, scissors and main-target rectangles are given in it and mapped
     // to the target, letterboxed on the main target.
-    float logical_width = 640.0f;
-    float logical_height = 480.0f;
-    float display_aspect = 4.0f / 3.0f; // width / height the logical frame is shown at
+    float                 logical_width = 640.0f;
+    float                 logical_height = 480.0f;
+    float                 display_aspect = 4.0f / 3.0f; // width / height the logical frame is shown at
     PresentMode           present_mode = PresentMode::Fifo;
     std::filesystem::path pipeline_cache = "save/pipeline_cache.bin";
     // Pixels per logical texel of render targets; 0 derives it from the window height at init.
@@ -117,6 +118,8 @@ struct RendererConfig {
     // Lowers the texture and mesh tables for tests; 0 is the build maximum, larger values are clamped to it.
     uint32_t texture_slots = 0;
     uint32_t mesh_slots = 0;
+    // Maximum main-scene raster height; zero keeps the output size. The swapchain remains unchanged.
+    uint32_t main_height_limit = 0;
     // KZ_RENDER_THREAD=off|lockstep|async in the environment overrides this.
     RenderThreadMode render_thread = RenderThreadMode::Off;
 };
@@ -174,6 +177,64 @@ void RendererSuspend();
 void RendererResume();
 // The swapchain is recreated with the mode at the next BeginFrame or tick render.
 void SetPresentMode(PresentMode mode);
+
+// Opt-in renderer timings for a performance log, summed since the last TakeFrameTimings. A canonical frame is a
+// submission that does not present (a tick's canonical render); a display frame presents. CPU times are measured
+// on the thread that owns device work; GPU times come from timestamps around a frame's draw commands where the
+// queue has them, and are read once its fence has signalled.
+struct FrameTimings {
+    struct Span {
+        uint32_t count = 0;
+        double   total_ms = 0.0;
+        double   max_ms = 0.0;
+
+        void Add(double ms) {
+            ++count;
+            total_ms += ms;
+            max_ms = ms > max_ms ? ms : max_ms;
+        }
+
+        double Average() const { return count == 0 ? 0.0 : total_ms / count; }
+    };
+
+    bool gpu_timestamps = false;
+    Span canonical_cpu;       // replay and submission of a canonical frame
+    Span display_cpu;         // preparation, acquire, replay or blit, submission and present of a display frame
+    Span display_prepare_cpu; // matching and interpolation overrides, included in display_cpu
+    Span canonical_gpu;
+    Span display_gpu;
+    Span acquire;       // vkAcquireNextImageKHR
+    Span queue_present; // vkQueuePresentKHR
+    Span fence_wait;    // waits for a frame slot's previous submission
+    Span present_interval;
+    // Present intervals of at most 1.25, 2.25 and 3.25 periods of 60 Hz, and longer.
+    uint32_t interval_buckets[4] = {};
+    uint32_t sync_waits = 0; // one-shot submissions that wait for the GPU
+
+    // KZ_GPU_SCOPES=pass or draw: GPU time between timestamps at the end of each pass, copy and the setup
+    // before a pass, and with draw at each pipeline change inside a pass. The timestamps do not wait, so a
+    // segment is the time from its predecessor's completion to its own.
+    struct Scope {
+        std::string name;
+        Span        span; // one entry per segment
+        uint64_t    draws = 0;
+        uint64_t    barriers = 0;
+    };
+
+    std::vector<Scope> scopes; // in order of first appearance
+    uint32_t           scope_frames = 0;
+    uint64_t           barriers = 0; // pipeline barriers recorded into scoped frames
+    uint64_t           passes = 0;   // dynamic-rendering spans in scoped frames
+};
+
+void         SetFrameTimingEnabled(bool enabled);
+bool         FrameTimingEnabled();
+FrameTimings TakeFrameTimings();
+
+/**
+ * Reports and clears accumulated CPU, GPU and presentation timing samples for an interval.
+ */
+void LogFrameTimings(double elapsed_seconds);
 
 // Anisotropic filtering of linearly filtered meshes: 0 or 1 is off, otherwise 2, 4, 8 or 16 samples
 // (a value in between takes the level below it). Takes effect from the next draw.
@@ -430,9 +491,9 @@ struct DrawState {
     bool      fog = false;
     uint8_t   fog_color[3] = {0, 0, 0};
     // GS TEXA for textures without alpha: AEM makes black texels transparent, TA0 is the rest.
-    bool        texa_aem = true;
-    uint8_t     texa_ta0 = 0x80;
-    bool        scissor = false;
+    bool    texa_aem = true;
+    uint8_t texa_ta0 = 0x80;
+    bool    scissor = false;
     // Frame-edge scissors normally follow Fill. Sliding UI can retain the logical frame.
     bool extend_scissor = true;
     // Infinite extents mean the whole frame, which is only known once RendererInit has run.
@@ -517,23 +578,23 @@ inline constexpr uint32_t kProg0Bones = 32;
 
 // A DrawMeshProg0 draw's inputs as floats. Colours are scaled so 128 is 1.0; the material is on 1.0.
 struct Prog0Constants {
-    float    model_world[16];       // model to world, columns
-    float    light_direction[3][4]; // x, y, z rows: world directions toward the four lights
-    float    light_color[4][4];     // per-light colour
-    float    ambient[4];            // w already multiplied by the object's alpha
-    float    object_color[4];
-    float    eye[4];                // object space
+    float model_world[16];       // model to world, columns
+    float light_direction[3][4]; // x, y, z rows: world directions toward the four lights
+    float light_color[4][4];     // per-light colour
+    float ambient[4];            // w already multiplied by the object's alpha
+    float object_color[4];
+    float eye[4]; // object space
     // World clip * model, or view * model under kProg0RefSphere: the game overlaps the two blocks, so a
     // draw with both clips against the view.
     float    clip_or_view[16];
-    float    diffuse[4];            // material
-    float    specular[4];           // material
-    float    point_light[4][4];     // positions relative to the object origin, world space; w is the power
-    float    point_color[4][4];     // per-light colour
-    float    fog[4];                // offset, near value, far value, scale
-    uint32_t flags = 0;             // Prog0Flags
+    float    diffuse[4];        // material
+    float    specular[4];       // material
+    float    point_light[4][4]; // positions relative to the object origin, world space; w is the power
+    float    point_color[4][4]; // per-light colour
+    float    fog[4];            // offset, near value, far value, scale
+    uint32_t flags = 0;         // Prog0Flags
     uint32_t pad0 = 0;
-    uint32_t specular_power = 0;    // specular exponent
+    uint32_t specular_power = 0; // specular exponent
     uint32_t pad = 0;
 };
 
@@ -543,6 +604,7 @@ struct Prog0Skin {
     float   unused[4];
     uint8_t bone[4]; // slot, the VU's offset / 4
 };
+
 static_assert(sizeof(Prog0Skin) == sizeof(Vertex3D));
 
 // Vu_prog0 culls only under kProg0Cull; a mirroring model_world swaps the faces it keeps.
@@ -551,8 +613,8 @@ inline CullMode Prog0CullMode(const Prog0Constants &constants) {
         return CullMode::None;
     }
     const float *m = constants.model_world;
-    float det = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) +
-                m[8] * (m[1] * m[6] - m[2] * m[5]);
+    float        det = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) +
+                       m[8] * (m[1] * m[6] - m[2] * m[5]);
     return det < 0.0f ? CullMode::Front : CullMode::Back;
 }
 
@@ -570,11 +632,12 @@ struct MeshConstants {
     float    specular[4];
     float    fog[4];           // F = clamp(fog[0] + fog[1] / w, fog[2], fog[3]), GS units 0..255
     float    clip_plane[2][4]; // object space, kept where dot(plane, (p, 1)) >= 0
-    float    world_uv[2][4]; // world x/z rows for terrain sampled across map cells
+    float    world_uv[2][4];   // world x/z rows for terrain sampled across map cells
     uint32_t flags = 0;
     uint32_t light_count = 0;
     uint32_t pad[2] = {};
 };
+
 static_assert(sizeof(MeshConstants) == 400);
 static_assert(offsetof(Prog0Constants, flags) == 464);
 static_assert(sizeof(Prog0Constants) == 480);
@@ -584,6 +647,7 @@ static_assert(sizeof(Prog0Constants) == 480);
 struct Prog0Palette {
     float bones[kProg0Bones][3][4];
 };
+
 static_assert(sizeof(Prog0Palette) == 1536);
 
 // How a mesh draw's mvp was made: projection * view * middle * model * local, column-major. Recorded
@@ -613,6 +677,45 @@ struct Presentation2D {
 
 void Draw2D(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &texture,
             const DrawState &state, const Presentation2D *presentation = nullptr);
+
+inline constexpr uint32_t kMaxDepthPlanes = 8;
+
+/**
+ * Describes the feathered depth planes of one DrawDepthPlanes2D pass.
+ *
+ * Plane i is the quad drawn at depth depth[i] with vertex alpha alpha[i]. The planes run front to
+ * back, so the depths never increase.
+ */
+struct DepthPlanes2D {
+    uint32_t count = 0;                   /**< Planes in use, 1 to kMaxDepthPlanes. */
+    float    depth[kMaxDepthPlanes] = {}; /**< Depth of each plane, as Vertex2D::z. */
+    uint8_t  alpha[kMaxDepthPlanes] = {}; /**< Vertex alpha of each plane. */
+};
+
+/**
+ * Whether DrawDepthPlanes2D takes its single-pass path on this renderer.
+ *
+ * That needs KZ_DEPTH_PLANES=1 in the environment when the renderer starts, the device's depth
+ * bounds feature, a D32_SFLOAT_S8 depth buffer and the bindless texture path. Callers that want
+ * their own planes drawn unchanged while it is off test this first.
+ */
+bool DepthPlanesAvailable();
+
+/**
+ * Accumulates up to eight depth planes of one quad over a black destination.
+ *
+ * Each plane is drawn additively under a greater-or-equal depth test without depth writes, the
+ * way eight Draw2D calls would draw it: the destination must hold zero colour beforehand, since
+ * the single-pass path writes the accumulated result outright. The pass shades every pixel at most
+ * once, by selecting the planes a pixel's stored depth passes with the depth bounds test and reading
+ * their eight-step blend result from a table the original blend pipeline filled. It applies when the
+ * state is exactly the feathered-haze state (blend 0,2,2,1 with FIX 0x80, greater-or-equal depth, no
+ * alpha test, fog or stencil), the quad is an axis-aligned rectangle with vertex colour 0x101010, the texture has no alpha and is
+ * sampled without filtering, and the target keeps alpha. Anything else, or a renderer that cannot,
+ * draws the planes one by one instead, so the image is the same.
+ */
+void DrawDepthPlanes2D(const DepthPlanes2D &planes, std::span<const Vertex2D, 4> quad,
+                       const TextureBinding &texture, const DrawState &state);
 void DrawMesh(MeshHandle mesh, uint32_t first_index, uint32_t index_count, const MeshConstants &constants,
               const TextureBinding &texture, const DrawState &state,
               const MeshTransform *transform = nullptr);
@@ -652,28 +755,56 @@ struct LogicalMapping {
     uint32_t pixel_height;
 };
 
-void           SetRenderTarget(TextureHandle target);
-TextureHandle  CurrentRenderTarget();
+void          SetRenderTarget(TextureHandle target);
+TextureHandle CurrentRenderTarget();
 // Where the target's logical space lands: meshes, clears, copies, depth reads, and 2D that tests
 // depth or samples an image of the frame.
 LogicalMapping GetLogicalMapping(TextureHandle target);
+
+/**
+ * Whether CopyMainDepthToTarget can write target's depth.
+ *
+ * The device must blit its depth format, and target must be a render target with a depth image of its own
+ * (not the main target, not one sharing the main depth). Nothing is changed.
+ */
+bool CanCopyMainDepth(TextureHandle target);
+
+/**
+ * Copies a rectangle of the main depth over the whole depth of the current render target.
+ *
+ * The rectangle is in the main target's logical space and is rounded to its pixels; the copy is a nearest-sample
+ * resize of the depth aspect, so each destination pixel takes the source pixel its centre lies in, as a Nearest
+ * sampler would for colour over the same rectangle. It runs at its place in the draw order, on the depth the frame
+ * has built so far, and leaves the main depth and stencil as they were. The target's stencil starts at zero and
+ * its previous depth is replaced, so it is meant to be drawn into afterwards with the depth test on. Returns false,
+ * and records nothing, when CanCopyMainDepth(current target) is false or the rectangle is empty or not finite.
+ */
+bool CopyMainDepthToTarget(const LogicalRect &source);
 // Where the rest of 2D lands: on the main target the logical mapping scaled by ui_scale about the
 // target's centre, elsewhere the logical mapping.
 LogicalMapping GetUiMapping(TextureHandle target);
+/**
+ * Maps logical coordinates to output pixels independently of the main raster size.
+ */
+LogicalMapping GetPresentationMapping(bool ui = false);
 // The anchor of the 2D drawn from here on that the UI mapping places on the main target.
 void     SetUiAnchor(const UiAnchor &anchor);
 UiAnchor CurrentUiAnchor();
+
 // Sets an anchor for its lifetime and puts back the one it replaced.
 class UiAnchorScope {
 public:
     explicit UiAnchorScope(const UiAnchor &anchor) : previous_(CurrentUiAnchor()) { SetUiAnchor(anchor); }
+
     ~UiAnchorScope() { SetUiAnchor(previous_); }
+
     UiAnchorScope(const UiAnchorScope &) = delete;
     UiAnchorScope &operator=(const UiAnchorScope &) = delete;
 
 private:
     UiAnchor previous_;
 };
+
 // The logical rect the target's pixels show: its logical frame, or with AspectMode::Fill on the main
 // target (and the targets mapped like it) all of the target, past the frame on its wider axis, and
 // on a frame target the main target's horizontal extent (and vertical, on a full-height one).
@@ -802,6 +933,45 @@ struct RenderOptions {
 bool RenderList(const DisplayList &list, float alpha, const RenderOptions &options);
 // Presents the last canonical render as it is (interpolation off, headless runs).
 bool PresentCanonical();
+
+/**
+ * Identifies one committed canonical image without extending its storage lifetime.
+ */
+class CanonicalImageToken {
+public:
+    /**
+     * Creates an empty image identity that cannot be presented.
+     */
+    CanonicalImageToken() = default;
+    /**
+     * Compares complete canonical-image identities.
+     */
+    bool operator==(const CanonicalImageToken &) const = default;
+
+    /**
+     * Checks whether two valid images belong to the same main-target allocation.
+     */
+    bool SharesStorageWith(const CanonicalImageToken &other) const noexcept {
+        return renderer_instance != 0 && renderer_instance == other.renderer_instance && target_generation == other.target_generation;
+    }
+
+private:
+    uint64_t                                  renderer_instance = 0; /**< Renderer lifetime that owns the image. */
+    uint64_t                                  target_generation = 0; /**< Main-target allocation that owns the slot. */
+    uint64_t                                  commit_serial = 0;     /**< Canonical render that produced the pixels. */
+    uint32_t                                  image_index = 0;       /**< Committed main-color slot. */
+    friend std::optional<CanonicalImageToken> CaptureCanonicalImage();
+    friend bool                               PresentCanonicalImage(const CanonicalImageToken &, const DisplayList *);
+};
+
+/**
+ * Captures the latest complete canonical image while it is eligible for presentation.
+ */
+std::optional<CanonicalImageToken> CaptureCanonicalImage();
+/**
+ * Presents the exact latest committed image, optionally compositing a host-only overlay.
+ */
+bool PresentCanonicalImage(const CanonicalImageToken &token, const DisplayList *overlay = nullptr);
 
 struct DisplayListStats {
     uint32_t draws_2d;

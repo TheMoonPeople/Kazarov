@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Build a minimal LGPL-only FFmpeg into DIR and stamp it.
 
-    kz-ffmpeg --out DIR [--target ios-arm64] [--tarball FILE] [--sha256 HEX] [--jobs N] [--check] [--print-configure]
+    kz-ffmpeg --out DIR [--target ios-arm64|switch-arm64] [--tarball FILE] [--sha256 HEX] [--jobs N] [--check] [--print-configure]
 
 The build provides lossless MPEG-2/ALAC MP4 extraction and MP4 playback through
 static codec, format, resampling and scaling libraries plus the FFmpeg command.
 The Linux image and macOS hosts use it; Windows takes BtbN's LGPL-shared bundle.
 --target ios-arm64 cross-compiles the libraries for iOS on a macOS host, without the command.
+--target switch-arm64 cross-compiles the libraries with devkitA64/libnx, without the command.
 scripts/build/kz-ffmpeg launches this shared FFmpeg tool; the image uses it directly.
 """
 
@@ -59,7 +60,7 @@ GPL_FLAGS = ('--enable-gpl', '--enable-nonfree', '--enable-version3')
 
 
 def products(target):
-    return LIBRARIES if target == 'ios-arm64' else LIBRARIES + ('bin/ffmpeg',)
+    return LIBRARIES if target in ('ios-arm64', 'switch-arm64') else LIBRARIES + ('bin/ffmpeg',)
 
 
 def ios_flags():
@@ -71,11 +72,26 @@ def ios_flags():
             f'--sysroot={sysroot}', f'--extra-cflags={target}', f'--extra-ldflags={target}']
 
 
+def switch_flags():
+    devkitpro = Path(os.environ.get('DEVKITPRO', '/opt/devkitpro'))
+    libnx = devkitpro / 'libnx'
+    cflags = ('-D__SWITCH__ -D_GNU_SOURCE -O2 -march=armv8-a+crc+crypto -mtune=cortex-a57 '
+              f'-mtp=soft -fPIC -ftls-model=local-exec -I{libnx / "include"}')
+    ldflags = (f'-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE '
+               f'-specs={libnx / "switch.specs"} -L{libnx / "lib"}')
+    return ['--enable-cross-compile', '--target-os=none', '--arch=aarch64',
+            '--cross-prefix=aarch64-none-elf-', '--cc=aarch64-none-elf-gcc',
+            f'--extra-cflags={cflags}', f'--extra-ldflags={ldflags}', '--extra-libs=-lnx -lpthread -lm']
+
+
 def configure_flags(target=None):
     flags = list(CONFIGURE_FLAGS)
     if target == 'ios-arm64':
         flags.remove('--enable-ffmpeg')
         flags += ios_flags()
+    elif target == 'switch-arm64':
+        flags.remove('--enable-ffmpeg')
+        flags += switch_flags()
     # configure aborts without nasm unless x86 assembly is disabled explicitly.
     elif shutil.which('nasm') is None:
         flags.append('--disable-x86asm')
@@ -147,6 +163,9 @@ def configure_and_build(src, out, jobs, target):
     log = result.stdout + result.stderr
     (out / 'configure.log').write_text(log, encoding='utf-8')
     if result.returncode != 0:
+        config_log = src / 'ffbuild/config.log'
+        if config_log.is_file():
+            shutil.copyfile(config_log, out / 'config-test.log')
         sys.stderr.write('\n'.join(log.splitlines()[-40:]) + '\n')
         sys.exit(result.returncode)
     if LICENSE_LINE not in (line.rstrip() for line in log.splitlines()):
@@ -160,7 +179,7 @@ def configure_and_build(src, out, jobs, target):
 def main():
     parser = argparse.ArgumentParser(description=f'Build a minimal LGPL-only FFmpeg {VERSION} for the Kazarov image.')
     parser.add_argument('--out', metavar='DIR')
-    parser.add_argument('--target', choices=['ios-arm64'], help='cross-compile the libraries for this target')
+    parser.add_argument('--target', choices=['ios-arm64', 'switch-arm64'], help='cross-compile the libraries for this target')
     parser.add_argument('--tarball', metavar='FILE')
     parser.add_argument('--sha256', metavar='HEX')
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 1, metavar='N')

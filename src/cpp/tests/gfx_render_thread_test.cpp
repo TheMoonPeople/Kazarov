@@ -415,3 +415,77 @@ TEST(GfxGpuRenderThread, InFrameIgnoresHookFrames) {
     EXPECT_TRUE(gfx::InFrame());
     gfx::EndRecording();
 }
+
+TEST(GfxGpuRenderThread, InlineMeshDispatchMatchesAcrossModesAndLeases) {
+    if (EnvOverridesMode()) {
+        GTEST_SKIP() << "KZ_RENDER_THREAD overrides the mode";
+    }
+    const EnvSnapshot saved = SaveEnv("KZ_INLINE_MESH_DISPATCH");
+
+    struct RestoreSetting {
+        const EnvSnapshot &saved;
+
+        ~RestoreSetting() { RestoreEnv(saved); }
+    } restore{saved};
+
+    SetEnv("KZ_INLINE_MESH_DISPATCH", "1", 1);
+
+    const std::array<gfx::Vertex3D, 3> retained = {
+        gfx::Vertex3D{.position = {-0.9f, -0.7f, 0.5f}},
+        gfx::Vertex3D{.position = {-0.1f, -0.7f, 0.5f}},
+        gfx::Vertex3D{.position = {-0.5f, 0.7f, 0.5f}}};
+    const std::array<gfx::Vertex3D, 3> immediate = {
+        gfx::Vertex3D{.position = {0.1f, -0.7f, 0.5f}},
+        gfx::Vertex3D{.position = {0.9f, -0.7f, 0.5f}},
+        gfx::Vertex3D{.position = {0.5f, 0.7f, 0.5f}}};
+    const std::array<uint32_t, 3> indices = {0, 1, 2};
+    gfx::MeshConstants            red{};
+    red.mvp[0] = red.mvp[5] = red.mvp[10] = red.mvp[15] = 1.0f;
+    red.diffuse[0] = 255.0f / 128.0f;
+    red.diffuse[3] = 1.0f;
+    gfx::MeshConstants green = red;
+    green.diffuse[0] = 0.0f;
+    green.diffuse[1] = 255.0f / 128.0f;
+    const std::array<uint8_t, 4> clear = {0x10, 0x20, 0x30, 0xFF};
+    std::vector<uint8_t>         reference;
+
+    for (gfx::RenderThreadMode mode : {gfx::RenderThreadMode::Off, gfx::RenderThreadMode::Lockstep,
+                                       gfx::RenderThreadMode::Async}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        GfxOptions options{.offscreen = true, .render_thread = mode};
+        GfxFixture fixture(64, 48, 1.0f, options);
+        ASSERT_EQ(gfx::ActiveRenderThreadMode(), mode);
+        const gfx::MeshHandle mesh = gfx::CreateMesh(retained, indices);
+        ASSERT_NE(mesh, gfx::kNullMesh);
+        for (bool leased : {false, true}) {
+            SCOPED_TRACE(leased);
+            fixture.Frame(clear, [&] {
+                EXPECT_FALSE(gfx::detail::OnWorkerThread());
+                EXPECT_EQ(gfx::detail::DeviceThreadAllowed(), mode == gfx::RenderThreadMode::Off);
+                const auto draw = [&] {
+                    gfx::DrawMesh(mesh, 0, 3, red, {}, {});
+                    gfx::DrawMeshImmediate(immediate, indices, green, {}, {});
+                };
+                if (leased) {
+                    gfx::RenderLease lease;
+                    EXPECT_TRUE(gfx::detail::DeviceThreadAllowed());
+                    EXPECT_FALSE(gfx::detail::OnWorkerThread());
+                    draw();
+                } else {
+                    draw();
+                }
+            });
+            ASSERT_FALSE(fixture.pixels.empty());
+            EXPECT_TRUE(fixture.PixelNear(16, 24, 255, 0, 0, 0));
+            EXPECT_TRUE(fixture.PixelNear(48, 24, 0, 255, 0, 0));
+            EXPECT_EQ(fixture.Pixel(32, 24), clear);
+            EXPECT_EQ(fixture.Pixel(0, 0), clear);
+            if (reference.empty()) {
+                reference = fixture.pixels;
+            } else {
+                EXPECT_EQ(fixture.pixels, reference);
+            }
+        }
+        gfx::DestroyMesh(mesh);
+    }
+}

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,14 +14,213 @@
 
 #include "gfx/context.hpp"
 #include "gfx/profile.hpp"
+#include "kazarov/log.hpp"
 
 namespace gfx {
 
 namespace detail {
 
+void BeginMeshAlphaDiagnosticCanonicalReplay();
+void EndMeshAlphaDiagnosticCanonicalReplay();
+void BeginMeshPhaseDiagnosticCanonicalReplay();
+void EndMeshPhaseDiagnosticCanonicalReplay();
+
 namespace {
 
+class MeshAlphaDiagnosticReplay {
+public:
+    MeshAlphaDiagnosticReplay() {
+        BeginMeshAlphaDiagnosticCanonicalReplay();
+        BeginMeshPhaseDiagnosticCanonicalReplay();
+    }
+
+    ~MeshAlphaDiagnosticReplay() {
+        EndMeshPhaseDiagnosticCanonicalReplay();
+        EndMeshAlphaDiagnosticCanonicalReplay();
+    }
+};
+
 constexpr Mat4 kIdentity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+bool ReplayPhasesEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_PERF_REPLAY_PHASES");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void RecordReplayPhases(const std::array<double, 3> &milliseconds) {
+    static uint64_t              instance = 0;
+    static uint64_t              canonical_replays = 0;
+    static uint32_t              count = 0;
+    static std::array<double, 4> sums = {};
+    static std::array<double, 4> maxima = {};
+    if (instance != g.renderer_instance) {
+        instance = g.renderer_instance;
+        canonical_replays = 0;
+        count = 0;
+        sums = {};
+        maxima = {};
+    }
+    ++canonical_replays;
+    ++count;
+    const std::array<double, 4> values = {milliseconds[0], milliseconds[1], milliseconds[2],
+                                          milliseconds[0] + milliseconds[1] + milliseconds[2]};
+    for (size_t i = 0; i < values.size(); ++i) {
+        sums[i] += values[i];
+        maxima[i] = std::max(maxima[i], values[i]);
+    }
+    if (count == 120) {
+        kz::Logf(kz::LogLevel::Info, "gfx",
+                 "cpu replayphases canonical_replay_count{}-{} instance{} n{} open {:.3f}/{:.3f} replay {:.3f}/{:.3f} close {:.3f}/{:.3f} total {:.3f}/{:.3f} ms_wall_mean/max nested_render_list",
+                 canonical_replays - count + 1, canonical_replays, instance, count,
+                 sums[0] / count, maxima[0], sums[1] / count, maxima[1],
+                 sums[2] / count, maxima[2], sums[3] / count, maxima[3]);
+        count = 0;
+        sums = {};
+        maxima = {};
+    }
+}
+
+enum class ReplayBucket : size_t {
+    RetainedPlain,
+    RetainedProg0,
+    ImmediateMesh,
+    Draw2D,
+    TargetClear,
+    CopyDepth,
+    UpdateReadback,
+    Other,
+    Count,
+};
+
+constexpr size_t                                       kReplayBucketCount = static_cast<size_t>(ReplayBucket::Count);
+constexpr std::array<const char *, kReplayBucketCount> kReplayBucketNames = {
+    "retained_plain", "retained_prog0", "immediate_mesh", "draw2d",
+    "target_clear", "copy_depth", "update_readback", "other"};
+
+bool ReplayBucketsEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_PERF_REPLAY_BUCKETS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+template <typename T>
+ReplayBucket BucketFor(const T &entry) {
+    if constexpr (std::is_same_v<T, MeshEntry>) {
+        return entry.mesh == kNullMesh ? ReplayBucket::ImmediateMesh
+               : entry.prog0 >= 0      ? ReplayBucket::RetainedProg0
+                                       : ReplayBucket::RetainedPlain;
+    } else if constexpr (std::is_same_v<T, Draw2DEntry>) {
+        return ReplayBucket::Draw2D;
+    } else if constexpr (std::is_same_v<T, TargetEntry> || std::is_same_v<T, ClearEntry>) {
+        return ReplayBucket::TargetClear;
+    } else if constexpr (std::is_same_v<T, CopyEntry> || std::is_same_v<T, DepthCopyEntry> ||
+                         std::is_same_v<T, DepthPlanesEntry>) {
+        return ReplayBucket::CopyDepth;
+    } else if constexpr (std::is_same_v<T, UpdateTextureEntry> || std::is_same_v<T, UpdateMeshEntry> ||
+                         std::is_same_v<T, ReadDepthEntry>) {
+        return ReplayBucket::UpdateReadback;
+    } else {
+        return ReplayBucket::Other;
+    }
+}
+
+struct ReplayBucketFrame {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point                          start = Clock::now();
+    Clock::time_point                          boundary = start;
+    ReplayBucket                               current = ReplayBucket::Count;
+    std::array<double, kReplayBucketCount + 2> milliseconds = {};
+    std::array<uint64_t, kReplayBucketCount>   entries = {};
+    std::array<uint64_t, kReplayBucketCount>   runs = {};
+
+    void Enter(ReplayBucket bucket) {
+        const size_t index = static_cast<size_t>(bucket);
+        if (bucket != current) {
+            const auto now = Clock::now();
+            milliseconds[static_cast<size_t>(current)] +=
+                std::chrono::duration<double, std::milli>(now - boundary).count();
+            boundary = now;
+            current = bucket;
+            ++runs[index];
+        }
+        ++entries[index];
+    }
+
+    void Finish() {
+        const auto now = Clock::now();
+        milliseconds[static_cast<size_t>(current)] +=
+            std::chrono::duration<double, std::milli>(now - boundary).count();
+        milliseconds[kReplayBucketCount + 1] = std::chrono::duration<double, std::milli>(now - start).count();
+    }
+};
+
+void RecordReplayBuckets(const ReplayBucketFrame &frame) {
+    static uint64_t                                   instance = 0;
+    static uint64_t                                   canonical_replays = 0;
+    static uint32_t                                   count = 0;
+    static std::array<double, kReplayBucketCount + 2> sums = {};
+    static std::array<double, kReplayBucketCount + 2> maxima = {};
+    static std::array<uint64_t, kReplayBucketCount>   entries = {};
+    static std::array<uint64_t, kReplayBucketCount>   runs = {};
+    if (instance != g.renderer_instance) {
+        instance = g.renderer_instance;
+        canonical_replays = 0;
+        count = 0;
+        sums = {};
+        maxima = {};
+        entries = {};
+        runs = {};
+    }
+    ++canonical_replays;
+    ++count;
+    for (size_t i = 0; i < sums.size(); ++i) {
+        sums[i] += frame.milliseconds[i];
+        maxima[i] = std::max(maxima[i], frame.milliseconds[i]);
+    }
+    for (size_t i = 0; i < entries.size(); ++i) {
+        entries[i] += frame.entries[i];
+        runs[i] += frame.runs[i];
+    }
+    if (count == 120) {
+        const uint64_t first = canonical_replays - count + 1;
+        kz::Logf(kz::LogLevel::Info, "gfx",
+                 "cpu replaybuckets canonical_replay_count{}-{} instance{} n{} loop {:.3f}/{:.3f} residual {:.3f}/{:.3f} ms_wall_mean/max_frame nested_replay_loop",
+                 first, canonical_replays, instance, count, sums[kReplayBucketCount + 1] / count,
+                 maxima[kReplayBucketCount + 1], sums[kReplayBucketCount] / count, maxima[kReplayBucketCount]);
+        for (size_t i = 0; i < entries.size(); ++i) {
+            kz::Logf(kz::LogLevel::Info, "gfx",
+                     "cpu replaybucket canonical_replay_count{}-{} instance{} kind{} ms_wall_mean{:.3f} max_frame{:.3f} entry_attempts_total{} coalesced_runs_total{}",
+                     first, canonical_replays, instance, kReplayBucketNames[i], sums[i] / count,
+                     maxima[i], entries[i], runs[i]);
+        }
+        count = 0;
+        sums = {};
+        maxima = {};
+        entries = {};
+        runs = {};
+    }
+}
+
+bool FullListArenaEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_LIST_ARENA");
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::pmr::memory_resource *ListKeyResource(DisplayList &list) {
+    return FullListArenaEnabled() ? &list.recording_storage : std::pmr::get_default_resource();
+}
+
+std::pmr::memory_resource *ListPayloadResource(DisplayList &list) {
+    return FullListArenaEnabled() ? &list.recording_storage : std::pmr::get_default_resource();
+}
 
 // Validate bindings while their recording still owns them, before a later replay can outlive them.
 bool CanRecordBinding(const TextureBinding &binding) {
@@ -50,6 +250,9 @@ struct RecordingSizes {
     size_t   entries = 0;
     size_t   records = 0;
     size_t   prog0 = 0;
+    size_t   keys = 0;
+    size_t   keys_2d = 0;
+    size_t   target_scenes = 0;
 };
 
 std::array<RecordingSizes, 2> g_recording_sizes;
@@ -323,9 +526,9 @@ bool VerticesBlend(const MeshEntry &before, const MeshEntry &after, float telepo
 }
 
 // Positions lerped, normals lerped and normalised; the rest is b's.
-void BlendVertices(const std::vector<Vertex3D> &a, const std::vector<Vertex3D> &b, float alpha,
+void BlendVertices(std::span<const Vertex3D> a, std::span<const Vertex3D> b, float alpha,
                    std::vector<Vertex3D> &out) {
-    out = b;
+    out.assign(b.begin(), b.end());
     for (size_t i = 0; i < out.size(); i++) {
         for (int k = 0; k < 3; k++) {
             out[i].position[k] = a[i].position[k] + (b[i].position[k] - a[i].position[k]) * alpha;
@@ -495,7 +698,7 @@ void BuildMatches(const DisplayList &list, const DisplayList &previous) {
     cache.blend.assign(list.records.size(), false);
     cache.draws_2d.clear();
     if (!list.camera_cut && !list.tagged_2d.empty()) {
-        std::unordered_map<InterpKey, std::vector<uint32_t> > before_2d;
+        std::unordered_map<InterpKey, std::vector<uint32_t>> before_2d;
         for (uint32_t entry : previous.tagged_2d) {
             before_2d[std::get<Draw2DEntry>(previous.entries[entry]).interpolation.key].push_back(entry);
         }
@@ -575,10 +778,10 @@ struct Overrides {
     // The vertex rewrites of meshes a matched draw uses (skinning), between the previous tick's
     // rewrite and this one's.
     std::unordered_map<const UpdateMeshEntry *, std::vector<Vertex3D>> poses;
-    std::vector<int32_t>                                           prog0_index; // per record, into prog0, or -1
-    std::vector<Prog0Constants>                                    prog0;
-    std::vector<int32_t>                                           palette_index; // per record, into palettes, or -1
-    std::vector<Prog0Palette>                                      palettes;
+    std::vector<int32_t>                                               prog0_index; // per record, into prog0, or -1
+    std::vector<Prog0Constants>                                        prog0;
+    std::vector<int32_t>                                               palette_index; // per record, into palettes, or -1
+    std::vector<Prog0Palette>                                          palettes;
 
     // Empties every container, so a reused Overrides holds nothing from its previous frame.
     void Clear() {
@@ -643,7 +846,7 @@ bool Invert(const Mat4 &m, Mat4 &out) {
 // interpolated one. A corner that falls behind that camera leaves the sprite as recorded.
 bool MoveSprite(const Draw2DEntry &sprite, const SpriteScene &scene, const Mat4 &carry,
                 std::vector<Vertex2D> &out) {
-    out = sprite.vertices;
+    out.assign(sprite.vertices.begin(), sprite.vertices.end());
     for (Vertex2D &vertex : out) {
         const float in[4] = {vertex.x * scene.to_clip[0] + scene.to_clip[2],
                              vertex.y * scene.to_clip[1] + scene.to_clip[3], vertex.z, 1.0f};
@@ -750,8 +953,8 @@ void PosesBetween(const DisplayList &list, const DisplayList &previous, float al
     std::vector<const UpdateMeshEntry *> before = RecordPoses(previous);
     const MatchCache                    &cache = list.cache;
     for (size_t i = 0; i < list.records.size(); i++) {
-        const MeshRecord &record = list.records[i];
-        int32_t           match = cache.match[i];
+        const MeshRecord      &record = list.records[i];
+        int32_t                match = cache.match[i];
         const UpdateMeshEntry *pose = now[i];
         if (match < 0 || pose == nullptr || out.poses.contains(pose)) {
             continue;
@@ -760,10 +963,10 @@ void PosesBetween(const DisplayList &list, const DisplayList &previous, float al
         if (old == nullptr || old->first != pose->first || old->vertices.size() != pose->vertices.size()) {
             continue;
         }
-        const std::vector<Vertex3D> &a = old->vertices;
-        const std::vector<Vertex3D> &b = pose->vertices;
-        bool                         same = true;
-        bool                         teleported = false;
+        const auto &a = old->vertices;
+        const auto &b = pose->vertices;
+        bool        same = true;
+        bool        teleported = false;
         for (size_t v = 0; v < b.size() && !teleported; v++) {
             float dx = b[v].position[0] - a[v].position[0];
             float dy = b[v].position[1] - a[v].position[1];
@@ -863,12 +1066,81 @@ bool MoveProg0(const MeshRecord &record, const Mat4 &view_b, const Mat4 &view_i,
     return true;
 }
 
+enum class InterpolationPhase : size_t { Matches, Cameras, Sprites, Quads, Reset, Meshes, Poses, Count };
+
+struct InterpolationPhases {
+    using Clock = std::chrono::steady_clock;
+    static constexpr size_t kPhaseCount = static_cast<size_t>(InterpolationPhase::Count);
+    bool enabled = [] {
+        static const bool setting = [] {
+            const char *value = std::getenv("KZ_PERF_INTERPOLATE_PHASES");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        return setting;
+    }();
+    Clock::time_point last = enabled ? Clock::now() : Clock::time_point{};
+    std::array<double, kPhaseCount> milliseconds = {};
+    uint32_t palette_blends = 0;
+
+    void Mark(InterpolationPhase phase) {
+        if (!enabled) return;
+        const auto now = Clock::now();
+        milliseconds[static_cast<size_t>(phase)] = std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+    }
+
+    void Record(const DisplayList &list, const MatchCache &cache, const Overrides &out, bool cache_miss) const {
+        if (!enabled) return;
+        struct Aggregate {
+            uint64_t instance = 0;
+            uint32_t count = 0;
+            uint32_t misses = 0;
+            std::array<double, kPhaseCount> milliseconds = {};
+            std::array<double, 8> counts = {};
+        };
+        static Aggregate aggregate;
+        if (aggregate.instance != g.renderer_instance) {
+            aggregate = {};
+            aggregate.instance = g.renderer_instance;
+        }
+        aggregate.count++;
+        aggregate.misses += cache_miss ? 1u : 0u;
+        for (size_t i = 0; i < kPhaseCount; ++i) aggregate.milliseconds[i] += milliseconds[i];
+        aggregate.counts[0] += static_cast<double>(list.records.size());
+        aggregate.counts[1] += static_cast<double>(list.cameras.size());
+        aggregate.counts[2] += static_cast<double>(cache.draws_2d.size());
+        aggregate.counts[3] += static_cast<double>(list.palettes.size());
+        aggregate.counts[4] += static_cast<double>(palette_blends);
+        aggregate.counts[5] += static_cast<double>(out.palettes.size());
+        aggregate.counts[6] += static_cast<double>(out.prog0.size());
+        for (const auto &vertices : out.vertices) aggregate.counts[7] += static_cast<double>(vertices.size());
+        if (aggregate.count != 120) return;
+        const double scale = 1.0 / aggregate.count;
+        kz::Logf(kz::LogLevel::Info, "gfx",
+                 "interpolate phases calls={} hit={} miss={} match={:.3f} camera={:.3f} sprites={:.3f} quads={:.3f} reset={:.3f} meshes={:.3f} poses={:.3f} ms; records={:.1f} cameras={:.1f} pairs_2d={:.1f} source_palettes={:.1f} palette_blends={:.1f} palettes={:.1f} prog0={:.1f} vertices={:.1f}",
+                 aggregate.count, aggregate.count - aggregate.misses, aggregate.misses,
+                 aggregate.milliseconds[0] * scale, aggregate.milliseconds[1] * scale,
+                 aggregate.milliseconds[2] * scale, aggregate.milliseconds[3] * scale,
+                 aggregate.milliseconds[4] * scale, aggregate.milliseconds[5] * scale,
+                 aggregate.milliseconds[6] * scale, aggregate.counts[0] * scale,
+                 aggregate.counts[1] * scale, aggregate.counts[2] * scale,
+                 aggregate.counts[3] * scale, aggregate.counts[4] * scale,
+                 aggregate.counts[5] * scale, aggregate.counts[6] * scale,
+                 aggregate.counts[7] * scale);
+        aggregate = {};
+        aggregate.instance = g.renderer_instance;
+    }
+};
+
 void Interpolated(const DisplayList &list, const DisplayList &previous, float alpha, Overrides &out) {
     KZ_PROFILE_ZONE("Kazarov Interpolated");
-    if (list.cache.previous_serial != previous.serial) {
+    InterpolationPhases phases;
+    const bool cache_miss = list.cache.previous_serial != previous.serial;
+    if (cache_miss) {
         BuildMatches(list, previous);
     }
     const MatchCache &cache = list.cache;
+    phases.Mark(InterpolationPhase::Matches);
 
     std::vector<Mat4> views(list.cameras.size());
     std::vector<bool> moved(list.cameras.size(), false);
@@ -883,7 +1155,9 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
         }
     }
 
+    phases.Mark(InterpolationPhase::Cameras);
     MoveSprites(list, views, moved, out);
+    phases.Mark(InterpolationPhase::Sprites);
     for (const auto &pair : cache.draws_2d) {
         const auto           &draw = std::get<Draw2DEntry>(list.entries[pair[0]]);
         const auto           &before = std::get<Draw2DEntry>(previous.entries[pair[1]]);
@@ -907,6 +1181,7 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
         }
     }
 
+    phases.Mark(InterpolationPhase::Quads);
     out.index.assign(list.records.size(), -1);
     out.constants.clear();
     out.vertex_index.assign(list.records.size(), -1);
@@ -927,6 +1202,7 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
     Mat4                    clip_projection = {};
     Mat4                    clip_middle = {};
     Mat4                    world_to_clip = {};
+    phases.Mark(InterpolationPhase::Reset);
     for (const Entry &entry : list.entries) {
         const MeshEntry *mesh = std::get_if<MeshEntry>(&entry);
         if (mesh == nullptr) {
@@ -968,6 +1244,7 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
                     (previous.prog0_blocks[static_cast<size_t>(earlier.prog0)].flags & kProg0Skinned) != 0) {
                     const Prog0Palette &newest_palette = list.palettes[static_cast<size_t>(mesh->palette)];
                     Prog0Palette       &blended = out.palettes.emplace_back();
+                    if (phases.enabled) phases.palette_blends++;
                     BlendProg0Bones(previous.palettes[static_cast<size_t>(earlier.palette)], newest_palette, alpha,
                                     record.teleport_distance, blended);
                     if (std::memcmp(&blended, &newest_palette, sizeof blended) != 0) {
@@ -1013,7 +1290,10 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
         out.constants.push_back(constants);
     }
 
+    phases.Mark(InterpolationPhase::Meshes);
     PosesBetween(list, previous, alpha, out);
+    phases.Mark(InterpolationPhase::Poses);
+    phases.Record(list, cache, out, cache_miss);
 }
 
 // A grab of the frame (a copy or blit out of the main target) is taken by the canonical render at
@@ -1101,7 +1381,7 @@ bool CoversDestination(const CopyEntry &entry, const TextureInfo &info) {
     PixelSpan      src_y = MappedSpan(entry.src_rect.y, entry.src_rect.h, src_mapping.scale_y, src_mapping.offset_y,
                                       src_info->pixel_height);
     // A blit stretches whatever the source spans; a copy needs a source at least as large as the destination.
-    bool copy = entry.kind == CopyEntry::Copy;
+    bool    copy = entry.kind == CopyEntry::Copy;
     int32_t need_x = copy ? static_cast<int32_t>(info.pixel_width) : 1;
     int32_t need_y = copy ? static_cast<int32_t>(info.pixel_height) : 1;
     return src_x.high - src_x.low >= need_x && src_y.high - src_y.low >= need_y;
@@ -1147,7 +1427,7 @@ void GrabAgain(const CopyEntry &entry) {
         return;
     }
     std::optional<TextureInfo> info = GetTextureInfo(entry.dst);
-    bool covers = info && CoversDestination(entry, *info);
+    bool                       covers = info && CoversDestination(entry, *info);
     // A self-grab reads the twin it writes, so the twin needs the destination's contents.
     TextureHandle dst = ActivateGrabTwin(entry.dst, entry.src == entry.dst || !covers);
     if (dst == kNullTexture) {
@@ -1311,34 +1591,41 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
         ResetGrabTwins();
         rewrites = &CachedRewrites(list);
     }
+    std::optional<ReplayBucketFrame> buckets;
+    if (canonical && ReplayBucketsEnabled()) {
+        buckets.emplace();
+    }
     for (const Entry &entry : list.entries) {
         tls.interpolation_tint = 0;
         std::visit(
             [&](const auto &e) {
                 using T = std::decay_t<decltype(e)>;
+                if (buckets) {
+                    buckets->Enter(BucketFor(e));
+                }
                 if constexpr (std::is_same_v<T, Draw2DEntry>) {
                     if (!canonical && suppressed_2d_key != 0 && e.target == kMainTarget &&
                         e.interpolation.key == suppressed_2d_key) {
                         return;
                     }
-                    const std::vector<Vertex2D> *vertices = &e.vertices;
-                    const DrawState             *state = &e.state;
-                    UiSide                       side = e.side;
+                    std::span<const Vertex2D> vertices = e.vertices;
+                    const DrawState          *state = &e.state;
+                    UiSide                    side = e.side;
                     if (!canonical && !e.presentation_vertices.empty()) {
-                        vertices = &e.presentation_vertices;
+                        vertices = e.presentation_vertices;
                         state = &e.presentation_state;
                         // Composite replacements are in target space, independent of the original UI box.
                         side = {};
                     } else if (overrides != nullptr) {
                         if (auto it = overrides->sprites.find(&e); it != overrides->sprites.end()) {
-                            vertices = &it->second;
+                            vertices = it->second;
                         }
                     }
                     if (tint && !canonical && CurrentRenderTarget() == kMainTarget) {
                         tls.interpolation_tint = overrides && overrides->sprites.contains(&e) ? 4 : (e.state.depth_test == DepthTest::Always || e.state.screen_space) ? 3
                                                                                                                                                                       : 2;
                     }
-                    Draw2DSided(e.primitive, *vertices, GrabbedBinding(e.binding, canonical), *state, side);
+                    Draw2DSided(e.primitive, vertices, GrabbedBinding(e.binding, canonical), *state, side);
                 } else if constexpr (std::is_same_v<T, MeshEntry>) {
                     if (tint && !canonical && CurrentRenderTarget() == kMainTarget) {
                         tls.interpolation_tint = MeshTint(e, list, overrides);
@@ -1366,15 +1653,15 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                             DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, e.state);
                         }
                     } else {
-                        const std::vector<Vertex3D> *vertices = &e.vertices;
+                        std::span<const Vertex3D> vertices = e.vertices;
                         if (overrides != nullptr && overrides->vertex_index[e.record] >= 0) {
-                            vertices = &overrides->vertices[overrides->vertex_index[e.record]];
+                            vertices = overrides->vertices[overrides->vertex_index[e.record]];
                         }
                         if (prog0 != nullptr) {
-                            DrawMeshImmediateProg0(*vertices, e.indices, *constants, *prog0, binding, e.state,
+                            DrawMeshImmediateProg0(vertices, e.indices, *constants, *prog0, binding, e.state,
                                                    nullptr, palette);
                         } else {
-                            DrawMeshImmediate(*vertices, e.indices, *constants, binding, e.state);
+                            DrawMeshImmediate(vertices, e.indices, *constants, binding, e.state);
                         }
                     }
                 } else if constexpr (std::is_same_v<T, ClearEntry>) {
@@ -1390,6 +1677,10 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         // narrowing the clear to that scissor leaks the previous part's image.
                         Clear(e.color, e.rgba, e.depth, e.z, rect);
                     }
+                } else if constexpr (std::is_same_v<T, DepthPlanesEntry>) {
+                    ExecuteDepthPlanes(e.planes, e.quad, GrabbedBinding(e.binding, canonical), e.state);
+                } else if constexpr (std::is_same_v<T, DepthCopyEntry>) {
+                    ExecuteDepthCopy(e.source);
                 } else if constexpr (std::is_same_v<T, TargetEntry>) {
                     // A display replay draws into a target's twin, leaving the canonical contents for later ticks.
                     TextureHandle target = e.target;
@@ -1418,21 +1709,25 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                     GrabAgain(e);
                 } else if constexpr (std::is_same_v<T, UpdateMeshEntry>) {
                     // A range rewritten more than once holds the tick's last rewrite, so each takes its own.
-                    const std::vector<Vertex3D> *vertices = nullptr;
+                    std::optional<std::span<const Vertex3D>> vertices;
                     if (overrides != nullptr) {
                         if (auto pose = overrides->poses.find(&e); pose != overrides->poses.end()) {
-                            vertices = &pose->second;
+                            vertices.emplace(pose->second);
                         }
                     }
-                    if (vertices == nullptr && rewrites->repeated.contains(RewriteKey(e))) {
-                        vertices = &e.vertices;
+                    if (!vertices && rewrites->repeated.contains(RewriteKey(e))) {
+                        vertices.emplace(e.vertices);
                     }
-                    if (vertices != nullptr) {
+                    if (vertices) {
                         UpdateMeshVertices(e.mesh, e.first, *vertices);
                     }
                 }
             },
             entry);
+    }
+    if (buckets) {
+        buckets->Finish();
+        RecordReplayBuckets(*buckets);
     }
     // The meshes hold the tick's pose again for whoever draws them next.
     if (!canonical && overrides != nullptr) {
@@ -1497,7 +1792,7 @@ bool InterpolateAffine(const Mat4 &a, const Mat4 &b, float alpha, Mat4 &out) {
 }
 
 bool Interpolate2D(const Draw2DEntry &before, const Draw2DEntry &after, float alpha, std::vector<Vertex2D> &out) {
-    out = after.vertices;
+    out.assign(after.vertices.begin(), after.vertices.end());
     if (!(alpha < 1.0f) || after.interpolation.key == 0 || before.interpolation.key != after.interpolation.key ||
         before.interpolation.generation != after.interpolation.generation || before.occurrence != after.occurrence ||
         before.primitive != after.primitive || before.target != after.target || before.binding != after.binding ||
@@ -1528,7 +1823,7 @@ bool Interpolate2D(const Draw2DEntry &before, const Draw2DEntry &after, float al
 bool InterpolateSprite(const Draw2DEntry &before, const SpriteScene &before_scene, const Mat4 &before_view,
                        const Draw2DEntry &after, const SpriteScene &after_scene, const Mat4 &after_view,
                        const Mat4 &display_view, float alpha, std::vector<Vertex2D> &out) {
-    out = after.vertices;
+    out.assign(after.vertices.begin(), after.vertices.end());
     if (!(alpha < 1.0f) || !before.interpolation.world_corners || !after.interpolation.world_corners ||
         after.interpolation.key == 0 || before.interpolation.key != after.interpolation.key ||
         before.interpolation.generation != after.interpolation.generation || before.occurrence != after.occurrence ||
@@ -1575,7 +1870,7 @@ bool InterpolateSprite(const Draw2DEntry &before, const SpriteScene &before_scen
         return false;
     }
     alpha = std::max(alpha, 0.0f);
-    auto blended = after.vertices;
+    std::vector<Vertex2D> blended(after.vertices.begin(), after.vertices.end());
     for (size_t i = 0; i < blended.size(); ++i) {
         std::array<float, 4> a, b, point, clip;
         if (!unproject(before.vertices[i], old_inverse, a) || !unproject(after.vertices[i], new_inverse, b)) {
@@ -1611,8 +1906,8 @@ void BlendProg0Bones(const Prog0Palette &before, const Prog0Palette &after, floa
         if (std::memcmp(before.bones[slot], after.bones[slot], sizeof after.bones[slot]) == 0) {
             continue;
         }
-        Mat4 a = BoneMatrix(before.bones[slot]);
-        Mat4 b = BoneMatrix(after.bones[slot]);
+        Mat4  a = BoneMatrix(before.bones[slot]);
+        Mat4  b = BoneMatrix(after.bones[slot]);
         float dx = b[12] - a[12];
         float dy = b[13] - a[13];
         float dz = b[14] - a[14];
@@ -1648,17 +1943,26 @@ void RecordEntry(Entry &&entry) {
     } else if (const TargetEntry *target = std::get_if<TargetEntry>(&entry)) {
         auto it = list.target_scenes.find(target->target);
         list.scene = it != list.target_scenes.end() ? it->second : -1;
+    } else if (const DepthPlanesEntry *planes = std::get_if<DepthPlanesEntry>(&entry)) {
+        if (!CanRecordBinding(planes->binding)) {
+            return;
+        }
+        NoteMainDraw(list);
     }
     list.entries.push_back(std::move(entry));
 }
 
 // Appends value to pool, or reuses the last element when it is identical: consecutive draws often share a block.
-template <typename T>
-int32_t PoolIndex(std::vector<T> &pool, const T &value) {
+template <typename T, typename Allocator>
+int32_t PoolIndex(std::vector<T, Allocator> &pool, const T &value) {
     if (pool.empty() || std::memcmp(&pool.back(), &value, sizeof(T)) != 0) {
         pool.push_back(value);
     }
     return static_cast<int32_t>(pool.size() - 1);
+}
+
+std::pmr::memory_resource *RecordingResource() {
+    return FullListArenaEnabled() && RecordingCalls() ? &g.list->recording_storage : std::pmr::get_default_resource();
 }
 
 void RecordMesh(MeshEntry &&entry, const MeshTransform *transform, const Prog0Constants *prog0,
@@ -1713,6 +2017,13 @@ void RecordDoomedMesh(MeshHandle handle) { g.list->doomed_meshes.push_back(handl
 } // namespace detail
 
 using namespace detail;
+
+DisplayList::DisplayList()
+    : entries(ListPayloadResource(*this)), records(ListPayloadResource(*this)), cameras(ListPayloadResource(*this)),
+      scenes(ListPayloadResource(*this)), prog0_blocks(ListPayloadResource(*this)), palettes(ListPayloadResource(*this)),
+      target_scenes(ListKeyResource(*this)), doomed_textures(ListPayloadResource(*this)),
+      doomed_meshes(ListPayloadResource(*this)), occurrences(ListKeyResource(*this)),
+      occurrences_2d(ListKeyResource(*this)), tagged_2d(ListPayloadResource(*this)) {}
 
 DisplayList::~DisplayList() {
     if (instance != g.renderer_instance || g.device == VK_NULL_HANDLE) {
@@ -1781,6 +2092,11 @@ void BeginRecording(RecordingKind kind) {
         g.list->entries.reserve(sizes.entries);
         g.list->records.reserve(sizes.records);
         g.list->prog0_blocks.reserve(sizes.prog0);
+        if (FullListArenaEnabled()) {
+            g.list->occurrences.reserve(sizes.keys);
+            g.list->occurrences_2d.reserve(sizes.keys_2d);
+            g.list->target_scenes.reserve(sizes.target_scenes);
+        }
     }
     g.list->instance = g.renderer_instance;
     g.list->serial = ++g.list_serial;
@@ -1802,7 +2118,8 @@ DisplayListRef EndRecording() {
         // Derive it from size, so a smaller scene does not retain a high-water mark.
         auto capacity = [](size_t size) { return size == 0 ? size_t{0} : std::bit_ceil(size); };
         g_recording_sizes[g_recording_kind] = {list->instance, capacity(list->entries.size()), capacity(list->records.size()),
-                                               capacity(list->prog0_blocks.size())};
+                                               capacity(list->prog0_blocks.size()), capacity(list->occurrences.size()),
+                                               capacity(list->occurrences_2d.size()), capacity(list->target_scenes.size())};
     }
     return list;
 }
@@ -1835,15 +2152,36 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
     bool rendered = false;
     RunOnRenderThread([&] {
         if (options.canonical) {
-            OpenListFrame(true, false, false);
-            Replay(list, true, nullptr);
-            CloseListFrame(true, false);
+            if (ReplayPhasesEnabled()) {
+                const auto start = std::chrono::steady_clock::now();
+                OpenListFrame(true, false, false);
+                const auto opened = std::chrono::steady_clock::now();
+                {
+                    const MeshAlphaDiagnosticReplay diagnostic;
+                    Replay(list, true, nullptr);
+                }
+                const auto replayed = std::chrono::steady_clock::now();
+                CloseListFrame(true, false);
+                const auto closed = std::chrono::steady_clock::now();
+                RecordReplayPhases({std::chrono::duration<double, std::milli>(opened - start).count(),
+                                    std::chrono::duration<double, std::milli>(replayed - opened).count(),
+                                    std::chrono::duration<double, std::milli>(closed - replayed).count()});
+            } else {
+                OpenListFrame(true, false, false);
+                {
+                    const MeshAlphaDiagnosticReplay diagnostic;
+                    Replay(list, true, nullptr);
+                }
+                CloseListFrame(true, false);
+            }
             rendered = true;
             return;
         }
         if (!g.canonical_newest) {
             return;
         }
+        const bool timing = FrameTimingEnabled();
+        const auto preparation_started = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // Reused across frames for its capacity; RenderList runs on one thread.
         static Overrides overrides;
         overrides.Clear();
@@ -1853,7 +2191,8 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
             KZ_PROFILE_ZONE("Kazarov interpolate");
             Interpolated(list, *options.previous, std::max(alpha, 0.0f), overrides);
         }
-        if (!OpenListFrame(false, options.present, list.needs_base)) {
+        const double preparation_ms = timing ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preparation_started).count() : 0.0;
+        if (!OpenListFrame(false, options.present, list.needs_base, preparation_ms)) {
             return;
         }
         static const bool env_tint = [] {
@@ -1879,7 +2218,7 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
 DisplayListStats ListStats(const DisplayList &list) {
     DisplayListStats stats = {};
     for (const Entry &entry : list.entries) {
-        if (std::holds_alternative<Draw2DEntry>(entry)) {
+        if (std::holds_alternative<Draw2DEntry>(entry) || std::holds_alternative<DepthPlanesEntry>(entry)) {
             stats.draws_2d++;
         } else if (const MeshEntry *mesh = std::get_if<MeshEntry>(&entry)) {
             stats.mesh_draws++;

@@ -15,12 +15,12 @@ struct Glyph {
 // A glyph of the counter's font (tools/font/gen_overlay_font.py), as 8-bit coverage: the w x h bitmap's
 // top-left corner lies x font pixels right of the pen and y below the line's top.
 struct FontGlyph {
-    char                 c;
-    int                  advance;
-    int                  x;
-    int                  y;
-    int                  w;
-    int                  h;
+    char                c;
+    int                 advance;
+    int                 x;
+    int                 y;
+    int                 w;
+    int                 h;
     const std::uint8_t *bits;
 };
 
@@ -167,8 +167,8 @@ gfx::DisplayListRef OverlayRecord(std::string_view text) {
         return nullptr;
     }
     // Draw2D places depthless 2D by the UI mapping; the counter's size follows the window alone.
-    int pixel = OverlayPixelSize(gfx::GetLogicalMapping(gfx::kMainTarget));
-    OverlayDrawText(text, gfx::GetUiMapping(gfx::kMainTarget), pixel, pixel * kOverlayPadding,
+    int pixel = OverlayPixelSize(gfx::GetPresentationMapping());
+    OverlayDrawText(text, gfx::GetPresentationMapping(true), pixel, pixel * kOverlayPadding,
                     pixel * kOverlayPadding);
     return gfx::EndRecording();
 }

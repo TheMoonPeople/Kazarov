@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "gfx/context.hpp"
 #include "tests/gfx_fixture.hpp"
 
 using namespace dc::test;
@@ -961,6 +965,43 @@ TEST(GfxGpuMeshDc2, PlainFogInterpolatesInScreenSpace) {
     }
 }
 
+TEST(GfxGpuMeshDc2, FourLightFogWithWhiteVertexModulationMatchesMaterialOnly) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::MeshConstants constants = ChronicleLit();
+    constants.flags |= gfx::kMeshFog;
+    constants.light_count = 4;
+    Set(constants.fog, {100, 50, 0, 255});
+    for (uint32_t i = 0; i < 4; i++) {
+        Set(constants.light_direction[i], {0, 0, -1, 0});
+        const float scale = static_cast<float>(i + 1);
+        Set(constants.light_color[i], {0.07f * scale, 0.03f * scale, 0.02f * scale, 0});
+    }
+    auto           vertices = ScreenVertices({0, 0, 2}, {128, 128, 128, 128});
+    const auto     texture = gfx::CreateTexture({1, 1, gfx::TextureFormat::Rgba8, 1, true});
+    const uint32_t white = Rgba(255, 255, 255, 255);
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 1, 1, &white));
+    gfx::TextureBinding binding;
+    binding.texture = texture;
+    gfx::DrawState state;
+    state.blend = true;
+    state.alpha = {0, 1, 0, 1, 0};
+    state.alpha_test = true;
+    state.alpha_func = gfx::AlphaFunc::GEqual;
+    state.alpha_ref = 64;
+    state.fog = true;
+    state.fog_color[0] = 30;
+    state.fog_color[1] = 60;
+    state.fog_color[2] = 90;
+    auto draw = [&] {
+        gfx::DrawMeshImmediate(vertices, kTriangle, constants, binding, state);
+    };
+    fixture.Frame(kClear, draw);
+    const auto material_only = fixture.pixels;
+    constants.flags |= gfx::kMeshVertexColor;
+    fixture.Frame(kClear, draw);
+    EXPECT_EQ(fixture.pixels, material_only);
+}
+
 TEST(GfxGpuMeshDc2, ConstantFullFogFactorMatchesUnfoggedPixels) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
     Prog0Draw  c = Prog0(gfx::kProg0Unlit);
@@ -977,4 +1018,361 @@ TEST(GfxGpuMeshDc2, ConstantFullFogFactorMatchesUnfoggedPixels) {
     state.fog = true;
     Render(fixture, vertices, indices, c, {}, state);
     EXPECT_EQ(fixture.pixels, unfogged);
+}
+
+namespace {
+
+constexpr float kHugeUv = 4096.0f; // minifies a 4x4 texture to its last mip
+
+// KZ_ALPHA_OPAQUE is read once by the renderer, so a case never changes it. The renderings below must
+// match with it on and off; only the knowledge asserted through ExpectKnownMips needs it on.
+bool AlphaOpaqueOn() {
+    const char *setting = std::getenv("KZ_ALPHA_OPAQUE");
+    return setting != nullptr && std::strcmp(setting, "1") == 0;
+}
+
+void ExpectKnownMips(gfx::TextureHandle texture, uint64_t mips) {
+    if (AlphaOpaqueOn()) {
+        EXPECT_EQ(gfx::detail::LookupTexture(texture)->opaque_alpha_mips, mips);
+    }
+}
+
+std::vector<uint32_t> RedTexels(size_t count, uint8_t alpha) {
+    return std::vector<uint32_t>(count, Rgba(255, 0, 0, alpha));
+}
+
+gfx::MeshConstants PlainMaterial(float alpha = 1.0f) {
+    gfx::MeshConstants c = ChronicleLit();
+    c.flags = 0;
+    c.diffuse[3] = alpha;
+    return c;
+}
+
+// An alpha-tested plain mesh at depth 0.5, then a blue triangle behind it at 0.25. Red: the texture drew
+// and wrote depth. Blue: it was discarded without writing colour or depth.
+void AlphaTestedOverBlue(const gfx::TextureBinding &binding, const gfx::MeshConstants &constants,
+                         float uv_span = 0.0f, uint8_t alpha_ref = 1, std::array<uint8_t, 4> vertex_color = {},
+                         uint8_t color_write_mask = gfx::kWriteRgba) {
+    auto front = ScreenVertices({0, 0, 1}, vertex_color);
+    front[1].uv[0] = uv_span;
+    front[2].uv[1] = uv_span;
+    gfx::DrawState state;
+    state.depth_test = gfx::DepthTest::GEqual;
+    state.depth_write = true;
+    state.alpha_test = true;
+    state.alpha_func = gfx::AlphaFunc::GEqual;
+    state.alpha_ref = alpha_ref;
+    state.color_write_mask = color_write_mask;
+    gfx::DrawMeshImmediate(front, kTriangle, constants, binding, state);
+
+    gfx::MeshConstants blue = PlainMaterial();
+    Set(blue.diffuse, {0, 0, 255.0f / 128.0f, 1});
+    auto back = ScreenVertices({0, 0, 1});
+    for (gfx::Vertex3D &vertex : back) {
+        vertex.position[2] = 0.25f;
+    }
+    gfx::DrawState behind;
+    behind.depth_test = gfx::DepthTest::GEqual;
+    behind.depth_write = true;
+    gfx::DrawMeshImmediate(back, kTriangle, blue, {}, behind);
+}
+
+bool Shows(const GfxFixture &fixture, bool red) {
+    const int r = red ? 255 : 0;
+    const int b = red ? 0 : 255;
+    return fixture.PixelNear(2, 2, r, 0, b) && Centre(fixture, r, 0, b) &&
+           fixture.PixelNear(fixture.width - 3, fixture.height - 3, r, 0, b);
+}
+
+} // namespace
+
+TEST(GfxGpuMeshDc2, OpaqueAlphaTexturesDrawAtEveryMipAndWriteDepth) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::TextureHandle texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 3, true});
+    for (uint32_t mip = 0; mip < 3; mip++) {
+        const uint32_t size = 4u >> mip;
+        const auto     texels = RedTexels(size * size, 255);
+        ASSERT_TRUE(gfx::UpdateTexture(texture, mip, 0, 0, size, size, texels.data()));
+    }
+    ExpectKnownMips(texture, 7);
+    for (float span : {0.0f, kHugeUv}) {
+        fixture.Frame(kClear, [&] { AlphaTestedOverBlue(NearestBinding(texture), PlainMaterial(), span); });
+        EXPECT_TRUE(Shows(fixture, true)) << span;
+    }
+
+    // Padding between rows, here with zero alpha, is not part of the upload.
+    gfx::TextureHandle    padded_texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+    std::vector<uint32_t> padded(6 * 4, Rgba(255, 0, 0, 0));
+    for (uint32_t y = 0; y < 4; y++) {
+        std::fill_n(padded.begin() + y * 6, 4, Rgba(255, 0, 0, 255));
+    }
+    ASSERT_TRUE(gfx::UpdateTexture(padded_texture, 0, 0, 0, 4, 4, padded.data(), 6));
+    ExpectKnownMips(padded_texture, 1);
+    fixture.Frame(kClear, [&] { AlphaTestedOverBlue(NearestBinding(padded_texture), PlainMaterial()); });
+    EXPECT_TRUE(Shows(fixture, true));
+    fixture.Frame(kClear, [&] {
+        AlphaTestedOverBlue(NearestBinding(padded_texture), PlainMaterial(), 0.0f, 1, {}, 0);
+    });
+    EXPECT_TRUE(Centre(fixture, 0, 0, 0));
+    padded[0] = Rgba(255, 0, 0, 0);
+    ASSERT_TRUE(gfx::UpdateTexture(padded_texture, 0, 0, 0, 4, 4, padded.data(), 6));
+    ExpectKnownMips(padded_texture, 0);
+    fixture.Frame(kClear, [&] { AlphaTestedOverBlue(NearestBinding(padded_texture), PlainMaterial()); });
+    EXPECT_TRUE(Shows(fixture, false));
+    fixture.Frame(kClear, [&] {
+        AlphaTestedOverBlue(NearestBinding(padded_texture), PlainMaterial(), 0.0f, 1, {}, 0);
+    });
+    EXPECT_TRUE(Shows(fixture, false));
+}
+
+TEST(GfxGpuMeshDc2, CpuUpdatesToTransparentAlphaStopTheOpaqueShortcut) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::TextureHandle texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+    const auto         opaque = RedTexels(16, 255);
+    const auto         clear = RedTexels(16, 0);
+    const auto         inner = RedTexels(4, 255);
+    const uint32_t     hole = Rgba(255, 0, 0, 0);
+    const uint32_t     solid = Rgba(255, 0, 0, 255);
+    auto               expect = [&](bool red, uint64_t mips, const char *step) {
+        SCOPED_TRACE(step);
+        ExpectKnownMips(texture, mips);
+        fixture.Frame(kClear, [&] { AlphaTestedOverBlue(NearestBinding(texture), PlainMaterial()); });
+        EXPECT_TRUE(Shows(fixture, red));
+    };
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 4, 4, opaque.data()));
+    expect(true, 1, "full opaque");
+    // A partial opaque write keeps what is known, and proves nothing by itself.
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 1, 1, 2, 2, inner.data()));
+    expect(true, 1, "partial opaque over known");
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 1, 1, &hole));
+    expect(false, 0, "partial transparent");
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 1, 1, &solid));
+    expect(true, 0, "partial opaque over unknown");
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 4, 4, opaque.data()));
+    expect(true, 1, "full opaque again");
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 4, 4, clear.data()));
+    expect(false, 0, "full transparent replacement");
+}
+
+TEST(GfxGpuMeshDc2, OpaqueAlphaShortcutNeedsEveryMipKnown) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::TextureHandle texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 3, true});
+    const auto         opaque = RedTexels(16, 255);
+    const uint32_t     hole = Rgba(255, 0, 0, 0);
+    const uint32_t     solid = Rgba(255, 0, 0, 255);
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 4, 4, opaque.data()));
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 1, 0, 0, 2, 2, opaque.data()));
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 2, 0, 0, 1, 1, &hole));
+    auto expect = [&](float span, bool red, uint64_t mips) {
+        SCOPED_TRACE(span);
+        ExpectKnownMips(texture, mips);
+        fixture.Frame(kClear, [&] { AlphaTestedOverBlue(NearestBinding(texture), PlainMaterial(), span); });
+        EXPECT_TRUE(Shows(fixture, red));
+    };
+    expect(0.0f, true, 3);
+    expect(kHugeUv, false, 3); // the transparent last mip
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 2, 0, 0, 1, 1, &solid));
+    expect(kHugeUv, true, 7);
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 1, 1, &hole));
+    expect(0.0f, false, 6);
+    expect(kHugeUv, true, 6);
+
+    // A mip that was never uploaded is not known, whatever the others hold.
+    gfx::TextureHandle partial = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 3, true});
+    ASSERT_TRUE(gfx::UpdateTexture(partial, 0, 0, 0, 4, 4, opaque.data()));
+    ASSERT_TRUE(gfx::UpdateTexture(partial, 1, 0, 0, 2, 2, opaque.data()));
+    ExpectKnownMips(partial, 3);
+    fixture.Frame(kClear, [&] { AlphaTestedOverBlue(NearestBinding(partial), PlainMaterial()); });
+    EXPECT_TRUE(Shows(fixture, true));
+}
+
+TEST(GfxGpuMeshDc2, CopyBlitAndSnapshotOverOpaqueAlphaTexturesKeepTheAlphaTest) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::TextureHandle source = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+    gfx::TextureHandle target = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+    const auto         clear = RedTexels(16, 0);
+    const auto         opaque = RedTexels(16, 255);
+    ASSERT_TRUE(gfx::UpdateTexture(source, 0, 0, 0, 4, 4, clear.data()));
+    const std::array<uint8_t, 4> transparent_clear = {0, 0, 0, 0};
+    const gfx::Rect              all = {0, 0, 4, 4};
+
+    struct Overwrite {
+        const char            *name;
+        std::array<uint8_t, 4> clear;
+        std::function<void()>  write;
+    };
+
+    const Overwrite overwrites[] = {
+        {"copy",     kClear,            [&] { EXPECT_TRUE(gfx::CopyTexture(source, all, target, 0, 0)); }                     },
+        {"blit",     kClear,            [&] { EXPECT_TRUE(gfx::BlitTexture(source, all, target, all, gfx::Filter::Nearest)); }},
+        {"snapshot", transparent_clear, [&] { EXPECT_TRUE(gfx::SnapshotFrame(target)); }                                      },
+    };
+    for (const Overwrite &overwrite : overwrites) {
+        SCOPED_TRACE(overwrite.name);
+        ASSERT_TRUE(gfx::UpdateTexture(target, 0, 0, 0, 4, 4, opaque.data()));
+        ExpectKnownMips(target, 1);
+        fixture.Frame(kClear, [&] { AlphaTestedOverBlue(NearestBinding(target), PlainMaterial()); });
+        EXPECT_TRUE(Shows(fixture, true));
+        fixture.Frame(overwrite.clear, [&] {
+            overwrite.write();
+            AlphaTestedOverBlue(NearestBinding(target), PlainMaterial());
+        });
+        EXPECT_TRUE(Shows(fixture, false));
+        ExpectKnownMips(target, 0);
+    }
+}
+
+TEST(GfxGpuMeshDc2, RecordedTextureUpdatesReplayOverOpaqueAlphaKnowledge) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::TextureHandle texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+    const auto         opaque = RedTexels(16, 255);
+    const auto         clear = RedTexels(16, 0);
+    ASSERT_TRUE(gfx::UpdateTextureNow(texture, 0, 0, 0, 4, 4, opaque.data()));
+    auto record = [&](auto &&before_draw) {
+        gfx::BeginRecording();
+        gfx::Clear(true, kClear.data(), true, 0.0f);
+        before_draw();
+        AlphaTestedOverBlue(NearestBinding(texture), PlainMaterial());
+        return gfx::EndRecording();
+    };
+    auto render = [&](const gfx::DisplayListRef &list) {
+        gfx::RenderOptions options;
+        options.canonical = true;
+        ASSERT_TRUE(gfx::RenderList(*list, 1, options));
+        ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+    };
+    render(record([] {}));
+    EXPECT_TRUE(Shows(fixture, true));
+
+    // The recorded write holds its own copy of the pixels and lands at replay, before the recorded draw.
+    std::vector<uint32_t> pixels = clear;
+    auto                  list = record([&] {
+        ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 4, 4, pixels.data()));
+        ExpectKnownMips(texture, 1);
+        std::fill(pixels.begin(), pixels.end(), Rgba(255, 0, 0, 255));
+    });
+    render(list);
+    EXPECT_TRUE(Shows(fixture, false));
+    ExpectKnownMips(texture, 0);
+
+    // UpdateTextureNow is not recorded: it lands at once, and the list only draws.
+    ASSERT_TRUE(gfx::UpdateTextureNow(texture, 0, 0, 0, 4, 4, opaque.data()));
+    ExpectKnownMips(texture, 1);
+    render(record([] {}));
+    EXPECT_TRUE(Shows(fixture, true));
+    list = record([&] {
+        ASSERT_TRUE(gfx::UpdateTextureNow(texture, 0, 0, 0, 4, 4, clear.data()));
+        ExpectKnownMips(texture, 0);
+    });
+    render(list);
+    EXPECT_TRUE(Shows(fixture, false));
+}
+
+TEST(GfxGpuMeshDc2, OpaqueAlphaShortcutKeepsTheTestWhereAlphaCanFail) {
+    GfxFixture         fixture(kWidth, kHeight);
+    gfx::TextureHandle texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+    const auto         opaque = RedTexels(16, 255);
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 4, 4, opaque.data()));
+    ExpectKnownMips(texture, 1);
+
+    struct Case {
+        const char *name;
+        float       diffuse_alpha;
+        uint8_t     alpha_ref;
+        bool        vertex_color;
+        uint8_t     vertex_alpha;
+        bool        red;
+    };
+
+    const Case cases[] = {
+        {"diffuse 0",                       0.0f,            1,   false, 0, false},
+        {"diffuse 1/1024",                  1.0f / 1024.0f,  1,   false, 0, false},
+        {"diffuse 1/128 reaches ref 1",     1.0f / 128.0f,   1,   false, 0, true },
+        {"diffuse 1",                       1.0f,            1,   false, 0, true },
+        {"diffuse 0.25 under ref 64",       0.25f,           64,  false, 0, false},
+        {"diffuse 0.5 reaches ref 64",      0.5f,            64,  false, 0, true },
+        {"diffuse 1 over ref 64",           1.0f,            64,  false, 0, true },
+        {"diffuse 127/128 reaches ref 127", 127.0f / 128.0f, 127, false, 0, true },
+        {"diffuse 1 reaches ref 128",       1.0f,            128, false, 0, true },
+        {"diffuse 1 under ref 129",         1.0f,            129, false, 0, false},
+        {"vertex colour alpha 0",           1.0f,            1,   true,  0, false},
+    };
+    for (const Case &c : cases) {
+        SCOPED_TRACE(c.name);
+        gfx::MeshConstants constants = PlainMaterial(c.diffuse_alpha);
+        if (c.vertex_color) {
+            constants.flags |= gfx::kMeshVertexColor;
+        }
+        fixture.Frame(kClear, [&] {
+            AlphaTestedOverBlue(NearestBinding(texture), constants, 0.0f, c.alpha_ref,
+                                {255, 255, 255, c.vertex_alpha});
+        });
+        EXPECT_TRUE(Shows(fixture, c.red));
+    }
+}
+
+TEST(GfxGpuMeshDc2, IndexedNearSafeFogMatchesImmediateReconstruction) {
+    GfxFixture fixture(kWidth, kHeight);
+    for (bool cutout : {false, true}) {
+        gfx::TextureHandle texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+        auto               texels = RedTexels(16, 255);
+        if (cutout) {
+            texels[0] = Rgba(255, 0, 0, 0);
+        }
+        ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 4, 4, texels.data()));
+        auto constants = PlainMaterial();
+        constants.flags = gfx::kMeshFog;
+        Set(constants.fog, {180, -60, 0, 255});
+        std::memset(constants.mvp, 0, sizeof constants.mvp);
+        constants.mvp[0] = constants.mvp[5] = constants.mvp[11] = 1.0f;
+        constants.mvp[10] = 0.5f;
+        gfx::DrawState state;
+        state.blend = true;
+        state.alpha = {0, 1, 0, 1, 0};
+        state.alpha_test = true;
+        state.alpha_func = gfx::AlphaFunc::GEqual;
+        state.alpha_ref = 64;
+        state.fog = true;
+        state.fog_color[0] = 20;
+        state.fog_color[1] = 40;
+        state.fog_color[2] = 70;
+        const auto binding = NearestBinding(texture);
+        for (int crossing = 0; crossing < 3; crossing++) {
+            SCOPED_TRACE(crossing);
+            auto vertices = ScreenVertices({0, 0, 1});
+            vertices[0].position[2] = crossing == 2 ? -1.0f : 2.0f;
+            vertices[1].position[2] = 4.0f;
+            vertices[2].position[2] = 6.0f;
+            vertices[1].uv[0] = vertices[2].uv[1] = 4.0f;
+            constants.mvp[14] = crossing == 1 ? 2.0f : 0.0f;
+            const auto mesh = gfx::CreateMesh(vertices, kTriangle);
+            ASSERT_NE(mesh, gfx::kNullMesh);
+            fixture.Frame(kClear, [&] { gfx::DrawMeshImmediate(vertices, kTriangle, constants, binding, state); });
+            const auto reference = fixture.pixels;
+            fixture.Frame(kClear, [&] {
+                gfx::DrawMesh(mesh, 0, 3, constants, binding, state);
+                if (gfx::detail::NearSafeFogEnabled()) {
+                    const bool safe = gfx::detail::MeshFogIsNearSafe(*gfx::detail::LookupMesh(mesh), constants);
+                    EXPECT_EQ(safe, crossing == 0);
+                    const uint32_t variant = !cutout && AlphaOpaqueOn() ? 0 : 1;
+                    VkPipeline     expected = gfx::detail::g.near_safe_fog_pipelines[variant];
+                    EXPECT_EQ(gfx::detail::g.bound.pipeline == expected, safe);
+                }
+            });
+            EXPECT_EQ(fixture.pixels, reference);
+            if (crossing == 0) {
+                vertices[1].position[0] += 0.25f;
+                ASSERT_TRUE(gfx::UpdateMeshVertices(mesh, 0, vertices));
+                fixture.Frame(kClear, [&] { gfx::DrawMeshImmediate(vertices, kTriangle, constants, binding, state); });
+                const auto updated = fixture.pixels;
+                fixture.Frame(kClear, [&] {
+                    gfx::DrawMesh(mesh, 0, 3, constants, binding, state);
+                    EXPECT_FALSE(gfx::detail::LookupMesh(mesh)->bounds_known);
+                });
+                EXPECT_EQ(fixture.pixels, updated);
+            }
+            gfx::DestroyMesh(mesh);
+        }
+        gfx::DestroyTexture(texture);
+    }
 }

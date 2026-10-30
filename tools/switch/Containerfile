@@ -1,0 +1,160 @@
+# The shared Nintendo Switch homebrew toolchain: devkitPro's devkitA64 and
+# libnx, with the two libraries devkitPro does not package yet built in from source:
+#
+# - Mesa with NVK from Dan's Switch port, using the direct libnx Horizon GPU backend.
+#   Its loaderless, merged static Vulkan archive is linked into the NRO.
+# - SDL3 for libnx: devkitPro's switch-sdl-3.4 branch with etonedemid's Vulkan surface support
+#   (VK_NN_vi_surface), from etonedemid/SDL.
+#
+# Both are installed under /opt/switch, ahead of devkitPro's portlibs (whose Mesa is 20.1).
+# Built by tools/switch/build.sh with Docker or another OCI-compatible runtime.
+
+FROM docker.io/devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
+
+ARG BUILD_JOBS=4
+ARG MESA_REV=0ff52079ca9e9e837ed27eb95a8d239f439a1864
+ARG SDL_REV=1e3b67ef787c0fdba47b42fc663c70613c8b04db
+ARG RUST_NIGHTLY=nightly-2026-09-20
+ARG BINDGEN_VERSION=0.72.1
+ARG MESON_VERSION=1.12.1
+ARG GLSLANG_TAG=16.6.0
+
+ENV DEVKITPRO=/opt/devkitpro
+ENV DEVKITA64=/opt/devkitpro/devkitA64
+ENV SWITCH_PREFIX=/opt/switch
+ENV RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} CARGO_BUILD_JOBS=${BUILD_JOBS} JOBS=${BUILD_JOBS}
+ENV PATH=/opt/rust/cargo/bin:/opt/devkitpro/devkitA64/bin:/opt/devkitpro/tools/bin:$PATH
+
+RUN test "${BUILD_JOBS}" -gt 0
+
+# Mesa's host shader compiler (mesa_clc) needs LLVM with clang, libclc and SPIRV-LLVM-Translator;
+# Debian 12 has all three at 15, which Mesa 26 accepts. Its Meson (1.0) is too old for Mesa 26.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl git ninja-build pkg-config flex bison python3-pip python3-venv \
+        python3-mako python3-yaml python3-packaging python3-ply \
+        llvm-15-dev clang-15 libclang-15-dev libclc-15-dev libclc-15 llvm-spirv-15 libllvmspirvlib-15-dev \
+        build-essential cmake \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --break-system-packages --no-cache-dir meson==${MESON_VERSION} \
+    && ln -sf /usr/bin/llvm-config-15 /usr/local/bin/llvm-config \
+    && ln -sf /usr/bin/clang-15 /usr/local/bin/clang \
+    && ln -sf /usr/bin/llvm-spirv-15 /usr/local/bin/llvm-spirv
+
+# Japanese retail text uses CP932; newlib does not provide an iconv implementation.
+ARG LIBICONV_VERSION=1.18
+ARG LIBICONV_SHA256=3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8
+RUN curl -sSfL "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-${LIBICONV_VERSION}.tar.gz" -o /tmp/libiconv.tar.gz \
+    && echo "${LIBICONV_SHA256}  /tmp/libiconv.tar.gz" | sha256sum -c - \
+    && mkdir /tmp/libiconv \
+    && tar -xzf /tmp/libiconv.tar.gz -C /tmp/libiconv --strip-components=1 \
+    && cd /tmp/libiconv \
+    && CC=aarch64-none-elf-gcc AR=aarch64-none-elf-ar RANLIB=aarch64-none-elf-ranlib \
+        CFLAGS="-O2 -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIC -ftls-model=local-exec" \
+        ./configure --host=aarch64-none-elf --prefix=${SWITCH_PREFIX} --disable-shared --enable-static --disable-nls \
+    && make -C libcharset -j"${BUILD_JOBS}" \
+    && make -C lib -j"${BUILD_JOBS}" \
+    && make -C libcharset install-lib \
+    && make -C lib install-lib \
+    && cp include/iconv.h ${SWITCH_PREFIX}/include/ \
+    && rm -rf /tmp/libiconv /tmp/libiconv.tar.gz
+
+# The portlibs FFmpeg enables GPL components; games use Kazarov's minimal LGPL-only build.
+# build.sh stages this single source tool beside the Switch context before invoking Docker.
+COPY kz-ffmpeg /tmp/kz-ffmpeg
+RUN python3 /tmp/kz-ffmpeg --target switch-arm64 --out ${SWITCH_PREFIX}/ffmpeg --jobs "${BUILD_JOBS}" \
+    && rm /tmp/kz-ffmpeg
+
+# Kazarov builds Vulkan shaders for the Switch target with this pinned glslang release.
+RUN git clone --depth 1 --branch ${GLSLANG_TAG} https://github.com/KhronosGroup/glslang.git /tmp/glslang \
+    && cmake -S /tmp/glslang -B /tmp/glslang/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /tmp/glslang/build --target install --parallel "${BUILD_JOBS}" \
+    && rm -rf /tmp/glslang
+
+# NVK's compiler (NAK) is Rust: a pinned nightly with rust-src, since the Switch's std is built from it.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
+    && rustup toolchain install ${RUST_NIGHTLY} --profile minimal --component rust-src --component rustfmt \
+    && rustup target add --toolchain ${RUST_NIGHTLY} aarch64-unknown-linux-gnu \
+    && rustup default ${RUST_NIGHTLY} \
+    && LIBCLANG_PATH=/usr/lib/llvm-15/lib cargo install --locked bindgen-cli --version ${BINDGEN_VERSION} \
+    && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
+ENV LIBCLANG_PATH=/usr/lib/llvm-15/lib
+
+# Dan's Mesa checkout omits ignored Meson wrap packagefiles; restore them from the matching release.
+ARG MESA_TARBALL_SHA256=bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9
+# NVK's image layout library (nil) also needs cbindgen 0.28 or later.
+# mesa_clc looks for clang's OpenCL headers beside itself rather than in Debian's LLVM, so the host
+# build bundles them into it.
+ARG CBINDGEN_VERSION=0.29.4
+# mesa_clc also needs SPIRV-Tools 2024.1 or later; Debian 12 has 2023.1.
+ARG SPIRV_SDK_TAG=vulkan-sdk-1.4.363.0
+# Keep the fixed extents reported by NVK in step with handheld and docked display modes.
+RUN git clone --depth 1 --branch ${SPIRV_SDK_TAG} https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers \
+    && git clone --depth 1 --branch ${SPIRV_SDK_TAG} https://github.com/KhronosGroup/SPIRV-Tools.git /tmp/spirv-tools \
+    && cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /tmp/spirv-headers/build --target install --parallel "${BUILD_JOBS}" \
+    && cmake -S /tmp/spirv-tools -B /tmp/spirv-tools/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local -DSPIRV-Headers_SOURCE_DIR=/tmp/spirv-headers \
+        -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON -DSPIRV_WERROR=OFF -DBUILD_SHARED_LIBS=ON \
+    && cmake --build /tmp/spirv-tools/build --target install --parallel "${BUILD_JOBS}" \
+    && ldconfig \
+    && rm -rf /tmp/spirv-headers /tmp/spirv-tools
+COPY patches/mesa-switch-dock-mode.patch /tmp/mesa-switch-dock-mode.patch
+COPY patches/mesa-switch-shader-va-fallback.patch /tmp/mesa-switch-shader-va-fallback.patch
+COPY patches/mesa-switch-no-elf.patch /tmp/mesa-switch-no-elf.patch
+COPY build-mesa.sh /tmp/build-mesa.sh
+COPY bindgen-switch-wrapper.sh /tmp/bindgen-switch-wrapper.sh
+COPY rustc-switch-wrapper.sh /tmp/rustc-switch-wrapper.sh
+COPY bindgen-atomic-shim.h /tmp/bindgen-atomic-shim.h
+COPY switch_cross_file.txt /tmp/switch_cross_file.txt
+COPY switch_native_file.txt /tmp/switch_native_file.txt
+RUN cargo install --locked cbindgen --version ${CBINDGEN_VERSION} \
+    && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git" \
+    && mkdir -p /tmp/mesa \
+    && git -C /tmp/mesa init \
+    && git -C /tmp/mesa remote add origin https://github.com/danfromtico/mesa-switch.git \
+    && git -C /tmp/mesa fetch --depth 1 origin ${MESA_REV} \
+    && git -C /tmp/mesa checkout --detach FETCH_HEAD \
+    && git -C /tmp/mesa apply --check /tmp/mesa-switch-dock-mode.patch \
+    && git -C /tmp/mesa apply /tmp/mesa-switch-dock-mode.patch \
+    && git -C /tmp/mesa apply --check /tmp/mesa-switch-shader-va-fallback.patch \
+    && git -C /tmp/mesa apply /tmp/mesa-switch-shader-va-fallback.patch \
+    && git -C /tmp/mesa apply --check /tmp/mesa-switch-no-elf.patch \
+    && git -C /tmp/mesa apply /tmp/mesa-switch-no-elf.patch \
+    && curl -sSfL -o /tmp/mesa.tar.xz https://archive.mesa3d.org/mesa-26.2.4.tar.xz \
+    && echo "${MESA_TARBALL_SHA256}  /tmp/mesa.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/mesa.tar.xz -C /tmp/mesa/subprojects --strip-components=2 mesa-26.2.4/subprojects/packagefiles \
+    && rm /tmp/mesa.tar.xz \
+    && cp /tmp/bindgen-switch-wrapper.sh /tmp/mesa/bindgen-switch-wrapper.sh \
+    && cp /tmp/rustc-switch-wrapper.sh /tmp/mesa/rustc-switch-wrapper.sh \
+    && cp /tmp/bindgen-atomic-shim.h /tmp/mesa/bindgen-atomic-shim.h \
+    && cp /tmp/switch_cross_file.txt /tmp/mesa/switch_cross_file.txt \
+    && cp /tmp/switch_native_file.txt /tmp/mesa/switch_native_file.txt \
+    && bash /tmp/build-mesa.sh \
+    && rm -rf /tmp/mesa
+
+# SDL3 with its Vulkan support on. It builds against its own copy of the Vulkan headers and only
+# records Vulkan API entry points for the application's link.
+# patches/sdl-vulkan-window-without-egl.patch: the fork refuses every window until EGL is loaded,
+# which SDL does only for OpenGL windows, so a Vulkan window could not be made at all.
+COPY patches/sdl-vulkan-window-without-egl.patch /tmp/sdl-vulkan-window-without-egl.patch
+COPY patches/sdl-static-nvk-no-legacy-mesa.patch /tmp/sdl-static-nvk-no-legacy-mesa.patch
+RUN git clone https://github.com/etonedemid/SDL.git /tmp/sdl \
+    && git -C /tmp/sdl checkout --detach ${SDL_REV} \
+    && git -C /tmp/sdl apply --check /tmp/sdl-vulkan-window-without-egl.patch \
+    && git -C /tmp/sdl apply /tmp/sdl-vulkan-window-without-egl.patch \
+    && git -C /tmp/sdl apply --check /tmp/sdl-static-nvk-no-legacy-mesa.patch \
+    && git -C /tmp/sdl apply /tmp/sdl-static-nvk-no-legacy-mesa.patch \
+    && cmake -S /tmp/sdl -B /tmp/sdl/build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=${DEVKITPRO}/cmake/Switch.cmake -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=${SWITCH_PREFIX} -DCMAKE_PREFIX_PATH=${SWITCH_PREFIX} \
+        -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_VULKAN=ON \
+        -DSDL_OPENGL=OFF \
+    && cmake --build /tmp/sdl/build --target install --parallel "${BUILD_JOBS}" \
+    && ! grep -Eq 'EGL|glapi|drm_nouveau|vulkan_nouveau' /opt/switch/lib/cmake/SDL3/SDL3staticTargets.cmake \
+    && rm -rf /tmp/sdl
+
+# The build runs as the invoking user so the mounted checkout keeps its ownership.
+RUN chmod -R a+rX /opt/rust ${SWITCH_PREFIX}

@@ -27,14 +27,15 @@ inline bool OffscreenByDefault() {
 struct GfxOptions {
     bool dynamic_color_write_mask = true;
     bool offscreen = OffscreenByDefault();
-    bool triangle_fans = true;
-    bool separate_stencil_masks = true;
-    bool prog0_meshes = false;
+    bool                  triangle_fans = true;
+    bool                  separate_stencil_masks = true;
+    bool                  prog0_meshes = false;
     uint32_t              texture_slots = 0;
     uint32_t              mesh_slots = 0;
     gfx::RenderThreadMode render_thread = gfx::RenderThreadMode::Off;
     float                 logical_width = 640.0f;
     float                 logical_height = 480.0f;
+    uint32_t              main_height_limit = 0;
     std::filesystem::path pipeline_cache = std::filesystem::temp_directory_path() / "dc_gfx_test" / "pipeline_cache.bin";
 };
 
@@ -61,6 +62,7 @@ struct GfxFixture {
         config.display_aspect = 4.0f / 3.0f;
         config.validation = true;
         config.render_scale = render_scale;
+        config.main_height_limit = options.main_height_limit;
         config.dynamic_color_write_mask = options.dynamic_color_write_mask;
         config.offscreen = options.offscreen;
         config.triangle_fans = options.triangle_fans;

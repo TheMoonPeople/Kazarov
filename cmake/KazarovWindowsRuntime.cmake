@@ -1,6 +1,29 @@
 # Bundle only redistributable program dependencies; never game data or disc files.
 include_guard(GLOBAL)
 
+# Build events must be attached in the directory that creates the executable.
+function(kz_windows_runtime_post_build target)
+    if(NOT WIN32 OR NOT MINGW OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        return()
+    endif()
+    get_target_property(attached ${target} KZ_WINDOWS_RUNTIME_POST_BUILD)
+    if(attached)
+        return()
+    endif()
+    get_filename_component(compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(KZ_LLVM_READOBJ NAMES llvm-readobj
+        HINTS "${compiler_bin}" NO_DEFAULT_PATH REQUIRED)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../scripts/build/windows-import-library.py"
+            --runtime-executable "$<TARGET_FILE:${target}>"
+            --compiler-bin "${compiler_bin}" --readobj "${KZ_LLVM_READOBJ}"
+        COMMENT "Bundling the compiler runtime imported by ${target}"
+        VERBATIM)
+    set_property(TARGET ${target} PROPERTY KZ_WINDOWS_RUNTIME_POST_BUILD TRUE)
+endfunction()
+
 function(kz_windows_runtime target)
     if(NOT WIN32)
         return()
@@ -36,6 +59,34 @@ function(kz_windows_runtime target)
     endif()
     set(runtime "$<TARGET_FILE:SDL3::SDL3>" "${KZ_LIBCXX_DLL}" "${KZ_PTHREAD_DLL}"
         "${KZ_UNWIND_DLL}" "${KZ_VULKAN_LOADER}" ${ffmpeg})
+    if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        find_program(KZ_LLVM_READOBJ NAMES llvm-readobj
+            HINTS "${compiler_bin}" NO_DEFAULT_PATH REQUIRED)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        # File-name components avoid CMP0112's dependency on the executable itself.
+        cmake_policy(PUSH)
+        cmake_policy(SET CMP0112 NEW)
+        set(preflight "${target}_kz_runtime_preflight")
+        add_custom_target(${preflight}
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../scripts/build/windows-import-library.py"
+                --runtime-executable "$<TARGET_FILE_DIR:${target}>/$<TARGET_FILE_NAME:${target}>"
+                --skip-missing-executable
+                --compiler-bin "${compiler_bin}" --readobj "${KZ_LLVM_READOBJ}"
+            VERBATIM)
+        add_dependencies(${target} ${preflight})
+        cmake_policy(POP)
+        get_target_property(target_source_dir ${target} SOURCE_DIR)
+        if(target_source_dir STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+            kz_windows_runtime_post_build(${target})
+        else()
+            get_target_property(attached ${target} KZ_WINDOWS_RUNTIME_POST_BUILD)
+            if(NOT attached)
+                message(FATAL_ERROR
+                    "Call kz_windows_runtime_post_build(${target}) in ${target_source_dir} before kz_windows_runtime")
+            endif()
+        endif()
+    endif()
     # A dependency target restores missing DLLs even when the executable needs no relink. Each copy is a
     # declared output, so an up-to-date build runs nothing.
     get_target_property(runtime_dir ${target} RUNTIME_OUTPUT_DIRECTORY)
