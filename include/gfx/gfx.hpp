@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -174,6 +175,58 @@ void RendererSuspend();
 void RendererResume();
 // The swapchain is recreated with the mode at the next BeginFrame or tick render.
 void SetPresentMode(PresentMode mode);
+
+// Opt-in renderer timings for a performance log, summed since the last TakeFrameTimings. A canonical frame is a
+// submission that does not present (a tick's canonical render); a display frame presents. CPU times are measured
+// on the thread that owns device work; GPU times come from timestamps around a frame's draw commands where the
+// queue has them, and are read once its fence has signalled.
+struct FrameTimings {
+    struct Span {
+        uint32_t count = 0;
+        double   total_ms = 0.0;
+        double   max_ms = 0.0;
+
+        void Add(double ms) {
+            ++count;
+            total_ms += ms;
+            max_ms = ms > max_ms ? ms : max_ms;
+        }
+
+        double Average() const { return count == 0 ? 0.0 : total_ms / count; }
+    };
+
+    bool gpu_timestamps = false;
+    Span canonical_cpu; // replay and submission of a canonical frame
+    Span display_cpu;   // replay or blit, submission and present of a display frame
+    Span canonical_gpu;
+    Span display_gpu;
+    Span acquire;       // vkAcquireNextImageKHR
+    Span queue_present; // vkQueuePresentKHR
+    Span fence_wait;    // waits for a frame slot's previous submission
+    Span present_interval;
+    // Present intervals of at most 1.25, 2.25 and 3.25 periods of 60 Hz, and longer.
+    uint32_t interval_buckets[4] = {};
+    uint32_t sync_waits = 0; // one-shot submissions that wait for the GPU
+
+    // KZ_GPU_SCOPES=pass or draw: GPU time between timestamps at the end of each pass, copy and the setup
+    // before a pass, and with draw at each pipeline change inside a pass. The timestamps do not wait, so a
+    // segment is the time from its predecessor's completion to its own.
+    struct Scope {
+        std::string name;
+        Span        span; // one entry per segment
+        uint64_t    draws = 0;
+        uint64_t    barriers = 0;
+    };
+
+    std::vector<Scope> scopes; // in order of first appearance
+    uint32_t           scope_frames = 0;
+    uint64_t           barriers = 0; // pipeline barriers recorded into scoped frames
+    uint64_t           passes = 0;   // dynamic-rendering spans in scoped frames
+};
+
+void         SetFrameTimingEnabled(bool enabled);
+bool         FrameTimingEnabled();
+FrameTimings TakeFrameTimings();
 
 // Anisotropic filtering of linearly filtered meshes: 0 or 1 is off, otherwise 2, 4, 8 or 16 samples
 // (a value in between takes the level below it). Takes effect from the next draw.
@@ -613,6 +666,45 @@ struct Presentation2D {
 
 void Draw2D(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &texture,
             const DrawState &state, const Presentation2D *presentation = nullptr);
+
+inline constexpr uint32_t kMaxDepthPlanes = 8;
+
+/**
+ * Describes the feathered depth planes of one DrawDepthPlanes2D pass.
+ *
+ * Plane i is the quad drawn at depth depth[i] with vertex alpha alpha[i]. The planes run front to
+ * back, so the depths never increase.
+ */
+struct DepthPlanes2D {
+    uint32_t count = 0;                   /**< Planes in use, 1 to kMaxDepthPlanes. */
+    float    depth[kMaxDepthPlanes] = {}; /**< Depth of each plane, as Vertex2D::z. */
+    uint8_t  alpha[kMaxDepthPlanes] = {}; /**< Vertex alpha of each plane. */
+};
+
+/**
+ * Whether DrawDepthPlanes2D takes its single-pass path on this renderer.
+ *
+ * That needs KZ_DEPTH_PLANES=1 in the environment when the renderer starts, the device's depth
+ * bounds feature, a D32_SFLOAT_S8 depth buffer and the bindless texture path. Callers that want
+ * their own planes drawn unchanged while it is off test this first.
+ */
+bool DepthPlanesAvailable();
+
+/**
+ * Accumulates up to eight depth planes of one quad over a black destination.
+ *
+ * Each plane is drawn additively under a greater-or-equal depth test without depth writes, the
+ * way eight Draw2D calls would draw it: the destination must hold zero colour beforehand, since
+ * the single-pass path writes the accumulated result outright. The pass shades every pixel at most
+ * once, by selecting the planes a pixel's stored depth passes with the depth bounds test and reading
+ * their eight-step blend result from a table the original blend pipeline filled. It applies when the
+ * state is exactly the feathered-haze state (blend 0,2,2,1 with FIX 0x80, greater-or-equal depth, no
+ * alpha test, fog or stencil), the quad is an axis-aligned rectangle with vertex colour 0x101010, the texture has no alpha and is
+ * sampled without filtering, and the target keeps alpha. Anything else, or a renderer that cannot,
+ * draws the planes one by one instead, so the image is the same.
+ */
+void DrawDepthPlanes2D(const DepthPlanes2D &planes, std::span<const Vertex2D, 4> quad,
+                       const TextureBinding &texture, const DrawState &state);
 void DrawMesh(MeshHandle mesh, uint32_t first_index, uint32_t index_count, const MeshConstants &constants,
               const TextureBinding &texture, const DrawState &state,
               const MeshTransform *transform = nullptr);
@@ -657,6 +749,26 @@ TextureHandle  CurrentRenderTarget();
 // Where the target's logical space lands: meshes, clears, copies, depth reads, and 2D that tests
 // depth or samples an image of the frame.
 LogicalMapping GetLogicalMapping(TextureHandle target);
+
+/**
+ * Whether CopyMainDepthToTarget can write target's depth.
+ *
+ * The device must blit its depth format, and target must be a render target with a depth image of its own
+ * (not the main target, not one sharing the main depth). Nothing is changed.
+ */
+bool CanCopyMainDepth(TextureHandle target);
+
+/**
+ * Copies a rectangle of the main depth over the whole depth of the current render target.
+ *
+ * The rectangle is in the main target's logical space and is rounded to its pixels; the copy is a nearest-sample
+ * resize of the depth aspect, so each destination pixel takes the source pixel its centre lies in, as a Nearest
+ * sampler would for colour over the same rectangle. It runs at its place in the draw order, on the depth the frame
+ * has built so far, and leaves the main depth and stencil as they were. The target's stencil starts at zero and
+ * its previous depth is replaced, so it is meant to be drawn into afterwards with the depth test on. Returns false,
+ * and records nothing, when CanCopyMainDepth(current target) is false or the rectangle is empty or not finite.
+ */
+bool CopyMainDepthToTarget(const LogicalRect &source);
 // Where the rest of 2D lands: on the main target the logical mapping scaled by ui_scale about the
 // target's centre, elsewhere the logical mapping.
 LogicalMapping GetUiMapping(TextureHandle target);

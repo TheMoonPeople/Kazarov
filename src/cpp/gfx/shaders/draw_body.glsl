@@ -3,8 +3,17 @@
 // fog, alpha test, and the source side of the alpha blend. The blend itself is fixed-function;
 // see README.md for how ((A - B) * C >> 7) + D is split between this shader and the pipeline.
 
+#extension GL_EXT_control_flow_attributes : require
+
 layout(constant_id = 0) const int kTextureMode = 0; // 0 none, 1 RGBA, 2 index + palette
 layout(constant_id = 1) const bool kAlphaTest  = false;
+layout(constant_id = 2) const int kColorFeatures = -1; // fog | TEXA | AEM flags, or -1 for pc.flags
+layout(constant_id = 3) const int kAlphaFunction = -1; // fixed alpha test function, or -1 for pc.alpha
+layout(constant_id = 4) const bool kSimpleColor = false;
+layout(constant_id = 5) const int kAlphaReference = -1;
+layout(constant_id = 6) const bool kPlainMeshFog = false;
+layout(constant_id = 10) const bool kNearSafeMeshFog = false;
+layout(constant_id = 11) const bool kNearSafeReciprocal = false;
 
 #ifdef KZ_BOUND_TEXTURES
 // Each draw pushes its own texture, palette and sampler: GPUs without 8192 update-after-bind
@@ -95,13 +104,18 @@ vec4 SamplePalette() {
     return mix(mix(PaletteEntry(index.w), PaletteEntry(index.z), f.x), mix(PaletteEntry(index.x), PaletteEntry(index.y), f.x), f.y);
 }
 
+uint ColorFlags() {
+    return kColorFeatures < 0 ? pc.flags : uint(kColorFeatures);
+}
+
 // TEXA expands alpha per texel before filtering too: with AEM a filtered edge between black and
 // coloured texels fades out instead of taking TA0 throughout.
 vec4 SampleRgba() {
     vec4 t = texture(TEXTURE, v_uv);
-    if ((pc.flags & kTexa) != 0u) {
+    uint flags = ColorFlags();
+    if ((flags & kTexa) != 0u) {
         float ta0 = float(pc.alpha >> 24) / 128.0;
-        bool  aem = (pc.flags & kAem) != 0u;
+        bool  aem = (flags & kAem) != 0u;
         if (aem && (pc.flags & kLinear) != 0u) {
             vec2 corner = FootprintCorner();
             vec4 sum    = textureGather(TEXTURE, corner, 0) + textureGather(TEXTURE, corner, 1) + textureGather(TEXTURE, corner, 2);
@@ -114,9 +128,9 @@ vec4 SampleRgba() {
 }
 
 bool AlphaPasses(float alpha) {
+    int  ref   = kAlphaReference >= 0 ? kAlphaReference : int(pc.alpha & 0xFFu);
     int  value = int(alpha * 128.0 + 0.5);
-    int  ref   = int(pc.alpha & 0xFFu);
-    uint func  = (pc.alpha >> 8) & 7u;
+    uint func  = kAlphaFunction >= 0 ? uint(kAlphaFunction) : (pc.alpha >> 8) & 7u;
     switch (func) {
         case 0u:
             return false;
@@ -152,27 +166,34 @@ void main() {
         discard;
     }
 
-    if ((pc.flags & kFog) != 0u) {
-        float fog = v_fog_mode.z < -1.5 ? v_fog_mode.w : v_fog.x;
-        if (v_fog_mode.z >= 0.0) {
-            // Each edge depends only on its own endpoints, including after homogeneous clipping.
-            // Zero markers give PS2 vertex-clamp-then-screen-interpolate.
-            // Hardware clipping cannot emit fresh PS2 vertex F; near/eye crossings blend towards it.
-            float fresh = v_fog.y * gl_FragCoord.w;
-            fresh = v_fog_mode.z > 0.5 ? max(max(min(fresh, v_fog_mode.x), v_fog_mode.y), 0.0)
-                                       : min(max(fresh, v_fog_mode.y), v_fog_mode.x);
-            if (v_fog_mode.z > 0.5) {
-                fresh = floor(fresh);
+    if ((ColorFlags() & kFog) != 0u) {
+        float fog;
+        if (kNearSafeMeshFog) {
+            fog = (kNearSafeReciprocal ? v_fog.x * gl_FragCoord.w : v_fog.x / v_fog.w) / 255.0;
+        } else {
+            fog = v_fog_mode.z < -1.5 ? v_fog_mode.w
+                                      : v_fog.x;
+            if (v_fog_mode.z >= 0.0) {
+                // Each edge depends only on its own endpoints, including after homogeneous clipping.
+                // Zero markers give PS2 vertex-clamp-then-screen-interpolate.
+                // Hardware clipping cannot emit fresh PS2 vertex F; near/eye crossings blend towards it.
+                float fresh = v_fog.y * gl_FragCoord.w;
+                // The plain mesh family emits only -2 or 0; the floor mode belongs to prog0.
+                fresh = !kPlainMeshFog && v_fog_mode.z > 0.5 ? max(max(min(fresh, v_fog_mode.x), v_fog_mode.y), 0.0)
+                                                             : min(max(fresh, v_fog_mode.y), v_fog_mode.x);
+                if (!kPlainMeshFog && v_fog_mode.z > 0.5) {
+                    fresh = floor(fresh);
+                }
+                fog = v_fog.w > 0.0 ? mix(v_fog.x / v_fog.w, fresh, clamp(v_fog.z, 0.0, 1.0)) : fresh;
+                fog /= 255.0;
             }
-            fog = v_fog.w > 0.0 ? mix(v_fog.x / v_fog.w, fresh, clamp(v_fog.z, 0.0, 1.0)) : fresh;
-            fog /= 255.0;
         }
         color.rgb = mix(unpackUnorm4x8(pc.fog_color).rgb, color.rgb, fog);
     }
 
     // Keep the original coverage, alpha test and blending. Only presentation RGB is tinted.
     uint status = (pc.flags >> 8) & 7u;
-    if (status != 0u) {
+    if (!kSimpleColor && status != 0u) {
         vec3 tint = status == 1u ? vec3(0.1, 1.0, 0.1) : status == 2u ? vec3(1.0, 0.1, 0.1)
                                                      : status == 3u   ? vec3(0.1, 0.2, 1.0)
                                                      : status == 4u   ? vec3(1.0, 1.0, 0.1)
@@ -181,7 +202,7 @@ void main() {
     }
 
     float factor    = (pc.flags & kFactorFix) != 0u ? float((pc.alpha >> 16) & 0xFFu) / 128.0 : color.a;
-    uint  transform = (pc.flags >> kTransformShift) & 3u;
+    uint  transform = kSimpleColor ? 0u : (pc.flags >> kTransformShift) & 3u;
     vec3  rgb       = transform == 1u ? color.rgb * (1.0 + factor) : transform == 2u ? vec3(factor) : color.rgb;
     o_color         = vec4(rgb, (pc.flags & kOpaqueTarget) != 0u ? 1.0 : color.a);
 #ifndef KZ_SINGLE_SOURCE

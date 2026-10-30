@@ -103,9 +103,14 @@ void ReportFirstDeviceTransient(const std::string &message) {
 }
 
 // As AllocateRaw, but a refused allocation or mapping is returned for the caller to fall back on.
-VkResult TryAllocateRaw(VkDeviceSize size, uint32_t type, VkDeviceMemory *memory, uint8_t **mapped) {
+VkResult TryAllocateRaw(VkDeviceSize size, uint32_t type, VkDeviceMemory *memory, uint8_t **mapped,
+                        VkImage dedicated_image = VK_NULL_HANDLE) {
+    VkMemoryDedicatedAllocateInfo dedicated = {};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image = dedicated_image;
     VkMemoryAllocateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    info.pNext = dedicated_image != VK_NULL_HANDLE ? &dedicated : nullptr;
     info.allocationSize = size;
     info.memoryTypeIndex = type;
     *mapped = nullptr;
@@ -113,7 +118,7 @@ VkResult TryAllocateRaw(VkDeviceSize size, uint32_t type, VkDeviceMemory *memory
     if (result != VK_SUCCESS) {
         return result;
     }
-    if (IsHostVisible(type)) {
+    if (IsHostVisible(type) && dedicated_image == VK_NULL_HANDLE) {
         void *pointer = nullptr;
         result = vkMapMemory(g.device, *memory, 0, VK_WHOLE_SIZE, 0, &pointer);
         if (result != VK_SUCCESS) {
@@ -126,9 +131,10 @@ VkResult TryAllocateRaw(VkDeviceSize size, uint32_t type, VkDeviceMemory *memory
     return VK_SUCCESS;
 }
 
-VkDeviceMemory AllocateRaw(VkDeviceSize size, uint32_t type, uint8_t **mapped) {
+VkDeviceMemory AllocateRaw(VkDeviceSize size, uint32_t type, uint8_t **mapped,
+                           VkImage dedicated_image = VK_NULL_HANDLE) {
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    Check(TryAllocateRaw(size, type, &memory, mapped), "vkAllocateMemory");
+    Check(TryAllocateRaw(size, type, &memory, mapped, dedicated_image), "vkAllocateMemory");
     return memory;
 }
 
@@ -183,14 +189,14 @@ void ReturnToBlock(Block &block, VkDeviceSize offset, VkDeviceSize size) {
 } // namespace
 
 Allocation AllocateMemory(const VkMemoryRequirements &requirements, VkMemoryPropertyFlags required,
-                          VkMemoryPropertyFlags preferred, bool linear) {
+                          VkMemoryPropertyFlags preferred, bool linear, VkImage dedicated_image) {
     AssertDeviceThread(__func__);
     uint32_t   type = FindMemoryType(requirements.memoryTypeBits, required, preferred);
     Allocation allocation;
     allocation.size = requirements.size;
 
-    if (requirements.size >= kDedicatedThreshold) {
-        allocation.memory = AllocateRaw(requirements.size, type, &allocation.mapped);
+    if (requirements.size >= kDedicatedThreshold || dedicated_image != VK_NULL_HANDLE) {
+        allocation.memory = AllocateRaw(requirements.size, type, &allocation.mapped, dedicated_image);
         return allocation;
     }
 

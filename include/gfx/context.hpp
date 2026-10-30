@@ -52,7 +52,8 @@ struct Allocation {
 };
 
 Allocation AllocateMemory(const VkMemoryRequirements &requirements, VkMemoryPropertyFlags required,
-                          VkMemoryPropertyFlags preferred, bool linear);
+                          VkMemoryPropertyFlags preferred, bool linear,
+                          VkImage dedicated_image = VK_NULL_HANDLE);
 void       FreeMemory(Allocation &allocation);
 void       ShutdownMemory();
 
@@ -94,6 +95,8 @@ bool       IsDepthFormat(VkFormat format);
 void       DestroyImage(Image &image);
 void       Transition(VkCommandBuffer cmd, Image &image, const ImageState &to);
 void       ToRest(VkCommandBuffer cmd, Image &image);
+// Initializes a depth target outside a rendering instance, without transfer-destination usage.
+void       InitializeDepth(VkCommandBuffer cmd, Image &image);
 ImageState TransferSrc();
 ImageState TransferDst();
 
@@ -105,6 +108,7 @@ struct Texture {
     TextureDesc desc;
     Image       image;
     Image       depth; // render targets that keep their own only
+    bool        depth_copy_dst = false; // depth was made with transfer-destination usage for CopyMainDepthToTarget
     bool        render_target = false;
     bool        shares_main_depth = false;
     bool        frame = false;
@@ -112,6 +116,7 @@ struct Texture {
     uint32_t    logical_height = 0;
     // The frame serial in which the draw command buffer last touched the image.
     uint64_t last_draw_use = 0;
+    uint64_t opaque_alpha_mips = 0; /**< Fully initialized RGBA8 mip levels with alpha255 throughout. */
     // The recording that owns destruction: only it may record further uses, but replays stay live.
     const DisplayList *doomed = nullptr;
 };
@@ -119,12 +124,25 @@ struct Texture {
 struct Mesh {
     bool     live = false;
     uint16_t generation = 0;
-    Buffer   buffer; // vertices, then indices
-    uint32_t vertex_count = 0;
-    uint32_t index_count = 0;
-    uint64_t last_draw_use = 0;
-    const DisplayList *doomed = nullptr;
+    Buffer               buffer; // vertices, then indices
+    uint32_t             vertex_count = 0;
+    uint32_t             index_count = 0;
+    uint64_t             last_draw_use = 0;
+    std::array<float, 3> bounds_min = {};
+    std::array<float, 3> bounds_max = {};
+    bool                 bounds_known = false; /**< Static upload bounds; vertex updates invalidate them. */
+    const DisplayList   *doomed = nullptr;
 };
+
+/**
+ * Enable conservative near-safe plain-mesh fog specialization.
+ */
+bool NearSafeFogEnabled();
+
+/**
+ * Prove positive clip W and zero near/eye fog markers over static mesh bounds.
+ */
+bool MeshFogIsNearSafe(const Mesh &mesh, const MeshConstants &constants);
 
 struct TransientChunk {
     Buffer          buffer;
@@ -155,6 +173,23 @@ struct DepthQuery {
     float       result = 0.0f;
 };
 
+// What a KZ_GPU_SCOPES segment covered: everything since the previous mark.
+enum class GpuScopeKind : uint8_t {
+    Setup, // outside rendering before a pass begins: transitions, clears and uploads recorded into the frame
+    Pass,  // a dynamic-rendering span
+    Run,   // KZ_GPU_SCOPES=draw: a span's draws with one pipeline
+    Copy,  // a grab copy or blit
+    Tail,  // the frame's end: the final transition, and for a display frame its blit
+};
+
+struct GpuScopeMark {
+    GpuScopeKind kind;
+    uint32_t     target;   // the TextureHandle drawn or copied to
+    uint32_t     pipeline; // the pipeline index of a Run, else UINT32_MAX
+    uint32_t     draws;    // draws recorded in the segment
+    uint32_t     barriers; // pipeline barriers recorded in the segment
+};
+
 struct Frame {
     VkCommandPool                      pool = VK_NULL_HANDLE;
     VkCommandBuffer                    upload_cmd = VK_NULL_HANDLE;
@@ -172,6 +207,17 @@ struct Frame {
     // The only buffer the GPU writes for the host; kept apart from the transients, which it reads.
     Buffer depth_readback;
     std::array<uint32_t, kDepthQueryCount> depth_texels = {};
+    // FrameTimings: timestamps opened by this slot's draw commands and closed before they were submitted.
+    enum class Timestamps : uint8_t {
+        None,
+        Open,
+        Canonical,
+        Display
+    } timestamps = Timestamps::None;
+    // KZ_GPU_SCOPES: what each segment of the slot's scope queries covered; segment i ends at query i + 1.
+    std::vector<GpuScopeMark> scope_marks;
+    uint32_t                  scope_reset = 0; // scope queries the slot's next frame resets
+    uint32_t                  scope_passes = 0;
 };
 
 struct Swapchain {
@@ -274,6 +320,7 @@ enum PushFlags : uint32_t {
     kPushTransformShift = 4,
     kPushFactorFix = 1u << 6,
     kPushLinear = 1u << 7,
+    kPushVariableMeshFog = 1u << 31,
 };
 
 // Axes along which an image shows past its logical frame.
@@ -299,8 +346,55 @@ enum TextureMode : uint32_t {
     kTextureModeCount,
 };
 
+// The fog and TEXA combinations the colour pipelines specialise on: fog in bit 0, then no TEXA, TEXA (2)
+// or TEXA with AEM (4). The shader's kPush flags for indices 0..5 are 0, 1, 2, 3, 6 and 7.
+inline constexpr uint32_t kColorFeatureCount = 6;
+// The upper half also guarantees untransformed colour without an interpolation status tint.
+inline constexpr uint32_t kFragmentFeatureCount = kColorFeatureCount * 2;
+
+inline constexpr uint32_t kNearSafeFogScope = UINT32_MAX - 3;
+inline constexpr uint32_t kNearSafeFogAlphaScope = UINT32_MAX - 4;
+inline constexpr uint32_t kDepthPlanesScope = UINT32_MAX - 5;
+
+/**
+ * One coverage draw of a depth-planes pass.
+ *
+ * It shades the pixels whose stored depth lies in [min_depth, max_depth] and reads the colour table
+ * row for that coverage. Prepare reads it from tls.plane_draw instead of choosing a pipeline.
+ */
+struct PlaneDraw {
+    float    min_depth = 0.0f;     /**< Lowest stored depth the draw shades. */
+    float    max_depth = 1.0f;     /**< Highest stored depth the draw shades. */
+    uint32_t row = 0;              /**< Table row: the coverage count minus one. */
+    uint32_t table_slot = 0;       /**< Texture slot of the colour table. */
+    float    table_scale_x = 1.0f; /**< Table pixels per logical texel across. */
+    float    table_scale_y = 1.0f; /**< Table pixels per logical texel down. */
+};
+
+/**
+ * The colour table of the depth-planes pass and what it was made for.
+ */
+struct PlaneTable {
+    TextureHandle ramp = kNullTexture;    /**< The 256 grey source texels the table is drawn from. */
+    TextureHandle table = kNullTexture;   /**< 256 columns by 8 rows: the blended result per value and coverage. */
+    VkImage       image = VK_NULL_HANDLE; /**< The table image when it was drawn; a new image means a new table. */
+    float         scale = 0.0f;           /**< Render scale when it was drawn. */
+    bool          ready = false;
+    bool          failed = false;
+};
+
+// Alpha test: disabled, dynamic, or GEQUAL against a dynamic reference.
+enum AlphaVariant : uint32_t {
+    kAlphaVariantNone,
+    kAlphaVariantGeneric,
+    kAlphaVariantGEqual,
+    kAlphaVariantCount,
+};
+
 // Per-frame renderer work counts, plotted to the profiler when a frame closes.
 struct FrameCounters {
+    uint32_t barriers = 0;
+    uint32_t passes = 0;
     uint32_t mesh_draws = 0;
     uint32_t draws_2d = 0;
     uint32_t grab_copies = 0;
@@ -308,6 +402,8 @@ struct FrameCounters {
     uint32_t descriptor_binds = 0;
     uint64_t transient_bytes = 0;
 };
+
+struct PipelineRecipes;
 
 struct Context {
     SDL_Window                      *window = nullptr;
@@ -364,9 +460,19 @@ struct Context {
     VkPipelineLayout             pipeline_layout = VK_NULL_HANDLE;
     VkPipelineCache              pipeline_cache = VK_NULL_HANDLE;
     std::vector<VkPipeline>      pipelines;
-    uint32_t                     blend_slot_count = 0;
+    uint32_t                    pipeline_count = 0;
+    // Set while pipelines compile on first use instead of at start-up: what each one is created from.
+    std::shared_ptr<PipelineRecipes> pipeline_recipes;
+    // KZ_DEPTH_PLANES: the depth-bounds colour pass; null when off, unsupported or unbindless.
+    VkPipeline                    depth_planes_pipeline = VK_NULL_HANDLE;
+    bool                          depth_bounds = false; // the device's depthBounds feature is enabled
+    bool                          depth_blit = false;   // the depth format blits as source and destination
+    PlaneTable                    plane_table;
+    std::array<VkPipeline, 2>     near_safe_fog_pipelines = {};
+    std::array<uint32_t, 2>       near_safe_fog_bases = {UINT32_MAX, UINT32_MAX};
+    uint32_t                      blend_slot_count = 0;
     std::array<BlendMapping, 162> blend_map = {};
-    double                       pipeline_seconds = 0.0;
+    double                        pipeline_seconds = 0.0;
 
     std::vector<Texture>                              textures;
     std::map<std::string, TextureHandle, std::less<>> named_targets;
@@ -400,6 +506,25 @@ struct Context {
     bool presented_display = false;
 
     FrameCounters counters;
+    // FrameTimings GPU timestamps, two per frame slot; null until timing is first enabled or where unsupported.
+    VkQueryPool timestamp_pool = VK_NULL_HANDLE;
+    bool        timestamps_checked = false;
+    uint64_t    timestamp_mask = 0;
+    // KZ_GPU_SCOPES=pass or draw while timing is on: timestamps between passes and copies and, for draw,
+    // at pipeline changes, kGpuScopeQueries per frame slot.
+    VkQueryPool scope_pool = VK_NULL_HANDLE;
+    uint32_t    gpu_scopes = 0; // 0 off, 1 pass, 2 draw
+    bool        scopes_open = false;
+    uint32_t    scope_pipeline = UINT32_MAX; // the open run's pipeline index
+    uint32_t    scope_target = 0;            // the open pass's target
+
+    // Optional pipeline diagnostics, read once at device creation.
+    struct PerfKnobs {
+        std::string stats; // KZ_PERF_SHADER_STATS=<substring>: log NVK executable stats and ISA
+    } perf;
+
+    uint32_t scope_draws = 0;    // draws counted at the last mark
+    uint32_t scope_barriers = 0; // barriers counted at the last mark
 
 #ifdef KZ_PORT_TRACY
     tracy::VkCtx                       *tracy_vk = nullptr;      // GPU timestamp context on the graphics queue
@@ -422,6 +547,8 @@ struct ThreadFlags {
     bool     host_draws = false;
     bool     in_idle_hook = false;
     uint32_t interpolation_tint = 0;
+    // Set around the 2D draws of one depth-planes coverage: they select its pipeline and bounds.
+    const PlaneDraw *plane_draw = nullptr;
 };
 
 extern thread_local ThreadFlags tls;
@@ -506,9 +633,13 @@ void DestroyDoomedMesh(MeshHandle handle);
 
 // pipelines.cpp
 void     CreatePipelineLayout();
+bool     DepthPlanesEnabled();
 void     CreatePipelines();
 void     DestroyPipelines();
-uint32_t PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, bool alpha_test);
+// The pipeline at an index, compiling it first when pipelines compile on first use.
+VkPipeline PipelineAt(uint32_t index);
+uint32_t PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, AlphaVariant alpha,
+                       uint32_t fragment_features);
 // Without a dynamic colour write mask: the alpha-testing pipelines that write no colour, after the others.
 uint32_t NoColorPipelineIndex(PipelineFamily family, TextureMode mode);
 // The depth and stencil only pipelines, which have no fragment stage, last.
@@ -527,6 +658,13 @@ const DisplayList *RecordingList();
 
 // draw.cpp
 void           EndRendering();
+// Ends a KZ_GPU_SCOPES segment with a timestamp while scopes are recorded at level or finer.
+void MarkGpuScope(VkCommandBuffer cmd, GpuScopeKind kind, uint32_t target, uint32_t pipeline = UINT32_MAX);
+
+inline bool GpuScopes(uint32_t level) { return g.scopes_open && g.gpu_scopes >= level; }
+
+// A pipeline index as family, texture mode, blend slot and alpha test, for KZ_GPU_SCOPES.
+std::string    DescribePipeline(uint32_t index);
 void           ResetDrawState();
 void           ReleaseTarget();
 LogicalMapping MainMapping(uint32_t width, uint32_t height);

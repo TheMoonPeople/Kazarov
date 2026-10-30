@@ -247,6 +247,18 @@ fn bank(root: &Path, key: &str, hd: &[u8], bd: &[u8]) -> CoreResult<String> {
     bank_with(key, hd, bd, &mut |name, bytes| write(root, name, &bytes))
 }
 
+/// Publishes one HD/BD bank under root as bank JSON and WAV samples, at the paths this converter
+/// gives key, for a game that walks its own sound packs; returns the bank document's path.
+pub fn publish_bank(root: &Path, key: &str, hd: &[u8], bd: &[u8]) -> CoreResult<String> {
+    bank(root, key, hd, bd)
+}
+
+/// Publishes one SQ file under root as sequence JSON, at the path this converter gives key; returns
+/// the document's path.
+pub fn publish_sequence(root: &Path, key: &str, sq: &[u8]) -> CoreResult<String> {
+    sequence(root, key, sq)
+}
+
 fn varlen(b: &[u8], at: &mut usize) -> CoreResult<u32> {
     let mut n = 0;
     for _ in 0..4 {
@@ -2693,6 +2705,51 @@ mod tests {
         assert_eq!(d["vags"][0]["loops"], true);
         fs::write(stage.join("data/test.sound/samples/0.wav"), b"bad").unwrap();
         assert!(verify(&stage).is_err());
+    }
+
+    #[test]
+    fn a_game_publishes_single_banks_and_sequences_at_the_converters_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut sample = vec![0; 42];
+        sample[11] = 60;
+        let mut info = vec![0; 8];
+        info[4..6].copy_from_slice(&44100u16.to_le_bytes());
+        let hd = [
+            table(b"Prog", &[vec![]]),
+            table(b"Smpl", &[sample]),
+            table(b"Vagi", &[info]),
+        ]
+        .concat();
+        let mut bd = vec![0; 16];
+        bd[1] = 1;
+        let bank = publish_bank(temp.path(), "sound/set/snd0.snd/e01a_c.hd", &hd, &bd).unwrap();
+        assert_eq!(bank, "sound/set/snd0.sound/bank.json");
+        let d: Value = serde_json::from_slice(&fs::read(temp.path().join(&bank)).unwrap()).unwrap();
+        assert_eq!(d["kind"], "bank");
+        assert_eq!(d["vags"][0]["wav"], "sound/set/snd0.sound/samples/0.wav");
+        assert!(
+            temp.path()
+                .join("sound/set/snd0.sound/samples/0.wav")
+                .exists()
+        );
+
+        let shared = publish_bank(temp.path(), "sound/banks/e01a_c-0123abcd.hd", &hd, &bd).unwrap();
+        assert_eq!(shared, "sound/banks/e01a_c-0123abcd.sound/bank.json");
+
+        let song = [
+            6u32.to_le_bytes().as_slice(),
+            &480u16.to_le_bytes(),
+            &[0, 0xff, 0x2f, 0],
+        ]
+        .concat();
+        let sq = table(b"Midi", &[song]);
+        let sequence = publish_sequence(temp.path(), "sound/set/snd0.snd/e01a_e.sq", &sq).unwrap();
+        assert_eq!(sequence, "sound/set/snd0.sound/sequences/e01a_e.json");
+        let d: Value =
+            serde_json::from_slice(&fs::read(temp.path().join(&sequence)).unwrap()).unwrap();
+        assert_eq!(d["kind"], "sequence");
+        assert_eq!(d["songs"][0]["division"], 480);
+        assert_eq!(d["songs"][0]["events"][0]["kind"], "end");
     }
 
     #[test]

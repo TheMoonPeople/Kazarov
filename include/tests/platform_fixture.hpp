@@ -124,9 +124,21 @@ int FaultStatus(F body) {
 
 #ifdef _WIN32
 #define KZ_ASSERT_EXIT(body, code) ASSERT_EXIT({ body(); std::_Exit(0); }, ::testing::ExitedWithCode(code), "")
-// UCRT abort exits with status 3; a guard-page write reports an NT access violation.
+// UCRT abort exits with status 3; ASan handles access violations before Windows reports them.
 #define KZ_ASSERT_ABORT(body) KZ_ASSERT_EXIT(body, 3)
+#if defined(__clang__)
+#if __has_feature(address_sanitizer)
+#define KZ_TEST_ADDRESS_SANITIZER
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define KZ_TEST_ADDRESS_SANITIZER
+#endif
+#ifdef KZ_TEST_ADDRESS_SANITIZER
+#define KZ_ASSERT_FAULT(body) ASSERT_EXIT({ body(); std::_Exit(0); }, ::testing::ExitedWithCode(1), "ERROR: AddressSanitizer: access-violation")
+#undef KZ_TEST_ADDRESS_SANITIZER
+#else
 #define KZ_ASSERT_FAULT(body) KZ_ASSERT_EXIT(body, static_cast<int>(0xC0000005))
+#endif
 #else
 #define KZ_ASSERT_EXIT(body, code)                                       \
     do {                                                                 \

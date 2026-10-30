@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Build a minimal LGPL-only FFmpeg into DIR and stamp it.
 
-    kz-ffmpeg --out DIR [--target ios-arm64] [--tarball FILE] [--sha256 HEX] [--jobs N] [--check] [--print-configure]
+    kz-ffmpeg --out DIR [--target ios-arm64|windows-x64] [--tarball FILE] [--sha256 HEX] [--jobs N] [--check]
+              [--print-configure]
 
 The build provides lossless MPEG-2/ALAC MP4 extraction and MP4 playback through
 static codec, format, resampling and scaling libraries plus the FFmpeg command.
-The Linux image and macOS hosts use it; Windows takes BtbN's LGPL-shared bundle.
+The Linux image and macOS hosts use it.
 --target ios-arm64 cross-compiles the libraries for iOS on a macOS host, without the command.
+--target windows-x64 cross-compiles DLLs, their import libraries and the command for Windows on a Linux host with
+llvm-mingw's x86_64-w64-mingw32- tools on PATH.
 scripts/build/kz-ffmpeg launches this shared FFmpeg tool; the image uses it directly.
 """
 
@@ -30,6 +33,8 @@ LICENSE_LINE = 'License: LGPL version 2.1 or later'
 STAMP = 'kz-ffmpeg.json'
 LIBRARIES = ('lib/libavcodec.a', 'lib/libavformat.a', 'lib/libavutil.a',
              'lib/libswresample.a', 'lib/libswscale.a', 'include/libavcodec/avcodec.h')
+WINDOWS_PRODUCTS = ('lib/libavcodec.dll.a', 'lib/libavformat.dll.a', 'lib/libavutil.dll.a', 'lib/libswresample.dll.a',
+                    'lib/libswscale.dll.a', 'include/libavcodec/avcodec.h', 'bin/ffmpeg.exe')
 IOS_MIN_VERSION = '16.0'
 CONFIGURE_FLAGS = [
     '--disable-everything',
@@ -59,7 +64,11 @@ GPL_FLAGS = ('--enable-gpl', '--enable-nonfree', '--enable-version3')
 
 
 def products(target):
-    return LIBRARIES if target == 'ios-arm64' else LIBRARIES + ('bin/ffmpeg',)
+    if target == 'ios-arm64':
+        return LIBRARIES
+    if target == 'windows-x64':
+        return WINDOWS_PRODUCTS
+    return LIBRARIES + ('bin/ffmpeg',)
 
 
 def ios_flags():
@@ -71,13 +80,23 @@ def ios_flags():
             f'--sysroot={sysroot}', f'--extra-cflags={target}', f'--extra-ldflags={target}']
 
 
+def windows_flags():
+    # Windows links the libraries as DLLs, which keeps relinking them trivial. The static libunwind keeps the DLLs
+    # free of llvm-mingw's runtime DLLs.
+    return ['--enable-cross-compile', '--target-os=mingw32', '--arch=x86_64', '--cross-prefix=x86_64-w64-mingw32-',
+            '--cc=x86_64-w64-mingw32-clang', '--enable-w32threads', '--extra-ldflags=-static-libgcc']
+
+
 def configure_flags(target=None):
     flags = list(CONFIGURE_FLAGS)
     if target == 'ios-arm64':
         flags.remove('--enable-ffmpeg')
         flags += ios_flags()
+    elif target == 'windows-x64':
+        flags = [flag for flag in flags if flag not in ('--enable-pic', '--disable-shared', '--enable-static')]
+        flags += ['--enable-shared', '--disable-static', *windows_flags()]
     # configure aborts without nasm unless x86 assembly is disabled explicitly.
-    elif shutil.which('nasm') is None:
+    if target != 'ios-arm64' and shutil.which('nasm') is None:
         flags.append('--disable-x86asm')
     return flags
 
@@ -160,7 +179,7 @@ def configure_and_build(src, out, jobs, target):
 def main():
     parser = argparse.ArgumentParser(description=f'Build a minimal LGPL-only FFmpeg {VERSION} for the Kazarov image.')
     parser.add_argument('--out', metavar='DIR')
-    parser.add_argument('--target', choices=['ios-arm64'], help='cross-compile the libraries for this target')
+    parser.add_argument('--target', choices=['ios-arm64', 'windows-x64'], help='cross-compile the libraries for this target')
     parser.add_argument('--tarball', metavar='FILE')
     parser.add_argument('--sha256', metavar='HEX')
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 1, metavar='N')

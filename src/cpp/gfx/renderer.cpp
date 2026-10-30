@@ -2,15 +2,20 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __ANDROID__
@@ -38,6 +43,116 @@ std::atomic<bool> g_resize_pending{false};
 bool g_bindless_forced = false;
 // Set by a game frame's OpenFrame, not by the idle hook's frames.
 std::atomic<bool> g_game_frame_open{false};
+
+using TimingClock = std::chrono::steady_clock;
+
+std::atomic<bool>       g_timing_enabled{false};
+std::mutex              g_timing_mutex;
+FrameTimings            g_timings;
+TimingClock::time_point g_last_present{};
+// Device thread only: when the frame being recorded opened.
+TimingClock::time_point g_frame_opened{};
+
+// Opt-in CPU spans after the submitted frame's existing canonical/display CPU timer ends.
+enum class FramePhase : size_t {
+    Advance,
+    Wait,
+    Fence,
+    Depth,
+    Timestamps,
+    Scopes,
+    Deletions,
+    Transients,
+    CommandPool,
+    Count,
+};
+
+constexpr size_t kFramePhaseCount = static_cast<size_t>(FramePhase::Count);
+using FramePhaseSample = std::array<double, kFramePhaseCount>;
+
+bool FramePhasesEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_PERF_FRAME_PHASES");
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+    }();
+    return enabled;
+}
+
+void NoteFramePhase(FramePhaseSample *sample, FramePhase phase, TimingClock::time_point start,
+                    TimingClock::time_point end) {
+    (*sample)[static_cast<size_t>(phase)] = std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+void NoteFramePhases(Frame::Timestamps kind, const FramePhaseSample &sample) {
+    struct Group {
+        uint64_t         count = 0;
+        FramePhaseSample total = {};
+        FramePhaseSample maximum = {};
+    };
+
+    static uint64_t             instance = 0;
+    static std::array<Group, 2> groups;
+    if (instance != g.renderer_instance) {
+        instance = g.renderer_instance;
+        groups = {};
+    }
+    Group &group = groups[kind == Frame::Timestamps::Canonical ? 0 : 1];
+    ++group.count;
+    for (size_t i = 0; i < kFramePhaseCount; ++i) {
+        group.total[i] += sample[i];
+        group.maximum[i] = std::max(group.maximum[i], sample[i]);
+    }
+    if (groups[0].count < 120) {
+        return;
+    }
+    constexpr std::array<const char *, kFramePhaseCount> names = {
+        "advance", "wait", "fence", "depth", "timestamps", "scopes", "deletions", "transients", "command_pool"};
+    for (size_t kind_index = 0; kind_index < groups.size(); ++kind_index) {
+        const Group &each = groups[kind_index];
+        if (each.count == 0) {
+            continue;
+        }
+        std::string spans;
+        for (size_t i = 0; i < kFramePhaseCount; ++i) {
+            spans += std::format(" {}={:.3f}/{:.3f}", names[i], each.total[i] / static_cast<double>(each.count),
+                                 each.maximum[i]);
+        }
+        kz::Logf(kz::LogLevel::Info, "gfx", "frame phases {} samples {} mean/max ms:{}",
+                 kind_index == 0 ? "canonical" : "display", each.count, spans);
+    }
+    groups = {};
+}
+
+bool Timing() { return g_timing_enabled.load(std::memory_order_relaxed); }
+
+double MillisecondsSince(TimingClock::time_point start) {
+    return std::chrono::duration<double, std::milli>(TimingClock::now() - start).count();
+}
+
+template <typename Update>
+void RecordTiming(Update update) {
+    std::lock_guard lock(g_timing_mutex);
+    update(g_timings);
+}
+
+// Records a vkQueuePresentKHR call that began at start and has returned.
+void NotePresent(TimingClock::time_point start) {
+    const TimingClock::time_point now = TimingClock::now();
+    RecordTiming([&](FrameTimings &timings) {
+        timings.queue_present.Add(std::chrono::duration<double, std::milli>(now - start).count());
+        if (g_last_present != TimingClock::time_point{}) {
+            constexpr double kRefresh = 1000.0 / 60.0;
+            const double     interval = std::chrono::duration<double, std::milli>(now - g_last_present).count();
+            const int        bucket = interval <= 1.25 * kRefresh   ? 0
+                                      : interval <= 2.25 * kRefresh ? 1
+                                      : interval <= 3.25 * kRefresh ? 2
+                                                                    : 3;
+            timings.present_interval.Add(interval);
+            ++timings.interval_buckets[bucket];
+        }
+    });
+    g_last_present = now;
+}
 
 // Formats a message, writes it to the Android system log, where stderr is not shown, and returns it.
 std::string Format([[maybe_unused]] bool fatal, const char *format, std::va_list args) {
@@ -351,8 +466,27 @@ bool SupportsDynamicColorWriteMask() {
     return dynamic3.extendedDynamicState3ColorWriteMask == VK_TRUE;
 }
 
+void ReadPerfKnobs() {
+    auto text = [](const char *name) -> std::string {
+        const char *value = std::getenv(name);
+        return value != nullptr ? value : "";
+    };
+    g.perf = {};
+    // args.txt splits at spaces, so + stands for one.
+    g.perf.stats = text("KZ_PERF_SHADER_STATS");
+    std::replace(g.perf.stats.begin(), g.perf.stats.end(), '+', ' ');
+    kz::Logf(kz::LogLevel::Info, "gfx", "shader statistics '{}'", g.perf.stats);
+}
+
 void CreateDevice() {
+    ReadPerfKnobs();
     g.depth_format = PickDepthFormat();
+    {
+        VkFormatProperties depth_properties = {};
+        vkGetPhysicalDeviceFormatProperties(g.physical_device, g.depth_format, &depth_properties);
+        constexpr VkFormatFeatureFlags kBlit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        g.depth_blit = (depth_properties.optimalTilingFeatures & kBlit) == kBlit;
+    }
     g.dynamic_color_write_mask = g.config.dynamic_color_write_mask && SupportsDynamicColorWriteMask();
 
     float                   priority = 1.0f;
@@ -400,6 +534,9 @@ void CreateDevice() {
     vkGetPhysicalDeviceFeatures(g.physical_device, &supported);
     g.sampler_anisotropy = supported.samplerAnisotropy == VK_TRUE;
     features.features.samplerAnisotropy = supported.samplerAnisotropy;
+    // The depth-planes pass needs the depth bounds test; it is optional and only the pass uses it.
+    features.features.depthBounds = supported.depthBounds;
+    g.depth_bounds = supported.depthBounds == VK_TRUE;
 
     std::vector<const char *> extensions;
     if (!g.offscreen) {
@@ -413,6 +550,19 @@ void CreateDevice() {
     }
     if (!g.bindless) {
         extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    }
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable = {};
+    executable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+    if (!g.perf.stats.empty()) {
+        if (HasExtension(g.physical_device, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+            extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+            executable.pipelineExecutableInfo = VK_TRUE;
+            executable.pNext = features.pNext;
+            features.pNext = &executable;
+        } else {
+            kz::Logf(kz::LogLevel::Info, "gfx", "perf: no {}", VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+            g.perf.stats.clear();
+        }
     }
 
     VkDeviceCreateInfo info = {};
@@ -631,6 +781,8 @@ bool CreateSwapchain() {
         Check(vkCreateSemaphore(g.device, &semaphore, nullptr, &g.swapchain.render_finished[i]),
               "vkCreateSemaphore");
     }
+    kz::Logf(kz::LogLevel::Info, "gfx", "swapchain {}x{}, {} images (asked {}), present mode {}", extent.width,
+             extent.height, count, image_count, static_cast<int>(info.presentMode));
     return true;
 }
 
@@ -751,25 +903,292 @@ void RunDeletions(Frame &frame) {
     }
 }
 
-void WaitFrame(Frame &frame) {
+// Nanoseconds per timestamp tick. The Switch's GM20B timer ticks every 625/384 ns, which NVK reports as
+// 1 ns; the official driver reports 1.627604.
+double TimestampPeriod() {
+    const double reported = g.properties.limits.timestampPeriod;
+#if defined(__SWITCH__)
+    if (reported == 1.0) {
+        return 625.0 / 384.0;
+    }
+#endif
+    return reported;
+}
+
+// A closed pair of timestamps from a frame whose fence has signalled.
+void HarvestTimestamps(Frame &frame) {
+    const Frame::Timestamps kind = frame.timestamps;
+    frame.timestamps = Frame::Timestamps::None;
+    if (g.timestamp_pool == VK_NULL_HANDLE ||
+        (kind != Frame::Timestamps::Canonical && kind != Frame::Timestamps::Display)) {
+        return;
+    }
+    const auto slot = static_cast<uint32_t>(&frame - g.frames.data());
+    uint64_t   ticks[2] = {};
+    if (vkGetQueryPoolResults(g.device, g.timestamp_pool, slot * 2, 2, sizeof(ticks), ticks, sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+        return;
+    }
+    const double ms = static_cast<double>((ticks[1] - ticks[0]) & g.timestamp_mask) * TimestampPeriod() / 1.0e6;
+    RecordTiming([&](FrameTimings &timings) {
+        (kind == Frame::Timestamps::Canonical ? timings.canonical_gpu : timings.display_gpu).Add(ms);
+    });
+}
+
+constexpr uint32_t kGpuScopeQueries = 2048;
+
+// KZ_GPU_SCOPES segments are summed by what they covered, kept apart for display frames.
+std::unordered_map<uint64_t, size_t> g_scope_index;
+
+uint64_t ScopeKey(const GpuScopeMark &mark, bool display) {
+    return static_cast<uint64_t>(mark.kind) << 56 | static_cast<uint64_t>(display) << 55 |
+           static_cast<uint64_t>(mark.pipeline & 0x7FFFFF) << 32 | mark.target;
+}
+
+std::string ScopeTarget(uint32_t handle) {
+    if (handle == kMainTarget) {
+        return "main";
+    }
+    if (handle == kPreviousFrame) {
+        return "previous";
+    }
+    const Texture *texture = LookupTexture(handle);
+    if (texture == nullptr) {
+        return std::format("{:#x}", handle);
+    }
+    return std::format("{:#x} {}x{}", handle, texture->image.width, texture->image.height);
+}
+
+std::string ScopeName(const GpuScopeMark &mark, bool display) {
+    static constexpr const char *kKinds[] = {"setup", "pass", "run", "copy", "tail"};
+    std::string                  name = std::format("{}{} {}", display ? "display " : "", kKinds[static_cast<int>(mark.kind)],
+                                                    mark.kind == GpuScopeKind::Copy
+                                                        ? std::format("to {}x{}", mark.target >> 16, mark.target & 0xFFFF)
+                                                        : ScopeTarget(mark.target));
+    if (mark.pipeline != UINT32_MAX) {
+        name += " | " + DescribePipeline(mark.pipeline);
+    }
+    return name;
+}
+
+// The segments of a frame whose fence has signalled.
+void HarvestScopes(Frame &frame, bool display) {
+    std::vector<GpuScopeMark> marks;
+    marks.swap(frame.scope_marks);
+    if (marks.empty() || g.scope_pool == VK_NULL_HANDLE) {
+        return;
+    }
+    const auto            slot = static_cast<uint32_t>(&frame - g.frames.data());
+    std::vector<uint64_t> ticks(marks.size() + 1);
+    if (vkGetQueryPoolResults(g.device, g.scope_pool, slot * kGpuScopeQueries, static_cast<uint32_t>(ticks.size()),
+                              ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+        return;
+    }
+    const double period = TimestampPeriod() / 1.0e6;
+    RecordTiming([&](FrameTimings &timings) {
+        ++timings.scope_frames;
+        for (size_t i = 0; i < marks.size(); i++) {
+            const GpuScopeMark &mark = marks[i];
+            const uint64_t      key = ScopeKey(mark, display);
+            auto [it, added] = g_scope_index.try_emplace(key, timings.scopes.size());
+            if (added) {
+                timings.scopes.push_back({ScopeName(mark, display)});
+            }
+            FrameTimings::Scope &scope = timings.scopes[it->second];
+            scope.span.Add(static_cast<double>((ticks[i + 1] - ticks[i]) & g.timestamp_mask) * period);
+            scope.draws += mark.draws;
+            scope.barriers += mark.barriers;
+            timings.barriers += mark.barriers;
+        }
+        timings.passes += frame.scope_passes;
+    });
+}
+
+void WaitFrame(Frame &frame, FramePhaseSample *phases = nullptr) {
     KZ_PROFILE_ZONE("Kazarov WaitFrame");
     if (frame.pending) {
+        TimingClock::time_point       phase_start = phases != nullptr ? TimingClock::now() : TimingClock::time_point{};
+        const TimingClock::time_point start = Timing() ? TimingClock::now() : TimingClock::time_point{};
         WaitFence(frame.fence, "frame");
+        if (phases != nullptr) {
+            NoteFramePhase(phases, FramePhase::Fence, phase_start, TimingClock::now());
+        }
+        if (start != TimingClock::time_point{}) {
+            RecordTiming([&](FrameTimings &timings) { timings.fence_wait.Add(MillisecondsSince(start)); });
+        }
         frame.pending = false;
+        if (phases != nullptr) {
+            phase_start = TimingClock::now();
+        }
         HarvestDepthQueries(frame);
+        if (phases != nullptr) {
+            const auto now = TimingClock::now();
+            NoteFramePhase(phases, FramePhase::Depth, phase_start, now);
+            phase_start = now;
+        }
+        const Frame::Timestamps kind = frame.timestamps;
+        HarvestTimestamps(frame);
+        if (phases != nullptr) {
+            const auto now = TimingClock::now();
+            NoteFramePhase(phases, FramePhase::Timestamps, phase_start, now);
+            phase_start = now;
+        }
+        if (kind == Frame::Timestamps::Canonical || kind == Frame::Timestamps::Display) {
+            HarvestScopes(frame, kind == Frame::Timestamps::Display);
+        }
+        if (phases != nullptr) {
+            NoteFramePhase(phases, FramePhase::Scopes, phase_start, TimingClock::now());
+        }
+        frame.scope_marks.clear();
     }
+}
+
+// KZ_GPU_SCOPES: pass or draw, read when timing first opens a frame.
+uint32_t ReadScopeLevel() {
+    const char *setting = std::getenv("KZ_GPU_SCOPES");
+    if (setting == nullptr) {
+        return 0;
+    }
+    if (std::strcmp(setting, "draw") == 0) {
+        return 2;
+    }
+    return std::strcmp(setting, "pass") == 0 || std::strcmp(setting, "1") == 0 ? 1 : 0;
+}
+
+// Starts the slot's scope queries after its opening timestamp, creating their pool on first use.
+void OpenScopes(VkCommandBuffer cmd, Frame &frame) {
+    g.scopes_open = false;
+    if (g.gpu_scopes == 0) {
+        return;
+    }
+    if (g.scope_pool == VK_NULL_HANDLE) {
+        VkQueryPoolCreateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = kFramesInFlight * kGpuScopeQueries;
+        if (vkCreateQueryPool(g.device, &info, nullptr, &g.scope_pool) != VK_SUCCESS) {
+            g.scope_pool = VK_NULL_HANDLE;
+            g.gpu_scopes = 0;
+            return;
+        }
+        for (Frame &each : g.frames) {
+            each.scope_reset = kGpuScopeQueries;
+        }
+        kz::Logf(kz::LogLevel::Info, "gfx", "GPU scopes: {}", g.gpu_scopes == 2 ? "draw" : "pass");
+    }
+    // Only the queries the slot used last time need a reset.
+    if (frame.scope_reset != 0) {
+        vkCmdResetQueryPool(cmd, g.scope_pool, g.frame_slot * kGpuScopeQueries, frame.scope_reset);
+    }
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g.scope_pool, g.frame_slot * kGpuScopeQueries);
+    frame.scope_marks.clear();
+    frame.scope_reset = 1;
+    g.scopes_open = true;
+    g.scope_pipeline = UINT32_MAX;
+    g.scope_draws = 0;
+    g.scope_barriers = 0;
+}
+
+// Starts the slot's GPU timing at the top of its draw commands, creating the query pool on first use.
+void OpenTimestamps(VkCommandBuffer cmd) {
+    Frame &frame = CurrentFrame();
+    frame.timestamps = Frame::Timestamps::None;
+    if (!Timing()) {
+        return;
+    }
+    g_frame_opened = TimingClock::now();
+    if (!g.timestamps_checked) {
+        g.timestamps_checked = true;
+        g.gpu_scopes = ReadScopeLevel();
+        uint32_t count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(g.physical_device, &count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(count);
+        vkGetPhysicalDeviceQueueFamilyProperties(g.physical_device, &count, families.data());
+        const uint32_t bits = g.queue_family < count ? families[g.queue_family].timestampValidBits : 0;
+        if (bits != 0 && g.properties.limits.timestampPeriod > 0.0f) {
+            g.timestamp_mask = bits >= 64 ? ~uint64_t{0} : (uint64_t{1} << bits) - 1;
+            VkQueryPoolCreateInfo info = {};
+            info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            info.queryCount = kFramesInFlight * 2;
+            if (vkCreateQueryPool(g.device, &info, nullptr, &g.timestamp_pool) != VK_SUCCESS) {
+                g.timestamp_pool = VK_NULL_HANDLE;
+            }
+        }
+        RecordTiming([](FrameTimings &timings) { timings.gpu_timestamps = g.timestamp_pool != VK_NULL_HANDLE; });
+    }
+    if (g.timestamp_pool == VK_NULL_HANDLE) {
+        return;
+    }
+    vkCmdResetQueryPool(cmd, g.timestamp_pool, g.frame_slot * 2, 2);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g.timestamp_pool, g.frame_slot * 2);
+    frame.timestamps = Frame::Timestamps::Open;
+    OpenScopes(cmd, frame);
+}
+
+// Ends the slot's GPU timing after everything its draw commands recorded.
+void CloseTimestamps(VkCommandBuffer cmd, bool display) {
+    Frame &frame = CurrentFrame();
+    if (g.scopes_open) {
+        MarkGpuScope(cmd, GpuScopeKind::Tail, kMainTarget);
+        frame.scope_passes = g.counters.passes;
+        g.scopes_open = false;
+    }
+    if (frame.timestamps == Frame::Timestamps::Open) {
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.timestamp_pool, g.frame_slot * 2 + 1);
+        frame.timestamps = display ? Frame::Timestamps::Display : Frame::Timestamps::Canonical;
+    }
+}
+
+// The CPU time from OpenFrame to the frame's submission (and present, for a display frame).
+void NoteFrameCpu(bool display) {
+    if (!Timing() || g_frame_opened == TimingClock::time_point{}) {
+        return;
+    }
+    const double ms = MillisecondsSince(g_frame_opened);
+    g_frame_opened = {};
+    RecordTiming([&](FrameTimings &timings) { (display ? timings.display_cpu : timings.canonical_cpu).Add(ms); });
 }
 
 // Moves recording to the next slot once the GPU is done with what that slot last submitted.
 void AdvanceSlot() {
     AssertDeviceThread(__func__);
+    // Attribute cleanup to the frame just submitted, not the older slot about to be recycled.
+    const Frame::Timestamps kind = CurrentFrame().timestamps;
+    const bool              trace = FramePhasesEnabled() &&
+                                    (kind == Frame::Timestamps::Canonical || kind == Frame::Timestamps::Display);
+    FramePhaseSample        sample = {};
+    const auto              advance_start = trace ? TimingClock::now() : TimingClock::time_point{};
     g.frame_slot = (g.frame_slot + 1) % kFramesInFlight;
     Frame &frame = CurrentFrame();
-    WaitFrame(frame);
+    auto   phase_start = trace ? TimingClock::now() : TimingClock::time_point{};
+    WaitFrame(frame, trace ? &sample : nullptr);
+    if (trace) {
+        const auto now = TimingClock::now();
+        NoteFramePhase(&sample, FramePhase::Wait, phase_start, now);
+        phase_start = now;
+    }
     RunDeletions(frame);
+    if (trace) {
+        const auto now = TimingClock::now();
+        NoteFramePhase(&sample, FramePhase::Deletions, phase_start, now);
+        phase_start = now;
+    }
     ResetTransients(frame);
+    if (trace) {
+        const auto now = TimingClock::now();
+        NoteFramePhase(&sample, FramePhase::Transients, phase_start, now);
+        phase_start = now;
+    }
     Check(vkResetCommandPool(g.device, frame.pool, 0), "vkResetCommandPool");
     frame.upload_open = false;
+    if (trace) {
+        const auto now = TimingClock::now();
+        NoteFramePhase(&sample, FramePhase::CommandPool, phase_start, now);
+        NoteFramePhase(&sample, FramePhase::Advance, advance_start, now);
+        NoteFramePhases(kind, sample);
+    }
 }
 
 void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal) {
@@ -838,11 +1257,28 @@ void SwapchainBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, Vk
     dependency.imageMemoryBarrierCount = 1;
     dependency.pImageMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &dependency);
+    g.counters.barriers++;
 }
 
 } // namespace
 
 Frame &CurrentFrame() { return g.frames[g.frame_slot]; }
+
+void MarkGpuScope(VkCommandBuffer cmd, GpuScopeKind kind, uint32_t target, uint32_t pipeline) {
+    Frame &frame = CurrentFrame();
+    // The last query is kept for the tail, so a frame with too many segments folds the rest into it.
+    if (!g.scopes_open || cmd != frame.draw_cmd ||
+        (frame.scope_marks.size() + 2 >= kGpuScopeQueries && kind != GpuScopeKind::Tail)) {
+        return;
+    }
+    const uint32_t draws = g.counters.mesh_draws + g.counters.draws_2d;
+    frame.scope_marks.push_back({kind, target, pipeline, draws - g.scope_draws, g.counters.barriers - g.scope_barriers});
+    g.scope_draws = draws;
+    g.scope_barriers = g.counters.barriers;
+    const auto query = static_cast<uint32_t>(frame.scope_marks.size());
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.scope_pool, g.frame_slot * kGpuScopeQueries + query);
+    frame.scope_reset = query + 1;
+}
 
 VkCommandBuffer UploadCommands() {
     AssertDeviceThread(__func__);
@@ -893,6 +1329,9 @@ void RetireDeletions() {
 
 void RunOneShot(const std::function<void(VkCommandBuffer)> &record) {
     AssertDeviceThread(__func__);
+    if (Timing()) {
+        RecordTiming([](FrameTimings &timings) { ++timings.sync_waits; });
+    }
     SubmitUploadsAndWait();
 
     VkCommandBuffer             cmd;
@@ -931,6 +1370,10 @@ Image &PreviousMainColor() { return g.main_color[g.main_current ^ 1]; }
 
 void CreateMainTargets() {
     AssertDeviceThread(__func__);
+    const bool trace_init = std::getenv("KZ_PERF_INIT_TRACE") != nullptr;
+    if (trace_init) {
+        std::fprintf(stderr, "perf init: allocating main targets\n");
+    }
     uint32_t width = g.swapchain.extent.width;
     uint32_t height = g.swapchain.extent.height;
     for (Image &image : g.main_color) {
@@ -943,10 +1386,12 @@ void CreateMainTargets() {
                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     for (Image *depth : {&g.main_depth, &g.display_depth}) {
         *depth = CreateImage(width, height, 1, g.depth_format,
-                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     }
 
+    if (trace_init) {
+        std::fprintf(stderr, "perf init: clearing main targets\n");
+    }
     RunOneShot([](VkCommandBuffer cmd) {
         VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkClearColorValue       black = {
@@ -958,14 +1403,13 @@ void CreateMainTargets() {
             ToRest(cmd, *image);
         }
         for (Image *depth : {&g.main_depth, &g.display_depth}) {
-            VkImageSubresourceRange  depth_range = {depth->aspect, 0, 1, 0, 1};
-            VkClearDepthStencilValue far = {0.0f, 0};
-            Transition(cmd, *depth, TransferDst());
-            vkCmdClearDepthStencilImage(cmd, depth->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1,
-                                        &depth_range);
-            ToRest(cmd, *depth);
+            InitializeDepth(cmd, *depth);
         }
     });
+
+    if (trace_init) {
+        std::fprintf(stderr, "perf init: main targets cleared\n");
+    }
 
     VkDescriptorImageInfo images[2];
     for (uint32_t i = 0; i < 2; i++) {
@@ -1116,6 +1560,15 @@ void RendererShutdown() {
     }
     vkDestroyCommandPool(g.device, g_oneshot_pool, nullptr);
     g_oneshot_pool = VK_NULL_HANDLE;
+    if (g.timestamp_pool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(g.device, g.timestamp_pool, nullptr);
+        g.timestamp_pool = VK_NULL_HANDLE;
+    }
+    if (g.scope_pool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(g.device, g.scope_pool, nullptr);
+        g.scope_pool = VK_NULL_HANDLE;
+    }
+    g.timestamps_checked = false;
     DestroyMainTargets();
     DestroySwapchainResources();
     if (g.swapchain.handle != VK_NULL_HANDLE) {
@@ -1188,6 +1641,7 @@ namespace {
 bool OpenFrame() {
     AssertDeviceThread(__func__);
     BeginCommands(CurrentFrame().draw_cmd);
+    OpenTimestamps(CurrentFrame().draw_cmd);
 #ifdef KZ_PORT_TRACY
     // Reads back the GPU timestamps of earlier frames; nothing is recorded while profiling is off.
     if (g.tracy_vk != nullptr && profile::Enabled()) {
@@ -1224,8 +1678,12 @@ bool AcquireImage(bool targets) {
         SubmitUploadsAndWait();
         return false;
     }
-    VkResult result = vkAcquireNextImageKHR(g.device, g.swapchain.handle, UINT64_MAX,
-                                            CurrentFrame().image_available, VK_NULL_HANDLE, &g.image_index);
+    const TimingClock::time_point acquire_start = Timing() ? TimingClock::now() : TimingClock::time_point{};
+    VkResult                      result = vkAcquireNextImageKHR(g.device, g.swapchain.handle, UINT64_MAX,
+                                                                 CurrentFrame().image_available, VK_NULL_HANDLE, &g.image_index);
+    if (acquire_start != TimingClock::time_point{}) {
+        RecordTiming([&](FrameTimings &timings) { timings.acquire.Add(MillisecondsSince(acquire_start)); });
+    }
     if (SwapchainLost(result)) {
         // Recreating may submit pending uploads and move to the next slot.
         if (tls.in_idle_hook) {
@@ -1277,6 +1735,7 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE);
     ToRest(cmd, source);
+    CloseTimestamps(cmd, true);
     Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
     VkSemaphore render_finished = g.swapchain.render_finished[g.image_index];
@@ -1291,7 +1750,12 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     present.swapchainCount = 1;
     present.pSwapchains = &g.swapchain.handle;
     present.pImageIndices = &g.image_index;
-    VkResult result = vkQueuePresentKHR(g.queue, &present);
+    const TimingClock::time_point present_start = Timing() ? TimingClock::now() : TimingClock::time_point{};
+    VkResult                      result = vkQueuePresentKHR(g.queue, &present);
+    if (present_start != TimingClock::time_point{}) {
+        NotePresent(present_start);
+        NoteFrameCpu(true);
+    }
     if (result == VK_SUBOPTIMAL_KHR) {
         if (SuboptimalNeedsRecreate()) {
             g_resize_pending.store(true);
@@ -1316,8 +1780,10 @@ void SubmitWithoutPresent(VkCommandBuffer cmd, Image &main) {
     // Every colour image rests shader-readable between operations; the next frame samples this
     // one as kPreviousFrame.
     ToRest(cmd, main);
+    CloseTimestamps(cmd, false);
     Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
     Submit(true, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    NoteFrameCpu(false);
     g.in_frame = false;
     g_game_frame_open.store(false);
 }
@@ -1500,6 +1966,19 @@ bool PresentCanonical() {
 }
 
 bool InFrame() { return GameFrameOpen() || RecordingCalls(); }
+
+void SetFrameTimingEnabled(bool enabled) { g_timing_enabled.store(enabled); }
+
+bool FrameTimingEnabled() { return Timing(); }
+
+FrameTimings TakeFrameTimings() {
+    std::lock_guard lock(g_timing_mutex);
+    FrameTimings    taken = g_timings;
+    g_timings = {};
+    g_scope_index.clear();
+    g_timings.gpu_timestamps = taken.gpu_timestamps;
+    return taken;
+}
 
 RendererFeatures ActiveRendererFeatures() {
     return {g.properties.apiVersion, g.offscreen, g.triangle_fans, g.separate_stencil_masks,

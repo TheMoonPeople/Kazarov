@@ -291,6 +291,59 @@ test, depth write, compare op, the whole stencil state, cull mode, front face, v
 and topology within a class are dynamic state, so they add none. The cache file is checked against the device before use and written through a temporary
 file and a rename.
 
+A CPU rasterizer (lavapipe, `VK_PHYSICAL_DEVICE_TYPE_CPU`) describes the same pipelines but compiles each one
+the first time a draw selects it (`PipelineAt`): lavapipe keeps every pipeline's machine code, which for the
+whole set is gigabytes per renderer, more than a CI runner has once a few test processes run at once.
+`KZ_PIPELINES_LAZY` set at start-up does the same on any device.
+
+## Depth planes
+
+`DrawDepthPlanes2D` draws up to eight feathered planes of one quad (the heat haze's coverage image) in a
+single pass per pixel. It is opt-in (`KZ_DEPTH_PLANES=1` when the renderer starts, off otherwise) and needs
+the device's `depthBounds` feature, a D32_SFLOAT_S8 depth buffer and the bindless path; `DepthPlanesAvailable`
+says whether it has them, and callers that want their own planes unchanged check it first.
+
+- A pixel whose stored depth `za` passes planes by `plane_depth >= za` passes a prefix of the planes (they run
+  front to back). The pass draws the quad once per prefix length k, with the depth bounds test selecting
+  `(plane[k], plane[k - 1]]` (`nextafter` for the exclusive end), the depth test off and nothing written to depth,
+  so each pixel is shaded at most once and the main depth keeps its usage. Intervals are drawn in ascending k.
+- The colour is not computed. Blending k identical planes in 8 bits rounds at every step, so the result for a
+  source value m and k planes is read from a 256 x 8 table (`depth_planes.frag`), built the first time the pass
+  runs by drawing a grey ramp 1..8 times through the same blend pipeline into its own target, so the table holds the
+  device's own rounding. The build happens on the device thread in the live frame (a short pass break on that
+  frame only); a render scale change or a recreated target rebuilds it, and a scale below one (a table
+  smaller than 256 x 8) uses the plane-by-plane path.
+- Alpha is the plane's vertex alpha through the same TEXA expression `draw.frag` uses, stored outright as the
+  blend would leave it.
+- It applies only to the haze's state: blend `A=source B=zero C=FIX 0x80 D=destination`, greater-or-equal depth test
+  without writes, no alpha test, fog or stencil, all channels written, no AEM, a target with alpha, a texture
+  without alpha (or `ignore_alpha`) sampled `Nearest`, vertex colour `0x101010`, finite planes in [0, 1] that never
+  increase. The destination must hold zero colour first, as the pass writes the accumulated result. Anything else
+  draws the planes one by one through `Draw2D`'s own path, to the same image, as does a renderer without the option.
+- Recording keeps the call whole as one `DepthPlanesEntry` (fixed-size planes, quad and state), so replays
+  and display renders decide again which path to take on the device thread.
+
+## Depth copy
+
+`CopyMainDepthToTarget(rect)` fills the whole own depth image of the current render target from a rectangle of the
+main depth, so a smaller image can be drawn with the depth test against what the frame has built (the heat haze's
+low-resolution coverage). `CanCopyMainDepth(target)` says whether it applies: the device must blit its depth format
+(`BLIT_SRC` and `BLIT_DST`), and the target must be an ordinary render target (not the main target, not one sharing the
+main depth).
+
+- It is a nearest-sample `vkCmdBlitImage` of the depth aspect, rect rounded to main pixels. A destination pixel takes the
+  source pixel its centre falls in, as a `Nearest` sampler does for colour over the same pixel-aligned rectangle; a centre
+  exactly on a pixel boundary (an exact 2x ratio) may take either neighbour, so a caller that needs agreement should not
+  depend on those pixels. Stencil is not copied: the target's starts at zero.
+- It runs on the draw command buffer at its place in the draw order (rendering is ended, main depth goes attachment to
+  transfer-source and back), never in the upload stream, so it sees the depth of the draws before it.
+- Main depth keeps its usage flags. A target's depth gains transfer-destination usage only the first time it is copied into
+  (the old image is dropped and the new one cleared, stencil zero); the capability is kept through `RecreateRenderTargets`.
+  A destination with transfer-destination usage may lose persistent depth compression on some drivers; the main image is not
+  affected.
+- Recording keeps the call whole (`DepthCopyEntry`). Replay, canonical or display, uses the render target active at that
+  point (a display render's twin included) and that render's own main depth, so each render copies for itself.
+
 ## Dark Chronicle's Vu_prog0 meshes
 
 `DrawMeshProg0` and `DrawMeshImmediateProg0` draw through `shaders/mesh_prog0.vert`, taking the
@@ -604,3 +657,23 @@ also CPU-only. Existing renderer/texture GPU families retain their existing excl
 A consumer that previously excluded only `^(GfxMisc|TexDecode)\.` must add
 `|(^|/)GfxGpu` to its CTest exclusion before adopting this dependency, or label
 this family and use `-LE gpu`. CPU display-list coverage continues to run.
+
+### Startup pipeline and cache work
+
+Untextured colour pipelines keep fog and simple-colour specialization but share
+TEXA/AEM variants: those flags only affect texture sampling. Original index slots
+remain available internally; unused slots contain null handles and own no pipeline.
+`PipelineCount()` and startup progress report the number actually created.
+
+On Vulkan 1.3 devices, pipeline creation requests
+[application-cache feedback](https://docs.vulkan.org/refpages/latest/refpages/source/VkPipelineCreationFeedbackFlagBits.html).
+Only valid, confirmed hits for every regular and optional startup pipeline allow
+retaining a compatible loaded cache without serializing and rewriting it. Missing
+feedback or any unconfirmed pipeline takes the persistence path; identical returned
+bytes also avoid rewriting. New, incompatible and corrupt caches are still rebuilt
+and written atomically. Serialized cache byte order need not be stable across runs.
+
+`KZ_PERF_INIT_TRACE=1` reports cache input size, load/create/description/compile
+spans and unconfirmed hits. The latter includes unavailable feedback and is not a
+count of shader compilations. A persistence attempt reports serialization/compare
+and write spans separately. Tracing is optional and its output adds observer cost.

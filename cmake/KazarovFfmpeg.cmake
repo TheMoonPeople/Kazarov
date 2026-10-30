@@ -1,5 +1,5 @@
 # Links FFmpeg's format, codec, resampling and scaling libraries as kz::ffmpeg: the static tree kz-ffmpeg builds
-# (Linux, macOS) or BtbN's win64-lgpl-shared archive (Windows, DLLs). Only LGPL builds are acceptable
+# (Linux, macOS), or its windows-x64 DLLs (Windows). Only LGPL builds are acceptable
 # inputs; a GPL or nonfree libavcodec must never reach a Kazarov consumer.
 
 include_guard(GLOBAL)
@@ -46,6 +46,8 @@ function(_kz_ffmpeg_import)
             set_target_properties(kz::${lib} PROPERTIES
                 IMPORTED_LOCATION "${dll}"
                 IMPORTED_IMPLIB "${KZ_FFMPEG_DIR}/lib/lib${lib}.dll.a")
+            include(${CMAKE_CURRENT_FUNCTION_LIST_DIR}/KazarovWindowsImports.cmake)
+            kz_windows_import_library(kz::${lib})
             list(APPEND runtime_dlls "${dll}")
         endforeach()
         # The extraction program uses the bundled FFmpeg command and all its shared components.

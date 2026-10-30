@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "gfx/context.hpp"
@@ -63,14 +65,6 @@ void ClearImage(VkCommandBuffer cmd, Image &image, const VkClearColorValue &colo
     ToRest(cmd, image);
 }
 
-void ClearDepth(VkCommandBuffer cmd, Image &image) {
-    Transition(cmd, image, TransferDst());
-    VkImageSubresourceRange  range = {image.aspect, 0, 1, 0, 1};
-    VkClearDepthStencilValue far = {0.0f, 0};
-    vkCmdClearDepthStencilImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1, &range);
-    ToRest(cmd, image);
-}
-
 // recording: whether the caller is recording a list, read on the caller before the call is dispatched.
 uint32_t AllocateTextureSlot(bool recording) {
     if (g.free_texture_slots.empty() && g.textures.size() >= g.texture_slot_limit && !g.in_frame && !recording) {
@@ -111,6 +105,7 @@ void MemoryBarrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAcces
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &dependency);
+    g.counters.barriers++;
 }
 
 constexpr VkPipelineStageFlags2 kVertexInput =
@@ -136,10 +131,10 @@ Image CreateTargetImage(uint32_t width, uint32_t height) {
                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 }
 
-Image CreateTargetDepth(uint32_t width, uint32_t height) {
+Image CreateTargetDepth(uint32_t width, uint32_t height, bool transfer_dst = false) {
     return CreateImage(width, height, 1, g.depth_format,
                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                           VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                           (transfer_dst ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0));
 }
 
 uint32_t ScaledSize(uint32_t logical, float scale) {
@@ -268,9 +263,20 @@ Image CreateImage(uint32_t width, uint32_t height, uint32_t mips, VkFormat forma
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     Check(vkCreateImage(g.device, &info, nullptr, &image.image), "vkCreateImage");
 
-    VkMemoryRequirements requirements;
-    vkGetImageMemoryRequirements(g.device, image.image, &requirements);
-    image.memory = AllocateMemory(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false);
+    VkMemoryDedicatedRequirements dedicated = {};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
+    VkMemoryRequirements2 requirements = {};
+    requirements.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+    requirements.pNext = &dedicated;
+    VkImageMemoryRequirementsInfo2 memory_info = {};
+    memory_info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
+    memory_info.image = image.image;
+    vkGetImageMemoryRequirements2(g.device, &memory_info, &requirements);
+    const char *setting = std::getenv("KZ_IMAGE_DEDICATED");
+    bool        use_dedicated = dedicated.requiresDedicatedAllocation ||
+                                (dedicated.prefersDedicatedAllocation && !(setting && std::strcmp(setting, "0") == 0));
+    image.memory = AllocateMemory(requirements.memoryRequirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                  false, use_dedicated ? image.image : VK_NULL_HANDLE);
     Check(vkBindImageMemory(g.device, image.image, image.memory.memory, image.memory.offset),
           "vkBindImageMemory");
 
@@ -320,10 +326,30 @@ void Transition(VkCommandBuffer cmd, Image &image, const ImageState &to) {
     dependency.imageMemoryBarrierCount = 1;
     dependency.pImageMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &dependency);
+    g.counters.barriers++;
     image.state = to;
 }
 
 void ToRest(VkCommandBuffer cmd, Image &image) { Transition(cmd, image, RestState(image)); }
+
+void InitializeDepth(VkCommandBuffer cmd, Image &image) {
+    ToRest(cmd, image);
+    VkRenderingAttachmentInfo depth = {};
+    depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depth.imageView = image.view;
+    depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.clearValue.depthStencil = {0.0f, 0};
+    VkRenderingInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    info.renderArea.extent = {image.width, image.height};
+    info.layerCount = 1;
+    info.pDepthAttachment = &depth;
+    info.pStencilAttachment = (image.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 ? &depth : nullptr;
+    vkCmdBeginRendering(cmd, &info);
+    vkCmdEndRendering(cmd);
+}
 
 VkCommandBuffer CommandsForWrite(uint64_t &last_draw_use) {
     if (g.in_frame && last_draw_use == g.frame_serial) {
@@ -443,7 +469,7 @@ void RecreateRenderTargets() {
             Image old_image = texture.image;
             Image old_depth = texture.depth;
             texture.image = CreateTargetImage(width, height);
-            texture.depth = CreateTargetDepth(width, height);
+            texture.depth = CreateTargetDepth(width, height, texture.depth_copy_dst);
             // What lies outside the logical frame on either side is the frame's, not this image's.
             VkOffset3D from[2];
             VkOffset3D to[2];
@@ -467,7 +493,7 @@ void RecreateRenderTargets() {
             vkCmdBlitImage(cmd, old_image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
             ToRest(cmd, texture.image);
-            ClearDepth(cmd, texture.depth);
+            InitializeDepth(cmd, texture.depth);
             DeferDestroy([old_image, old_depth]() mutable {
                 DestroyImage(old_image);
                 DestroyImage(old_depth);
@@ -519,6 +545,8 @@ void DestroyDoomedTexture(TextureHandle handle) {
     Image image = texture.image;
     Image depth = texture.depth;
     texture.live = false;
+    texture.opaque_alpha_mips = 0;
+    texture.depth_copy_dst = false;
     texture.doomed = nullptr;
     texture.image = {};
     texture.depth = {};
@@ -542,12 +570,96 @@ void DestroyDoomedMesh(MeshHandle handle) {
     }
     Buffer buffer = mesh.buffer;
     mesh.live = false;
+    mesh.bounds_known = false;
     mesh.doomed = nullptr;
     mesh.buffer = {};
     DeferDestroy([slot, buffer]() mutable {
         DestroyBuffer(buffer);
         g.free_mesh_slots.push_back(slot);
     });
+}
+
+bool NearSafeFogEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_FOG_NEAR_SAFE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+namespace {
+
+// Interval of c * x over [lo, hi], accumulated into sum, and the largest magnitude one term can reach.
+void AddTerm(double c, double lo, double hi, double &min, double &max, double &magnitude) {
+    const double a = c * lo;
+    const double b = c * hi;
+    min += std::min(a, b);
+    max += std::max(a, b);
+    magnitude += std::max(std::abs(a), std::abs(b));
+}
+
+} // namespace
+
+bool MeshFogIsNearSafe(const Mesh &mesh, const MeshConstants &constants) {
+    if (!mesh.bounds_known || (constants.flags & kMeshFog) == 0) {
+        return false;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (!std::isfinite(mesh.bounds_min[i]) || !std::isfinite(mesh.bounds_max[i]) ||
+            mesh.bounds_min[i] > mesh.bounds_max[i]) {
+            return false;
+        }
+    }
+    for (float v : constants.mvp) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    for (float v : constants.fog) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    const double f0 = constants.fog[0];
+    const double f1 = constants.fog[1];
+    const double f2 = constants.fog[2];
+    const double f3 = constants.fog[3];
+    if (f1 == 0.0 || f2 < 0.0 || f2 > f3 || f3 > 255.0) {
+        return false;
+    }
+
+    // Column-major: w = m3 x + m7 y + m11 z + m15, z = m2 x + m6 y + m10 z + m14, w - z from the differences.
+    const float *m = constants.mvp;
+    const int    wi[3] = {3, 7, 11};
+    const int    zi[3] = {2, 6, 10};
+    double       w_min = m[15], w_max = m[15], w_mag = std::abs(static_cast<double>(m[15]));
+    double       z_min = m[14], z_max = m[14], z_mag = std::abs(static_cast<double>(m[14]));
+    double       d_min = static_cast<double>(m[15]) - m[14], d_max = d_min, d_mag = std::abs(d_min);
+    for (int axis = 0; axis < 3; axis++) {
+        const double lo = mesh.bounds_min[axis];
+        const double hi = mesh.bounds_max[axis];
+        AddTerm(m[wi[axis]], lo, hi, w_min, w_max, w_mag);
+        AddTerm(m[zi[axis]], lo, hi, z_min, z_max, z_mag);
+        AddTerm(static_cast<double>(m[wi[axis]]) - m[zi[axis]], lo, hi, d_min, d_max, d_mag);
+    }
+    // The GPU rounds w and z on their own, so w - z is guarded by the size of both, not of the difference.
+    const double limit = static_cast<double>(FLT_MAX) / 4.0;
+    if (!(w_mag < limit) || !(z_mag < limit) || !(d_mag < limit)) {
+        return false;
+    }
+    const double w_guard = 64.0 * FLT_EPSILON * std::max(1.0, w_mag);
+    const double d_guard = 64.0 * FLT_EPSILON * std::max(1.0, w_mag + z_mag);
+    if (!(w_min > w_guard) || !(d_min > d_guard)) {
+        return false;
+    }
+    // fog * W, fog0 * W + fog1 and fog0 + fog1 / W must stay finite for every covered fragment.
+    const double w_top = w_mag + w_guard;
+    const double w_bottom = w_min - w_guard;
+    if (!(f3 * w_top < limit) || !(std::abs(f0) * w_top + std::abs(f1) < limit) ||
+        !(std::abs(f0) + std::abs(f1) / w_bottom < limit)) {
+        return false;
+    }
+    return true;
 }
 
 } // namespace detail
@@ -577,6 +689,8 @@ TextureHandle CreateTexture(const TextureDesc &desc) {
         texture.generation = NextGeneration(texture.generation);
         texture.desc = desc;
         texture.render_target = false;
+        texture.opaque_alpha_mips = 0;
+        texture.depth_copy_dst = false;
         texture.shares_main_depth = false;
         texture.frame = false;
         texture.logical_width = desc.logical_width != 0 ? desc.logical_width : desc.width;
@@ -628,6 +742,8 @@ TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height
         texture.generation = NextGeneration(texture.generation);
         texture.desc = TextureDesc{logical_width, logical_height, TextureFormat::Rgba8, 1, has_alpha};
         texture.render_target = true;
+        texture.opaque_alpha_mips = 0;
+        texture.depth_copy_dst = false;
         texture.shares_main_depth = share_main_depth;
         texture.frame = frame_target;
         texture.logical_width = logical_width;
@@ -641,7 +757,7 @@ TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height
         });
         if (!share_main_depth) {
             texture.depth = CreateTargetDepth(width, height);
-            ClearDepth(cmd, texture.depth);
+            InitializeDepth(cmd, texture.depth);
         }
         WriteTextureDescriptor(slot, texture.image.view);
         handle = MakeHandle(texture.generation, slot);
@@ -718,7 +834,8 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
     uint32_t stride = (row_length ? row_length : w) * texel;
     uint32_t row = w * texel;
     if (record && RecordingCalls()) {
-        UpdateTextureEntry entry{handle, mip, x, y, w, h, std::vector<uint8_t>(static_cast<size_t>(row) * h)};
+        UpdateTextureEntry entry{handle, mip, x, y, w, h,
+                                 std::pmr::vector<uint8_t>(static_cast<size_t>(row) * h, RecordingResource())};
         for (uint32_t i = 0; i < h; i++) {
             std::memcpy(entry.pixels.data() + static_cast<size_t>(i) * row,
                         static_cast<const uint8_t *>(pixels) + static_cast<size_t>(i) * stride, row);
@@ -729,7 +846,23 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
 
     RunOnRenderThread([&] {
         TransientSpan staging = AllocateStaging(static_cast<VkDeviceSize>(row) * h);
+        static const bool track_alpha = [] {
+            const char *setting = std::getenv("KZ_ALPHA_OPAQUE");
+            return setting != nullptr && std::strcmp(setting, "1") == 0;
+        }();
+        const bool inspect_alpha = track_alpha && !texture->render_target && texture->desc.has_alpha &&
+                                   texture->desc.format == TextureFormat::Rgba8;
+        bool       opaque = inspect_alpha;
         for (uint32_t i = 0; i < h; i++) {
+            const auto *source = static_cast<const uint8_t *>(pixels) + static_cast<size_t>(i) * stride;
+            if (opaque) {
+                for (uint32_t column = 0; column < w; column++) {
+                    if (source[static_cast<size_t>(column) * 4 + 3] != 255) {
+                        opaque = false;
+                        break;
+                    }
+                }
+            }
             std::memcpy(staging.data + static_cast<size_t>(i) * row,
                         static_cast<const uint8_t *>(pixels) + static_cast<size_t>(i) * stride, row);
         }
@@ -743,6 +876,14 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
         region.imageExtent = {w, h, 1};
         vkCmdCopyBufferToImage(cmd, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                &region);
+        if (inspect_alpha) {
+            const uint64_t bit = uint64_t{1} << mip;
+            if (!opaque) {
+                texture->opaque_alpha_mips &= ~bit;
+            } else if (x == 0 && y == 0 && w == mip_width && h == mip_height) {
+                texture->opaque_alpha_mips |= bit;
+            }
+        }
         ToRest(cmd, image);
     });
     return true;
@@ -832,6 +973,26 @@ MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32
         mesh.vertex_count = static_cast<uint32_t>(vertices.size());
         mesh.index_count = static_cast<uint32_t>(indices.size());
         mesh.last_draw_use = 0;
+        mesh.bounds_known = false;
+        if (NearSafeFogEnabled() && std::all_of(indices.begin(), indices.end(),
+                                                [count = vertices.size()](uint32_t index) { return index < count; })) {
+            std::array<float, 3> lo = {INFINITY, INFINITY, INFINITY};
+            std::array<float, 3> hi = {-INFINITY, -INFINITY, -INFINITY};
+            bool                 finite = true;
+            for (const Vertex3D &vertex : vertices) {
+                for (int axis = 0; axis < 3; axis++) {
+                    const float p = vertex.position[axis];
+                    finite = finite && std::isfinite(p);
+                    lo[axis] = std::min(lo[axis], p);
+                    hi[axis] = std::max(hi[axis], p);
+                }
+            }
+            if (finite) {
+                mesh.bounds_min = lo;
+                mesh.bounds_max = hi;
+                mesh.bounds_known = true;
+            }
+        }
         mesh.buffer = CreateBuffer(vertex_bytes + index_bytes,
                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -853,10 +1014,12 @@ bool UpdateMeshVertices(MeshHandle handle, uint32_t first, std::span<const Verte
         return true;
     }
     if (RecordingCalls()) {
-        RecordEntry(UpdateMeshEntry{handle, first, std::vector<Vertex3D>(vertices.begin(), vertices.end())});
+        RecordEntry(UpdateMeshEntry{handle, first,
+                                    std::pmr::vector<Vertex3D>(vertices.begin(), vertices.end(), RecordingResource())});
         return true;
     }
     RunOnRenderThread([&] {
+        mesh->bounds_known = false;
         UploadToBuffer(*mesh, first * sizeof(Vertex3D), vertices.data(), vertices.size_bytes());
     });
     return true;

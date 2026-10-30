@@ -124,7 +124,10 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../port/gameplay"));
     println!("cargo:rerun-if-env-changed=KAZAROV_GAMEPLAY_ROOT");
     println!("cargo:rerun-if-env-changed=KAZAROV_GAMEPLAY_ARCHIVE");
-    println!("cargo:rerun-if-changed={}", root.display());
+    // Cargo treats a missing rerun-if-changed path as changed, which would rebuild on every run.
+    if root.exists() {
+        println!("cargo:rerun-if-changed={}", root.display());
+    }
     if configured_root.is_none() && !root.join("character_clips.json").is_file() {
         let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
         fs::write(

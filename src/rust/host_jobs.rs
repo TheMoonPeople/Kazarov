@@ -20,7 +20,13 @@ mod ffi {
         type JobSet;
         fn new_job_set() -> Box<JobSet>;
         /// Queues a job of asset class `kind`; `work` orders the largest jobs of each class first.
-        fn job_set_add(set: &mut JobSet, kind: u8, label: &str, work: u64, body: UniquePtr<ExtractJob>);
+        fn job_set_add(
+            set: &mut JobSet,
+            kind: u8,
+            label: &str,
+            work: u64,
+            body: UniquePtr<ExtractJob>,
+        );
         /// Runs the jobs on `workers` threads, interleaving classes; the first failure stops the rest.
         fn job_set_run(set: Box<JobSet>, workers: usize) -> Result<()>;
     }
@@ -58,7 +64,13 @@ pub fn new_job_set() -> Box<JobSet> {
     Box::default()
 }
 
-pub fn job_set_add(set: &mut JobSet, kind: u8, label: &str, work: u64, body: UniquePtr<ExtractJob>) {
+pub fn job_set_add(
+    set: &mut JobSet,
+    kind: u8,
+    label: &str,
+    work: u64,
+    body: UniquePtr<ExtractJob>,
+) {
     set.jobs.push(HostJob {
         class: usize::from(kind),
         work,
@@ -68,6 +80,8 @@ pub fn job_set_add(set: &mut JobSet, kind: u8, label: &str, work: u64, body: Uni
 }
 
 /// Runs every job on `workers` threads, interleaving classes; the first failure stops the rest.
+// The host hands the set over through the bridge as the Box it owns, so the Box is the signature.
+#[allow(clippy::boxed_local)]
 pub fn job_set_run(set: Box<JobSet>, workers: usize) -> CoreResult<()> {
     if !(1..=1024).contains(&workers) {
         return Err(CoreError("workers must be between 1 and 1024".into()));

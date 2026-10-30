@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <memory_resource>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -17,6 +18,11 @@ namespace detail {
 
 using Mat4 = std::array<float, 16>;
 
+/**
+ * Keeps command payload allocation tied to the recording that owns the command.
+ */
+std::pmr::memory_resource *RecordingResource();
+
 // The visible edges a UI draw keeps its distance to: -1 the low edge, 1 the high edge, 0 neither.
 struct UiSide {
     bool   operator==(const UiSide &) const = default;
@@ -28,7 +34,7 @@ struct UiSide {
 
 struct Draw2DEntry {
     Primitive             primitive;
-    std::vector<Vertex2D> vertices;
+    std::pmr::vector<Vertex2D> vertices{RecordingResource()};
     TextureBinding        binding;
     DrawState             state;
     UiSide                side;
@@ -37,7 +43,7 @@ struct Draw2DEntry {
     Interp2D              interpolation;
     uint32_t              occurrence = 0;
     TextureHandle         target = kMainTarget;
-    std::vector<Vertex2D> presentation_vertices;
+    std::pmr::vector<Vertex2D> presentation_vertices{RecordingResource()};
     DrawState             presentation_state;
 };
 
@@ -55,8 +61,8 @@ struct MeshEntry {
     MeshHandle            mesh = kNullMesh; // kNullMesh: immediate, vertices and indices below
     uint32_t              first_index = 0;
     uint32_t              index_count = 0;
-    std::vector<Vertex3D> vertices;
-    std::vector<uint32_t> indices;
+    std::pmr::vector<Vertex3D> vertices{RecordingResource()};
+    std::pmr::vector<uint32_t> indices{RecordingResource()};
     MeshConstants         constants;
     TextureBinding        binding;
     DrawState             state;
@@ -95,13 +101,13 @@ struct CopyEntry {
 struct UpdateTextureEntry {
     TextureHandle        texture;
     uint32_t             mip, x, y, w, h;
-    std::vector<uint8_t> pixels;
+    std::pmr::vector<uint8_t> pixels{RecordingResource()};
 };
 
 struct UpdateMeshEntry {
     MeshHandle            mesh;
     uint32_t              first;
-    std::vector<Vertex3D> vertices;
+    std::pmr::vector<Vertex3D> vertices{RecordingResource()};
 };
 
 struct ReadDepthEntry {
@@ -109,8 +115,31 @@ struct ReadDepthEntry {
     LogicalRect rect;
 };
 
+/**
+ * One DrawDepthPlanes2D call, kept whole.
+ *
+ * The planes, the quad and its binding are fixed-size copies, so the entry owns everything it
+ * replays; the texture it names is kept alive by the recording like any other draw's.
+ */
+struct DepthPlanesEntry {
+    DepthPlanes2D           planes;
+    std::array<Vertex2D, 4> quad;
+    TextureBinding          binding;
+    DrawState               state;
+};
+
+/**
+ * One CopyMainDepthToTarget call.
+ *
+ * The copy happens where the entry stands in the list, on whichever main depth and render target (a display
+ * render's twin included) that replay has by then, so it follows the draws before it.
+ */
+struct DepthCopyEntry {
+    LogicalRect source;
+};
+
 using Entry = std::variant<Draw2DEntry, MeshEntry, ClearEntry, TargetEntry, CopyEntry, UpdateTextureEntry,
-                           UpdateMeshEntry, ReadDepthEntry>;
+                           UpdateMeshEntry, ReadDepthEntry, DepthPlanesEntry, DepthCopyEntry>;
 
 struct MeshRecord {
     InterpKey key = 0;
@@ -146,33 +175,34 @@ struct MatchCache {
 } // namespace detail
 
 struct DisplayList {
-    uint64_t                        instance = 0;
-    uint64_t                        serial = 0;
-    std::vector<detail::Entry>      entries;
-    std::vector<detail::MeshRecord> records;
-    std::vector<detail::Mat4>       cameras;
-    std::vector<detail::SpriteScene> scenes;
-    std::vector<Prog0Constants>      prog0_blocks;
-    std::vector<Prog0Palette>        palettes;
+    std::pmr::monotonic_buffer_resource   recording_storage; /**< Owns recorded command storage. */
+    uint64_t                              instance = 0;
+    uint64_t                              serial = 0;
+    std::pmr::vector<detail::Entry>       entries;
+    std::pmr::vector<detail::MeshRecord>  records;
+    std::pmr::vector<detail::Mat4>        cameras;
+    std::pmr::vector<detail::SpriteScene> scenes;
+    std::pmr::vector<Prog0Constants>      prog0_blocks;
+    std::pmr::vector<Prog0Palette>        palettes;
     // While recording: the scene of the last mesh drawn on the current target, or -1, and on each
     // target drawn into so far (the fire's texture is blended between the map and its sprites).
-    int32_t                                    scene = -1;
-    std::unordered_map<TextureHandle, int32_t> target_scenes;
-    std::vector<TextureHandle>      doomed_textures;
-    std::vector<MeshHandle>         doomed_meshes;
-    bool                            cut = false;
-    bool                            camera_cut = false;
-    uint64_t                                   cut_generation = 0; // CutInterpolation calls before this list was finished
+    int32_t                                         scene = -1;
+    std::pmr::unordered_map<TextureHandle, int32_t> target_scenes;
+    std::pmr::vector<TextureHandle>                 doomed_textures;
+    std::pmr::vector<MeshHandle>                    doomed_meshes;
+    bool                                            cut = false;
+    bool                                            camera_cut = false;
+    uint64_t                                        cut_generation = 0; // CutInterpolation calls before this list was finished
     // A draw reaches the main target before a clear covers its logical frame, so whatever the
     // target held shows through; a display render starts from the canonical image.
-    bool                                    needs_base = false;
-    bool                                    main_cleared = false;
-    std::unordered_map<InterpKey, uint32_t> occurrences;
-    std::unordered_map<InterpKey, uint32_t> occurrences_2d;
-    std::vector<uint32_t>                   tagged_2d;
-    mutable detail::MatchCache              cache;
+    bool                                         needs_base = false;
+    bool                                         main_cleared = false;
+    std::pmr::unordered_map<InterpKey, uint32_t> occurrences;
+    std::pmr::unordered_map<InterpKey, uint32_t> occurrences_2d;
+    std::pmr::vector<uint32_t>                   tagged_2d;
+    mutable detail::MatchCache                   cache;
 
-    DisplayList() = default;
+    DisplayList();
     DisplayList(const DisplayList &) = delete;
     DisplayList &operator=(const DisplayList &) = delete;
     ~DisplayList();
@@ -184,6 +214,14 @@ namespace detail {
 // Draw2D with the sides its anchor chose.
 void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &binding,
                  const DrawState &state, UiSide side, const Presentation2D *presentation = nullptr);
+
+// Draws a DrawDepthPlanes2D call on the device thread, in one pass per pixel where it can and plane by plane
+// where it cannot.
+void ExecuteDepthPlanes(const DepthPlanes2D &planes, std::span<const Vertex2D, 4> quad, const TextureBinding &binding,
+                        const DrawState &state);
+
+// Copies the main depth's rectangle over the current target's own depth; false when it cannot (nothing changed).
+bool ExecuteDepthCopy(const LogicalRect &source);
 
 // displaylist.cpp
 void RecordEntry(Entry &&entry);

@@ -65,6 +65,7 @@ layout(location = 3) flat out vec4 v_fog_mode;
 out float gl_ClipDistance[2];
 
 void main() {
+    uint flags = mc.flags;
     vec4 position = vec4(a_position, 1.0);
     vec4 clip     = mc.mvp * position;
     // The GS rasterises vertices at 1/16-pixel precision. Separate ground cells can reach the
@@ -79,13 +80,13 @@ void main() {
     }
     gl_Position   = clip;
 
-    gl_ClipDistance[0] = (mc.flags & kClip0) != 0u ? dot(mc.clip_plane[0], position) : 1.0;
-    gl_ClipDistance[1] = (mc.flags & kClip1) != 0u ? dot(mc.clip_plane[1], position) : 1.0;
+    gl_ClipDistance[0] = (flags & kClip0) != 0u ? dot(mc.clip_plane[0], position) : 1.0;
+    gl_ClipDistance[1] = (flags & kClip1) != 0u ? dot(mc.clip_plane[1], position) : 1.0;
 
     vec3  color = mc.diffuse.rgb;
     float alpha = mc.diffuse.a;
-    if ((mc.flags & kShadow) == 0u) {
-        if ((mc.flags & kLit) != 0u) {
+    if ((flags & kShadow) == 0u) {
+        if ((flags & kLit) != 0u) {
             vec3 normal = normalize(mc.normal_matrix * a_normal);
             vec3 light  = vec3(0.0);
             for (uint i = 0u; i < min(mc.light_count, 4u); i++) {
@@ -93,7 +94,7 @@ void main() {
             }
             color = mc.ambient.rgb * mc.ambient_material.rgb + light * mc.diffuse.rgb;
         }
-        if ((mc.flags & kVertexColor) != 0u) {
+        if ((flags & kVertexColor) != 0u) {
             color *= a_color.rgb * kModulate;
             alpha *= a_color.a * kModulate;
         }
@@ -101,10 +102,10 @@ void main() {
 
     // Back to GS bytes, saturated as VU1 saturates its colour output.
     v_color = clamp(vec4(color, alpha) / kModulate, 0.0, 1.0);
-    v_uv    = (mc.flags & kWorldUv) != 0u ? vec2(dot(mc.world_uv[0], position), dot(mc.world_uv[1], position)) :
-              (mc.flags & kScreenUv) != 0u ? clip.xy / clip.w * 0.5 + 0.5 + a_uv : a_uv;
+    v_uv    = (flags & kWorldUv) != 0u ? vec2(dot(mc.world_uv[0], position), dot(mc.world_uv[1], position)) :
+              (flags & kScreenUv) != 0u ? clip.xy / clip.w * 0.5 + 0.5 + a_uv : a_uv;
     v_fog_mode = vec4(mc.fog.w, mc.fog.z, 0.0, 1.0);
-    if ((mc.flags & kFog) == 0u) {
+    if ((flags & kFog) == 0u) {
         v_fog = vec4(1.0, 0.0, 0.0, 0.0);
         v_fog_mode.z = -2.0;
     } else if (mc.fog.y == 0.0) {

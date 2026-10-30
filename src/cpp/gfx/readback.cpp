@@ -30,6 +30,7 @@ void HostBarrier(VkCommandBuffer cmd) {
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &dependency);
+    g.counters.barriers++;
 }
 
 bool ReadImage(Image &image, uint32_t texel_size, std::vector<uint8_t> &pixels) {
