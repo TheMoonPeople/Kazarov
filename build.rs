@@ -128,7 +128,8 @@ fn main() {
     if root.exists() {
         println!("cargo:rerun-if-changed={}", root.display());
     }
-    if configured_root.is_none() && !root.join("character_clips.json").is_file() {
+    // A game without tracked gameplay documents gets an empty seed.
+    if configured_root.is_none() && !root.is_dir() {
         let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
         fs::write(
             out.join("tracked_configs.rs"),
@@ -168,8 +169,14 @@ fn main() {
         let json: serde_json::Value =
             serde_json::from_slice(&bytes).expect("parse tracked config JSON");
         let standalone = relative.ends_with(".cfg.json") || relative.ends_with(".map.json");
+        // Each game versions its own kinds; Dark Cloud 2's standalone configurations are version 2.
+        let schema = json["schema_version"].as_u64();
         assert!(
-            json["schema_version"] == if standalone { 2 } else { 1 },
+            if standalone {
+                schema == Some(2)
+            } else {
+                schema.is_some_and(|version| version >= 1)
+            },
             "unsupported gameplay schema: {relative}"
         );
         assert!(
@@ -230,15 +237,16 @@ fn main() {
     ));
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     write_generated(&out.join("tracked_configs.rs"), generated.as_bytes());
-    let plan: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.join("character_clips.json")).expect("read character clip plan"),
-    )
-    .expect("parse character clip plan");
-    assert!(
-        plan["schema_version"] == 1
-            && plan["kind"] == "character_clips"
-            && plan["characters"].is_object(),
-        "invalid character clip plan"
-    );
+    // Dark Cloud 2 slices its characters' animations by a tracked plan; another game may have none.
+    if let Ok(bytes) = fs::read(root.join("character_clips.json")) {
+        let plan: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse character clip plan");
+        assert!(
+            plan["schema_version"] == 1
+                && plan["kind"] == "character_clips"
+                && plan["characters"].is_object(),
+            "invalid character clip plan"
+        );
+    }
     publish_archive(&out, &documents);
 }

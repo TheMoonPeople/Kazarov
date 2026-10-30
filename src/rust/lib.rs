@@ -70,6 +70,10 @@ mod ffi {
         /// Publishes one Sony SQ sequence under data_out as sequence JSON, named from key as the
         /// sound converter names one's; returns the document's path under data_out.
         fn audio_publish_sequence(key: &str, sq: &[u8], data_out: &str) -> Result<String>;
+        /// Writes the build's gameplay documents into data_root as loose files at their archive
+        /// paths (gameplay/...), each checked against its digest, and removes JSON under gameplay/
+        /// the build no longer has; returns how many were written.
+        fn gameplay_publish(data_root: &str) -> Result<usize>;
         fn list(source: &str) -> Result<String>;
         fn sound(source: &str) -> Result<String>;
         fn refresh_configs(source: &str, config_dir: &str) -> Result<usize>;
@@ -315,6 +319,10 @@ fn audio_publish_bank(
 
 fn audio_publish_sequence(key: &str, sq: &[u8], data_out: &str) -> Result<String, core::CoreError> {
     core::audio::publish_sequence(data_out.as_ref(), key, sq)
+}
+
+fn gameplay_publish(data_root: &str) -> Result<usize, core::CoreError> {
+    core::configs::publish_gameplay_tree(data_root.as_ref())
 }
 
 fn list(source: &str) -> Result<String, core::CoreError> {
