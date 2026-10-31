@@ -198,6 +198,7 @@ struct Frame {
     VkSemaphore                 image_available = VK_NULL_HANDLE;
     VkFence                     fence = VK_NULL_HANDLE;
     bool                        pending = false;
+    bool                        presents = false; /**< Whether the pending submission ends in a present. */
     std::vector<TransientChunk> chunks;
     uint32_t                    chunk = 0;
     // Upload sources, apart from chunks so that a load's worth of texels never takes descriptor sets.
@@ -547,6 +548,8 @@ struct ThreadFlags {
     bool     quiet = false;
     bool     host_draws = false;
     bool     in_idle_hook = false;
+    // Whether the worker runs a job queued by RunOnRenderThreadAsync, which opens no frame for the game thread.
+    bool     in_async_job = false;
     uint32_t interpolation_tint = 0;
     // Set around the 2D draws of one depth-planes coverage: they select its pipeline and bounds.
     const PlaneDraw *plane_draw = nullptr;

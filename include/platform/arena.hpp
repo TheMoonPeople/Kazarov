@@ -79,4 +79,11 @@ std::optional<Region> RegionFor(const void *pointer);
  */
 bool IsLive(const Region &region);
 
+/**
+ *
+ * Returns a value that changes whenever any mapping's identity changes, so IsLive results can be cached.
+ *
+ */
+std::uint64_t Epoch();
+
 } // namespace kz::arena

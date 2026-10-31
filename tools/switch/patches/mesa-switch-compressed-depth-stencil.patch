@@ -1,0 +1,79 @@
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index 7e8d79d..b4d6f8d 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -192,8 +192,10 @@ nvk_allocate_memory(VkDevice device,
+       VK_FROM_HANDLE(nvk_image, image, dedicated_info->image);
+ 
+ #ifdef __SWITCH__
+-      /* The stencil-copy plane needs a different PTE kind from the depth plane. */
+-      mem->dedicated_image = image->stencil_copy_temp.nil.size_B ? NULL : image;
++      /* The depth plane takes the allocation's kind; nvk_image_plane_bind maps a
++       * stencil-copy plane separately with its own kind.
++       */
++      mem->dedicated_image = image;
+ 
+       /* Use NIL kinds for dedicated Switch block-linear images.
+        * Compressible private images use compressed_pte_kind; scanout stays
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 13b86f4..dbefbce 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -1303,6 +1303,9 @@ nvk_image_finish(struct nvk_device *dev, struct nvk_image *image,
+                              image->vk.create_flags, pAllocator);
+    }
+ 
++   if (image->stencil_copy_temp_mem != NULL)
++      nvkmd_mem_unref(image->stencil_copy_temp_mem);
++
+    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+       assert(image->linear_tiled_shadows[plane].va == NULL);
+       if (image->linear_tiled_shadow_mem[plane] != NULL)
+@@ -1808,10 +1811,28 @@ nvk_bind_image_memory(struct nvk_device *dev,
+    }
+ 
+    if (image->stencil_copy_temp.nil.size_B > 0) {
+-      result = nvk_image_plane_bind(dev, image, &image->stencil_copy_temp,
+-                                    mem, offset_B);
+-      if (result != VK_SUCCESS)
+-         return result;
++#ifdef __SWITCH__
++      /* A compressed dedicated allocation has the depth plane's fixed kind,
++       * which the stencil-copy plane cannot share, so it gets memory of its own.
++       */
++      if (mem->dedicated_image == image && image->is_compressed) {
++         struct nvk_image_plane *temp = &image->stencil_copy_temp;
++         result = nvkmd_dev_alloc_tiled_mem(dev->nvkmd, &image->vk.base,
++                                            align64(temp->nil.size_B, temp->plane_align_B),
++                                            temp->plane_align_B, temp->nil.pte_kind,
++                                            temp->nil.tile_mode, NVKMD_MEM_LOCAL,
++                                            &image->stencil_copy_temp_mem);
++         if (result != VK_SUCCESS)
++            return result;
++         temp->addr = image->stencil_copy_temp_mem->va->addr;
++      } else
++#endif
++      {
++         result = nvk_image_plane_bind(dev, image, &image->stencil_copy_temp,
++                                       mem, offset_B);
++         if (result != VK_SUCCESS)
++            return result;
++      }
+    }
+ 
+    return VK_SUCCESS;
+diff --git a/src/nouveau/vulkan/nvk_image.h b/src/nouveau/vulkan/nvk_image.h
+index 6dd4c3d..3f3c9ef 100644
+--- a/src/nouveau/vulkan/nvk_image.h
++++ b/src/nouveau/vulkan/nvk_image.h
+@@ -122,6 +122,10 @@ struct nvk_image {
+     * copied again down to the 8-bit result.
+     */
+    struct nvk_image_plane stencil_copy_temp;
++   /* Switch: the stencil-copy plane's own memory when the image's dedicated
++    * allocation carries the depth plane's compressed kind.
++    */
++   struct nvkmd_mem *stencil_copy_temp_mem;
+ 
+    /* The hardware doesn't support rendering to linear images except
+     * under certain conditions, so to support DRM_FORMAT_MOD_LINEAR

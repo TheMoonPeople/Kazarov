@@ -1,5 +1,6 @@
 #include "platform/arena.hpp"
 
+#include <atomic>
 #include <format>
 #include <limits>
 #include <mutex>
@@ -22,7 +23,8 @@ struct Block {
 
 std::vector<Block> g_blocks;
 std::mutex         blocks_mutex;
-std::uint64_t      next_generation = 1;
+// Written under blocks_mutex; Epoch reads it without the lock.
+std::atomic<std::uint64_t> next_generation{1};
 
 /**
  *
@@ -30,10 +32,10 @@ std::uint64_t      next_generation = 1;
  *
  */
 std::uint64_t NewGeneration() {
-    if (next_generation == std::numeric_limits<std::uint64_t>::max()) {
+    if (next_generation.load(std::memory_order_relaxed) == std::numeric_limits<std::uint64_t>::max()) {
         kz::Abort("arena", "mapping generation is exhausted");
     }
-    return next_generation++;
+    return next_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 // Blocks an owner outgrew stay mapped: retail's memory never went away, and a
@@ -126,6 +128,8 @@ std::optional<kz::arena::Region> kz::arena::RegionFor(const void *pointer) {
     }
     return std::nullopt;
 }
+
+std::uint64_t kz::arena::Epoch() { return next_generation.load(std::memory_order_acquire); }
 
 bool kz::arena::IsLive(const Region &region) {
     const std::lock_guard<std::mutex> lock(blocks_mutex);

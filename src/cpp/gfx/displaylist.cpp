@@ -1576,6 +1576,197 @@ void TraceInterpolation(const DisplayList &list, const DisplayList *previous, co
     std::fclose(file);
 }
 
+// The draw's Vu_prog0 block, as the replay sees it.
+const Prog0Constants *ReplayProg0(const MeshEntry &e, const DisplayList &list, const Overrides *overrides) {
+    const Prog0Constants *prog0 = e.prog0 >= 0 ? &list.prog0_blocks[static_cast<size_t>(e.prog0)] : nullptr;
+    if (prog0 != nullptr && overrides != nullptr && overrides->prog0_index[e.record] >= 0) {
+        prog0 = &overrides->prog0[static_cast<size_t>(overrides->prog0_index[e.record])];
+    }
+    return prog0;
+}
+
+void ReplayMesh(const MeshEntry &e, const DisplayList &list, bool canonical, const Overrides *overrides,
+                const DrawState &state) {
+    const MeshConstants *constants = &e.constants;
+    if (overrides != nullptr && overrides->index[e.record] >= 0) {
+        constants = &overrides->constants[overrides->index[e.record]];
+    }
+    const Prog0Constants *prog0 = ReplayProg0(e, list, overrides);
+    const Prog0Palette   *palette = e.palette >= 0 ? &list.palettes[static_cast<size_t>(e.palette)] : nullptr;
+    if (palette != nullptr && overrides != nullptr && overrides->palette_index[e.record] >= 0) {
+        palette = &overrides->palettes[static_cast<size_t>(overrides->palette_index[e.record])];
+    }
+    TextureBinding binding = GrabbedBinding(e.binding, canonical);
+    if (e.mesh != kNullMesh) {
+        if (prog0 != nullptr) {
+            DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, state, nullptr, palette);
+        } else {
+            DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, state);
+        }
+    } else {
+        std::span<const Vertex3D> vertices = e.vertices;
+        if (overrides != nullptr && overrides->vertex_index[e.record] >= 0) {
+            vertices = overrides->vertices[overrides->vertex_index[e.record]];
+        }
+        if (prog0 != nullptr) {
+            DrawMeshImmediateProg0(vertices, e.indices, *constants, *prog0, binding, state, nullptr, palette);
+        } else {
+            DrawMeshImmediate(vertices, e.indices, *constants, binding, state);
+        }
+    }
+}
+
+bool OcclusionPrepassEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_OCCLUSION_PREPASS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+// The least vertex alpha, in GS units, a prog0 draw's Vu_prog0 lighting can give, or a negative value when no bound is
+// known: lights, point lights and specular only add to the ambient (or unlit) alpha when their alphas are not negative,
+// and per-vertex colour can lower it.
+float Prog0AlphaLowerBound(const Prog0Constants &p0, uint32_t face) {
+    if ((face & kProg0FaceColor) != 0) {
+        return -1.0f;
+    }
+    const bool unlit = (p0.flags & kProg0Unlit) != 0 || (face & kProg0FaceNoNormal) != 0;
+    if (!unlit) {
+        for (int light = 0; light < 4; light++) {
+            if (!(p0.light_color[light][3] >= 0.0f) ||
+                ((p0.flags & kProg0PointLights) != 0 && !(p0.point_color[light][3] >= 0.0f))) {
+                return -1.0f;
+            }
+        }
+        if ((p0.flags & (kProg0Real | kProg0PointLights)) == kProg0Real && !(p0.specular[3] >= 0.0f)) {
+            return -1.0f;
+        }
+    }
+    const float base = unlit ? p0.object_color[3] : p0.ambient[3];
+    const float lower = base * p0.diffuse[3];
+    // The vertex shader truncates alpha to a whole GS unit.
+    return base >= 0.0f && p0.diffuse[3] >= 0.0f && std::isfinite(lower) ? std::floor(std::min(lower, 255.0f)) : -1.0f;
+}
+
+// Whether a draw samples an RGBA texture whose every texel has full alpha, so its alpha is the vertex alpha.
+bool SamplesOpaqueTexture(const TextureBinding &binding) {
+    if (binding.texture == kNullTexture || binding.texture == kMainTarget || binding.texture == kPreviousFrame ||
+        binding.ignore_alpha) {
+        return false;
+    }
+    const Texture *texture = LookupTexture(binding.texture);
+    return texture != nullptr && !texture->render_target && texture->desc.format == TextureFormat::Rgba8 &&
+           texture->desc.has_alpha && texture->image.mips > 0 && texture->image.mips <= 32 &&
+           texture->opaque_alpha_mips == (uint64_t{1} << texture->image.mips) - 1;
+}
+
+// A draw whose colour and depth replace whatever lies behind it on the main target.
+bool Occludes(const MeshEntry &e, const DisplayList &list, const Overrides *overrides) {
+    const DrawState &state = e.state;
+    if (!state.depth_write || (state.depth_test != DepthTest::GEqual && state.depth_test != DepthTest::Always) ||
+        state.stencil_test || state.color_write_mask != kWriteRgba ||
+        (e.mesh == kNullMesh && (e.vertices.empty() || e.indices.empty()))) {
+        return false;
+    }
+    const Prog0Constants *prog0 = ReplayProg0(e, list, overrides);
+    const bool            textured = e.binding.texture != kNullTexture;
+    // The least alpha the draw's fragments can have, in GS units, when it is known.
+    float least = -1.0f;
+    if (prog0 != nullptr && (!textured || SamplesOpaqueTexture(e.binding))) {
+        least = Prog0AlphaLowerBound(*prog0, state.prog0_face);
+    }
+    const bool alpha_tests = state.alpha_test && state.alpha_func != AlphaFunc::Always &&
+                             !(state.alpha_func == AlphaFunc::GEqual && (state.alpha_ref == 0 || least >= state.alpha_ref));
+    if (alpha_tests) {
+        return false;
+    }
+    // A source-over blend of alpha one or more is its source.
+    return !state.blend || (state.alpha.a == 0 && state.alpha.b == 1 && state.alpha.c == 0 && state.alpha.d == 1 && least >= 128.0f);
+}
+
+/**
+ * The opening stretch of a replay on the main target, from its clear up to the first entry that can observe the
+ * target's contents before the frame ends. Drawing the stretch's occluders' depth first lets the depth test reject
+ * what they will cover.
+ */
+struct OcclusionPlan {
+    size_t              start = 0;          /**< First entry after the clear; the pre-pass runs before it. */
+    size_t              first_occluder = 0; /**< Entries before it, from start, lie behind every occluder. */
+    std::vector<size_t> occluders;          /**< Occluding draws in replay order. */
+
+    // Whether a draw before every occluder may test against them, since an occluder covering it replaces it.
+    [[nodiscard]] bool Background(size_t index) const {
+        return !occluders.empty() && index >= start && index < first_occluder;
+    }
+};
+
+OcclusionPlan PlanOcclusion(const DisplayList &list, const Overrides *overrides) {
+    OcclusionPlan plan;
+    if (!OcclusionPrepassEnabled()) {
+        return plan;
+    }
+    TextureHandle target = kMainTarget;
+    bool          open = false;
+    for (size_t index = 0; index < list.entries.size(); index++) {
+        const Entry &entry = list.entries[index];
+        if (!open) {
+            if (const auto *target_entry = std::get_if<TargetEntry>(&entry)) {
+                target = target_entry->target;
+                continue;
+            }
+            const auto *clear = std::get_if<ClearEntry>(&entry);
+            // A full clear of the main target's depth to the far value gives the depth the pre-pass starts from.
+            if (clear != nullptr && target == kMainTarget && clear->depth && !clear->has_rect && clear->z == 0.0f &&
+                !clear->stencil) {
+                open = true;
+                plan.start = index + 1;
+                continue;
+            }
+            if (std::holds_alternative<MeshEntry>(entry) || std::holds_alternative<Draw2DEntry>(entry)) {
+                return {};
+            }
+            continue;
+        }
+        const auto *mesh = std::get_if<MeshEntry>(&entry);
+        const auto *sprite = std::get_if<Draw2DEntry>(&entry);
+        const bool  stencils = (mesh != nullptr && mesh->state.stencil_test) || (sprite != nullptr && sprite->state.stencil_test);
+        if ((mesh == nullptr && sprite == nullptr && !std::holds_alternative<UpdateTextureEntry>(entry)) || stencils) {
+            break;
+        }
+        if (mesh != nullptr && Occludes(*mesh, list, overrides)) {
+            if (plan.occluders.empty()) {
+                plan.first_occluder = index;
+            }
+            plan.occluders.push_back(index);
+        }
+    }
+    if (plan.occluders.empty()) {
+        return {};
+    }
+    return plan;
+}
+
+// A background draw tested against the occluders drawn ahead of it: where one covers it, it is replaced anyway.
+DrawState BehindOccluders(const DrawState &state) {
+    DrawState tested = state;
+    if (tested.depth_test == DepthTest::Always && !tested.depth_write) {
+        tested.depth_test = DepthTest::GEqual;
+    }
+    return tested;
+}
+
+// Draws the occluders' depth alone, in their order and with their own tests.
+void DrawOccluderDepth(const OcclusionPlan &plan, const DisplayList &list, bool canonical, const Overrides *overrides) {
+    KZ_PROFILE_ZONE("Kazarov occlusion prepass");
+    for (const size_t index : plan.occluders) {
+        const auto &e = std::get<MeshEntry>(list.entries[index]);
+        DrawState   depth_only = e.state;
+        depth_only.color_write_mask = 0;
+        ReplayMesh(e, list, canonical, overrides, depth_only);
+    }
+}
+
 void Replay(const DisplayList &list, bool canonical, const Overrides *overrides, bool host = false,
             bool tint = false, InterpKey suppressed_2d_key = 0) {
     AssertDeviceThread(__func__);
@@ -1595,7 +1786,12 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
     if (canonical && ReplayBucketsEnabled()) {
         buckets.emplace();
     }
-    for (const Entry &entry : list.entries) {
+    const OcclusionPlan occlusion = PlanOcclusion(list, overrides);
+    for (size_t index = 0; index < list.entries.size(); index++) {
+        const Entry &entry = list.entries[index];
+        if (!occlusion.occluders.empty() && index == occlusion.start) {
+            DrawOccluderDepth(occlusion, list, canonical, overrides);
+        }
         tls.interpolation_tint = 0;
         std::visit(
             [&](const auto &e) {
@@ -1625,45 +1821,13 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         tls.interpolation_tint = overrides && overrides->sprites.contains(&e) ? 4 : (e.state.depth_test == DepthTest::Always || e.state.screen_space) ? 3
                                                                                                                                                                       : 2;
                     }
-                    Draw2DSided(e.primitive, vertices, GrabbedBinding(e.binding, canonical), *state, side);
+                    const DrawState tested = occlusion.Background(index) ? BehindOccluders(*state) : *state;
+                    Draw2DSided(e.primitive, vertices, GrabbedBinding(e.binding, canonical), tested, side);
                 } else if constexpr (std::is_same_v<T, MeshEntry>) {
                     if (tint && !canonical && CurrentRenderTarget() == kMainTarget) {
                         tls.interpolation_tint = MeshTint(e, list, overrides);
                     }
-                    const MeshConstants *constants = &e.constants;
-                    if (overrides != nullptr && overrides->index[e.record] >= 0) {
-                        constants = &overrides->constants[overrides->index[e.record]];
-                    }
-                    const Prog0Constants *prog0 =
-                        e.prog0 >= 0 ? &list.prog0_blocks[static_cast<size_t>(e.prog0)] : nullptr;
-                    if (prog0 != nullptr && overrides != nullptr && overrides->prog0_index[e.record] >= 0) {
-                        prog0 = &overrides->prog0[static_cast<size_t>(overrides->prog0_index[e.record])];
-                    }
-                    const Prog0Palette *palette =
-                        e.palette >= 0 ? &list.palettes[static_cast<size_t>(e.palette)] : nullptr;
-                    if (palette != nullptr && overrides != nullptr && overrides->palette_index[e.record] >= 0) {
-                        palette = &overrides->palettes[static_cast<size_t>(overrides->palette_index[e.record])];
-                    }
-                    TextureBinding binding = GrabbedBinding(e.binding, canonical);
-                    if (e.mesh != kNullMesh) {
-                        if (prog0 != nullptr) {
-                            DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, e.state,
-                                          nullptr, palette);
-                        } else {
-                            DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, e.state);
-                        }
-                    } else {
-                        std::span<const Vertex3D> vertices = e.vertices;
-                        if (overrides != nullptr && overrides->vertex_index[e.record] >= 0) {
-                            vertices = overrides->vertices[overrides->vertex_index[e.record]];
-                        }
-                        if (prog0 != nullptr) {
-                            DrawMeshImmediateProg0(vertices, e.indices, *constants, *prog0, binding, e.state,
-                                                   nullptr, palette);
-                        } else {
-                            DrawMeshImmediate(vertices, e.indices, *constants, binding, e.state);
-                        }
-                    }
+                    ReplayMesh(e, list, canonical, overrides, occlusion.Background(index) ? BehindOccluders(e.state) : e.state);
                 } else if constexpr (std::is_same_v<T, ClearEntry>) {
                     if (e.stencil) {
                         ClearStencil(e.stencil_value, e.has_rect ? &e.rect : nullptr);

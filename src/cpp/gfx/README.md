@@ -44,6 +44,12 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
   is the worker or holds a `RenderLease`.
 - `RenderLease` parks the worker and holds it off the device, so the holder runs device work inline.
   The game holds one per tick around its canonical render and other per-tick device work.
+- `RunOnRenderThreadAsync` (Async only; elsewhere it runs before returning) queues work for the worker
+  and returns at once; it runs before any later lease or forwarded call. A frame such a job opens is
+  the worker's, so the caller can begin recording while it runs.
+- `GpuPresentsPendingAtMost(n)` tells the device thread, without waiting, whether at most `n`
+  submitted presents are still running on the GPU, so a present can be deferred until earlier
+  frames have drained.
 - Idle hook (`SetRenderIdleHook`, Async only): the worker calls it when the queue is empty and no
   lease is wanted. It runs on the worker and must only call `gfx` functions. Its return value is how
   long the worker sleeps before calling it again; zero calls again at once. `WakeRenderThread` and
@@ -544,6 +550,15 @@ renders one.
   towards or away from the eye must be left to `DrawState::cull`: the shadow volumes are recorded
   wound outwards and counted by a back-culled adding draw and a front-culled subtracting draw.
 
+- **Occlusion pre-pass** (`KZ_OCCLUSION_PREPASS=1`). From a list's full clear of the main depth to
+  its first entry other than a mesh, 2D draw or texture update, or its first stencil draw, the meshes
+  whose colour and depth replace what lies behind them are drawn first into depth alone. They are
+  depth-writing, GEqual or Always tested, unstenciled meshes that write all of colour, without an
+  alpha test that can fail and with a blend that replaces the target: source-over at an alpha the
+  Vu_prog0 lighting bound and an opaque texture keep at one or more. Draws in that span before the
+  first occluder lie behind every occluder in drawing order, so those that test Always without
+  writing depth test GEqual instead, and the hardware rejects what the occluders will cover.
+
 ## Device
 
 `RendererInit` takes the best device that has everything below (a discrete GPU over an integrated
@@ -610,7 +625,7 @@ with its swapchain and made again on a later frame. Errors also go to the system
 
 ## Profiling
 
-Kazarov's renderer instrumentation is compiled in with the `KZ_PORT_TRACY` CMake option, which links `Tracy::TracyClient` into the host library. Without it the macros in `gfx/profile.hpp` compile to nothing. At run time zones record only while `gfx::profile::SetEnabled(true)` is set (the host sets it from its debug-mode gate) and a profiler is connected.
+Kazarov's renderer instrumentation is compiled in with the `KZ_PORT_TRACY` CMake option, which links `Tracy::TracyClient` into the host library. Without it `KZ_PROFILE_ZONE` feeds `gfx::profile::sites` instead: while a host sets `gfx::profile::sampling`, each site sums its inclusive time apart for the thread marked `gfx::profile::game_thread` and for every other thread, and the other macros compile to nothing. At run time zones record only while `gfx::profile::SetEnabled(true)` is set (the host sets it from its debug-mode gate) and a profiler is connected.
 
 - `KZ_PROFILE_ZONE` and `KZ_PROFILE_PLOT` are CPU zones and plots.
 - `KZ_PROFILE_GPU_ZONE(cmd, name)` scopes a GPU timestamp zone. `KZ_PROFILE_GPU_BEGIN` and `KZ_PROFILE_GPU_END` open and close one across functions (dynamic rendering spans).

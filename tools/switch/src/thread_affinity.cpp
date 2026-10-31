@@ -1,5 +1,6 @@
 #include <switch.h>
 
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -55,11 +56,15 @@ void SwitchConfigureThreads() {
         return;
     }
 
+    // Threads created without a core (audio, decoders, loaders) start on the main thread's core and share its
+    // priority band, so with a third core the game and render threads move off it.
     const u32 current = svcGetCurrentProcessorNumber();
-    int       game_core = current < 32 && (allowed & (u64{1} << current)) != 0 ? static_cast<int>(current) : -1;
+    const int shared_core = current < 32 && (allowed & (u64{1} << current)) != 0 ? static_cast<int>(current) : -1;
+    const int core_count = std::popcount(allowed & UINT32_MAX);
+    int       game_core = core_count >= 3 ? -1 : shared_core;
     int       render_core = -1;
     for (int core = 0; core < 32; ++core) {
-        if ((allowed & (u64{1} << core)) == 0) {
+        if ((allowed & (u64{1} << core)) == 0 || (core_count >= 3 && core == shared_core)) {
             continue;
         }
         if (game_core == -1) {

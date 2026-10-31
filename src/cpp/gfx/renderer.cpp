@@ -16,6 +16,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -1230,6 +1231,7 @@ void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal) {
     Check(vkResetFences(g.device, 1, &frame.fence), "vkResetFences");
     Check(vkQueueSubmit2(g.queue, 1, &submit, frame.fence), "vkQueueSubmit2");
     frame.pending = true;
+    frame.presents = signal != VK_NULL_HANDLE;
 }
 
 void BeginCommands(VkCommandBuffer cmd) {
@@ -1683,7 +1685,8 @@ bool OpenFrame() {
     }
 #endif
     g.in_frame = true;
-    if (!tls.in_idle_hook) {
+    // Only a frame the game thread asked for keeps it from recording.
+    if (!tls.in_idle_hook && !tls.in_async_job) {
         g_game_frame_open.store(true);
     }
     g.frame_serial++;
@@ -1745,6 +1748,24 @@ bool AcquireImage(bool targets) {
 
 // Ends the frame's draw commands with source blitted onto the acquired swapchain image, submits
 // and presents.
+// A whole-image nearest blit between images of one size and format is a copy, which skips the 3D engine.
+void CopyOrBlitWhole(VkCommandBuffer cmd, VkImage source, VkFormat source_format, VkExtent2D source_extent,
+                     VkImage destination, VkFormat destination_format, VkExtent2D destination_extent,
+                     const VkImageBlit &region) {
+    if (source_format == destination_format && source_extent.width == destination_extent.width &&
+        source_extent.height == destination_extent.height) {
+        VkImageCopy copy = {};
+        copy.srcSubresource = region.srcSubresource;
+        copy.dstSubresource = region.dstSubresource;
+        copy.extent = {source_extent.width, source_extent.height, 1};
+        vkCmdCopyImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &copy);
+        return;
+    }
+    vkCmdBlitImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                   &region, VK_FILTER_NEAREST);
+}
+
 void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     AssertDeviceThread(__func__);
     KZ_PROFILE_ZONE("Kazarov PresentImage");
@@ -1762,8 +1783,8 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
                             static_cast<int32_t>(g.swapchain.extent.height), 1};
     {
         KZ_PROFILE_GPU_ZONE(cmd, "Kazarov swapchain blit");
-        vkCmdBlitImage(cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+        CopyOrBlitWhole(cmd, source.image, source.format, {source.width, source.height}, swapchain, g.swapchain.format,
+                        g.swapchain.extent, region);
     }
     SwapchainBarrier(cmd, swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -1785,7 +1806,8 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     present.pSwapchains = &g.swapchain.handle;
     present.pImageIndices = &g.image_index;
     const TimingClock::time_point present_start = Timing() ? TimingClock::now() : TimingClock::time_point{};
-    VkResult                      result = vkQueuePresentKHR(g.queue, &present);
+    VkResult                      result = VK_SUCCESS;
+    result = vkQueuePresentKHR(g.queue, &present);
     if (present_start != TimingClock::time_point{}) {
         NotePresent(present_start);
         NoteFrameCpu(true);
@@ -1887,8 +1909,8 @@ bool OpenListFrame(bool canonical, bool present, bool base, double preparation_m
         region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.dstOffsets[1] = {static_cast<int32_t>(g.display_color.width),
                                 static_cast<int32_t>(g.display_color.height), 1};
-        vkCmdBlitImage(cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.display_color.image,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+        CopyOrBlitWhole(cmd, source.image, source.format, {source.width, source.height}, g.display_color.image,
+                        g.display_color.format, {g.display_color.width, g.display_color.height}, region);
         ToRest(cmd, source);
         ToRest(cmd, g.display_color);
     }
@@ -2044,6 +2066,18 @@ bool PresentCanonicalImage(const CanonicalImageToken &token, const DisplayList *
 }
 
 bool InFrame() { return GameFrameOpen() || RecordingCalls(); }
+
+bool GpuPresentsPendingAtMost(uint32_t presents) {
+    AssertDeviceThread(__func__);
+    if (g.device == VK_NULL_HANDLE) {
+        return true;
+    }
+    uint32_t pending = 0;
+    for (const Frame &frame : g.frames) {
+        pending += frame.pending && frame.presents && vkGetFenceStatus(g.device, frame.fence) == VK_NOT_READY ? 1 : 0;
+    }
+    return pending <= presents;
+}
 
 void SetFrameTimingEnabled(bool enabled) { g_timing_enabled.store(enabled); }
 

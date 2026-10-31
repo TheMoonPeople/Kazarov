@@ -104,6 +104,7 @@ RUN git clone --depth 1 --branch ${SPIRV_SDK_TAG} https://github.com/KhronosGrou
 COPY patches/mesa-switch-dock-mode.patch /tmp/mesa-switch-dock-mode.patch
 COPY patches/mesa-switch-shader-va-fallback.patch /tmp/mesa-switch-shader-va-fallback.patch
 COPY patches/mesa-switch-no-elf.patch /tmp/mesa-switch-no-elf.patch
+COPY patches/mesa-switch-compressed-depth-stencil.patch /tmp/mesa-switch-compressed-depth-stencil.patch
 COPY build-mesa.sh /tmp/build-mesa.sh
 COPY bindgen-switch-wrapper.sh /tmp/bindgen-switch-wrapper.sh
 COPY rustc-switch-wrapper.sh /tmp/rustc-switch-wrapper.sh
@@ -123,6 +124,8 @@ RUN cargo install --locked cbindgen --version ${CBINDGEN_VERSION} \
     && git -C /tmp/mesa apply /tmp/mesa-switch-shader-va-fallback.patch \
     && git -C /tmp/mesa apply --check /tmp/mesa-switch-no-elf.patch \
     && git -C /tmp/mesa apply /tmp/mesa-switch-no-elf.patch \
+    && git -C /tmp/mesa apply --check /tmp/mesa-switch-compressed-depth-stencil.patch \
+    && git -C /tmp/mesa apply /tmp/mesa-switch-compressed-depth-stencil.patch \
     && curl -sSfL -o /tmp/mesa.tar.xz https://archive.mesa3d.org/mesa-26.2.4.tar.xz \
     && echo "${MESA_TARBALL_SHA256}  /tmp/mesa.tar.xz" | sha256sum -c - \
     && tar -xJf /tmp/mesa.tar.xz -C /tmp/mesa/subprojects --strip-components=2 mesa-26.2.4/subprojects/packagefiles \

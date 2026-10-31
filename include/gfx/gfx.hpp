@@ -244,6 +244,12 @@ bool BeginFrame();
 void EndFrame();
 // Inside BeginFrame/EndFrame or BeginRecording/EndRecording.
 bool InFrame();
+// Device thread: whether at most `presents` submitted presents are still running on the GPU, checked without waiting.
+// A present waits for an earlier present to finish, so a caller can defer one until this holds.
+bool GpuPresentsPendingAtMost(uint32_t presents);
+// Async: queues device work for the render thread and returns at once; it runs before any later lease or device call
+// from another thread. Off and Lockstep, or on the device thread, it runs before returning.
+void RunOnRenderThreadAsync(std::function<void()> fn);
 // Validation-layer messages seen so far (validation and performance types, warning or worse).
 uint32_t ValidationMessageCount();
 uint32_t PipelineCount();

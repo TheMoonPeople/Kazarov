@@ -5,9 +5,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 
 namespace {
 
@@ -72,15 +75,44 @@ bool SafeName(std::string_view name) {
     return true;
 }
 
+// The local header's fixed part; its name and extra field follow.
+constexpr std::size_t kLocalHeaderBytes = 30;
+// Room past the name for the local extra field when a first read takes the header and the data together.
+constexpr std::uint64_t kLocalExtraAllowance = 256;
+
+std::atomic<std::uint64_t> next_archive_id{1};
+
 } // namespace
 
 namespace kazarov {
 
-ZipArchive::ZipArchive(const std::filesystem::path &path) : file_(path, std::ios::binary) {
+std::ifstream &ZipArchive::Stream() const {
+    thread_local std::unordered_map<std::uint64_t, std::unique_ptr<std::ifstream> > streams;
+    auto                                                                           &stream = streams[id_];
+    if (stream == nullptr) {
+        stream = std::make_unique<std::ifstream>(path_, std::ios::binary);
+        Require(stream->is_open());
+    }
+    return *stream;
+}
+
+std::uint64_t ZipArchive::LocalDataStart(const Entry &entry, std::span<const std::uint8_t> bytes) const {
+    Require(bytes.size() >= kLocalHeaderBytes + entry.name.size());
+    const std::uint8_t *header = bytes.data();
+    Require(U32(header) == 0x04034b50 && static_cast<Compression>(U16(header + 8)) == entry.method && U16(header + 6) == entry.flags &&
+            U16(header + 26) == entry.name.size());
+    Require(std::string_view(reinterpret_cast<const char *>(header + kLocalHeaderBytes), entry.name.size()) == entry.name);
+    const auto start = kLocalHeaderBytes + entry.name.size() + U16(header + 28);
+    Require(entry.offset + start <= central_offset_ && entry.compressed_size <= central_offset_ - entry.offset - start);
+    return start;
+}
+
+ZipArchive::ZipArchive(const std::filesystem::path &path) : path_(path), id_(next_archive_id.fetch_add(1)) {
+    std::ifstream &file = Stream();
     const auto file_size = std::filesystem::file_size(path);
     Require(file_size >= 22);
     std::vector<std::uint8_t> tail(static_cast<std::size_t>(std::min<std::uint64_t>(file_size, 65557)));
-    ReadAt(file_, file_size - tail.size(), tail);
+    ReadAt(file, file_size - tail.size(), tail);
     std::size_t end = tail.size();
     for (std::size_t at = tail.size() - 21; at-- > 0;) {
         if (U32(tail.data() + at) == 0x06054b50 && at + 22 + U16(tail.data() + at + 20) == tail.size()) {
@@ -98,10 +130,10 @@ ZipArchive::ZipArchive(const std::filesystem::path &path) : file_(path, std::ios
     if (count == 0xffff || central_size == 0xffffffff || central == 0xffffffff) {
         Require(trailer >= 20);
         std::array<std::uint8_t, 20> locator{};
-        ReadAt(file_, trailer - 20, locator);
+        ReadAt(file, trailer - 20, locator);
         Require(U32(locator.data()) == 0x07064b50 && U32(locator.data() + 4) == 0 && U32(locator.data() + 16) == 1);
         std::array<std::uint8_t, 56> zip64{};
-        ReadAt(file_, U64(locator.data() + 8), zip64);
+        ReadAt(file, U64(locator.data() + 8), zip64);
         Require(U32(zip64.data()) == 0x06064b50 && U64(zip64.data() + 4) >= 44 && U32(zip64.data() + 16) == 0 && U32(zip64.data() + 20) == 0);
         count = U64(zip64.data() + 32);
         Require(count == U64(zip64.data() + 24));
@@ -112,7 +144,7 @@ ZipArchive::ZipArchive(const std::filesystem::path &path) : file_(path, std::ios
     Require(central_size <= 64ull * 1024 * 1024);
     central_offset_ = central;
     std::vector<std::uint8_t> directory(static_cast<std::size_t>(central_size));
-    ReadAt(file_, central, directory);
+    ReadAt(file, central, directory);
     const auto directory_start = central;
     entries_.reserve(static_cast<std::size_t>(count));
     const auto central_end = central + central_size;
@@ -172,21 +204,18 @@ ZipArchive::ZipArchive(const std::filesystem::path &path) : file_(path, std::ios
 }
 
 std::uint64_t ZipArchive::DataOffset(std::size_t index) const {
-    std::scoped_lock lock(mutex_);
-    const auto      &entry = entries_.at(index);
-    auto            &offset = data_offsets_.at(index);
-    if (offset != 0) {
-        return offset;
+    const auto &entry = entries_.at(index);
+    {
+        std::scoped_lock lock(mutex_);
+        if (data_offsets_.at(index) != 0) {
+            return data_offsets_[index];
+        }
     }
-    std::array<std::uint8_t, 30> header{};
-    ReadAt(file_, entry.offset, header);
-    Require(U32(header.data()) == 0x04034b50 && static_cast<Compression>(U16(header.data() + 8)) == entry.method && U16(header.data() + 6) == entry.flags && U16(header.data() + 26) == entry.name.size());
-    std::vector<std::uint8_t> name(entry.name.size());
-    ReadAt(file_, entry.offset + header.size(), name);
-    Require(std::string_view(reinterpret_cast<const char *>(name.data()), name.size()) == entry.name);
-    const auto data = entry.offset + 30 + entry.name.size() + U16(header.data() + 28);
-    Require(data <= central_offset_ && entry.compressed_size <= central_offset_ - data);
-    offset = data;
+    std::vector<std::uint8_t> header(kLocalHeaderBytes + entry.name.size());
+    ReadAt(Stream(), entry.offset, header);
+    const auto       offset = entry.offset + LocalDataStart(entry, header);
+    std::scoped_lock lock(mutex_);
+    data_offsets_[index] = offset;
     return offset;
 }
 
@@ -196,32 +225,58 @@ bool ZipArchive::Read(std::size_t index, std::span<std::uint8_t> output) const {
     }
     const auto &entry = entries_[index];
     try {
-        const auto                offset = DataOffset(index);
-        std::vector<std::uint8_t> compressed;
+        std::ifstream &file = Stream();
+        std::uint64_t  offset = 0;
         {
             std::scoped_lock lock(mutex_);
-            if (entry.method == Compression::Stored) {
-                ReadAt(file_, offset, output);
-            } else {
-                if (entry.compressed_size > std::numeric_limits<std::size_t>::max()) {
-                    return false;
-                }
-                compressed.resize(static_cast<std::size_t>(entry.compressed_size));
-                ReadAt(file_, offset, compressed);
+            offset = data_offsets_[index];
+        }
+        // A first read takes the local header with the data, so a small file costs one read rather than three.
+        std::vector<std::uint8_t>     bytes;
+        std::span<const std::uint8_t> data;
+        if (offset == 0) {
+            const auto span = std::min(kLocalHeaderBytes + entry.name.size() + kLocalExtraAllowance + entry.compressed_size,
+                                       central_offset_ - entry.offset);
+            Require(span <= std::numeric_limits<std::size_t>::max());
+            bytes.resize(static_cast<std::size_t>(span));
+            ReadAt(file, entry.offset, bytes);
+            const auto start = LocalDataStart(entry, bytes);
+            offset = entry.offset + start;
+            {
+                std::scoped_lock lock(mutex_);
+                data_offsets_[index] = offset;
+            }
+            if (start + entry.compressed_size <= bytes.size()) {
+                data = std::span<const std::uint8_t>(bytes).subspan(static_cast<std::size_t>(start),
+                                                                    static_cast<std::size_t>(entry.compressed_size));
             }
         }
+        if (data.data() == nullptr && entry.compressed_size != 0) {
+            if (entry.compressed_size > std::numeric_limits<std::size_t>::max()) {
+                return false;
+            }
+            if (entry.method == Compression::Stored) {
+                ReadAt(file, offset, output);
+            } else {
+                bytes.resize(static_cast<std::size_t>(entry.compressed_size));
+                ReadAt(file, offset, bytes);
+                data = bytes;
+            }
+        } else if (entry.method == Compression::Stored) {
+            std::copy(data.begin(), data.end(), output.begin());
+        }
         if (entry.method == Compression::Zstandard) {
-            const auto decoded = ZSTD_decompress(output.data(), output.size(), compressed.data(), compressed.size());
+            const auto decoded = ZSTD_decompress(output.data(), output.size(), data.data(), data.size());
             if (ZSTD_isError(decoded) || decoded != output.size()) {
                 return false;
             }
         } else if (entry.method == Compression::Deflate) {
-            if (output.size() > std::numeric_limits<uInt>::max() || compressed.size() > std::numeric_limits<uInt>::max()) {
+            if (output.size() > std::numeric_limits<uInt>::max() || data.size() > std::numeric_limits<uInt>::max()) {
                 return false;
             }
             z_stream stream{};
-            stream.next_in = compressed.data();
-            stream.avail_in = static_cast<uInt>(compressed.size());
+            stream.next_in = const_cast<Bytef *>(data.data());
+            stream.avail_in = static_cast<uInt>(data.size());
             std::uint8_t empty{};
             stream.next_out = output.empty() ? &empty : output.data();
             stream.avail_out = output.empty() ? 1 : static_cast<uInt>(output.size());
@@ -230,7 +285,7 @@ bool ZipArchive::Read(std::size_t index, std::span<std::uint8_t> output) const {
             }
             const auto result = inflate(&stream, Z_FINISH);
             inflateEnd(&stream);
-            if (result != Z_STREAM_END || stream.total_out != output.size() || stream.total_in != compressed.size()) {
+            if (result != Z_STREAM_END || stream.total_out != output.size() || stream.total_in != data.size()) {
                 return false;
             }
         }

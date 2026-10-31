@@ -38,7 +38,7 @@ ninja -j "${JOBS:-4}" -C builddir-native src/compiler/clc/mesa_clc src/compiler/
 
 meson setup builddir-switch \
     --cross-file switch_cross_file.txt --native-file switch_native_file.txt \
-    --buildtype=release -Doptimization=1 \
+    --buildtype=release -Doptimization=2 \
     -Db_lto=false -Db_ndebug=true -Dvulkan-drivers=nouveau -Dgallium-drivers=nouveau \
     -Dshader-cache=true -Dgallium-rusticl=false -Dplatforms=switch -Dglx=disabled \
     -Degl=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled \

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 #ifdef KZ_PORT_TRACY
@@ -19,6 +21,78 @@ inline bool Enabled() { return enabled.load(std::memory_order_relaxed); }
 inline void SetEnabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 
 } // namespace gfx::profile
+
+// Per-site inclusive timings for builds without Tracy; a host turns `sampling` on and reads `sites`.
+namespace gfx::profile {
+
+/**
+ * One instrumented site's inclusive time, kept apart for the game thread and every other thread.
+ */
+struct Site {
+    const char                *name = nullptr; /**< The zone's label. */
+    std::atomic<std::uint64_t> game_ns{0};     /**< Nanoseconds spent on the game thread. */
+    std::atomic<std::uint64_t> game_count{0};  /**< Entries on the game thread. */
+    std::atomic<std::uint64_t> other_ns{0};    /**< Nanoseconds spent on other threads. */
+    std::atomic<std::uint64_t> other_count{0}; /**< Entries on other threads. */
+};
+
+inline constexpr int               kMaxSites = 512;
+inline std::array<Site, kMaxSites> sites;               /**< Registered sites, in registration order. */
+inline std::atomic<int>            site_count{0};       /**< Number of registered sites. */
+inline std::atomic<bool>           sampling{false};     /**< Whether zones currently record time. */
+inline thread_local bool           game_thread = false; /**< Whether this thread runs the game loop. */
+
+/**
+ * Registers a zone site on its first entry; sites past the table's end share its last slot.
+ */
+inline Site &RegisterSite(const char *name) {
+    const int index = site_count.fetch_add(1, std::memory_order_relaxed);
+    Site     &site = sites[static_cast<std::size_t>(index < kMaxSites ? index : kMaxSites - 1)];
+    site.name = index < kMaxSites ? name : "(overflow)";
+    return site;
+}
+
+/**
+ * Adds the time between its construction and destruction to a site while sampling.
+ */
+class Zone {
+public:
+    explicit Zone(Site &site) : site_(sampling.load(std::memory_order_relaxed) ? &site : nullptr) {
+        if (site_ != nullptr) {
+            start_ = std::chrono::steady_clock::now();
+        }
+    }
+
+    Zone(const Zone &) = delete;
+    Zone &operator=(const Zone &) = delete;
+
+    ~Zone() {
+        if (site_ == nullptr) {
+            return;
+        }
+        const auto ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start_).count());
+        if (game_thread) {
+            site_->game_ns.fetch_add(ns, std::memory_order_relaxed);
+            site_->game_count.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            site_->other_ns.fetch_add(ns, std::memory_order_relaxed);
+            site_->other_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+private:
+    Site                                 *site_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+} // namespace gfx::profile
+
+#define KZ_PROFILE_CONCAT_INNER(a, b) a##b
+#define KZ_PROFILE_CONCAT(a, b) KZ_PROFILE_CONCAT_INNER(a, b)
+#define KZ_PROFILE_SITE_ZONE(variable, name)                                                                         \
+    static ::gfx::profile::Site &KZ_PROFILE_CONCAT(variable##_site_, __LINE__) = ::gfx::profile::RegisterSite(name); \
+    const ::gfx::profile::Zone   variable(KZ_PROFILE_CONCAT(variable##_site_, __LINE__))
 
 #ifdef KZ_PORT_TRACY
 #define KZ_PROFILE_ZONE(name) ZoneNamedN(kz_profile_zone, name, ::gfx::profile::Enabled())
@@ -44,7 +118,7 @@ inline void SetEnabled(bool value) { enabled.store(value, std::memory_order_rela
     } while (false)
 #define KZ_PROFILE_GPU_END(slot) ::gfx::detail::g.slot.reset()
 #else
-#define KZ_PROFILE_ZONE(name)
+#define KZ_PROFILE_ZONE(name) KZ_PROFILE_SITE_ZONE(kz_profile_zone, name)
 #define KZ_PROFILE_THREAD(name)
 #define KZ_PROFILE_PLOT(name, value) \
     do {                             \
