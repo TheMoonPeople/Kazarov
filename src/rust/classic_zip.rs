@@ -115,7 +115,10 @@ fn entries_of(source: &Path) -> CoreResult<Vec<Entry>> {
     let mut entries = Vec::new();
     for input in directory_inputs(source)? {
         if !safe_relative(&input.name) || input.name.len() > 0xFFFF {
-            return Err(fail(format!("unsafe or too-long data path: {}", input.name)));
+            return Err(fail(format!(
+                "unsafe or too-long data path: {}",
+                input.name
+            )));
         }
         let size = fs::metadata(&input.source)?.len();
         if size > MAX_ENTRY {

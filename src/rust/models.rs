@@ -114,6 +114,46 @@ fn is_character(alias: &str) -> bool {
         .eq_ignore_ascii_case("chr")
 }
 
+/// Reads one of a game's character configuration (`.cfg`) or cloth (`.clo`) files, by alias, into
+/// typed commands (`{"commands":[{"command","args"}]}`); `null` when the file is not one the game
+/// reads that way. A string argument may give its raw bytes in hex (`"bytes"`) in place of its
+/// `"value"`; they are decoded as Shift-JIS.
+pub type ProfileReader = dyn Fn(&str, &[u8]) -> CoreResult<Value> + Send + Sync;
+
+/// What a game tells the converter about its own data. The default reads Dark Cloud 2's.
+#[derive(Clone, Default)]
+pub struct GameProfile {
+    /// The game's reader of configuration and cloth files; Dark Cloud 2's syntax when absent.
+    pub reader: Option<Arc<ProfileReader>>,
+    /// Profiles and actions keep each KEY's source frames, for games whose code compares motion
+    /// times with absolute frame numbers.
+    pub absolute_frames: bool,
+    /// Every strip corner indexes a position, a normal and a texture coordinate, plus a colour when
+    /// the mesh has a colour stream, and a strip's prim word only says how its corners join (4, a
+    /// strip; anything else, a triangle list). Otherwise the prim word's flags choose the streams.
+    pub fixed_strip_streams: bool,
+    /// Sidecars keep what rebuilding the source files byte for byte needs, for a game that loads
+    /// its models through its own retail loaders.
+    pub keep_source_records: bool,
+}
+
+impl GameProfile {
+    /// Typed commands of one configuration or cloth file, or `None` when the game doesn't read it.
+    fn parse(&self, alias: &str, data: &[u8]) -> CoreResult<Option<Value>> {
+        match &self.reader {
+            Some(reader) => {
+                let mut document = reader(alias, data)?;
+                if document.is_null() {
+                    return Ok(None);
+                }
+                super::configs::decode_string_arguments(&mut document)?;
+                Ok(Some(document))
+            }
+            None => super::configs::parse(data).map(Some),
+        }
+    }
+}
+
 /// Native profile names available to script migration before graphics jobs run.
 pub(crate) fn planned_profile_names(
     inventory: &super::inventory::Inventory,
@@ -295,6 +335,13 @@ fn mesh_extent(b: &[u8]) -> CoreResult<usize> {
     }
     bytes(b, 0, 64)?;
     let mut end = 64;
+    // A collision mesh's last header words locate its triangle attributes, not materials; it spans
+    // the size its header gives.
+    let collision = collision_polygons(b).is_some();
+    if collision {
+        end = u32le(b, 8)? as usize;
+        bytes(b, 0, end)?;
+    }
     for (count, offset, stride) in [
         (12, 16, 16),
         (20, 24, 16),
@@ -302,7 +349,10 @@ fn mesh_extent(b: &[u8]) -> CoreResult<usize> {
         (36, 40, 1),
         (44, 48, 16),
         (52, 56, 96),
-    ] {
+    ]
+    .into_iter()
+    .filter(|&(count, _, _)| !(collision && count == 52))
+    {
         let n = u32le(b, count)? as usize;
         let at = u32le(b, offset)? as usize;
         if n > 0 {
@@ -460,6 +510,10 @@ fn scrub(
             break;
         };
         if let Ok(at) = offset.parse::<usize>() {
+            // A scene emptied already, or past the file, is left as it is.
+            if at >= b.len() || !(b[at..].starts_with(b"MDS\0") || b[at..].starts_with(b"MDT\0")) {
+                continue;
+            }
             let size = if b[at..].starts_with(b"MDS\0") {
                 scene_extent(&b[at..])?
             } else {
@@ -496,7 +550,28 @@ fn channels(resource: &Resource) -> CoreResult<Vec<Value>> {
         let mut keys = Vec::with_capacity(count);
         for i in 0..count {
             let p = at + 32 + i * 32;
-            keys.push(json!({"frame":u32le(b,p)?,"value":floats(b,p+16,4)?,"reserved_u32":[u32le(b,p+4)?,u32le(b,p+8)?,u32le(b,p+12)?]}));
+            let mut key = json!({"frame":u32le(b,p)?,"reserved_u32":[u32le(b,p+4)?,u32le(b,p+8)?,u32le(b,p+12)?]});
+            key["value"] = match floats(b, p + 16, 4) {
+                Ok(value) => json!(value),
+                // Lanes a channel type doesn't read can hold leftover bits that aren't numbers; the
+                // key keeps its words, and reads 0 there.
+                Err(_) => {
+                    let words: Vec<u32> = (0..4)
+                        .map(|k| u32le(b, p + 16 + k * 4))
+                        .collect::<CoreResult<_>>()?;
+                    key["value_u32"] = json!(words);
+                    json!(
+                        words
+                            .iter()
+                            .map(|&w| {
+                                let f = f32::from_bits(w);
+                                if f.is_finite() { f } else { 0. }
+                            })
+                            .collect::<Vec<f32>>()
+                    )
+                }
+            };
+            keys.push(key);
         }
         out.push(json!({"alias":resource.alias,"frame":i32le(b,at)?,"target":i32le(b,at+4)?,"type":i32le(b,at+8)?,"reserved_u32":[u32le(b,at+12)?,u32le(b,at+24)?,u32le(b,at+28)?],"keys":keys}));
         at += 32 + count * 32;
@@ -525,7 +600,66 @@ fn bind_pose(resource: &Resource) -> CoreResult<Value> {
     Ok(json!({"alias":resource.alias,"matrices":matrices?}))
 }
 
-fn script_links(resources: &[Resource]) -> BTreeMap<String, BTreeSet<String>> {
+/// Links each model to the motion, bind-pose and weight files its configuration names with it.
+fn script_links(
+    resources: &[Resource],
+    game: &GameProfile,
+) -> CoreResult<BTreeMap<String, BTreeSet<String>>> {
+    if game.reader.is_none() {
+        return Ok(raw_script_links(resources));
+    }
+    let mut links = BTreeMap::<String, BTreeSet<String>>::new();
+    for r in resources
+        .iter()
+        .filter(|r| matches!(extension(&r.alias), "cfg" | "clo"))
+    {
+        let Some(document) = game.parse(&r.alias, &r.data)? else {
+            continue;
+        };
+        let mut model = String::new();
+        let mut shadow = String::new();
+        for statement in document["commands"].as_array().into_iter().flatten() {
+            let command = statement["command"].as_str().unwrap_or("");
+            let values: Vec<&str> = statement["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|a| a["type"] == "string")
+                .filter_map(|a| a["value"].as_str())
+                .collect();
+            let target = match command {
+                "MODEL" | "SHADOW_MODEL" => {
+                    if let Some(value) = values.first() {
+                        let path = format!("{}/{}", parent(&r.alias), value.replace('\\', "/"));
+                        *if command == "MODEL" {
+                            &mut model
+                        } else {
+                            &mut shadow
+                        } = path;
+                    }
+                    continue;
+                }
+                "MOTION" => &model,
+                "SHADOW_MOTION" => &shadow,
+                _ => continue,
+            };
+            if target.is_empty() {
+                continue;
+            }
+            for value in values.iter().filter(|v| !v.is_empty()) {
+                links.entry(target.clone()).or_default().insert(format!(
+                    "{}/{}",
+                    parent(&r.alias),
+                    value.replace('\\', "/")
+                ));
+            }
+        }
+    }
+    Ok(links)
+}
+
+/// Links read from Dark Cloud 2's `;`-terminated statements without parsing their arguments.
+fn raw_script_links(resources: &[Resource]) -> BTreeMap<String, BTreeSet<String>> {
     let mut links = BTreeMap::<String, BTreeSet<String>>::new();
     for r in resources
         .iter()
@@ -627,12 +761,14 @@ impl TransformStats {
         self.boundary_keys += other.boundary_keys;
     }
 }
-/// Converts a memory card icon model into glTF referencing `image_uri` and the PNG it names.
+/// Converts a memory card icon model into glTF referencing `image_uri` and the PNG it names. An
+/// icon with several animation shapes draws its first; the others become morph targets, and its
+/// animation's keys are kept in the mesh's extras.
 fn memory_card_icon(data: &[u8], image_uri: &str) -> CoreResult<(Value, Vec<u8>)> {
     let shapes = u32le(data, 4)? as usize;
     let count = u32le(data, 16)? as usize;
     if u32le(data, 0)? != 0x10000
-        || shapes != 1
+        || !(1..=16).contains(&shapes)
         || count == 0
         || !count.is_multiple_of(3)
         || count > 1_000_000
@@ -648,6 +784,7 @@ fn memory_card_icon(data: &[u8], image_uri: &str) -> CoreResult<(Value, Vec<u8>)
             .ok_or_else(|| fail("icon vertex overflow"))?,
     )?;
     let mut positions = Vec::new();
+    let mut targets = vec![Vec::new(); shapes - 1];
     let mut normals = Vec::new();
     let mut uvs = Vec::new();
     let mut colours = Vec::new();
@@ -659,9 +796,17 @@ fn memory_card_icon(data: &[u8], image_uri: &str) -> CoreResult<(Value, Vec<u8>)
         for component in 0..3 {
             positions.push(signed(at + component * 2)? * if component == 0 { 1. } else { -1. });
         }
+        for (shape, target) in targets.iter_mut().enumerate() {
+            for component in 0..3 {
+                let value = signed(at + (shape + 1) * 8 + component * 2)?
+                    * if component == 0 { 1. } else { -1. };
+                target.push(value - positions[positions.len() - 3 + component]);
+            }
+        }
+        let normal_at = at + shapes * 8;
         let mut normal = Vec::new();
         for component in 0..3 {
-            normal.push(signed(at + 8 + component * 2)? * if component == 0 { 1. } else { -1. });
+            normal.push(signed(normal_at + component * 2)? * if component == 0 { 1. } else { -1. });
         }
         let length = normal.iter().map(|v| v * v).sum::<f32>().sqrt();
         if length > 1e-20 {
@@ -672,30 +817,38 @@ fn memory_card_icon(data: &[u8], image_uri: &str) -> CoreResult<(Value, Vec<u8>)
             normal = vec![0., 1., 0.];
         }
         normals.extend(normal);
-        uvs.extend([signed(at + 16)?, signed(at + 18)?]);
-        colours.extend(bytes(data, at + 20, 4)?.iter().map(|v| *v as f32 / 255.));
+        uvs.extend([signed(normal_at + 8)?, signed(normal_at + 10)?]);
+        colours.extend(
+            bytes(data, normal_at + 12, 4)?
+                .iter()
+                .map(|v| *v as f32 / 255.),
+        );
     }
     let mut at = 20 + count * stride;
     let frames = u32le(data, at + 16)? as usize;
-    floats(data, at + 8, 1)?;
+    let animation_header = json!({"frame_length":u32le(data, at + 4)?,"speed":floats(data, at + 8, 1)?[0],"offset":u32le(data, at + 12)?});
     at += 20;
     if frames > 1024 {
         return Err(fail("excessive icon animation frames"));
     }
+    let mut animation = Vec::new();
     for _ in 0..frames {
-        let shape = u32le(data, at)?;
+        let shape = u32le(data, at)? as usize;
         let keys = u32le(data, at + 4)? as usize;
         at += 8;
-        if shape != 0 || keys > 1024 {
+        if shape >= shapes || keys > 1024 {
             return Err(fail("unsupported animated icon shape"));
         }
+        let mut list = Vec::new();
         for _ in 0..keys {
             let key = floats(data, at, 2)?;
-            if key[1] != 1. {
+            if shapes == 1 && key[1] != 1. {
                 return Err(fail("unsupported changing icon shape weight"));
             }
+            list.push(key);
             at += 8;
         }
+        animation.push(json!({"shape":shape,"keys":list}));
     }
     let mut texels = Vec::new();
     if u32le(data, 8)? & 8 != 0 {
@@ -766,6 +919,17 @@ fn memory_card_icon(data: &[u8], image_uri: &str) -> CoreResult<(Value, Vec<u8>)
     gltf.doc["textures"] = json!([{"source":0}]);
     gltf.doc["materials"] = json!([{"pbrMetallicRoughness":{"baseColorTexture":{"index":0},"metallicFactor":0,"roughnessFactor":1},"doubleSided":true}]);
     gltf.doc["meshes"] = json!([{"primitives":[{"attributes":{"POSITION":position,"NORMAL":normal,"TEXCOORD_0":uv,"COLOR_0":colour},"mode":4,"material":0}]}]);
+    if shapes > 1 {
+        let targets: Vec<Value> = targets
+            .iter()
+            .map(|target| json!({"POSITION":gltf.accessor(target, 3, "VEC3", true)}))
+            .collect();
+        gltf.doc["meshes"][0]["primitives"][0]["targets"] = json!(targets);
+        gltf.doc["meshes"][0]["weights"] = json!(vec![0.; shapes - 1]);
+        let mut extras = animation_header;
+        extras["frames"] = json!(animation);
+        gltf.doc["meshes"][0]["extras"] = json!({"icon_animation":extras});
+    }
     gltf.doc["nodes"] = json!([{"name":"memory_card_icon","mesh":0}]);
     gltf.doc["scenes"][0]["nodes"] = json!([0]);
     Ok((gltf.finish(), png))
@@ -1159,7 +1323,7 @@ fn material(
         json!({"name":texture,"pbrMetallicRoughness":pbr,"doubleSided":true,"alphaMode":"BLEND"}),
     );
     Ok(
-        json!({"texture":texture,"texture_source":selected_texture.map(|(t,_)|&t.source),"texture_path":selected_texture.map(|(_,i)|&i.asset),"texture_images":embedded_pictures,"diffuse":diffuse,"ambient":ambient,"specular":specular,"power":power,"flags":u32le(b,at+84)?,"extra":floats(b,at+88,2)?}),
+        json!({"texture":texture,"texture_source":selected_texture.map(|(t,_)|&t.source),"texture_path":selected_texture.map(|(_,i)|&i.asset),"texture_images":embedded_pictures,"diffuse":diffuse,"ambient":ambient,"specular":specular,"power":power,"flags":u32le(b,at+84)?,"extra":floats(b,at+88,2)?,"record_u32":(0..24).map(|k| u32le(b, at + k * 4)).collect::<CoreResult<Vec<_>>>()?}),
     )
 }
 /// Adds a named image backed by a standalone PNG, reusing an existing image of that name.
@@ -1368,10 +1532,19 @@ fn png_identity(path: &Path) -> String {
     parts.join("/")
 }
 fn prune_metadata(value: &mut Value) {
+    prune_metadata_keeping(value, false)
+}
+
+/// Prunes a sidecar to what standard glTF can't express. With `keep_records` it also keeps what
+/// rebuilding the source files byte for byte needs: their reserved and header words, local
+/// matrices, parents, source aliases and whole material records.
+fn prune_metadata_keeping(value: &mut Value, keep_records: bool) {
     match value {
         Value::Object(object) => {
             for key in ["channels", "motion_channels"] {
-                if let Some(channels) = object.get_mut(key).and_then(Value::as_array_mut) {
+                if let Some(channels) = object.get_mut(key).and_then(Value::as_array_mut)
+                    && !keep_records
+                {
                     channels.retain(|channel| {
                         channel["keys"]
                             .as_array()
@@ -1388,9 +1561,14 @@ fn prune_metadata(value: &mut Value) {
                 "parent",
                 "frames_per_second",
             ] {
-                object.remove(key);
+                if !keep_records || key == "frames_per_second" {
+                    object.remove(key);
+                }
             }
-            if object.contains_key("diffuse") && object.contains_key("ambient") {
+            if !keep_records {
+                object.remove("record_u32");
+            }
+            if !keep_records && object.contains_key("diffuse") && object.contains_key("ambient") {
                 object.retain(|key, _| matches!(key.as_str(), "diffuse" | "ambient" | "texture"));
             }
             if let Some(streams) = object.remove("streams") {
@@ -1457,12 +1635,12 @@ fn prune_metadata(value: &mut Value) {
                 object.remove("name");
             }
             for child in object.values_mut() {
-                prune_metadata(child);
+                prune_metadata_keeping(child, keep_records);
             }
         }
         Value::Array(values) => {
             for child in values {
-                prune_metadata(child)
+                prune_metadata_keeping(child, keep_records)
             }
         }
         _ => {}
@@ -1476,7 +1654,7 @@ fn publish_pair(
     metadata: &mut Value,
     report: &mut ConversionReport,
 ) -> CoreResult<()> {
-    publish_pair_impl(published, path, gltf, metadata, report, None)
+    publish_pair_impl(published, path, gltf, metadata, report, false, None)
 }
 
 struct StreamPair {
@@ -1514,6 +1692,7 @@ fn publish_pair_impl(
     gltf: &mut Value,
     metadata: &mut Value,
     report: &mut ConversionReport,
+    keep_records: bool,
     mut stream: Option<&mut StreamPairs<'_>>,
 ) -> CoreResult<()> {
     if let Some(output) = stream.as_mut()
@@ -1549,10 +1728,34 @@ fn publish_pair_impl(
             }
         }
     } else if gltf["animations"].as_array().is_some_and(|a| !a.is_empty()) {
-        metadata["motion_channels"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|c| c["type"].as_i64().unwrap() > 2);
+        if keep_records {
+            // Each scene motion's clip covers it from frame 0 to its last key.
+            let channels = metadata["motion_channels"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let mut residue = Vec::new();
+            let aliases: BTreeSet<String> = channels
+                .iter()
+                .filter_map(|c| c["alias"].as_str().map(str::to_owned))
+                .collect();
+            for alias in aliases {
+                let own: Vec<Value> = channels
+                    .iter()
+                    .filter(|c| c["alias"] == alias.as_str())
+                    .cloned()
+                    .collect();
+                let rebaked =
+                    rebaked_frames(metadata["frames"].as_array().map_or(&[], Vec::as_slice));
+                residue.extend(retail_residue(&own, &[(0, motion_extent(&own))], &rebaked));
+            }
+            metadata["motion_channels"] = json!(residue);
+        } else {
+            metadata["motion_channels"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|c| c["type"].as_i64().unwrap() > 2);
+        }
     }
     fn minimal_model(model: &mut Value) {
         if let Some(frames) = model.get_mut("frames").and_then(Value::as_array_mut) {
@@ -1599,7 +1802,7 @@ fn publish_pair_impl(
         }
     }
     gltf.as_object_mut().unwrap().remove("extras");
-    prune_metadata(metadata);
+    prune_metadata_keeping(metadata, keep_records);
     let document = path.replace('\\', "/");
     if let Some(output) = stream.as_mut() {
         if metadata["kind"] == "character" {
@@ -2010,6 +2213,159 @@ fn prepare_transform_nodes(gltf: &mut Gltf, motions: &[&[Value]]) -> CoreResult<
     Ok(())
 }
 
+/// Whether an MDT's strips stay inside its streams: what every drawn mesh does.
+fn strips_fit(b: &[u8]) -> bool {
+    let read = || -> CoreResult<bool> {
+        let counts = [
+            u32le(b, 12)? as usize,
+            u32le(b, 20)? as usize,
+            u32le(b, 44)? as usize,
+            u32le(b, 28)? as usize,
+        ];
+        let face_offset = u32le(b, 40)? as usize;
+        let mut at = face_offset + u32le(b, face_offset + 4)? as usize;
+        for _ in 0..u32le(b, face_offset + 8)? {
+            let kind = u32le(b, at)?;
+            let corners = u32le(b, at + 4)? as usize;
+            at += 12;
+            if kind & 7 > 5 {
+                return Ok(false);
+            }
+            let enabled = [true, kind & 0x200 == 0, kind & 0x10 == 0, kind & 0x100 != 0];
+            for _ in 0..corners {
+                for s in (0..4).filter(|&s| enabled[s]) {
+                    if u32le(b, at)? as usize >= counts[s] {
+                        return Ok(false);
+                    }
+                    at += 4;
+                }
+            }
+        }
+        Ok(at <= u32le(b, 8)? as usize)
+    };
+    read().unwrap_or(false)
+}
+
+/// The triangles of a collision MDT: one with no texture coordinates whose mesh section is a
+/// triangle set (vertex indices, attribute index and a reserved word each) rather than strips.
+/// Every drawn mesh on the discs counts texture coordinates, and every one that counts none is a
+/// collision mesh, which the loader reading it decides in the games themselves.
+fn collision_polygons(b: &[u8]) -> Option<Vec<[u32; 5]>> {
+    let read = || -> CoreResult<Option<Vec<[u32; 5]>>> {
+        if u32le(b, 44)? != 0 || strips_fit(b) {
+            return Ok(None);
+        }
+        let vertices = u32le(b, 12)?;
+        let set = u32le(b, 40)? as usize + 16;
+        let count = u32le(b, set + 4)? as usize;
+        if set + 8 + count * 20 > u32le(b, 8)? as usize {
+            return Ok(None);
+        }
+        let mut polygons = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = set + 8 + i * 20;
+            let polygon: [u32; 5] =
+                std::array::from_fn(|k| u32le(b, at + k * 4).unwrap_or(u32::MAX));
+            if polygon[..3].iter().any(|&v| v >= vertices) {
+                return Ok(None);
+            }
+            polygons.push(polygon);
+        }
+        Ok(Some(polygons))
+    };
+    read().ok().flatten()
+}
+
+/// The nonzero words of `b[..size]` outside every `covered` range: bytes no reader looks at, which
+/// rebuilding a source file byte for byte puts back.
+fn padding_words(b: &[u8], size: usize, covered: &[(usize, usize)]) -> CoreResult<Vec<[u32; 2]>> {
+    let mut words = Vec::new();
+    for at in (0..size.min(b.len()) / 4 * 4).step_by(4) {
+        if covered
+            .iter()
+            .any(|&(start, end)| at + 4 > start && at < end)
+        {
+            continue;
+        }
+        let word = u32le(b, at)?;
+        if word != 0 {
+            words.push([at as u32, word]);
+        }
+    }
+    Ok(words)
+}
+
+/// The 16 header words of an MDT and the 4 that open its mesh section, which locate its streams.
+fn header_words(b: &[u8], face_offset: usize) -> CoreResult<Vec<u32>> {
+    (0..16)
+        .map(|k| u32le(b, k * 4))
+        .chain((0..4).map(|k| u32le(b, face_offset + k * 4)))
+        .collect()
+}
+
+/// Publishes a collision MDT as a triangle mesh, with each triangle's attribute record and the
+/// records themselves in its metadata.
+fn collision_mesh(
+    gltf: &mut Gltf,
+    b: &[u8],
+    frame: usize,
+    polygons: &[[u32; 5]],
+) -> CoreResult<Value> {
+    let vertex_count = u32le(b, 12)? as usize;
+    let vertex_offset = u32le(b, 16)? as usize;
+    let vertices = (0..vertex_count)
+        .map(|i| floats(b, vertex_offset + i * 16, 4))
+        .collect::<CoreResult<Vec<_>>>()?;
+    let mut positions = Vec::with_capacity(polygons.len() * 9);
+    for polygon in polygons {
+        for &v in &polygon[..3] {
+            positions.extend_from_slice(&vertices[v as usize][..3]);
+        }
+    }
+    let info_offset = u32le(b, 56)? as usize;
+    let info_count = polygons
+        .iter()
+        .filter_map(|p| (p[3] as i32 >= 0).then_some(p[3] as usize + 1))
+        .max()
+        .filter(|_| info_offset != 0)
+        .unwrap_or(0);
+    let info = (0..info_count)
+        .map(|i| {
+            (0..4)
+                .map(|k| u32le(b, info_offset + i * 16 + k * 4))
+                .collect()
+        })
+        .collect::<CoreResult<Vec<Vec<u32>>>>()?;
+    let id = gltf.doc["meshes"].as_array().unwrap().len();
+    if !polygons.is_empty() {
+        let accessor = gltf.accessor(&positions, 3, "VEC3", true);
+        gltf.doc["meshes"].as_array_mut().unwrap().push(
+            json!({"primitives":[{"attributes":{"POSITION":accessor},"mode":4}],"extras":{"collision":true}}),
+        );
+        gltf.doc["nodes"][frame]["mesh"] = json!(id);
+    }
+    let face_offset = u32le(b, 40)? as usize;
+    Ok(json!({
+        "frame":frame,
+        "kind":"collision",
+        "vertex_count":vertex_count,
+        "primitives":[],
+        "materials":[],
+        "polygons":polygons,
+        "info":info,
+        "reserved_u32":[u32le(b,8)?,u32le(b,60)?],
+        "face_reserved_u32":[u32le(b,face_offset)?,u32le(b,face_offset+12)?,u32le(b,face_offset+16)?],
+        "record_u32":header_words(b, face_offset)?,
+        "padding_u32":padding_words(b, u32le(b, 8)? as usize, &[
+            (0, 64),
+            (vertex_offset, vertex_offset + vertex_count * 16),
+            (face_offset, face_offset + 24 + polygons.len() * 20),
+            (info_offset, info_offset + info.len() * 16),
+        ])?,
+        "streams":{"positions":vertices}
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mesh(
     gltf: &mut Gltf,
@@ -2020,20 +2376,33 @@ fn mesh(
     used: &mut BTreeSet<String>,
     weight_channels: &[Value],
     world: &[Vec<f32>],
+    game: &GameProfile,
 ) -> CoreResult<Value> {
+    if let Some(polygons) = collision_polygons(b) {
+        return collision_mesh(gltf, b, frame, &polygons);
+    }
     mesh_extent(b)?;
-    let counts = [
+    let mut counts = [
         u32le(b, 12)? as usize,
         u32le(b, 20)? as usize,
         u32le(b, 44)? as usize,
         u32le(b, 28)? as usize,
     ];
-    let offsets = [
+    let mut offsets = [
         u32le(b, 16)? as usize,
         u32le(b, 24)? as usize,
         u32le(b, 48)? as usize,
         u32le(b, 32)? as usize,
     ];
+    let (header_counts, header_offsets) = (counts, offsets);
+    // With fixed streams a stream offset that isn't positive means the stream is absent: a mesh
+    // without texture coordinates indexes its positions in their place, and one without colours
+    // has three indices a corner.
+    let has_colours = i32le(b, 32)? > 0;
+    if game.fixed_strip_streams && i32le(b, 48)? <= 0 {
+        counts[2] = counts[0];
+        offsets[2] = offsets[0];
+    }
     let material_base = gltf.doc["materials"].as_array().unwrap().len();
     let mut materials = Vec::new();
     for i in 0..u32le(b, 52)? as usize {
@@ -2047,6 +2416,7 @@ fn mesh(
         )?)
     }
     let mut influences = vec![Vec::<(u16, f32)>::new(); counts[0]];
+    let mut dropped_weights = 0usize;
     let mut bones = Vec::new();
     for channel in weight_channels.iter().filter(|c| {
         c["frame"].as_u64() == Some(frame as u64)
@@ -2065,7 +2435,14 @@ fn mesh(
         for key in channel["keys"].as_array().unwrap() {
             let vertex = key["frame"].as_u64().unwrap() as usize;
             if vertex >= influences.len() {
-                return Err(fail("skin vertex outside MDT"));
+                // Like the strips, a skin may weight a vertex past the stream's count that the
+                // mesh still holds. Weights past all of it (a character given another's weight
+                // file) would land outside the mesh, so they are dropped and counted.
+                if offsets[0] + (vertex + 1) * 16 > u32le(b, 8)? as usize {
+                    dropped_weights += 1;
+                    continue;
+                }
+                influences.resize(vertex + 1, Vec::new());
             }
             influences[vertex].push((slot, key["value"][0].as_f64().unwrap() as f32 / 100.));
         }
@@ -2100,12 +2477,17 @@ fn mesh(
         .unwrap_or(0)
         .max(1)
         .div_ceil(4);
-    for _ in 0..primitive_count {
+    let mut empty_strips = Vec::new();
+    for primitive_index in 0..primitive_count {
         let kind = u32le(b, at)?;
         let corners = u32le(b, at + 4)? as usize;
         let mat = u32le(b, at + 8)? as usize;
         at += 12;
-        let enabled = [true, kind & 0x200 == 0, kind & 0x10 == 0, kind & 0x100 != 0];
+        let enabled = if game.fixed_strip_streams {
+            [true, true, true, has_colours]
+        } else {
+            [true, kind & 0x200 == 0, kind & 0x10 == 0, kind & 0x100 != 0]
+        };
         let mut streams = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         let mut ids = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         let mut joints = vec![Vec::new(); influence_sets];
@@ -2115,7 +2497,9 @@ fn mesh(
                 if enabled[s] {
                     let id = u32le(b, at)? as usize;
                     at += 4;
-                    if id >= counts[s] {
+                    // The game reads an index past a stream's count from the bytes after it; a
+                    // few retail meshes rely on that.
+                    if id >= counts[s] && offsets[s] + (id + 1) * 16 > u32le(b, 8)? as usize {
                         return Err(fail(format!(
                             "MDT stream {s} index {id} outside {} ({alias})",
                             counts[s]
@@ -2170,6 +2554,7 @@ fn mesh(
             }
         }
         if corners == 0 {
+            empty_strips.push(json!({"index":primitive_index,"type":kind,"material":mat}));
             continue;
         }
         let mut attributes = json!({});
@@ -2205,6 +2590,13 @@ fn mesh(
             }
         }
         let mode = match kind & 7 {
+            _ if game.fixed_strip_streams => {
+                if kind == 4 {
+                    5
+                } else {
+                    4
+                }
+            }
             0 => 0,
             1 => 1,
             2 => 3,
@@ -2231,14 +2623,35 @@ fn mesh(
     let mut original_streams = Vec::new();
     for s in 0..4 {
         original_streams.push(
-            (0..counts[s])
-                .map(|i| floats(b, offsets[s] + i * 16, 4))
+            (0..header_counts[s])
+                .map(|i| floats(b, header_offsets[s] + i * 16, 4))
                 .collect::<CoreResult<Vec<_>>>()?,
         );
     }
-    Ok(
-        json!({"frame":frame,"vertex_count":counts[0],"normal_count":counts[1],"uv_count":counts[2],"colour_count":counts[3],"primitives":metadata,"materials":materials,"reserved_u32":[u32le(b,8)?,u32le(b,60)?],"face_reserved_u32":[u32le(b,face_offset)?,u32le(b,face_offset+12)?],"streams":{"positions":original_streams[0],"normals":original_streams[1],"uvs":original_streams[2],"colours":original_streams[3]}}),
-    )
+    let mut out = json!({"frame":frame,"vertex_count":header_counts[0],"normal_count":header_counts[1],"uv_count":header_counts[2],"colour_count":header_counts[3],"primitives":metadata,"materials":materials,"reserved_u32":[u32le(b,8)?,u32le(b,60)?],"face_reserved_u32":[u32le(b,face_offset)?,u32le(b,face_offset+12)?],"streams":{"positions":original_streams[0],"normals":original_streams[1],"uvs":original_streams[2],"colours":original_streams[3]}});
+    if dropped_weights > 0 {
+        out["dropped_weights"] = json!(dropped_weights);
+    }
+    if !empty_strips.is_empty() {
+        out["empty_strips"] = json!(empty_strips);
+    }
+    out["record_u32"] = json!(header_words(b, face_offset)?);
+    let mut covered = vec![(0, 64), (face_offset, at)];
+    for s in 0..4 {
+        if (header_offsets[s] as i32) > 0 {
+            covered.push((header_offsets[s], header_offsets[s] + header_counts[s] * 16));
+        }
+    }
+    let material_offset = u32le(b, 56)? as usize;
+    covered.push((
+        material_offset,
+        material_offset + u32le(b, 52)? as usize * 96,
+    ));
+    let padding = padding_words(b, u32le(b, 8)? as usize, &covered)?;
+    if !padding.is_empty() {
+        out["padding_u32"] = json!(padding);
+    }
+    Ok(out)
 }
 
 fn prepare_morphs(gltf: &mut Gltf, meshes: &[Value], channels: &[Value]) -> CoreResult<()> {
@@ -2583,6 +2996,130 @@ fn animation_clip(
     let animations = gltf.doc["animations"].as_array_mut().unwrap();
     animations.push(json!({"name":name,"samplers":samplers,"channels":targets}));
     Ok(Some(animations.len() - 1))
+}
+
+/// What a game rebuilding a motion from its clips can't read back from them: the keys outside every
+/// action and on an action's first and last frame (a clip has keys only inside its action, and merges
+/// runs of equal ones), the keys inside an action a clip doesn't give back bit for bit (glTF's unit
+/// rotations change the last bit of a retail rotation that wasn't quite one; a clip key has no reserved
+/// words or fourth lane), kept with their words, and whole the channels a clip doesn't hold as retail
+/// keys (every channel but rotation, scale and translation, and the rotation and scale of a frame
+/// scaled unevenly, which may be rebaked). A channel kept whole says so (`"complete": true`).
+///
+/// Every channel is listed, in the motion's order and with its header words, even one keeping no keys:
+/// the game reads every vertex channel of a frame at the key of the motion's first channel, so a rebuild
+/// keeps the order.
+fn retail_residue(
+    channels: &[Value],
+    actions: &[(u64, u64)],
+    rebaked: &BTreeSet<u64>,
+) -> Vec<Value> {
+    let mut residue = Vec::new();
+    for channel in channels {
+        let mut kept = channel.clone();
+        let (Some(frame), Some(kind)) = (channel["frame"].as_u64(), channel["type"].as_i64())
+        else {
+            // A channel no frame of a model drives still keeps its place.
+            kept["complete"] = json!(true);
+            residue.push(kept);
+            continue;
+        };
+        if kind > 2 || (kind < 2 && rebaked.contains(&frame)) {
+            kept["complete"] = json!(true);
+        } else {
+            let all: Vec<&Value> = channel["keys"].as_array().into_iter().flatten().collect();
+            let standard = |key: &Value| -> Vec<f32> {
+                if kind == 0 {
+                    super::actions::standard_rotation(&key["value"]).to_vec()
+                } else {
+                    (0..3)
+                        .map(|i| key["value"][i].as_f64().unwrap_or(0.) as f32)
+                        .collect()
+                }
+            };
+            // A clip keeps one key of a channel that doesn't change within its action, so the
+            // keys inside such an action are kept here, where they are.
+            let constant: Vec<(u64, u64)> = actions
+                .iter()
+                .copied()
+                .filter(|&(start, end)| {
+                    let inside: Vec<Vec<f32>> = all
+                        .iter()
+                        .filter(|k| (start + 1..end).contains(&k["frame"].as_u64().unwrap_or(0)))
+                        .map(|k| standard(k))
+                        .collect();
+                    inside.windows(2).all(|pair| pair[0] == pair[1])
+                })
+                .collect();
+            let channel_keys = channel["keys"].as_array().map_or(&[][..], Vec::as_slice);
+            let keys: Vec<Value> = all
+                .iter()
+                .filter_map(|key| {
+                    let f = key["frame"].as_u64().unwrap_or(0);
+                    let inside = |&(start, end): &(u64, u64)| start < f && f < end;
+                    if !actions.iter().any(inside) || constant.iter().any(inside) {
+                        return Some((*key).clone());
+                    }
+                    let disc = key_words(key);
+                    (clip_key_words(channel_keys, kind == 0, f) != disc).then(|| {
+                        let mut exact = (*key).clone();
+                        exact["value_u32"] = json!(&disc[3..]);
+                        exact
+                    })
+                })
+                .collect();
+            kept["keys"] = json!(keys);
+        }
+        residue.push(kept);
+    }
+    residue
+}
+
+/// A retail key's reserved and value words, as the disc has them.
+fn key_words(key: &Value) -> [u32; 7] {
+    let mut words = [0u32; 7];
+    for i in 0..3 {
+        words[i] = key["reserved_u32"][i].as_u64().unwrap_or(0) as u32;
+    }
+    for i in 0..4 {
+        words[3 + i] = match key["value_u32"][i].as_u64() {
+            Some(word) => word as u32,
+            None => (key["value"][i].as_f64().unwrap_or(0.) as f32).to_bits(),
+        };
+    }
+    words
+}
+
+/// The reserved and value words a rebuild writes for a key it reads from a clip at source frame
+/// `frame`: no reserved words; a rotation from glTF's normalized x, y, z, w to retail's scalar-first,
+/// conjugated form; a translation or scale with a zero fourth lane.
+fn clip_key_words(keys: &[Value], rotation: bool, frame: u64) -> [u32; 7] {
+    let value = super::actions::sample_transform(keys, rotation, frame as f32);
+    let lanes = if rotation {
+        [value[3], -value[0], -value[1], -value[2]]
+    } else {
+        [value[0], value[1], value[2], 0.]
+    };
+    [
+        0,
+        0,
+        0,
+        lanes[0].to_bits(),
+        lanes[1].to_bits(),
+        lanes[2].to_bits(),
+        lanes[3].to_bits(),
+    ]
+}
+
+/// The frames of a model whose rotation and scale clips are rebaked from the retail pose, which
+/// retail keys can't be read back from.
+fn rebaked_frames(frames: &[Value]) -> BTreeSet<u64> {
+    frames
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| frame["rebaked"] == true)
+        .map(|(f, _)| f as u64)
+        .collect()
 }
 
 /// Last source frame of any key of a motion, the extent of a motion without KEY intervals.
@@ -2941,6 +3478,7 @@ fn resource_operand(command: &str, arg: usize) -> Option<&'static str> {
             _ => None,
         },
         "SHADOW_MOTION" => match arg {
+            0 => Some("animation"),
             1 => Some("bind_pose"),
             2 => Some("weights"),
             _ => None,
@@ -2959,8 +3497,9 @@ fn resource_operand(command: &str, arg: usize) -> Option<&'static str> {
 }
 /// Rewrites one profile for native loading: typed resources, English action names and local timing.
 ///
-/// KEY keeps its English action name and step; the action's clip supplies its length. Sound frames
-/// given as absolute source frames become ratios of their named action.
+/// KEY keeps its English action name and step; the action's clip supplies its length. With
+/// `absolute_frames` it also keeps its source start and end frames. Sound frames given as absolute
+/// source frames become ratios of their named action.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_profile(
     mut document: Value,
@@ -2969,6 +3508,7 @@ fn rewrite_profile(
     references: &BTreeMap<(String, String), usize>,
     book: &mut NameBook,
     unbound: &BTreeMap<String, usize>,
+    absolute_frames: bool,
 ) -> CoreResult<Value> {
     let commands = document["commands"]
         .as_array_mut()
@@ -3009,7 +3549,7 @@ fn rewrite_profile(
             "KEY" => {
                 let start = args[1]["value"].as_u64().unwrap_or(0);
                 let action = KeyAction {
-                    game: args[0].clone(),
+                    game: super::actions::key_name(&args[0]),
                     start,
                     end: args[2]["value"].as_u64().unwrap_or(0).max(start),
                 };
@@ -3018,7 +3558,16 @@ fn rewrite_profile(
                     .get(3)
                     .cloned()
                     .ok_or_else(|| fail(format!("KEY without step in {profile}")))?;
-                *args = vec![json!({"type":"string","value":name}), step];
+                *args = if absolute_frames {
+                    vec![
+                        json!({"type":"string","value":name}),
+                        json!({"type":"int","value":action.start}),
+                        json!({"type":"int","value":action.end}),
+                        step,
+                    ]
+                } else {
+                    vec![json!({"type":"string","value":name}), step]
+                };
                 continue;
             }
             "SE" | "SELP" => {
@@ -3089,6 +3638,8 @@ pub(crate) struct ExternalMotion {
     channels: PackedChannels,
     /// English action names with their source intervals.
     actions: Vec<(String, u64, u64)>,
+    /// Source alias of the motion.
+    source: String,
 }
 
 /// Motion channels kept compressed while they wait for placement: as JSON values the disc's external motions
@@ -3178,7 +3729,9 @@ fn decode_u64(bytes: &[u8], at: &mut usize) -> u64 {
 
 fn decode_text(bytes: &[u8], at: &mut usize) -> String {
     let length = decode_u64(bytes, at) as usize;
-    let text = std::str::from_utf8(&bytes[*at..*at + length]).unwrap().to_owned();
+    let text = std::str::from_utf8(&bytes[*at..*at + length])
+        .unwrap()
+        .to_owned();
     *at += length;
     text
 }
@@ -3228,6 +3781,8 @@ pub(crate) struct Rig {
     translations: Vec<[f32; 3]>,
     /// Shear helper of each native frame that has one.
     helpers: BTreeMap<usize, usize>,
+    /// Frames whose rotation and scale clips are rebaked from the retail pose.
+    rebaked: BTreeSet<u64>,
 }
 
 /// Names an action's glTF clip, telling apart the clips of a motion shared by several models.
@@ -3267,8 +3822,11 @@ fn publish_native(
     artifacts: &BTreeMap<String, NativeArtifact>,
     documents: &[super::textures::ConvertedTextureDocument],
     report: &mut ConversionReport,
+    game: &GameProfile,
 ) -> CoreResult<()> {
-    publish_native_impl(published, resources, artifacts, documents, report, None)
+    publish_native_impl(
+        published, resources, artifacts, documents, report, game, None,
+    )
 }
 
 fn publish_native_impl(
@@ -3277,6 +3835,7 @@ fn publish_native_impl(
     artifacts: &BTreeMap<String, NativeArtifact>,
     documents: &[super::textures::ConvertedTextureDocument],
     report: &mut ConversionReport,
+    game: &GameProfile,
     mut stream: Option<&mut StreamPairs<'_>>,
 ) -> CoreResult<()> {
     // Packed artifacts are expanded where they are merged, one bundle at a time: a file with many models would
@@ -3355,13 +3914,15 @@ fn publish_native_impl(
             for profile in resources.iter().filter(|r| {
                 extension(&r.alias) == "cfg" && character_parent(&r.alias) == Some(alias.as_str())
             }) {
-                profiles.push((profile.alias.clone(), super::configs::parse(&profile.data)?));
+                if let Some(document) = game.parse(&profile.alias, &profile.data)? {
+                    profiles.push((profile.alias.clone(), document));
+                }
             }
             super::actions::key_actions(&profiles)?
         };
         let mut book = NameBook::default();
         for (motion, action) in &keyed.order {
-            book.action(motion, action, "")?;
+            book.action(motion, action, &leaf_stem(motion))?;
         }
         let mut gltf = empty_gltf();
         let mut models = Vec::new();
@@ -3380,7 +3941,9 @@ fn publish_native_impl(
             {
                 let id = models.len();
                 let mut metadata = artifact.metadata.clone();
-                metadata.as_object_mut().unwrap().remove("source");
+                if !game.keep_source_records {
+                    metadata.as_object_mut().unwrap().remove("source");
+                }
                 metadata["name"] = json!(leaf_stem(source));
                 metadata["scene"] = json!(offsets["scenes"]);
                 metadata["node_offset"] = json!(offsets["nodes"]);
@@ -3428,6 +3991,7 @@ fn publish_native_impl(
                             frame["rotation_node"].as_u64().map(|h| (f, h as usize))
                         })
                         .collect(),
+                    rebaked: rebaked_frames(frames),
                 });
                 models.push(metadata);
                 Some(id)
@@ -3511,7 +4075,12 @@ fn publish_native_impl(
                             .filter(|c| c["type"].as_i64().is_some_and(|t| t > 2))
                             .map(|c| super::actions::slice_aux(c, action.start, action.end))
                             .collect();
-                        actions.push(json!({"name":name,"duration":action.end - action.start,"channels":auxiliary}));
+                        let mut entry = json!({"name":name,"duration":action.end - action.start,"channels":auxiliary});
+                        if game.absolute_frames {
+                            entry["start"] = json!(action.start);
+                            entry["end"] = json!(action.end);
+                        }
+                        actions.push(entry);
                         named.push((name, action.start, action.end));
                     }
                     let variants = animation_variants
@@ -3532,21 +4101,37 @@ fn publish_native_impl(
                             resource: index,
                             channels: PackedChannels::new(&channels)?,
                             actions: named,
+                            source: resource.alias.clone(),
                         });
                     } else {
                         value = json!({"actions":actions,"variants":variants});
+                    }
+                    if game.keep_source_records {
+                        let spans: Vec<(u64, u64)> =
+                            list.iter().map(|a| (a.start, a.end)).collect();
+                        let mut rebaked = BTreeSet::new();
+                        for variant in value["variants"].as_array().into_iter().flatten() {
+                            if let Some(frames) = variant["model"]
+                                .as_u64()
+                                .and_then(|m| native["models"][m as usize]["frames"].as_array())
+                            {
+                                rebaked.extend(rebaked_frames(frames));
+                            }
+                        }
+                        value["retail_channels"] =
+                            json!(retail_residue(&channels, &spans, &rebaked));
                     }
                 }
                 "bind_pose" => value["matrices"] = bind_pose(resource)?["matrices"].clone(),
                 "weights" => value["channels"] = json!(channels(resource)?),
                 "cloth" => {
-                    if stream.is_none()
+                    if (stream.is_none()
                         || stream
                             .as_ref()
-                            .is_some_and(|output| output.gameplay.is_some())
+                            .is_some_and(|output| output.gameplay.is_some()))
+                        && let Some(document) = game.parse(&resource.alias, &resource.data)?
                     {
-                        value["commands"] =
-                            super::configs::parse(&resource.data)?["commands"].clone();
+                        value["commands"] = document["commands"].clone();
                     }
                 }
                 "script" => {
@@ -3564,6 +4149,9 @@ fn publish_native_impl(
                     value["path"] = json!(super::configs::native_path(&resource.alias, "gltf"))
                 }
                 _ => {}
+            }
+            if game.keep_source_records {
+                value["source"] = json!(resource.alias);
             }
             native["resources"][key].as_array_mut().unwrap().push(value);
             references.insert((kind.into(), resource.alias.clone()), index);
@@ -3585,7 +4173,12 @@ fn publish_native_impl(
             let mut actions = Vec::new();
             for action in list {
                 let name = book.action(&id, action, "")?;
-                actions.push(json!({"name":name,"duration":action.end - action.start}));
+                let mut entry = json!({"name":name,"duration":action.end - action.start});
+                if game.absolute_frames {
+                    entry["start"] = json!(action.start);
+                    entry["end"] = json!(action.end);
+                }
+                actions.push(entry);
             }
             let index = native["resources"]["animations"].as_array().unwrap().len();
             native["resources"]["animations"]
@@ -3657,8 +4250,15 @@ fn publish_native_impl(
                 if native.get("default_profile").is_none() {
                     native["default_profile"] = json!(name);
                 }
-                native["profiles"][&name] =
-                    rewrite_profile(document, &profile, alias, &references, &mut book, &unbound)?;
+                native["profiles"][&name] = rewrite_profile(
+                    document,
+                    &profile,
+                    alias,
+                    &references,
+                    &mut book,
+                    &unbound,
+                    game.absolute_frames,
+                )?;
             }
             let names: serde_json::Map<String, Value> = book
                 .names
@@ -3676,6 +4276,7 @@ fn publish_native_impl(
             &mut gltf,
             &mut native,
             report,
+            game.keep_source_records,
             stream.as_deref_mut(),
         )?;
     }
@@ -3741,6 +4342,7 @@ fn publish_native_impl(
             &mut gltf,
             &mut metadata,
             report,
+            game.keep_source_records,
             stream.as_deref_mut(),
         )?;
     }
@@ -4179,12 +4781,18 @@ fn place_externals(report: &mut ConversionReport) -> Vec<BTreeSet<usize>> {
 }
 
 /// Publishes every external motion's actions into the models `place_externals` chooses.
-fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResult<()> {
+fn publish_external(
+    published: &Path,
+    report: &mut ConversionReport,
+    game: &GameProfile,
+) -> CoreResult<()> {
     let port = published.join("data");
     let mut work = BTreeMap::<String, Vec<(usize, usize)>>::new();
     let mut targets = vec![BTreeSet::<String>::new(); report.externals.len()];
+    let mut rebaked = vec![BTreeSet::<u64>::new(); report.externals.len()];
     for (index, rigs) in place_externals(report).into_iter().enumerate() {
         for rig in rigs {
+            rebaked[index].extend(report.rigs[rig].rebaked.iter().copied());
             work.entry(report.rigs[rig].path.clone())
                 .or_default()
                 .push((index, rig));
@@ -4234,10 +4842,25 @@ fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResu
                             .filter(|c| c["type"].as_i64().is_some_and(|t| t > 2))
                             .map(|c| super::actions::slice_aux(c, *start, *end))
                             .collect();
-                        json!({"name":name,"duration":end - start,"channels":auxiliary})
+                        let mut action =
+                            json!({"name":name,"duration":end - start,"channels":auxiliary});
+                        if game.absolute_frames {
+                            action["start"] = json!(start);
+                            action["end"] = json!(end);
+                        }
+                        action
                     })
                     .collect();
-                json!({"external":motion.key,"actions":actions,"variants":[]})
+                let mut entry = json!({"external":motion.key,"actions":actions,"variants":[]});
+                // A motion with no bundle of its own is found, and rebuilt, where it was placed.
+                if motion.sidecar.is_none() && game.keep_source_records {
+                    let spans: Vec<(u64, u64)> =
+                        motion.actions.iter().map(|a| (a.1, a.2)).collect();
+                    entry["source"] = json!(motion.source);
+                    entry["retail_channels"] =
+                        json!(retail_residue(&channels, &spans, &rebaked[motion_index]));
+                }
+                entry
             });
             let previous = entry["variants"].as_array().unwrap().len();
             let scene = doc["scenes"]
@@ -4299,7 +4922,7 @@ fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResu
                     shift(clip, offsets["animations"]);
                 }
             }
-            prune_metadata(&mut entry);
+            prune_metadata_keeping(&mut entry, game.keep_source_records);
             sidecar["resources"]["animations"]
                 .as_array_mut()
                 .ok_or_else(|| fail(format!("external motion target is not a character: {path}")))?
@@ -4313,14 +4936,55 @@ fn publish_external(published: &Path, report: &mut ConversionReport) -> CoreResu
         save(&gltf_path, &doc)?;
         save(&sidecar_path, &sidecar)?;
     }
-    for (motion, targets) in report.externals.iter().zip(targets) {
+    let mut own_bundles = Vec::new();
+    for ((motion, targets), rebaked) in report.externals.iter().zip(targets).zip(rebaked) {
         let Some(sidecar) = &motion.sidecar else {
+            // A motion no model plays and no bundle holds keeps all its keys in a bundle of its own.
+            if targets.is_empty() && game.keep_source_records {
+                let mut channels = retail_residue(&motion.channels.values(), &[], &BTreeSet::new());
+                for channel in &mut channels {
+                    channel["complete"] = json!(true);
+                    channel["alias"] = json!(motion.source);
+                }
+                // Beside, not over, the bundle of a model of the same name.
+                let path = super::configs::native_path(&motion.source, "motion.gltf");
+                let mut gltf = empty_gltf();
+                let mut metadata = json!({"schema_version":1,"kind":"animation","source":motion.source,"motion_channels":channels});
+                own_bundles.push((path, gltf.take(), metadata.take()));
+            }
             continue;
         };
         let path = port.join(sidecar);
         let mut document: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        if game.keep_source_records {
+            let channels = motion.channels.values();
+            let mut residue = if targets.is_empty() {
+                // A motion no model plays has no clips, so its keys are all kept.
+                let mut all = retail_residue(&channels, &[], &BTreeSet::new());
+                for channel in &mut all {
+                    channel["complete"] = json!(true);
+                }
+                Value::Array(all)
+            } else {
+                let spans: Vec<(u64, u64)> = motion.actions.iter().map(|a| (a.1, a.2)).collect();
+                Value::Array(retail_residue(&channels, &spans, &rebaked))
+            };
+            prune_metadata_keeping(&mut residue, true);
+            document["resources"]["animations"][motion.resource]["retail_channels"] = residue;
+        }
         document["resources"]["animations"][motion.resource]["targets"] = json!(targets);
         save(&path, &document)?;
+    }
+    for (path, mut gltf, mut metadata) in own_bundles {
+        publish_pair_impl(
+            published,
+            &path,
+            &mut gltf,
+            &mut metadata,
+            report,
+            true,
+            None,
+        )?;
     }
     Ok(())
 }
@@ -4585,6 +5249,7 @@ fn analyze_file(
     icon_paths: &BTreeMap<String, String>,
     phase: &Phase,
     embedded_gameplay: bool,
+    game: &GameProfile,
 ) -> CoreResult<Option<FileAnalysis>> {
     phase.item(alias);
     if source.len(alias)? > 128 << 20 {
@@ -4641,7 +5306,7 @@ fn analyze_file(
             super::native_scripts::string_literals(&script.data)?,
         ));
     }
-    let links = script_links(&resources);
+    let links = script_links(&resources, game)?;
     let keyed = if embedded_gameplay {
         let mut actions = super::actions::ProfileActions::default();
         for character in resources
@@ -4668,10 +5333,9 @@ fn analyze_file(
         for resource in resources.iter().filter(|resource| {
             extension(&resource.alias) == "cfg" && character_parent(&resource.alias).is_some()
         }) {
-            profiles.push((
-                resource.alias.clone(),
-                super::configs::parse(&resource.data)?,
-            ));
+            if let Some(profile) = game.parse(&resource.alias, &resource.data)? {
+                profiles.push((resource.alias.clone(), profile));
+            }
         }
         super::actions::key_actions(&profiles)?
     };
@@ -4703,7 +5367,7 @@ fn analyze_file(
             for id in 0..u32le(&r.data, 8)? as usize {
                 let matrix = floats(&r.data, at + 48, 16)?;
                 let mdt = u32le(&r.data, at + 40)? as usize;
-                frames.push(json!({"id":id,"name":name(bytes(&r.data,at+8,32)?),"parent":i32le(&r.data,at+44)?,"local_matrix":matrix,"mdt":if mdt>0{Some(mdts.len())}else{None},"reserved_u32":[u32le(&r.data,at)?]}));
+                frames.push(json!({"id":id,"name":name(bytes(&r.data,at+8,32)?),"parent":i32le(&r.data,at+44)?,"local_matrix":matrix,"mdt":if mdt>0{Some(mdts.len())}else{None},"reserved_u32":[u32le(&r.data,at)?],"record_u32":[u32le(&r.data,at+4)?,mdt]}));
                 if mdt > 0 {
                     mdts.push((id, mdt))
                 }
@@ -4753,7 +5417,18 @@ fn analyze_file(
             }
         }
         gltf.doc["scenes"][0]["nodes"] = json!(roots);
-        let weights_alias = format!("{}.wgt", stem(&r.alias));
+        let mut weights_alias = format!("{}.wgt", stem(&r.alias));
+        // A game reading its own configurations names a model's weights beside its motion.
+        if game.reader.is_some()
+            && !parsed.contains_key(&weights_alias)
+            && let Some(linked) = links.get(&r.alias).and_then(|linked| {
+                linked
+                    .iter()
+                    .find(|alias| extension(alias) == "wgt" && parsed.contains_key(*alias))
+            })
+        {
+            weights_alias = linked.clone();
+        }
         let weight_channels = parsed.get(&weights_alias).cloned().unwrap_or_default();
         let pose_alias = format!("{}.bbp", stem(&r.alias));
         let selected_pose = poses.get(&pose_alias).or_else(|| {
@@ -4804,6 +5479,7 @@ fn analyze_file(
                 &mut used_textures,
                 &weight_channels,
                 &bind_world,
+                game,
             )?)
         }
         let linked: Vec<(&String, &Vec<Value>)> = parsed
@@ -4824,6 +5500,10 @@ fn analyze_file(
         prepare_transform_nodes(&mut gltf, &motion_lists)?;
         for (&frame, &helper) in &gltf.rotation_nodes {
             frames[frame]["rotation_node"] = json!(helper);
+        }
+        let frame_count = frames.len();
+        for &node in gltf.baked.iter().filter(|&&node| node < frame_count) {
+            frames[node]["rebaked"] = json!(true);
         }
         let mut animation_aliases = Vec::new();
         for (alias, cs) in &linked {
@@ -4859,7 +5539,31 @@ fn analyze_file(
         };
         let gltf_path = output_path(&r.alias, "gltf");
         let metadata_path = output_path(&r.alias, "metadata.json");
-        let metadata = json!({"schema_version":1,"source":r.alias,"frames":frames,"meshes":meshes,"motion_channels":motion_channels,"bind_poses":bind_poses,"weights":weights,"frames_per_second":30});
+        let mut metadata = json!({"schema_version":1,"source":r.alias,"frames":frames,"meshes":meshes,"motion_channels":motion_channels,"bind_poses":bind_poses,"weights":weights,"frames_per_second":30});
+        if r.data.starts_with(b"MDS\0") {
+            metadata["record_u32"] = json!(
+                (0..4)
+                    .map(|k| u32le(&r.data, k * 4))
+                    .collect::<CoreResult<Vec<_>>>()?
+            );
+            let first = u32le(&r.data, 12)? as usize;
+            let mut covered = vec![(0, 16)];
+            let mut at = first;
+            for _ in 0..u32le(&r.data, 8)? {
+                let step = u32le(&r.data, at + 4)? as usize;
+                let mdt = u32le(&r.data, at + 40)? as usize;
+                covered.push((at, at + step));
+                if mdt > 0 {
+                    covered.push((mdt, mdt + u32le(&r.data, mdt + 8)? as usize));
+                }
+                at += step;
+            }
+            let padding = padding_words(&r.data, r.data.len(), &covered)?;
+            if !padding.is_empty() {
+                metadata["padding_u32"] = json!(padding);
+            }
+            metadata["size"] = json!(r.data.len());
+        }
         let mut catalog = Vec::new();
         for a in &animation_aliases {
             let alias = a["alias"].as_str().unwrap();
@@ -4914,6 +5618,7 @@ fn analyze_file(
                     resource: 0,
                     actions: vec![(name, 0, motion_extent(&channels))],
                     channels: PackedChannels::new(&channels)?,
+                    source: r.alias.clone(),
                 })
             } else {
                 None
@@ -5149,6 +5854,7 @@ fn publish_jobs(
     jobs: Vec<NativeJob>,
     documents: &[super::textures::ConvertedTextureDocument],
     report: &mut ConversionReport,
+    game: &GameProfile,
 ) -> CoreResult<()> {
     let publish = |job: &NativeJob| -> CoreResult<ConversionReport> {
         let mut local = ConversionReport::default();
@@ -5158,6 +5864,7 @@ fn publish_jobs(
             &job.artifacts,
             documents,
             &mut local,
+            game,
         )?;
         Ok(local)
     };
@@ -5275,6 +5982,7 @@ impl ModelPlan {
                             &job.artifacts,
                             &documents,
                             &mut local,
+                            &GameProfile::default(),
                             Some(&mut stream),
                         )?;
                         let elapsed = started.elapsed();
@@ -5399,6 +6107,7 @@ impl ModelPlan {
                         &job.artifacts,
                         &documents,
                         &mut local,
+                        &GameProfile::default(),
                         Some(&mut stream),
                     )?;
                     let mut pairs = pairs
@@ -5482,6 +6191,7 @@ fn collect_character_gameplay(
             &icon_paths,
             &Phase::noop(),
             false,
+            &GameProfile::default(),
         )
         .map_err(|error| fail(format!("analyze gameplay source {alias}: {error}")))?;
         let Some(analysis) = analysis else { continue };
@@ -5520,6 +6230,7 @@ fn collect_character_gameplay(
             &job.artifacts,
             &documents,
             &mut local,
+            &GameProfile::default(),
             Some(&mut stream),
         )
         .map_err(|error| fail(format!("render gameplay source {alias}: {error}")))?;
@@ -5670,6 +6381,7 @@ pub fn plan_source(
                     &icon_paths,
                     &Phase::noop(),
                     true,
+                    &GameProfile::default(),
                 )?;
                 if let Some(analysis) = analysis.as_mut() {
                     analysis.pack_artifacts()?;
@@ -5734,6 +6446,17 @@ pub fn convert_source(
     documents: &[super::textures::ConvertedTextureDocument],
     phase: &Phase,
 ) -> CoreResult<ConversionReport> {
+    convert_source_for(source, published, documents, &GameProfile::default(), phase)
+}
+
+/// Publishes a source tree's models as [`convert_source`] does, reading the data as `game` describes.
+pub fn convert_source_for(
+    source: &super::archive::SourceTree,
+    published: &Path,
+    documents: &[super::textures::ConvertedTextureDocument],
+    game: &GameProfile,
+    phase: &Phase,
+) -> CoreResult<ConversionReport> {
     let mut report = ConversionReport::default();
     let mut files: Vec<&str> = source
         .names()
@@ -5787,7 +6510,7 @@ pub fn convert_source(
     let analyze = |chunk: &[&str]| -> Vec<CoreResult<Option<FileAnalysis>>> {
         chunk
             .par_iter()
-            .map(|p| analyze_file(source, p, &all_textures, &icon_paths, phase, false))
+            .map(|p| analyze_file(source, p, &all_textures, &icon_paths, phase, false, game))
             .collect()
     };
     let mut chunks = files.chunks(64).zip(work.chunks(64));
@@ -5817,7 +6540,7 @@ pub fn convert_source(
         }
         // Analysis never reads committed state, so the next chunk is analysed while this one publishes.
         let (published_jobs, following) = rayon::join(
-            || publish_jobs(published, jobs, documents, &mut report),
+            || publish_jobs(published, jobs, documents, &mut report, game),
             || {
                 chunks
                     .next()
@@ -5828,7 +6551,7 @@ pub fn convert_source(
         phase.inc(units.iter().sum());
         next = following;
     }
-    publish_external(published, &mut report)?;
+    publish_external(published, &mut report, game)?;
     phase.set_done(total);
     phase.log(format!(
         "models: {} plain, {} rebaked (max pose error {:.2e}), {} shear helpers, {} boundary keys, {} external motions",
@@ -5847,6 +6570,131 @@ pub fn convert_source(
     }
     report.converted = converted;
     Ok(report)
+}
+
+/// Indexes every source a converted tree's sidecars record, as `data/models.json`: each source
+/// alias names its bundle, what it became there and where.
+fn write_source_index(
+    published: &Path,
+    report: &ConversionReport,
+    checksums: &BTreeMap<String, (u32, usize)>,
+) -> CoreResult<()> {
+    let mut index = serde_json::Map::new();
+    let mut add = |alias: &Value, entry: Value| {
+        if let Some(alias) = alias.as_str() {
+            index.entry(alias.to_owned()).or_insert(entry);
+        }
+    };
+    let mut files: Vec<&String> = report
+        .files
+        .iter()
+        .filter(|file| file.ends_with(".game.json"))
+        .collect();
+    files.sort();
+    files.dedup();
+    for file in files {
+        let sidecar: Value = serde_json::from_slice(&fs::read(published.join("data").join(file))?)?;
+        let bundle = file.trim_end_matches(".game.json").to_owned() + ".gltf";
+        if sidecar["kind"] == "character" {
+            for (i, model) in sidecar["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                add(
+                    &model["source"],
+                    json!({"bundle":bundle,"kind":"model","index":i}),
+                );
+            }
+            for (key, resources) in sidecar["resources"].as_object().into_iter().flatten() {
+                for (i, resource) in resources.as_array().into_iter().flatten().enumerate() {
+                    add(
+                        &resource["source"],
+                        json!({"bundle":bundle,"kind":key,"index":i}),
+                    );
+                }
+            }
+        } else {
+            if sidecar.get("record_u32").is_some() {
+                add(&sidecar["source"], json!({"bundle":bundle,"kind":"model"}));
+            }
+            for key in ["motion_channels", "weights"] {
+                for channel in sidecar[key].as_array().into_iter().flatten() {
+                    add(&channel["alias"], json!({"bundle":bundle,"kind":key}));
+                }
+            }
+            for pose in sidecar["bind_poses"].as_array().into_iter().flatten() {
+                add(&pose["alias"], json!({"bundle":bundle,"kind":"bind_poses"}));
+            }
+        }
+    }
+    // Each source's size and CRC-32, so a game rebuilding it can tell it is writing over the very
+    // bytes it was converted from.
+    for (alias, entry) in index.iter_mut() {
+        if let Some(&(crc, size)) = checksums.get(alias) {
+            entry["crc32"] = json!(crc);
+            entry["size"] = json!(size);
+        }
+    }
+    save(&published.join("data/models.json"), &Value::Object(index))
+}
+
+/// The size and CRC-32 of every model source in a raw tree, found as the conversion finds them.
+fn source_checksums(
+    source: &super::archive::SourceTree,
+) -> CoreResult<BTreeMap<String, (u32, usize)>> {
+    let names: Vec<String> = source.names().map(str::to_owned).collect();
+    let found = names
+        .par_iter()
+        .map(|alias| -> CoreResult<Vec<(String, (u32, usize))>> {
+            if source.len(alias)? > 128 << 20 {
+                return Ok(Vec::new());
+            }
+            let mut resources = Vec::new();
+            discover(&source.read(alias)?, alias, &mut resources, 0)?;
+            Ok(resources
+                .into_iter()
+                .map(|r| (r.alias, (crc32fast::hash(&r.data), r.data.len())))
+                .collect())
+        })
+        .collect::<CoreResult<Vec<_>>>()?;
+    Ok(found.into_iter().flatten().collect())
+}
+
+/// Converts a Dark Cloud raw tree's textures and then its models into `output`, so the models'
+/// glTF reference the PNGs published beside them.
+pub fn convert_tree_dc1(
+    raw: &Path,
+    output: &Path,
+    game: &GameProfile,
+    jobs: usize,
+) -> CoreResult<(super::textures::ConversionReport, ConversionReport)> {
+    let textures = super::textures::convert_tree_dc1(raw, output, jobs)?;
+    // Checked before the models add their memory card icons' PNGs, which only the icons reference.
+    super::textures::verify_tree(&output.join("data/textures"))?;
+    let models = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .map_err(|e| fail(e.to_string()))?
+        .install(|| {
+            convert_source_for(
+                &super::archive::SourceTree::directory_dc1(raw)?,
+                output,
+                &textures.documents,
+                game,
+                &Phase::noop(),
+            )
+        })?;
+    if game.keep_source_records {
+        let checksums = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .map_err(|e| fail(e.to_string()))?
+            .install(|| source_checksums(&super::archive::SourceTree::directory_dc1(raw)?))?;
+        write_source_index(output, &models, &checksums)?;
+    }
+    Ok((textures, models))
 }
 
 /// Removes converted model sources from the data tree and scrubs model members from the rest.
@@ -5894,6 +6742,66 @@ pub fn strip_source(
         })
         .collect();
     results.into_iter().collect()
+}
+
+/// Empties, in a data tree converted for a game that rebuilds its sources as it reads them
+/// ([`GameProfile::keep_source_records`]), every source `data/models.json` indexes: pack members
+/// and scenes inside files are zero-filled where they are, a converted file is zeroed whole. Files
+/// keep their sizes and packs their layout, so the game finds every source where the disc has it.
+/// Returns the number of sources emptied.
+pub fn strip_tree_dc1(data: &Path) -> CoreResult<usize> {
+    let index: Value = serde_json::from_slice(&fs::read(data.join("models.json"))?)?;
+    let converted: BTreeSet<String> = index
+        .as_object()
+        .ok_or_else(|| fail("models.json is not a source index"))?
+        .iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry["kind"].as_str(),
+                Some("model" | "animations" | "weights" | "bind_poses" | "motion_channels")
+            )
+        })
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    // Each source's file: the first of its path's parts that is a file in the data.
+    let mut files = BTreeSet::new();
+    for alias in &converted {
+        let mut file = String::new();
+        for part in alias.split('/') {
+            if !file.is_empty() {
+                file.push('/');
+            }
+            file.push_str(part.split('#').next().unwrap_or(part));
+            if data.join(&file).is_file() {
+                break;
+            }
+        }
+        files.insert(file);
+    }
+    let files: Vec<String> = files.into_iter().collect();
+    // Marked first: data with sources emptied must not run without the models that rebuild them.
+    fs::write(data.join("models.stripped"), b"")?;
+    files
+        .par_iter()
+        .map(|file| -> CoreResult<()> {
+            let path = data.join(file);
+            let mut b = fs::read(&path)?;
+            if converted.contains(file) {
+                b.fill(0);
+            } else if !scrub(&mut b, file, &converted, 0)? {
+                return Ok(());
+            }
+            // Written beside and renamed over, so an interrupted strip leaves every file whole.
+            // Named after the whole file name: "x.chr" and "x.chr_" are different files.
+            let mut staged = path.clone().into_os_string();
+            staged.push(".stripping");
+            let staged = PathBuf::from(staged);
+            fs::write(&staged, b)?;
+            fs::rename(staged, path)?;
+            Ok(())
+        })
+        .collect::<CoreResult<Vec<_>>>()?;
+    Ok(converted.len())
 }
 
 fn compact_pack(original: &[u8]) -> CoreResult<Option<Vec<u8>>> {
@@ -6491,7 +7399,9 @@ fn validate_game_names(metadata: &Value) -> CoreResult<BTreeSet<String>> {
             .rsplit_once("_v")
             .filter(|(_, n)| n.parse::<u32>().is_ok())
             .map_or(name.as_str(), |p| p.0);
-        if super::actions::english(text)? != base {
+        // A name an ASCII original gives itself may end like a uniqueness suffix.
+        let english = super::actions::english(text)?;
+        if english != name.as_str() && english != base {
             return Err(fail(format!("{name} does not translate {text}")));
         }
         names.insert(name.clone());
@@ -7042,6 +7952,7 @@ mod tests {
             resource: 0,
             channels: PackedChannels::new(&[]).unwrap(),
             actions: Vec::new(),
+            source: String::new(),
         };
         let motions = vec![
             external("event/a/foo.gltf#0"),
@@ -7087,6 +7998,7 @@ mod tests {
             resource: 0,
             channels: PackedChannels::new(&[json!({"type":1,"keys":[{}, {}, {}]})]).unwrap(),
             actions: vec![("clip".into(), 0, 90)],
+            source: String::new(),
         };
         let external = external_motion_work(&motion);
         assert!(external > 90);
@@ -7696,6 +8608,55 @@ mod tests {
         }
     }
     #[test]
+    fn retail_residue_keeps_the_motions_order_and_what_a_clip_would_change() {
+        // A rotation a hair off unit length, as the disc's often are (from Saget's motion), and an exact
+        // one inside an action; a channel without keys; a translation a clip gives back exactly.
+        let rotation = json!({"frame":2,"target":0,"type":0,"reserved_u32":[32,7,9],"keys":[
+            {"frame":0,"reserved_u32":[0,0,0],"value":[1.0,0.0,0.0,0.0]},
+            {"frame":3,"reserved_u32":[0,0,0],"value":[0.0,0.0,1.0,0.0]},
+            {"frame":5,"reserved_u32":[0,0,0],"value":[0.947_944_343_090_057_4,-0.027_186_272_665_858_27,0.305_882_424_116_134_64,-0.084_251_567_721_366_88]},
+            {"frame":10,"reserved_u32":[0,0,0],"value":[0.0,1.0,0.0,0.0]}]});
+        let empty = json!({"frame":6,"target":0,"type":2,"reserved_u32":[32,7,9],"keys":[]});
+        let translation = json!({"frame":1,"target":0,"type":2,"reserved_u32":[32,7,9],"keys":[
+            {"frame":0,"reserved_u32":[0,0,0],"value":[0.0,0.0,0.0,0.0]},
+            {"frame":3,"reserved_u32":[0,0,0],"value":[0.5,1.0,1.5,0.0]},
+            {"frame":5,"reserved_u32":[0,0,0],"value":[1.0,2.0,3.0,0.0]},
+            {"frame":10,"reserved_u32":[0,0,0],"value":[2.0,4.0,6.0,0.0]}]});
+        let residue = retail_residue(
+            &[rotation, empty, translation],
+            &[(0, 10)],
+            &BTreeSet::new(),
+        );
+        // Every channel, in the motion's order, with its header words.
+        let frames: Vec<u64> = residue
+            .iter()
+            .map(|c| c["frame"].as_u64().unwrap())
+            .collect();
+        assert_eq!(frames, [2, 6, 1]);
+        assert_eq!(residue[0]["reserved_u32"], json!([32, 7, 9]));
+        assert_eq!(residue[1]["keys"], json!([]));
+        // The rotation inside the action comes back from glTF's unit rotation other than the disc has it.
+        let kept: Vec<u64> = residue[0]["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["frame"].as_u64().unwrap())
+            .collect();
+        assert_eq!(kept, [0, 5, 10]);
+        let exact = &residue[0]["keys"][1]["value_u32"];
+        assert_eq!(residue[0]["keys"][1]["frame"], json!(5));
+        assert_eq!(exact[0], json!(0x3f72_ac7b_u32));
+        // The translation inside it comes back as it is; only its ends are kept.
+        let kept: Vec<u64> = residue[2]["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["frame"].as_u64().unwrap())
+            .collect();
+        assert_eq!(kept, [0, 10]);
+    }
+
+    #[test]
     fn rebaked_scale_keys_keep_the_authored_rotation_in_every_clip() {
         let mut gltf = Gltf::new();
         // Authored a quarter turn about z, as e101a's jnt21_1 is, with the uniform scale and an offset
@@ -7910,6 +8871,7 @@ mod tests {
             &refs,
             &mut NameBook::default(),
             &BTreeMap::new(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -8053,6 +9015,354 @@ mod tests {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
+    /// Builds an MDT with `vertices` positions and normals, `uvs` texture coordinates (none: no
+    /// stream) and optionally `colours` colours (none: offset -1), one untextured material and
+    /// strips of (prim word, rows of corner indices).
+    fn test_mdt(
+        vertices: usize,
+        uvs: usize,
+        colours: Option<usize>,
+        strips: &[(u32, Vec<Vec<u32>>)],
+    ) -> Vec<u8> {
+        let mut b = vec![0; 64];
+        b[..4].copy_from_slice(b"MDT\0");
+        let stream = |b: &mut Vec<u8>, count: usize, base: f32| {
+            let at = b.len();
+            for i in 0..count {
+                for k in 0..4 {
+                    b.extend((base + i as f32 + k as f32 / 10.).to_le_bytes());
+                }
+            }
+            at
+        };
+        let positions = stream(&mut b, vertices, 0.);
+        let normals = stream(&mut b, vertices, 0.);
+        let uv_at = if uvs > 0 { stream(&mut b, uvs, 50.) } else { 0 };
+        let colour_at = colours.map(|count| stream(&mut b, count, 0.));
+        let mesh = b.len();
+        for word in [0, 16, strips.len() as u32, 0] {
+            b.extend(word.to_le_bytes());
+        }
+        for (prim, rows) in strips {
+            for word in [*prim, rows.len() as u32, 0] {
+                b.extend(word.to_le_bytes());
+            }
+            for index in rows.iter().flatten() {
+                b.extend(index.to_le_bytes());
+            }
+        }
+        let materials = b.len();
+        b.extend(vec![0; 96]);
+        let size = b.len() as u32;
+        for (at, value) in [
+            (8, size),
+            (12, vertices as u32),
+            (16, positions as u32),
+            (20, vertices as u32),
+            (24, normals as u32),
+            (28, colours.unwrap_or(0) as u32),
+            (32, colour_at.map_or(u32::MAX, |at| at as u32)),
+            (40, mesh as u32),
+            (44, uvs as u32),
+            (48, uv_at as u32),
+            (52, 1),
+            (56, materials as u32),
+        ] {
+            put(&mut b, at, value);
+        }
+        b
+    }
+    fn mesh_with(game: &GameProfile, b: &[u8]) -> (Gltf, Value) {
+        let mut gltf = Gltf::new();
+        gltf.doc["nodes"] = json!([{"name":"f0"}]);
+        let metadata = mesh(
+            &mut gltf,
+            b,
+            0,
+            "test.mds",
+            &[],
+            &mut BTreeSet::new(),
+            &[],
+            &[identity()],
+            game,
+        )
+        .unwrap();
+        (gltf, metadata)
+    }
+
+    #[test]
+    fn fixed_strip_streams_index_every_stream_whatever_the_prim_flags() {
+        let game = GameProfile {
+            fixed_strip_streams: true,
+            ..GameProfile::default()
+        };
+        // Colours present: four indices a corner; a texture coordinate offset that isn't positive:
+        // they come from the positions; the prim word's flags (0x96) don't switch streams off.
+        let rows = vec![vec![0, 1, 2, 0], vec![1, 2, 0, 1], vec![2, 0, 1, 2]];
+        let mut b = test_mdt(3, 1, Some(3), &[(0x96, rows)]);
+        put(&mut b, 48, 0);
+        let (gltf, metadata) = mesh_with(&game, &b);
+        let primitive = &gltf.doc["meshes"][0]["primitives"][0];
+        assert_eq!(primitive["mode"], 4);
+        assert!(primitive["attributes"].get("COLOR_0").is_some());
+        let uv =
+            gltf.accessor_floats(primitive["attributes"]["TEXCOORD_0"].as_u64().unwrap() as usize);
+        assert_eq!(uv, [2., 2.1, 0., 0.1, 1., 1.1]);
+        assert_eq!(metadata["uv_count"], 1);
+        assert_eq!(
+            metadata["primitives"][0]["source_colours"],
+            json!([0, 1, 2])
+        );
+        // A colour offset of -1 means no colours: three indices a corner. A prim of 4 is a strip.
+        let rows = vec![vec![0, 0, 0], vec![1, 1, 1], vec![2, 2, 1], vec![1, 0, 0]];
+        let (gltf, _) = mesh_with(&game, &test_mdt(3, 2, None, &[(4, rows)]));
+        let primitive = &gltf.doc["meshes"][0]["primitives"][0];
+        assert_eq!(primitive["mode"], 5);
+        assert!(primitive["attributes"].get("COLOR_0").is_none());
+        assert_eq!(
+            gltf.accessor_floats(primitive["attributes"]["POSITION"].as_u64().unwrap() as usize)
+                .len(),
+            12
+        );
+    }
+
+    #[test]
+    fn strips_may_index_past_a_stream_count_into_the_meshes_own_bytes() {
+        let game = GameProfile {
+            fixed_strip_streams: true,
+            ..GameProfile::default()
+        };
+        // Index 3 of three positions reads the first normal, which follows them, as the game does.
+        let rows = vec![vec![0, 0, 0], vec![1, 1, 1], vec![3, 2, 0]];
+        let (gltf, metadata) = mesh_with(&game, &test_mdt(3, 1, None, &[(3, rows)]));
+        let primitive = &gltf.doc["meshes"][0]["primitives"][0];
+        let positions =
+            gltf.accessor_floats(primitive["attributes"]["POSITION"].as_u64().unwrap() as usize);
+        assert_eq!(positions[6..], [0., 0.1, 0.2]);
+        assert_eq!(
+            metadata["primitives"][0]["source_vertices"],
+            json!([0, 1, 3])
+        );
+        let far = vec![vec![0, 0, 0], vec![1, 1, 1], vec![100, 0, 0]];
+        let mut gltf = Gltf::new();
+        gltf.doc["nodes"] = json!([{"name":"f0"}]);
+        let b = test_mdt(3, 1, None, &[(3, far)]);
+        assert!(
+            mesh(
+                &mut gltf,
+                &b,
+                0,
+                "test.mds",
+                &[],
+                &mut BTreeSet::new(),
+                &[],
+                &[identity()],
+                &game
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kept_source_records_survive_pruning_with_the_words_no_reader_looks_at() {
+        let game = GameProfile {
+            fixed_strip_streams: true,
+            ..GameProfile::default()
+        };
+        let rows = vec![vec![0, 0, 0], vec![1, 1, 0], vec![2, 2, 0]];
+        let mut b = test_mdt(3, 1, None, &[(3, rows)]);
+        // A leftover word past the texture coordinates, before the materials.
+        let materials = u32le(&b, 56).unwrap() as usize;
+        b.splice(
+            materials..materials,
+            0x2au32.to_le_bytes().iter().copied().chain([0; 12]),
+        );
+        put(&mut b, 56, materials as u32 + 16);
+        let size = b.len() as u32;
+        put(&mut b, 8, size);
+        let (_, metadata) = mesh_with(&game, &b);
+        assert_eq!(metadata["padding_u32"], json!([[materials, 0x2a]]));
+        assert_eq!(metadata["record_u32"].as_array().unwrap().len(), 20);
+        assert_eq!(
+            metadata["materials"][0]["record_u32"]
+                .as_array()
+                .unwrap()
+                .len(),
+            24
+        );
+        let mut kept = json!({"meshes":[metadata.clone()]});
+        prune_metadata_keeping(&mut kept, true);
+        assert_eq!(kept["meshes"][0]["padding_u32"], metadata["padding_u32"]);
+        assert!(
+            kept["meshes"][0]["materials"][0]
+                .get("record_u32")
+                .is_some()
+        );
+        let mut pruned = json!({"meshes":[metadata]});
+        prune_metadata(&mut pruned);
+        assert!(pruned["meshes"][0].get("record_u32").is_none());
+        assert!(
+            pruned["meshes"][0]["materials"][0]
+                .get("record_u32")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn collision_mdt_becomes_triangles_with_their_attribute_records() {
+        let mut b = vec![0; 64];
+        b[..4].copy_from_slice(b"MDT\0");
+        for v in [[0f32, 0., 0., 1.], [1., 0., 0., 1.], [0., 0., 1., 1.]] {
+            for f in v {
+                b.extend(f.to_le_bytes());
+            }
+        }
+        let mesh_at = b.len();
+        for word in [0u32, 16, 1, 0, 0, 1, 0, 1, 2, 0, 9] {
+            b.extend(word.to_le_bytes());
+        }
+        let info = b.len();
+        for word in [7u32, 0, 0, 0] {
+            b.extend(word.to_le_bytes());
+        }
+        let size = b.len() as u32;
+        for (at, value) in [
+            (8, size),
+            (12, 3),
+            (16, 64),
+            (32, u32::MAX),
+            (40, mesh_at as u32),
+            (52, 1),
+            (56, info as u32),
+        ] {
+            put(&mut b, at, value);
+        }
+        assert_eq!(mesh_extent(&b).unwrap(), size as usize);
+        let (gltf, metadata) = mesh_with(&GameProfile::default(), &b);
+        assert_eq!(metadata["kind"], "collision");
+        assert_eq!(metadata["polygons"], json!([[0, 1, 2, 0, 9]]));
+        assert_eq!(metadata["info"], json!([[7, 0, 0, 0]]));
+        assert_eq!(gltf.doc["meshes"][0]["extras"]["collision"], true);
+        let primitive = &gltf.doc["meshes"][0]["primitives"][0];
+        assert_eq!(
+            gltf.accessor_floats(primitive["attributes"]["POSITION"].as_u64().unwrap() as usize),
+            [0., 0., 0., 1., 0., 0., 0., 0., 1.]
+        );
+    }
+
+    #[test]
+    fn unused_key_lanes_that_are_not_numbers_keep_their_words() {
+        let mut motion = test_motion(&[(0, 2, &[(0, [1., 2., 3., 0.])])]);
+        put(&mut motion, 32 + 28, u32::MAX);
+        let channels = channels(&Resource {
+            alias: "hero.mot".into(),
+            data: motion,
+        })
+        .unwrap();
+        let key = &channels[0]["keys"][0];
+        assert_eq!(key["value"], json!([1., 2., 3., 0.]));
+        assert_eq!(key["value_u32"][3], u32::MAX);
+    }
+
+    #[test]
+    fn a_game_reader_links_three_file_motions_and_keeps_key_frames() {
+        // A model whose second frame carries a mesh, skinned by weights named only beside the
+        // motion, in the game's own configuration syntax.
+        let mut model = test_model(2);
+        let mdt = test_mdt(
+            3,
+            1,
+            None,
+            &[(3, vec![vec![0, 0, 0], vec![1, 1, 0], vec![2, 2, 0]])],
+        );
+        let mdt_at = model.len() as u32;
+        put(&mut model, 16 + 112 + 40, mdt_at);
+        model.extend(mdt);
+        let weights = test_motion(&[(
+            1,
+            20,
+            &[
+                (0, [100., 0., 0., 0.]),
+                (1, [100., 0., 0., 0.]),
+                (2, [100., 0., 0., 0.]),
+            ],
+        )]);
+        let mut weights = weights;
+        put(&mut weights, 4, 0);
+        let mut bind = Vec::new();
+        for _ in 0..2 {
+            for value in identity() {
+                bind.extend(value.to_le_bytes());
+            }
+        }
+        let motion = test_motion(&[(1, 2, &[(0, [0., 0., 0., 1.]), (30, [30., 0., 0., 1.])])]);
+        let pack = test_pack(&[
+            ("hero.mds", &model),
+            ("herobas.mot", &motion),
+            ("herobas.bbp", &bind),
+            ("herobas.wgt", &weights),
+            ("info.cfg", b"game syntax"),
+        ]);
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let string = |text: &[u8]| json!({"type":"string","bytes":hex(text)});
+        let profile = json!({"commands":[
+            {"command":"MODEL","args":[string(b"hero.mds")]},
+            {"command":"MOTION","args":[{"type":"int","value":0},string(b"herobas.mot"),string(b"herobas.bbp"),string(b"herobas.wgt")]},
+            {"command":"KEY","args":[string(&shift_jis("立ち")),{"type":"int","value":5},{"type":"int","value":7},{"type":"float","value":0.05}]},
+            {"command":"KEY","args":[{"type":"none"},{"type":"int","value":10},{"type":"int","value":20},{"type":"float","value":0.5}]},
+            {"command":"MOTION_END","args":[]}
+        ]});
+        let reader = move |alias: &str, _: &[u8]| -> CoreResult<Value> {
+            Ok(if alias.ends_with("info.cfg") {
+                profile.clone()
+            } else {
+                Value::Null
+            })
+        };
+        let game = GameProfile {
+            reader: Some(Arc::new(reader)),
+            absolute_frames: true,
+            fixed_strip_streams: true,
+            keep_source_records: true,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let raw = temp.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("hero.chr"), pack).unwrap();
+        let published = temp.path().join("published");
+        convert_source_for(
+            &super::super::archive::SourceTree::directory(&raw).unwrap(),
+            &published,
+            &[],
+            &game,
+            &Phase::noop(),
+        )
+        .unwrap();
+        let doc = read_json(published.join("data/hero.gltf"));
+        let sidecar = read_json(published.join("data/hero.game.json"));
+        assert_eq!(doc["skins"].as_array().unwrap().len(), 1);
+        let names: Vec<_> = doc["animations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["idle", "herobas"]);
+        let actions = &sidecar["resources"]["animations"][0]["actions"];
+        assert_eq!(actions[0]["start"], 5);
+        assert_eq!(actions[0]["end"], 7);
+        assert_eq!(actions[1]["start"], 10);
+        let commands = sidecar["profiles"]["info"]["commands"].as_array().unwrap();
+        let motion = commands.iter().find(|c| c["command"] == "MOTION").unwrap();
+        assert_eq!(motion["args"][2]["kind"], "bind_pose");
+        assert_eq!(motion["args"][3]["kind"], "weights");
+        let key = commands.iter().find(|c| c["command"] == "KEY").unwrap();
+        assert_eq!(key["args"][0]["value"], "idle");
+        assert_eq!(key["args"][1]["value"], 5);
+        assert_eq!(key["args"][2]["value"], 7);
+        assert_eq!(sidecar["game_names"]["idle"]["value"], "立ち");
+    }
+
     #[test]
     fn key_intervals_become_named_english_actions() {
         let motion = test_motion(&[(1, 2, &[(0, [0., 0., 0., 1.]), (30, [30., 0., 0., 1.])])]);
@@ -8120,6 +9430,40 @@ mod tests {
         let (_temp, report) = convert_packs(&[("hero.chr", pack)]);
         let error = report.err().unwrap();
         assert!(error.0.contains("no English translation"), "{}", error.0);
+    }
+
+    #[test]
+    fn ascii_motion_names_the_table_lacks_name_their_actions() {
+        let motion = test_motion(&[(1, 2, &[(0, [0., 0., 0., 1.]), (30, [30., 0., 0., 1.])])]);
+        // "attack v2" names itself attack_v2, which reads like a uniqueness suffix of attack.
+        let cfg = b"MODEL \"hero.mds\";MOTION 0,\"hero.mot\",\"\",\"\";KEY_START;\
+            KEY \"stagger and fall\",0,10,0.5;KEY \"attack v2\",10,20,0.5;KEY_END;MOTION_END;";
+        let pack = test_pack(&[
+            ("hero.mds", &test_model(2)),
+            ("hero.mot", &motion),
+            ("info.cfg", cfg),
+        ]);
+        let (temp, report) = convert_packs(&[("hero.chr", pack)]);
+        report.unwrap();
+        let published = temp.path().join("published");
+        verify(&published).unwrap();
+        let doc = read_json(published.join("data/hero.gltf"));
+        let game = read_json(published.join("data/hero.game.json"));
+        let names: Vec<_> = doc["animations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["stagger_and_fall", "attack_v2"]);
+        assert_eq!(
+            game["game_names"]["stagger_and_fall"]["value"],
+            "stagger and fall"
+        );
+        assert_eq!(game["game_names"]["attack_v2"]["value"], "attack v2");
+        let commands = game["profiles"]["info"]["commands"].as_array().unwrap();
+        let key = commands.iter().find(|c| c["command"] == "KEY").unwrap();
+        assert_eq!(key["args"][0]["value"], "stagger_and_fall");
     }
 
     #[test]

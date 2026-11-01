@@ -6,7 +6,7 @@ name: Prebuilt dependencies
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths: [tools/ffmpeg/kz-ffmpeg, .github/workflows/prebuilt.yml]
   workflow_dispatch:
 
@@ -50,27 +50,45 @@ jobs:
           # The oldest glibc a consumer links against, so the static archives need no newer symbols.
           - { name: linux-x64, os: ubuntu-latest, container: 'debian:trixie-slim' }
           - { name: macos-arm64, os: macos-26 }
+          # DLLs cross-compiled with llvm-mingw, the toolchain Windows consumers link them with.
+          - { name: windows-x64, os: ubuntu-latest, container: 'debian:trixie-slim', target: windows-x64 }
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     env:
       MACOSX_DEPLOYMENT_TARGET: '14.0'
+      LLVM_MINGW: llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64
+      LLVM_MINGW_SHA256: bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21
     steps:
       - name: Install the build tools
         if: runner.os == 'Linux'
         run: apt-get update && apt-get install -y --no-install-recommends build-essential nasm python3 curl ca-certificates xz-utils
+      - name: Install llvm-mingw
+        if: matrix.target == 'windows-x64'
+        run: |
+          curl -fL --retry 3 -o llvm-mingw.tar.xz "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/$LLVM_MINGW.tar.xz"
+          echo "$LLVM_MINGW_SHA256  llvm-mingw.tar.xz" | sha256sum -c -
+          tar -xJf llvm-mingw.tar.xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
       - name: Build
         run: |
           version=$(python3 -c "import runpy; print(runpy.run_path('tools/ffmpeg/kz-ffmpeg')['VERSION'])")
-          curl -fL --retry 3 -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-$version.tar.xz"
-          python3 tools/ffmpeg/kz-ffmpeg --tarball ffmpeg.tar.xz --out "$PWD/out"
+          # ffmpeg.org drops some TLS handshakes, which plain --retry does not retry.
+          curl -fL --retry 5 --retry-all-errors --retry-delay 15 -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-$version.tar.xz"
+          target=${{ matrix.target }}
+          python3 tools/ffmpeg/kz-ffmpeg ${target:+--target "$target"} --tarball ffmpeg.tar.xz --out "$PWD/out"
           tar -xJf ffmpeg.tar.xz -O "ffmpeg-$version/COPYING.LGPLv2.1" > out/COPYING.LGPLv2.1
           rm out/configure.log
-          tar -czf "kz-ffmpeg-$version-${{ matrix.name }}.tar.gz" -C out .
+          archive="kz-ffmpeg-$version-${{ matrix.name }}"
+          if [ "$target" = windows-x64 ]; then
+            (cd out && python3 -m zipfile -c "../$archive.zip" *)
+          else
+            tar -czf "$archive.tar.gz" -C out .
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-${{ matrix.name }}
-          path: kz-ffmpeg-*.tar.gz
+          path: kz-ffmpeg-*
           if-no-files-found: error
 
   cxxbridge:

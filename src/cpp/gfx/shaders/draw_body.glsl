@@ -62,15 +62,18 @@ const uint kOpaqueTarget   = 8u;
 const uint kTransformShift = 4u;
 const uint kFactorFix      = 64u;
 const uint kLinear         = 128u;
+const uint kAemMask        = 2048u;
 
 const float kModulate = 255.0 / 128.0;
 
 #ifdef KZ_BOUND_TEXTURES
 #define TEXTURE sampler2D(u_texture, u_sampler)
 #define PALETTE sampler2D(u_palette, u_palette_sampler)
+#define AEM_MASK sampler2D(u_palette, u_sampler)
 #else
 #define TEXTURE sampler2D(u_textures[pc.texture_slot], u_samplers[pc.sampler_slot])
 #define PALETTE sampler2D(u_textures[pc.palette_slot], u_samplers[0])
+#define AEM_MASK sampler2D(u_textures[pc.palette_slot], u_samplers[pc.sampler_slot])
 #endif
 
 // textureGather returns texels (0,1), (1,1), (1,0), (0,0) of the 2x2 footprint.
@@ -118,8 +121,14 @@ vec4 SampleRgba() {
         bool  aem = (flags & kAem) != 0u;
         if (aem && (pc.flags & kLinear) != 0u) {
             vec2 corner = FootprintCorner();
-            vec4 sum    = textureGather(TEXTURE, corner, 0) + textureGather(TEXTURE, corner, 1) + textureGather(TEXTURE, corner, 2);
-            t.a      = Bilerp(vec4(greaterThan(sum, vec4(0.0))) * ta0, Footprint());
+            vec4 mask;
+            if ((pc.flags & kAemMask) != 0u) {
+                mask = textureGather(AEM_MASK, corner, 0);
+            } else {
+                vec4 sum = textureGather(TEXTURE, corner, 0) + textureGather(TEXTURE, corner, 1) + textureGather(TEXTURE, corner, 2);
+                mask = vec4(greaterThan(sum, vec4(0.0)));
+            }
+            t.a = Bilerp(mask * ta0, Footprint());
         } else {
             t.a = aem && t.r + t.g + t.b == 0.0 ? 0.0 : ta0;
         }

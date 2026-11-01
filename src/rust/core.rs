@@ -10,10 +10,10 @@ pub mod actions;
 pub mod archive;
 #[path = "artifacts.rs"]
 pub mod artifacts;
-#[path = "classic_zip.rs"]
-pub mod classic_zip;
 #[path = "audio.rs"]
 pub mod audio;
+#[path = "classic_zip.rs"]
+pub mod classic_zip;
 #[path = "configs.rs"]
 pub mod configs;
 #[path = "configs_native.rs"]

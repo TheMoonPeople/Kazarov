@@ -21,6 +21,100 @@
 
 namespace gfx::detail {
 
+/**
+ * Distinguishes pending feedback from validated admission and invalid bounded probes.
+ */
+enum class PresentedFeedbackStatus {
+    Pending,
+    Ready,
+    Invalid,
+    Timeout
+};
+
+/**
+ * Carries one validated producer-history observation for exact predecessor admission.
+ */
+struct PresentedFeedbackObservation {
+    bool     valid = true;              /**< Whether producer mode and transport validation succeeded. */
+    uint64_t latest_id = 0;             /**< Newest producer frame identifier. */
+    bool     predecessor_found = false; /**< Whether the exact expected frame is retained. */
+    uint64_t enqueue_ns = 0;            /**< Exact predecessor enqueue timestamp. */
+    bool     presented = false;         /**< Whether the predecessor is in the Presented state. */
+    uint64_t presentation_ns = 0;       /**< Positive presentation callback timestamp, when available. */
+};
+
+/**
+ * Retains one bounded predecessor polling budget across worker yields and blocking admission.
+ */
+struct PresentedFeedbackBudget {
+    bool     active = false;          /**< Whether an admission episode has started. */
+    bool     identity_set = false;    /**< Whether an exact predecessor identity was observed. */
+    uint64_t begin_ns = 0;            /**< First demand for this admission episode. */
+    uint64_t last_ns = 0;             /**< Most recent validated monotonic clock sample. */
+    uint64_t expected_id = 0;         /**< Exact predecessor bound to this episode. */
+    uint64_t expected_enqueue_ns = 0; /**< Stable predecessor enqueue identity. */
+    uint32_t queries = 0;             /**< Queries consumed without resetting a pending episode. */
+
+    /**
+     * Admits one query within the cumulative clock and query limits.
+     */
+    PresentedFeedbackStatus BeginQuery(uint64_t now_ns) {
+        if (now_ns == 0 || (active && now_ns < last_ns)) {
+            return PresentedFeedbackStatus::Invalid;
+        }
+        if (!active) {
+            active = true;
+            begin_ns = now_ns;
+        }
+        if (now_ns - begin_ns >= 100'000'000 || queries >= 128) {
+            return PresentedFeedbackStatus::Timeout;
+        }
+        last_ns = now_ns;
+        ++queries;
+        return PresentedFeedbackStatus::Pending;
+    }
+
+    /**
+     * Validates exact predecessor feedback and the elapsed budget after a synchronous query.
+     */
+    PresentedFeedbackStatus Observe(uint64_t id, uint64_t enqueue, const PresentedFeedbackObservation &observation, uint64_t now_ns) {
+        if (!active || now_ns < last_ns || !observation.valid) {
+            return PresentedFeedbackStatus::Invalid;
+        }
+        last_ns = now_ns;
+        if (now_ns - begin_ns >= 100'000'000) {
+            return PresentedFeedbackStatus::Timeout;
+        }
+        if (identity_set && (id != expected_id || enqueue != expected_enqueue_ns)) {
+            return PresentedFeedbackStatus::Invalid;
+        }
+        identity_set = true;
+        expected_id = id;
+        expected_enqueue_ns = enqueue;
+        if (observation.latest_id != id) {
+            return PresentedFeedbackStatus::Invalid;
+        }
+        if (id == 0) {
+            return PresentedFeedbackStatus::Ready;
+        }
+        if (!observation.predecessor_found || observation.enqueue_ns != enqueue) {
+            return PresentedFeedbackStatus::Invalid;
+        }
+        if (!observation.presented || observation.presentation_ns == 0) {
+            return PresentedFeedbackStatus::Pending;
+        }
+        if (observation.presentation_ns < enqueue || observation.presentation_ns > now_ns) {
+            return PresentedFeedbackStatus::Invalid;
+        }
+        return PresentedFeedbackStatus::Ready;
+    }
+
+    /**
+     * Starts a fresh episode only after ready admission or validated queue advancement.
+     */
+    void Reset() { *this = {}; }
+};
+
 inline constexpr uint32_t kFramesInFlight = 4;
 // Descriptor slots in the bindless array; a handle's low 16 bits are its slot.
 inline constexpr uint32_t kMaxTextures = 8192;
@@ -115,8 +209,11 @@ struct Texture {
     uint32_t    logical_width = 0;
     uint32_t    logical_height = 0;
     // The frame serial in which the draw command buffer last touched the image.
-    uint64_t last_draw_use = 0;
-    uint64_t opaque_alpha_mips = 0; /**< Fully initialized RGBA8 mip levels with alpha255 throughout. */
+    uint64_t      last_draw_use = 0;
+    uint64_t      opaque_alpha_mips = 0;   /**< Fully initialized RGBA8 mip levels with alpha255 throughout. */
+    uint64_t      nonblack_rgb_mips = 0;   /**< Fully initialized RGBA8 mip levels without black RGB texels. */
+    TextureHandle aem_mask = kNullTexture; /**< Owned R8 image containing the RGB nonblack predicate. */
+    uint64_t      aem_mask_mips = 0;       /**< Companion mip levels that exactly describe the owner's uploaded RGB. */
     // The recording that owns destruction: only it may record further uses, but replays stay live.
     const DisplayList *doomed = nullptr;
 };
@@ -130,19 +227,46 @@ struct Mesh {
     uint64_t             last_draw_use = 0;
     std::array<float, 3> bounds_min = {};
     std::array<float, 3> bounds_max = {};
-    bool                 bounds_known = false; /**< Static upload bounds; vertex updates invalidate them. */
+    bool                 bounds_known = false;         /**< Static upload bounds; vertex updates invalidate them. */
+    bool                 bounds_normal_inputs = false; /**< Every immutable uploaded position component is zero or normal. */
+    std::array<float, 3> skin_bounds_min = {};         /**< Bounds of the position slots in the packed skin stream. */
+    std::array<float, 3> skin_bounds_max = {};         /**< Upper bounds of the packed skin positions. */
+    double               skin_weight_sum_min = 0.0;    /**< Conservative least sum of the four nonnegative shader weights. */
+    double               skin_weight_sum_max = 0.0;    /**< Conservative greatest sum of the four shader weights. */
+    uint32_t             skin_bones = 0;               /**< Bone slots referenced by all four influences, including zero weights. */
+    bool                 skin_bounds_known = false;    /**< Packed positions and weight intervals remain immutable and valid. */
     const DisplayList   *doomed = nullptr;
 };
 
 /**
- * Enable conservative near-safe plain-mesh fog specialization.
+ * Enables conservative near-safe vertex-fog specialization.
  */
 bool NearSafeFogEnabled();
+
+/**
+ * Enables companion nonblack masks for immutable RGB24 texture filtering.
+ */
+bool TexaMaskEnabled();
 
 /**
  * Prove positive clip W and zero near/eye fog markers over static mesh bounds.
  */
 bool MeshFogIsNearSafe(const Mesh &mesh, const MeshConstants &constants);
+
+/**
+ * Proves finite rigid Prog0 fog interpolation with positive W and zero near-crossing markers.
+ */
+bool Prog0FogIsNearSafe(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0);
+
+/**
+ * Describes immutable packed skin positions, referenced bones and positive weight-sum intervals.
+ */
+void SetMeshSkinBounds(Mesh &mesh, std::span<const Vertex3D> vertices, std::span<const uint32_t> indices);
+/**
+ * Bounds shader-skinned positions under the actual palette, including weight sums and float rounding.
+ */
+bool SkinnedMeshPositionBounds(const Mesh &mesh, const Prog0Palette &palette,
+                               std::array<float, 3> &bounds_min, std::array<float, 3> &bounds_max);
 
 struct TransientChunk {
     Buffer       buffer;
@@ -194,10 +318,14 @@ struct Frame {
     VkCommandPool               pool = VK_NULL_HANDLE;
     VkCommandBuffer             upload_cmd = VK_NULL_HANDLE;
     VkCommandBuffer             draw_cmd = VK_NULL_HANDLE;
+    VkCommandBuffer             present_cmd = VK_NULL_HANDLE; /**< Final swapchain transfer retained through the slot fence. */
+    bool                        split_submit = false;         /**< This frame submitted replay separately from its swapchain transfer. */
+    bool                        split_timestamps = false;     /**< Both optional replay/copy boundary queries were recorded. */
     bool                        upload_open = false;
     VkSemaphore                 image_available = VK_NULL_HANDLE;
     VkFence                     fence = VK_NULL_HANDLE;
     bool                        pending = false;
+    bool                        presents = false; /**< Whether the pending submission ends in a present. */
     std::vector<TransientChunk> chunks;
     uint32_t                    chunk = 0;
     // Upload sources, apart from chunks so that a load's worth of texels never takes descriptor sets.
@@ -320,6 +448,7 @@ enum PushFlags : uint32_t {
     kPushTransformShift = 4,
     kPushFactorFix = 1u << 6,
     kPushLinear = 1u << 7,
+    kPushAemMask = 1u << 11,
     kPushVariableMeshFog = 1u << 31,
 };
 
@@ -356,6 +485,8 @@ inline constexpr uint32_t kNearSafeFogScope = UINT32_MAX - 3;
 inline constexpr uint32_t kNearSafeFogAlphaScope = UINT32_MAX - 4;
 inline constexpr uint32_t kDepthPlanesScope = UINT32_MAX - 5;
 inline constexpr uint32_t kZeroAlphaNoopScope = UINT32_MAX - 6;
+inline constexpr uint32_t kProg0NearSafeFogAlphaScope = UINT32_MAX - 7;
+inline constexpr uint32_t kProg0NearSafeFogBlendScope = UINT32_MAX - 8;
 
 /**
  * One coverage draw of a depth-planes pass.
@@ -398,6 +529,8 @@ struct FrameCounters {
     uint32_t passes = 0;
     uint32_t mesh_draws = 0;
     uint32_t draws_2d = 0;
+    uint32_t bounded_presentation_regions = 0; /**< Scratch regions replayed with a proven smaller display rectangle. */
+    uint32_t near_safe_prog0_fog = 0;          /**< Rigid Prog0 draws using proven vertex-fog reconstruction. */
     uint32_t grab_copies = 0;
     uint32_t grab_precopies = 0;
     uint32_t descriptor_binds = 0;
@@ -467,8 +600,15 @@ struct Context {
     PlaneTable                    plane_table;
     std::array<VkPipeline, 2>     near_safe_fog_pipelines = {};
     std::array<uint32_t, 2>       near_safe_fog_bases = {UINT32_MAX, UINT32_MAX};
-    VkPipeline                    zero_alpha_noop_pipeline = VK_NULL_HANDLE; /**< Exact-zero discard for RGB-only source-over sprites. */
-    uint32_t                      zero_alpha_noop_base = UINT32_MAX;         /**< Ordinary pipeline whose draw states permit exact-zero discard. */
+    std::array<VkPipeline, 2>     prog0_near_safe_fog_pipelines = {};                   /**< Exact fog variants for alpha-tested and blended rigid Prog0. */
+    std::array<uint32_t, 2>       prog0_near_safe_fog_bases = {UINT32_MAX, UINT32_MAX}; /**< Generic pipelines replaced by those variants. */
+    uint64_t                      prog0_fog_candidates = 0;                             /**< Draws matching the targeted fog and blend states. */
+    uint64_t                      prog0_fog_selected = 0;                               /**< Draws proven safe and submitted through an exact fog variant. */
+    uint64_t                      prog0_fog_unknown = 0;                                /**< Targeted draws without immutable position bounds. */
+    uint64_t                      prog0_fog_skinned = 0;                                /**< Targeted draws retaining the generic skin fog path. */
+    uint64_t                      prog0_fog_unsafe = 0;                                 /**< Targeted rigid draws without a complete numerical proof. */
+    VkPipeline                    zero_alpha_noop_pipeline = VK_NULL_HANDLE;            /**< Exact-zero discard for RGB-only source-over sprites. */
+    uint32_t                      zero_alpha_noop_base = UINT32_MAX;                    /**< Ordinary pipeline whose draw states permit exact-zero discard. */
     uint32_t                      blend_slot_count = 0;
     std::array<BlendMapping, 162> blend_map = {};
     double                        pipeline_seconds = 0.0;
@@ -489,19 +629,29 @@ struct Context {
 
     // Display lists. The canonical render of a list draws into main_color like an immediate frame;
     // a display render draws into display_color with display_depth.
-    uint64_t                     renderer_instance = 0;
-    uint64_t                     canonical_target_generation = 0; /**< Main-image allocation identity. */
-    uint64_t                     canonical_commit_serial = 0;     /**< Most recently completed canonical render. */
-    uint64_t                     list_serial = 0;
-    std::shared_ptr<DisplayList> list;
-    TextureHandle                record_target = kMainTarget;
-    InterpKey                    interp_key = 0;
-    Interp2D                     interp_2d;
-    bool                         interp_no_interpolation = false;
-    float                        interp_teleport_distance = INFINITY;
-    bool                         interp_blend_vertices = false;
-    Image                        display_color;
-    Image                        display_depth;
+    uint64_t                           renderer_instance = 0;
+    uint64_t                           canonical_target_generation = 0;     /**< Main-image allocation identity. */
+    uint64_t                           canonical_commit_serial = 0;         /**< Most recently completed canonical render. */
+    bool                               canonical_commit_pending = false;    /**< A submitted canonical image awaits its bounded retirement callback. */
+    std::optional<CanonicalImageToken> deferred_prior_image;                /**< Exact prior identity permitted during a pending commit. */
+    const DisplayList                 *deferred_prior_overlay = nullptr;    /**< Only host overlay permitted during that retirement. */
+    bool                               deferred_endpoint_attempted = false; /**< Whether the single permitted retirement was attempted. */
+    bool                               split_replay_submit = false;         /**< Default-off separation of replay rendering from the acquire-dependent copy. */
+    uint64_t                           split_replay_candidates = 0;         /**< Display replays eligible for the optional split path. */
+    uint64_t                           split_replay_selected = 0;           /**< Display replays recorded into separate retained command buffers. */
+    uint64_t                           split_replay_first_submits = 0;      /**< Successful acquire-independent replay submissions. */
+    uint64_t                           split_replay_final_submits = 0;      /**< Successful fence-owning final transfer submissions. */
+    uint64_t                           split_replay_timed = 0;              /**< Split frames carrying both optional boundary timestamps. */
+    uint64_t                           list_serial = 0;
+    std::shared_ptr<DisplayList>       list;
+    TextureHandle                      record_target = kMainTarget;
+    InterpKey                          interp_key = 0;
+    Interp2D                           interp_2d;
+    bool                               interp_no_interpolation = false;
+    float                              interp_teleport_distance = INFINITY;
+    bool                               interp_blend_vertices = false;
+    Image                              display_color;
+    Image                              display_depth;
     // The newest main_color image is a canonical render no immediate frame has followed.
     bool canonical_newest = false;
     bool presented_display = false;
@@ -542,11 +692,13 @@ extern Context g;
 // host_draws: the list being replayed is the host's own 2D, which the full-frame rule leaves as drawn.
 // interpolation_tint: display replay only, packed into push flags bits 8-10.
 struct ThreadFlags {
-    bool     replaying = false;
-    bool     display_pass = false;
-    bool     quiet = false;
-    bool     host_draws = false;
-    bool     in_idle_hook = false;
+    bool replaying = false;
+    bool display_pass = false;
+    bool quiet = false;
+    bool host_draws = false;
+    bool in_idle_hook = false;
+    // Whether the worker runs a job queued by RunOnRenderThreadAsync, which opens no frame for the game thread.
+    bool     in_async_job = false;
     uint32_t interpolation_tint = 0;
     // Set around the 2D draws of one depth-planes coverage: they select its pipeline and bounds.
     const PlaneDraw *plane_draw = nullptr;
@@ -573,12 +725,38 @@ void AssertDeviceThread(const char *what);
 // Frames of RenderList: a canonical one draws into main_color and harvests depth queries, a
 // display one into display_color (starting from the canonical image when base) and presents it
 // when present. False when a display frame cannot present.
-bool OpenListFrame(bool canonical, bool present, bool base, double preparation_ms = 0.0);
+bool OpenListFrame(bool canonical, bool present, bool base, double preparation_ms = 0.0, bool canonical_prepared = false);
 // The main targets take the window's size before a tick records draws laid out for them.
 void PrepareRecording();
 // PrepareRecording, dispatched only when it has work; callable from the game thread while it records.
-void            PrepareRecordingFromCaller();
-void            CloseListFrame(bool canonical, bool present);
+void PrepareRecordingFromCaller();
+
+/**
+ * Keeps a precommit callback and its prior image inside one device-owned canonical replay.
+ */
+struct CanonicalCommitTransaction {
+    CanonicalImageToken          prior;                 /**< Exact latest image before replay. */
+    const DisplayList           *overlay = nullptr;     /**< Declared safe host overlay for its retirement. */
+    const std::function<void()> *callback = nullptr;    /**< Synchronous retirement callback, never retained. */
+    uint64_t                     renderer_instance = 0; /**< Renderer lifetime validated before replay. */
+    uint64_t                     target_generation = 0; /**< Main allocation validated before replay. */
+    uint64_t                     commit_serial = 0;     /**< Latest completed image before replay. */
+    uint32_t                     image_index = 0;       /**< Canonical destination slot awaiting commit. */
+};
+
+/**
+ * Synchronizes canonical target storage before a preservation check.
+ */
+bool PrepareCanonicalTargets();
+/**
+ * Checks the restricted host overlay permitted while a canonical commit is pending.
+ */
+bool DeferredCanonicalOverlaySafe(const DisplayList *overlay);
+/**
+ * Reports the validated old-endpoint rendering scope on the device owner.
+ */
+bool            CanonicalEndpointScopeActive();
+void            CloseListFrame(bool canonical, bool present, const CanonicalCommitTransaction *transaction = nullptr);
 Frame          &CurrentFrame();
 VkCommandBuffer UploadCommands();
 VkCommandBuffer DrawCommands();
@@ -637,12 +815,16 @@ void DestroyDoomedTexture(TextureHandle handle);
 void DestroyDoomedMesh(MeshHandle handle);
 
 // pipelines.cpp
-void     CreatePipelineLayout();
-bool     DepthPlanesEnabled();
-void     CreatePipelines();
-void     DestroyPipelines();
-uint32_t PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, AlphaVariant alpha,
-                       uint32_t fragment_features);
+void CreatePipelineLayout();
+bool DepthPlanesEnabled();
+void CreatePipelines();
+void DestroyPipelines();
+/**
+ * Returns a regular pipeline, creating it on first use when prewarming is disabled.
+ */
+VkPipeline PipelineByIndex(uint32_t index);
+uint32_t   PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, AlphaVariant alpha,
+                         uint32_t fragment_features);
 // Without a dynamic colour write mask: the alpha-testing pipelines that write no colour, after the others.
 uint32_t NoColorPipelineIndex(PipelineFamily family, TextureMode mode);
 // The depth and stencil only pipelines, which have no fragment stage, last.

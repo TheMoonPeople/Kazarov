@@ -57,9 +57,21 @@ public:
     std::uint64_t DataOffset(std::size_t index) const;
 
 private:
+    /**
+     * Returns the calling thread's own stream on the archive, so reads on different threads never wait for each other.
+     */
+    std::ifstream &Stream() const;
+
+    /**
+     * Validates the local file header at the start of bytes, read from the entry's header offset, and returns how far
+     * into them its data begins.
+     */
+    std::uint64_t LocalDataStart(const Entry &entry, std::span<const std::uint8_t> bytes) const;
+
+    std::filesystem::path              path_;             /**< Archive file, which each reading thread opens. */
+    std::uint64_t                      id_{};             /**< Identity of this archive among every one opened. */
     std::vector<Entry>                 entries_;          /**< Validated file directory. */
-    mutable std::ifstream              file_;             /**< Shared seekable archive stream. */
-    mutable std::mutex                 mutex_;            /**< Protects stream positioning. */
+    mutable std::mutex                 mutex_;            /**< Protects data_offsets_. */
     std::uint64_t                      central_offset_{}; /**< Upper bound of local file data. */
     mutable std::vector<std::uint64_t> data_offsets_;     /**< Lazily validated local data offsets. */
 };

@@ -1,15 +1,19 @@
 """kz-ffmpeg: the LGPL configure line, the build stamp, and the refusals."""
 
 import hashlib
+from http.client import IncompleteRead
 import io
 import json
 import os
+import runpy
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -237,3 +241,88 @@ def test_the_image_build_is_lgpl():
     assert result.returncode == 0, result.stderr
     lines = (out / 'configure.log').read_text().splitlines()
     assert LICENSE_LINE in [line.rstrip() for line in lines]
+
+
+@pytest.fixture
+def download_helper(monkeypatch):
+    helper = runpy.run_path(str(KZ_FFMPEG))
+    monkeypatch.setattr(helper['time'], 'sleep', Mock())
+    return helper
+
+
+def test_download_retries_connection_reset_atomically(tmp_path, monkeypatch, download_helper):
+    content = b'verified FFmpeg source'
+    destination = tmp_path / 'source.tar.xz'
+    destination.write_bytes(b'previous verified archive')
+    attempts = Mock(side_effect=[ConnectionResetError('connection reset'), io.BytesIO(content)])
+    monkeypatch.setattr(download_helper['urllib'].request, 'urlopen', attempts)
+
+    download_helper['download'](destination, hashlib.sha256(content).hexdigest())
+
+    assert destination.read_bytes() == content
+    assert not destination.with_name(destination.name + '.partial').exists()
+    assert attempts.call_count == 2
+    assert all(call.kwargs['timeout'] == 120 for call in attempts.call_args_list)
+
+
+@pytest.mark.parametrize('failure', [ConnectionResetError('interrupted body'), IncompleteRead(b'partial', 9)])
+def test_download_discards_an_interrupted_body(tmp_path, monkeypatch, download_helper, failure):
+    class InterruptedBody(io.BytesIO):
+        def read(self, size=-1):
+            if self.tell():
+                raise failure
+            return super().read(size)
+
+    content = b'complete archive'
+    destination = tmp_path / 'source.tar.xz'
+    attempts = Mock(side_effect=[InterruptedBody(b'partial archive'), io.BytesIO(content)])
+    monkeypatch.setattr(download_helper['urllib'].request, 'urlopen', attempts)
+
+    download_helper['download'](destination, hashlib.sha256(content).hexdigest())
+
+    assert destination.read_bytes() == content
+    assert not destination.with_name(destination.name + '.partial').exists()
+    assert attempts.call_count == 2
+
+
+def test_download_retries_checksum_failure(tmp_path, monkeypatch, download_helper):
+    content = b'complete verified archive'
+    destination = tmp_path / 'source.tar.xz'
+    attempts = Mock(side_effect=[io.BytesIO(b'truncated archive'), io.BytesIO(content)])
+    monkeypatch.setattr(download_helper['urllib'].request, 'urlopen', attempts)
+
+    download_helper['download'](destination, hashlib.sha256(content).hexdigest())
+
+    assert destination.read_bytes() == content
+    assert attempts.call_count == 2
+
+
+@pytest.mark.parametrize('failure', ['network', 'checksum'])
+def test_download_failure_preserves_verified_archive(tmp_path, monkeypatch, download_helper, failure):
+    destination = tmp_path / 'source.tar.xz'
+    original = b'previous verified archive'
+    destination.write_bytes(original)
+    responses = ([ConnectionResetError('connection reset')] * 5 if failure == 'network'
+                 else [io.BytesIO(b'unverified source') for _ in range(5)])
+    attempts = Mock(side_effect=responses)
+    monkeypatch.setattr(download_helper['urllib'].request, 'urlopen', attempts)
+
+    with pytest.raises(SystemExit, match='after five attempts'):
+        download_helper['download'](destination, '0' * 64)
+
+    assert destination.read_bytes() == original
+    assert not destination.with_name(destination.name + '.partial').exists()
+    assert attempts.call_count == 5
+
+
+def test_native_macos_stamp_tracks_deployment_target(monkeypatch):
+    helper = runpy.run_path(str(KZ_FFMPEG))
+    stamp = helper['expected_stamp']
+    monkeypatch.setitem(stamp.__globals__, 'sys', SimpleNamespace(platform='darwin'))
+    monkeypatch.setenv('MACOSX_DEPLOYMENT_TARGET', '14.0')
+    baseline = stamp('digest', None)
+    monkeypatch.setenv('MACOSX_DEPLOYMENT_TARGET', '27.0')
+
+    assert baseline != stamp('digest', None)
+    assert baseline['macos_deployment_target'] == '14.0'
+    assert 'macos_deployment_target' not in stamp('digest', 'switch-arm64')

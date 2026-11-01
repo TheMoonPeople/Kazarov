@@ -8,8 +8,9 @@
 # binutils-mips-ps2-decompals needs glibc 2.38.
 
 # SatansFiddle, the compiler wrapper that stands in for statefix in ChronicleTwo.
-FROM debian:trixie-slim AS satansfiddle-build
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS satansfiddle-build
 ARG SATANSFIDDLE_REV=365415fa2fd7bf69e899044b704b571a64ed4e6c
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates git cargo build-essential liblldb-19-dev \
@@ -48,15 +49,17 @@ RUN cargo build --release --locked --jobs 3 \
 #
 # Image
 #
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 
 # Tool versions
 ARG BINUTILS_VERSION=v0.10
-ARG CLANGD_VERSION=22.1.6
+ARG BINUTILS_SHA256=9fe31ea3ee1a37536f9f0e2e12c668e7c3cb99e59f5154bd2f1fc4762473094c
 ARG OBJDIFF_VERSION=v3.7.3
+ARG OBJDIFF_SHA256=1c8a7564970e86b548f0921908d36e5b54646fe72f86e5c82b8c0eba64020cea
 ARG LLVM_VERSION=23
 
 ENV DEBIAN_FRONTEND=noninteractive
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries
 ENV BINUTILS=/usr/local/binutils-mips-ps2-decompals
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=${VIRTUAL_ENV}/bin:/usr/lib/llvm-${LLVM_VERSION}/bin:${PATH}:${BINUTILS}
@@ -78,6 +81,7 @@ RUN apt-get update \
         less \
         python3 \
         python3-venv \
+        python3-pytest \
         cmake \
         ninja-build \
         gdb \
@@ -101,21 +105,26 @@ RUN apt-get update \
         libgtest-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# clang, lld and llvm for the PC port. Debian stops at LLVM 19, so these come
-# from apt.llvm.org and install under /usr/lib/llvm-<version>/bin.
-RUN wget -qO /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
-    && echo "deb http://apt.llvm.org/trixie/ llvm-toolchain-trixie-${LLVM_VERSION} main" \
+# clang, lld and llvm for the PC port, with compiler-rt for its AddressSanitizer build. Debian stops at
+# LLVM 19, so these come from apt.llvm.org and install under /usr/lib/llvm-<version>/bin.
+RUN wget --tries=5 --timeout=30 --retry-connrefused -qO /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
+    && echo "deb https://apt.llvm.org/trixie/ llvm-toolchain-trixie-${LLVM_VERSION} main" \
         > /etc/apt/sources.list.d/llvm.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         clang-${LLVM_VERSION} \
+        clangd-${LLVM_VERSION} \
+        clang-format-${LLVM_VERSION} \
+        clang-tidy-${LLVM_VERSION} \
         lld-${LLVM_VERSION} \
         llvm-${LLVM_VERSION} \
+        libclang-rt-${LLVM_VERSION}-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Assembler, objcopy, objdump, readelf and nm for the PS2 decompilation projects.
-RUN wget -O /tmp/binutils.tar.gz \
+RUN wget --tries=5 --timeout=30 --retry-connrefused -O /tmp/binutils.tar.gz \
         https://github.com/decompals/binutils-mips-ps2-decompals/releases/download/${BINUTILS_VERSION}/binutils-mips-ps2-decompals-linux-x86-64.tar.gz \
+    && echo "${BINUTILS_SHA256}  /tmp/binutils.tar.gz" | sha256sum -c - \
     && mkdir -p ${BINUTILS} \
     && tar xzf /tmp/binutils.tar.gz -C ${BINUTILS} \
     && rm /tmp/binutils.tar.gz
@@ -126,18 +135,14 @@ COPY --from=ghcr.io/decompals/wibo@sha256:3a89948cf841cd6ae2555eb9d8b8ba60c35700
 COPY --from=satansfiddle-build /satansfiddle-production /usr/local/bin/satansfiddle
 COPY --from=satansfiddle-build /satansfiddle-tests/ /usr/local/libexec/satansfiddle-tests/
 
-# clangd formats the tree with the same clang-format it bundles; the two must
-# agree on .clang-format, so both come from the same version.
-RUN wget -O /tmp/clangd.zip \
-        https://github.com/clangd/clangd/releases/download/${CLANGD_VERSION}/clangd-linux-${CLANGD_VERSION}.zip \
-    && unzip -q /tmp/clangd.zip -d /opt \
-    && ln -s /opt/clangd_${CLANGD_VERSION}/bin/clangd /usr/local/bin/clangd \
-    && ln -s /opt/clangd_${CLANGD_VERSION}/bin/clangd /usr/bin/clangd \
-    && rm /tmp/clangd.zip
+# The language server and formatting tools share the compiler's signed LLVM packages.
+RUN ln -s /usr/lib/llvm-${LLVM_VERSION}/bin/clangd /usr/local/bin/clangd \
+    && ln -s /usr/lib/llvm-${LLVM_VERSION}/bin/clangd /usr/bin/clangd
 
 # Single static binary that compares each unit against retail.
-RUN wget -O /usr/local/bin/objdiff-cli \
+RUN wget --tries=5 --timeout=30 --retry-connrefused -O /usr/local/bin/objdiff-cli \
         https://github.com/encounter/objdiff/releases/download/${OBJDIFF_VERSION}/objdiff-cli-linux-x86_64 \
+    && echo "${OBJDIFF_SHA256}  /usr/local/bin/objdiff-cli" | sha256sum -c - \
     && chmod +x /usr/local/bin/objdiff-cli
 
 # splat is the disassembler; its MIPS support is an extra and must be named.
@@ -145,7 +150,10 @@ RUN wget -O /usr/local/bin/objdiff-cli \
 # imports; m2c vendors its own pycparser.
 RUN python3 -m venv ${VIRTUAL_ENV} \
     && ${VIRTUAL_ENV}/bin/python -m pip install --no-cache-dir \
-        pycdlib "splat64[mips]==0.50.0" libclang "graphviz~=0.20.1" toml levenshtein
+        pycdlib==1.22.0 "splat64[mips]==0.50.0" libclang==18.1.1 graphviz==0.20.3 toml==0.10.2 levenshtein==0.27.5 \
+        colorama==0.4.6 crunch64==0.6.2 intervaltree==3.1.0 n64img==0.3.3 pygfxd==1.0.5 \
+        pylibyaml==0.1.0 pypng==0.20220715.0 pyyaml==6.0.3 rabbitizer==1.16.2 rapidfuzz==3.14.6 \
+        sortedcontainers==2.4.0 spimdisasm==1.42.4 tqdm==4.67.1
 
 # m2c and mwccps2-debugger, pinned by commit.
 RUN mkdir -p /opt/kazarov/m2c /opt/kazarov/mwccps2-debugger \
@@ -171,7 +179,7 @@ ENV KZ_FFMPEG_DIR=/opt/kazarov/ffmpeg
 
 # The native data publisher is Rust 1.99.0, linked to its C++ CLI through cxx.
 # Install the official release only after its digest matches the pinned source.
-RUN wget -O /tmp/rust.tar.xz \
+RUN wget --tries=5 --timeout=30 --retry-connrefused -O /tmp/rust.tar.xz \
         https://static.rust-lang.org/dist/2026-10-01/rust-1.99.0-x86_64-unknown-linux-gnu.tar.xz \
     && echo '891c6366d7100feda0bca4c03ce63f3c9ac827cbebbc283e7433061d42c6a376  /tmp/rust.tar.xz' | sha256sum -c - \
     && tar -xJf /tmp/rust.tar.xz -C /tmp \
@@ -180,7 +188,7 @@ RUN wget -O /tmp/rust.tar.xz \
 ENV PATH=/opt/rust-1.99.0/bin:${PATH}
 RUN cargo install cxxbridge-cmd --version 1.0.205 --locked
 
-RUN wget -O /tmp/corrosion.zip \
+RUN wget --tries=5 --timeout=30 --retry-connrefused -O /tmp/corrosion.zip \
         https://github.com/corrosion-rs/corrosion/archive/refs/tags/v0.6.1.zip \
     && echo '5c1c5c6ab7196fe4466321c14e9698ec2d0a977c89fd9f1639a37fcffdf604f2  /tmp/corrosion.zip' | sha256sum -c - \
     && unzip -q /tmp/corrosion.zip -d /opt/kazarov \

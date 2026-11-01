@@ -1,16 +1,263 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <format>
+#include <limits>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
-#include "tests/gfx_fixture.hpp"
 #include "platform/overlay.hpp"
+#include "tests/gfx_fixture.hpp"
 
 using namespace dc::test;
+
+namespace {
+
+/**
+ * Evaluates matching with a direct ordered scan independent of candidate buckets.
+ */
+std::vector<int32_t> ReferenceMeshMatches(const gfx::DisplayList &list, const gfx::DisplayList &previous,
+                                          std::unordered_set<gfx::InterpKey> &instanced) {
+    using Records = std::unordered_map<gfx::InterpKey, std::vector<int32_t>>;
+    const auto groups = [&](const gfx::DisplayList &source) {
+        Records result;
+        for (size_t index = 0; index < source.records.size(); ++index) {
+            const auto &record = source.records[index];
+            if (!record.key || !record.has_transform) {
+                continue;
+            }
+            auto &family = result[record.key];
+            if (!family.empty() && source.records[family.front()].model != record.model) {
+                instanced.insert(record.key);
+            }
+            family.push_back(static_cast<int32_t>(index));
+        }
+        return result;
+    };
+    const auto before = groups(previous);
+    const auto now = groups(list);
+    const auto mirrored = [](const gfx::detail::Mat4 &m) {
+        const float cross_x = m[5] * m[10] - m[6] * m[9];
+        const float cross_y = m[6] * m[8] - m[4] * m[10];
+        const float cross_z = m[4] * m[9] - m[5] * m[8];
+        return m[0] * cross_x + m[1] * cross_y + m[2] * cross_z < 0;
+    };
+    const auto distance = [](const auto &a, const auto &b) {
+        const float x = b.model[12] - a.model[12];
+        const float y = b.model[13] - a.model[13];
+        const float z = b.model[14] - a.model[14];
+        return std::sqrt(x * x + y * y + z * z);
+    };
+    const auto compatible = [&](int32_t index, int32_t candidate) {
+        const auto &record = list.records[index];
+        const auto &earlier = previous.records[candidate];
+        const auto &a = std::get<gfx::detail::MeshEntry>(list.entries[record.entry]);
+        const auto &b = std::get<gfx::detail::MeshEntry>(previous.entries[earlier.entry]);
+        if (mirrored(record.model) != mirrored(earlier.model) || a.mesh != b.mesh ||
+            a.binding != b.binding || a.first_index != b.first_index || a.index_count != b.index_count ||
+            (a.prog0 >= 0) != (b.prog0 >= 0)) {
+            return false;
+        }
+        if (a.mesh != gfx::kNullMesh) {
+            return true;
+        }
+        if (a.indices != b.indices || a.vertices.size() != b.vertices.size()) {
+            return false;
+        }
+        bool identical = true;
+        for (size_t vertex = 0; vertex < a.vertices.size(); ++vertex) {
+            identical &= std::memcmp(&a.vertices[vertex], &b.vertices[vertex], sizeof(gfx::Vertex3D)) == 0;
+        }
+        if (identical) {
+            return true;
+        }
+        if (!record.blend_vertices || !earlier.blend_vertices || record.occurrence != earlier.occurrence) {
+            return false;
+        }
+        for (size_t vertex = 0; vertex < a.vertices.size(); ++vertex) {
+            if (std::memcmp(a.vertices[vertex].uv, b.vertices[vertex].uv, sizeof(a.vertices[vertex].uv)) ||
+                std::memcmp(a.vertices[vertex].color, b.vertices[vertex].color, sizeof(a.vertices[vertex].color))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    std::vector<int32_t> result(list.records.size(), -1);
+    for (const auto &[key, records] : now) {
+        const auto found = before.find(key);
+        if (found == before.end()) {
+            continue;
+        }
+        const auto       &candidates = found->second;
+        std::vector<bool> claimed(candidates.size(), false);
+        if (instanced.contains(key)) {
+            for (int32_t index : records) {
+                if (list.records[index].no_interpolation) {
+                    continue;
+                }
+                for (size_t position = 0; position < candidates.size(); ++position) {
+                    const int32_t candidate = candidates[position];
+                    if (!claimed[position] && previous.records[candidate].model == list.records[index].model && compatible(index, candidate)) {
+                        claimed[position] = true;
+                        result[index] = candidate;
+                        break;
+                    }
+                }
+            }
+            for (int32_t index : records) {
+                if (list.records[index].no_interpolation || result[index] >= 0) {
+                    continue;
+                }
+                float  nearest = std::min(25.0f, list.records[index].teleport_distance);
+                size_t chosen = 0;
+                for (size_t position = 0; position < candidates.size(); ++position) {
+                    const float moved = distance(previous.records[candidates[position]], list.records[index]);
+                    if (!claimed[position] && moved <= nearest && compatible(index, candidates[position])) {
+                        nearest = moved;
+                        chosen = position;
+                        result[index] = candidates[position];
+                    }
+                }
+                if (result[index] >= 0) {
+                    claimed[chosen] = true;
+                }
+            }
+        } else {
+            for (int32_t index : records) {
+                for (size_t position = 0; position < candidates.size(); ++position) {
+                    const int32_t candidate = candidates[position];
+                    if (claimed[position] || !compatible(index, candidate)) {
+                        continue;
+                    }
+                    claimed[position] = true;
+                    if (!list.records[index].no_interpolation &&
+                        !(distance(previous.records[candidate], list.records[index]) > list.records[index].teleport_distance)) {
+                        result[index] = candidate;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+} // namespace
+
+TEST(GfxGpuDisplayList, CandidateBucketsPreserveOrderedReferenceMatches) {
+    GfxOptions options;
+    options.prog0_meshes = true;
+    options.pipeline_cache = std::filesystem::temp_directory_path() / "dc_gfx_test" / "pipeline_cache_match_reference.bin";
+    GfxFixture                              fixture(16, 16, 1.0f, options);
+    const std::vector<gfx::Vertex3D>        vertices = {{{-.2f, -.2f, .5f}}, {{.2f, -.2f, .5f}}, {{0, .2f, .5f}}};
+    const std::vector<uint32_t>             indices = {0, 1, 2, 0, 2, 1};
+    const std::array<gfx::MeshHandle, 2>    meshes{gfx::CreateMesh(vertices, indices), gfx::CreateMesh(vertices, indices)};
+    const std::array<gfx::TextureHandle, 3> textures{gfx::kNullTexture, gfx::CreateTexture({1, 1}), gfx::CreateTexture({1, 1})};
+    const uint8_t                           white[4] = {128, 128, 128, 128};
+    ASSERT_NE(meshes[0], gfx::kNullMesh);
+    ASSERT_NE(meshes[1], gfx::kNullMesh);
+    ASSERT_TRUE(gfx::UpdateTexture(textures[1], 0, 0, 0, 1, 1, white));
+    ASSERT_TRUE(gfx::UpdateTexture(textures[2], 0, 0, 0, 1, 1, white));
+    const auto identity = [] {
+        gfx::detail::Mat4 matrix{};
+        matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1;
+        return matrix;
+    }();
+    uint64_t   serial = 100000;
+    const auto make = [&](int scenario, int generation) {
+        auto list = std::make_shared<gfx::DisplayList>();
+        list->instance = gfx::detail::g.renderer_instance;
+        list->serial = ++serial;
+        list->cut_generation = 100000 + scenario;
+        list->cameras.push_back(identity);
+        list->prog0_blocks.emplace_back().flags = gfx::kProg0Unlit;
+        gfx::detail::ClearEntry clear;
+        clear.color = clear.depth = true;
+        list->entries.emplace_back(clear);
+        list->main_cleared = true;
+        for (uint32_t index = 0; index < 96; ++index) {
+            if (generation && (index + static_cast<uint32_t>(scenario)) % 17 == 0) {
+                continue;
+            }
+            const uint32_t         shape = (index * 13 + static_cast<uint32_t>(scenario)) % 19;
+            gfx::detail::MeshEntry mesh;
+            mesh.mesh = shape % 3 ? meshes[shape % 2] : gfx::kNullMesh;
+            mesh.first_index = shape % 2;
+            mesh.index_count = shape % 4;
+            mesh.binding.texture = textures[shape % 3];
+            mesh.binding.palette = textures[shape % 2];
+            mesh.binding.filter = shape % 2 ? gfx::Filter::Nearest : gfx::Filter::Linear;
+            mesh.binding.wrap_u = shape % 3 ? gfx::Wrap::Clamp : gfx::Wrap::Repeat;
+            mesh.binding.wrap_v = shape % 5 ? gfx::Wrap::Repeat : gfx::Wrap::Clamp;
+            mesh.binding.ignore_alpha = shape % 7 == 0;
+            mesh.prog0 = shape % 2 ? 0 : -1;
+            mesh.vertices.resize(2);
+            mesh.vertices[0].position[0] = static_cast<float>((index % 3) + (generation && scenario % 3 == 0));
+            mesh.vertices[0].uv[0] = static_cast<float>(shape % 2);
+            mesh.vertices[1] = mesh.vertices[0];
+            std::memcpy(mesh.constants.mvp, identity.data(), sizeof mesh.constants.mvp);
+            gfx::detail::MeshRecord record;
+            record.key = index % 11 ? 1 + index % 3 : 0;
+            record.has_transform = index % 23 != 0;
+            record.entry = static_cast<uint32_t>(list->entries.size());
+            record.occurrence = index % 5;
+            record.no_interpolation = generation && index % 13 == 0;
+            record.blend_vertices = index % 3 == 0;
+            record.teleport_distance = index % 7 == 0 ? -1.0f : index % 5 == 0 ? 0.0f
+                                                                               : 25.0f;
+            record.projection = record.middle = record.local = identity;
+            record.model = identity;
+            record.model[12] = scenario % 2 ? static_cast<float>(static_cast<int>(index % 5) - 2 + generation) : static_cast<float>(generation);
+            if (scenario % 4 == 1) {
+                record.model[0] = index % 4 == 0 ? -1.0f : 1.0f;
+            }
+            if (scenario % 4 == 2) {
+                record.model[0] = index % 4 == 0 ? 0.0f : index % 7 == 0 ? std::numeric_limits<float>::quiet_NaN()
+                                                                         : 1.0f;
+            }
+            if (scenario % 4 == 3 && index % 7 == 0) {
+                record.teleport_distance = std::numeric_limits<float>::quiet_NaN();
+            }
+            if (generation && scenario % 3 == 1 && index % 7 == 0) {
+                mesh.binding.texture = textures[(shape % 3 + 1) % textures.size()];
+            }
+            mesh.record = static_cast<uint32_t>(list->records.size());
+            list->records.push_back(record);
+            list->entries.emplace_back(std::move(mesh));
+        }
+        return list;
+    };
+    for (int scenario = 0; scenario < 12; ++scenario) {
+        SCOPED_TRACE(scenario);
+        auto before = make(scenario, 0);
+        auto after = make(scenario, 1);
+        ASSERT_TRUE(gfx::RenderList(*before, 1, {.canonical = true}));
+        std::unordered_set<gfx::InterpKey> instanced;
+        for (int generation = 1; generation < 3; ++generation) {
+            const auto expected = ReferenceMeshMatches(*after, *before, instanced);
+            ASSERT_TRUE(gfx::RenderList(*after, .5f, {.previous = before.get()}));
+            EXPECT_EQ(after->cache.match, expected);
+            before = std::move(after);
+            after = make(scenario, generation + 1);
+        }
+    }
+    for (auto mesh : meshes) {
+        gfx::DestroyMesh(mesh);
+    }
+    for (auto texture : textures) {
+        if (texture != gfx::kNullTexture) {
+            gfx::DestroyTexture(texture);
+        }
+    }
+}
 
 TEST(GfxGpuMeshDc2, InterpolatedOutlineEscapesNewestPartCrop) {
     GfxOptions options;
@@ -93,10 +340,10 @@ TEST(GfxGpuMeshDc2, InterpolatedOutlineEscapesNewestPartCrop) {
 
 namespace {
 
-constexpr int kWidth = 64;
-constexpr int kHeight = 48;
+constexpr int                kWidth = 64;
+constexpr int                kHeight = 48;
 const std::array<uint8_t, 4> kClear = {0, 0, 0, 0x80};
-const std::vector<uint32_t> kTriangle = {0, 1, 2};
+const std::vector<uint32_t>  kTriangle = {0, 1, 2};
 
 using Rows = std::array<float, 12>;
 constexpr Rows kIdentityRows = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
@@ -122,10 +369,12 @@ void SetBone(gfx::Prog0Palette &p, uint32_t slot, const Rows &rows) {
 }
 
 gfx::Vertex3D Vert(std::array<float, 3> position, std::array<float, 3> normal, std::array<uint8_t, 4> color = {}) {
-    return {{position[0], position[1], position[2]},
-            {normal[0], normal[1], normal[2]},
-            {0.0f, 0.0f},
-            {color[0], color[1], color[2], color[3]}};
+    return {
+        {position[0], position[1], position[2]},
+        {normal[0], normal[1], normal[2]},
+        {0.0f, 0.0f},
+        {color[0], color[1], color[2], color[3]}
+    };
 }
 
 // Each vertex followed by its skin, as Vu_prog0 reads a kProg0Skinned mesh.
@@ -327,14 +576,14 @@ TEST(GfxDisplayList, BonesBlendPerBoneAtHalf) {
 }
 
 TEST(GfxGpuMeshDc2, SkinnedPaletteInterpolatesInDisplayFrame) {
-    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    GfxFixture                       fixture(kWidth, kHeight, 1.0f, Prog0Options());
     const std::vector<gfx::Vertex3D> vertices =
         Skinned({Vert({-0.2f, -0.2f, 0.5f}, {0, 0, 1}), Vert({0.2f, -0.2f, 0.5f}, {0, 0, 1}),
                  Vert({0.0f, 0.2f, 0.5f}, {0, 0, 1})},
                 {1, 0, 0, 0}, {0, 0, 0, 0});
     gfx::MeshConstants constants = {};
     Identity(constants.mvp);
-    gfx::MeshTransform transform = gfx::IdentityMeshTransform();
+    gfx::MeshTransform  transform = gfx::IdentityMeshTransform();
     gfx::Prog0Constants block = {};
     block.flags = gfx::kProg0Unlit | gfx::kProg0Skinned;
     for (uint32_t k = 0; k < 4; k++) {
@@ -435,8 +684,8 @@ TEST(GfxGpuMeshDc2, SharedMeshRewritesInterpolatePerDraw) {
         return halves();
     };
 
-    gfx::DisplayListRef before = record(-0.6f, 0.4f);
-    gfx::DisplayListRef after = record(-0.4f, 0.6f);
+    gfx::DisplayListRef     before = record(-0.6f, 0.4f);
+    gfx::DisplayListRef     after = record(-0.4f, 0.6f);
     std::array<Coverage, 2> at_before = canonical(*before);
     std::array<Coverage, 2> at_after = canonical(*after);
     ASSERT_TRUE(gfx::RenderList(*after, 0.5f, {.previous = before.get(), .present = true}));
@@ -510,8 +759,8 @@ void DrawWindowRed(GfxFixture &fixture) {
     constants.diffuse[3] = 2.0f;
     const std::vector<gfx::Vertex3D> vertices = {
         {{-1.0f, -1.0f, 0.5f}, {0, 0, 1}, {0, 0}, {}},
-        {{3.0f, -1.0f, 0.5f}, {0, 0, 1}, {0, 0}, {}},
-        {{-1.0f, 3.0f, 0.5f}, {0, 0, 1}, {0, 0}, {}},
+        {{3.0f, -1.0f, 0.5f},  {0, 0, 1}, {0, 0}, {}},
+        {{-1.0f, 3.0f, 0.5f},  {0, 0, 1}, {0, 0}, {}},
     };
     fixture.Frame({0xFF, 0xFF, 0xFF, 0xFF}, [&] { gfx::DrawMeshImmediate(vertices, kTriangle, constants, {}, {}); });
 }
@@ -1356,8 +1605,8 @@ TEST(GfxGpuDisplayList, FilteredOutlineCopiesDoNotSamplePreviousPartOutsideBound
     GfxFixture fixture(64, 48, 1, options);
     const auto target = gfx::CreateRenderTarget(64, 48, true, true);
     ASSERT_NE(target, gfx::kNullTexture);
-    const uint8_t opaque[4] = {128, 128, 128, 128};
-    const uint8_t transparent[4] = {0, 0, 0, 0};
+    const uint8_t          opaque[4] = {128, 128, 128, 128};
+    const uint8_t          transparent[4] = {0, 0, 0, 0};
     const gfx::LogicalRect full{0, 0, 64, 48};
     const gfx::LogicalRect crop{16, 8, 16, 24};
     gfx::BeginRecording();
@@ -1473,4 +1722,587 @@ TEST(GfxGpuMeshDc2, RotatingThinOutlineKeepsIntermediateTips) {
     render(*after, 1, {.canonical = true});
     EXPECT_EQ(render(*after, .5f, {.previous = before.get()}), reference);
     gfx::DestroyTexture(target);
+}
+
+TEST(GfxPresentationBounds, UsesActualMidpointRotationBeyondEndpointUnion) {
+    const gfx::LogicalMapping mapping{.scale_x = 1, .scale_y = 1, .offset_x = 0, .offset_y = 0, .pixel_width = 64, .pixel_height = 48};
+    gfx::detail::Mat4         before = {};
+    gfx::detail::Mat4         after = {};
+    for (size_t i = 0; i < 4; ++i) {
+        before[i * 5] = after[i * 5] = 1;
+    }
+    const float diagonal = std::sqrt(0.5f);
+    before[0] = before[5] = after[0] = after[5] = diagonal;
+    before[1] = before[4] = diagonal;
+    before[4] = -diagonal;
+    after[1] = -diagonal;
+    after[4] = diagonal;
+    gfx::detail::Mat4 midpoint;
+    ASSERT_TRUE(gfx::detail::InterpolateAffine(before, after, 0.5f, midpoint));
+    const std::array<float, 3> bounds_min{-0.75f, -0.05f, 0.5f};
+    const std::array<float, 3> bounds_max{0.75f, 0.05f, 0.5f};
+    auto                       project = [&](const gfx::detail::Mat4 &matrix) {
+        gfx::MeshConstants constants{};
+        std::memcpy(constants.mvp, matrix.data(), sizeof constants.mvp);
+        return gfx::detail::ProjectPresentationBounds(bounds_min, bounds_max, constants, mapping);
+    };
+    const auto first = project(before);
+    const auto last = project(after);
+    const auto middle = project(midpoint);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(last);
+    ASSERT_TRUE(middle);
+    EXPECT_LT(middle->x, std::min(first->x, last->x));
+    EXPECT_GT(middle->x + middle->w, std::max(first->x + first->w, last->x + last->w));
+}
+
+TEST(GfxPresentationBounds, RejectsEyeCrossingsAndNonfiniteGeometry) {
+    const gfx::LogicalMapping mapping{.scale_x = 1, .scale_y = 1, .offset_x = 0, .offset_y = 0, .pixel_width = 64, .pixel_height = 48};
+    gfx::MeshConstants        constants{};
+    Identity(constants.mvp);
+    constants.mvp[3] = 1;
+    constants.mvp[15] = 0.2f;
+    EXPECT_FALSE(gfx::detail::ProjectPresentationBounds({-0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, constants, mapping));
+    Identity(constants.mvp);
+    EXPECT_FALSE(gfx::detail::ProjectPresentationBounds({-INFINITY, 0, 0}, {1, 1, 1}, constants, mapping));
+    EXPECT_TRUE(gfx::detail::ProjectPresentationBounds({-0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, constants, mapping));
+}
+
+namespace {
+
+/**
+ * Compares bounded rigid and skinned presentation with complete RGBA and alpha-consumer references.
+ */
+void PresentationRegionComparisons(float render_scale) {
+    /**
+     * Selects a rigid stream, an animated skin or the conservative missing-palette fallback.
+     */
+    enum class SourceMode {
+        Rigid,
+        Skinned,
+        MissingPalette
+    };
+
+    /**
+     * Pixels and submitted work for one reference or bounded presentation.
+     */
+    struct Sample {
+        std::vector<uint8_t> pixels;          /**< Complete output RGBA image. */
+        uint32_t             draws;           /**< Submitted 2D draw count, including frame flanks. */
+        uint32_t             bounded_regions; /**< Groups using a proven smaller display rectangle. */
+    };
+
+    GfxOptions options;
+    options.offscreen = true;
+    options.prog0_meshes = true;
+    options.logical_width = 64;
+    options.logical_height = 48;
+    GfxFixture fixture(96, 48, render_scale, options);
+    if (!gfx::ActiveRendererFeatures().dynamic_color_write_mask) {
+        GTEST_SKIP() << "Partial colour masks unavailable";
+    }
+    const auto scratch = gfx::CreateRenderTarget(64, 48, true, true);
+    ASSERT_NE(scratch, gfx::kNullTexture);
+    const std::vector<gfx::Vertex3D> vertices = {
+        {{-.75f, -.05f, .5f}}, {{.75f, -.05f, .5f}}, {{0, .05f, .5f}}};
+    const auto rigid = gfx::CreateMesh(vertices, kTriangle);
+    const auto skinned_vertices = Skinned(vertices, {.3f, .7f, 0, 0}, {0, 1, 0, 0});
+    const auto skinned = gfx::CreateMesh(skinned_vertices, kTriangle);
+    ASSERT_NE(rigid, gfx::kNullMesh);
+    ASSERT_NE(skinned, gfx::kNullMesh);
+    for (const auto aspect : {gfx::AspectMode::Letterbox, gfx::AspectMode::Fill}) {
+        for (const float ui_scale : {1.0f, 1.3f}) {
+            gfx::SetFrameLayout({.aspect = aspect, .ui_scale = ui_scale});
+            for (const auto source : {SourceMode::Rigid, SourceMode::Skinned, SourceMode::MissingPalette}) {
+                const bool use_skin = source != SourceMode::Rigid;
+                const bool missing_palette = source == SourceMode::MissingPalette;
+                for (const bool consume_alpha : {false, true}) {
+                    auto record = [&](float angle, bool bounded) {
+                        auto        transform = gfx::IdentityMeshTransform();
+                        const float cosine = std::cos(angle);
+                        const float sine = std::sin(angle);
+                        if (!use_skin) {
+                            transform.model[0] = transform.model[5] = cosine;
+                            transform.model[1] = sine;
+                            transform.model[4] = -sine;
+                        }
+                        gfx::MeshConstants constants{};
+                        std::memcpy(constants.mvp, transform.model, sizeof constants.mvp);
+                        constants.diffuse[0] = constants.diffuse[3] = 1;
+                        gfx::Prog0Constants prog0{};
+                        prog0.flags = gfx::kProg0Unlit | gfx::kProg0Skinned;
+                        for (size_t i = 0; i < 4; ++i) {
+                            prog0.object_color[i] = 128;
+                            prog0.diffuse[i] = 1;
+                        }
+                        gfx::Prog0Palette palette{};
+                        for (uint32_t bone = 0; bone < gfx::kProg0Bones; ++bone) {
+                            SetBone(palette, bone, kIdentityRows);
+                        }
+                        if (use_skin) {
+                            const Rows rotation = {cosine, -sine, 0, 0, sine, cosine, 0, 0, 0, 0, 1, 0};
+                            SetBone(palette, 0, rotation);
+                            SetBone(palette, 1, rotation);
+                        }
+                        gfx::BeginRecording();
+                        const uint8_t background[4] = {19, 37, 53, 93};
+                        gfx::Clear(true, background, true, 0);
+                        const auto full = gfx::VisibleLogicalRect(gfx::kMainTarget);
+                        gfx::SetRenderTarget(scratch);
+                        const uint8_t poison[4] = {117, 83, 41, 128};
+                        gfx::Clear(true, poison, false, 0);
+                        gfx::SetRenderTarget(gfx::kMainTarget);
+                        if (bounded) {
+                            gfx::BeginPresentationRegion(scratch, full, 1.0f);
+                        }
+                        gfx::SetRenderTarget(scratch);
+                        const uint8_t empty[4] = {};
+                        gfx::Clear(true, empty, false, 0, &full, &full);
+                        gfx::SetInterpKey(17);
+                        if (use_skin) {
+                            gfx::DrawMeshProg0(skinned, 0, 3, constants, prog0, {}, {}, &transform, missing_palette ? nullptr : &palette);
+                        } else {
+                            gfx::DrawMesh(rigid, 0, 3, constants, {}, {}, &transform);
+                        }
+                        gfx::SetRenderTarget(gfx::kMainTarget);
+                        const gfx::TextureBinding binding{.texture = scratch, .filter = gfx::Filter::Linear};
+                        gfx::DrawState            body;
+                        body.blend = true;
+                        auto edge = body;
+                        edge.color_write_mask = gfx::kWriteRed | gfx::kWriteGreen | gfx::kWriteBlue;
+                        const auto copy = [&](float dx, float dy, const gfx::DrawState &state) {
+                            const auto                quad = Quad(full.x + dx, full.y + dy, full.w, full.h, {128, 128, 128, 128},
+                                                                  full.x, full.y, full.x + full.w, full.y + full.h);
+                            const gfx::Presentation2D presentation{.vertices = quad, .state = state, .bounded_region = bounded};
+                            gfx::Draw2D(gfx::Primitive::Quads, quad, binding, state, &presentation);
+                        };
+                        copy(.75f, 0, edge);
+                        copy(-.75f, 0, edge);
+                        copy(0, .75f, edge);
+                        copy(0, -.75f, edge);
+                        if (bounded) {
+                            auto reset = body;
+                            reset.blend = false;
+                            reset.color_write_mask = gfx::kWriteAlpha;
+                            const auto                quad = Quad(full.x, full.y, full.w, full.h, {0, 0, 0, 0});
+                            const gfx::Presentation2D presentation{.vertices = quad, .state = reset, .presentation_only = true, .region_alpha_reset = true};
+                            gfx::Draw2D(gfx::Primitive::Quads, quad, {}, reset, &presentation);
+                        }
+                        copy(0, 0, body);
+                        if (bounded) {
+                            gfx::EndPresentationRegion(true);
+                        }
+                        if (consume_alpha) {
+                            auto consumer = body;
+                            consumer.alpha.c = 1;
+                            const auto quad = Quad(full.x, full.y, full.w, full.h, {128, 19, 83, 128});
+                            gfx::Draw2D(gfx::Primitive::Quads, quad, {}, consumer);
+                        }
+                        return gfx::EndRecording();
+                    };
+                    auto render = [&](const gfx::DisplayList &list, const gfx::DisplayList *previous, bool canonical) {
+                        EXPECT_TRUE(gfx::RenderList(list, .5f, {.canonical = canonical, .previous = previous, .present = !canonical}));
+                        const auto draws = gfx::detail::g.counters.draws_2d;
+                        const auto bounded_regions = gfx::detail::g.counters.bounded_presentation_regions;
+                        EXPECT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+                        return Sample{.pixels = fixture.pixels, .draws = draws, .bounded_regions = bounded_regions};
+                    };
+                    const float before_angle = use_skin ? 0.0f : -.785398163f;
+                    const float after_angle = use_skin ? 3.1415925f : .785398163f;
+                    const auto  before = record(before_angle, false);
+                    const auto  reference = record(after_angle, false);
+                    const auto  optimized = record(after_angle, true);
+                    const auto  canonical_reference = render(*reference, nullptr, true);
+                    const auto  canonical_optimized = render(*optimized, nullptr, true);
+                    EXPECT_EQ(canonical_optimized.pixels, canonical_reference.pixels);
+                    const auto display_reference = render(*reference, before.get(), false);
+                    const auto display_optimized = render(*optimized, before.get(), false);
+                    EXPECT_EQ(display_optimized.pixels, display_reference.pixels)
+                        << static_cast<int>(aspect) << " ui " << ui_scale << " source " << static_cast<int>(source) << " consume " << consume_alpha;
+                    EXPECT_EQ(display_optimized.bounded_regions, missing_palette ? 0u : 1u);
+                    EXPECT_EQ(display_reference.bounded_regions, 0u);
+                    EXPECT_LE(display_optimized.draws, display_reference.draws + (missing_palette ? 0u : 1u));
+                }
+            }
+        }
+    }
+    gfx::DestroyMesh(rigid);
+    gfx::DestroyMesh(skinned);
+    gfx::DestroyTexture(scratch);
+}
+
+} // namespace
+
+TEST(GfxGpuMeshDc2, PresentationRegionsPreserveRgbaAndDestinationAlpha) {
+    PresentationRegionComparisons(1.0f);
+}
+
+TEST(GfxGpuMeshDc2, LowResolutionPresentationRegionsPreserveFilteredRgba) {
+    PresentationRegionComparisons(0.5f);
+}
+
+TEST(GfxGpuMeshDc2, ConsecutivePresentationBodiesPreserveRgbaAndAlphaReaders) {
+    /**
+     * Selects writes or signature changes between consecutive outlined bodies.
+     */
+    enum class Interference {
+        None,
+        RgbAlphaReader,
+        MainAlphaWrite,
+        ScratchWrite,
+        ChangedExtent,
+        UnknownMiddleBody,
+        ChangedDestination,
+        ChangedSourceMapping,
+        PartialScissor
+    };
+
+    /**
+     * Retains both destination images and the exercised bounded-region count.
+     */
+    struct Sample {
+        std::vector<uint8_t> main;                /**< Complete main-target RGBA image. */
+        std::vector<uint8_t> alternate;           /**< Complete alternate-target RGBA image. */
+        uint32_t             bounded_regions = 0; /**< Regions taking the bounded presentation path. */
+    };
+
+    GfxOptions options;
+    options.offscreen = true;
+    options.logical_width = 64;
+    options.logical_height = 48;
+    GfxFixture fixture(96, 48, .75f, options);
+    if (!gfx::ActiveRendererFeatures().dynamic_color_write_mask) {
+        GTEST_SKIP() << "Partial colour masks unavailable";
+    }
+    const auto scratch = gfx::CreateRenderTarget(64, 48, true, true);
+    const auto differently_mapped_scratch = gfx::CreateRenderTarget(64, 48, true);
+    const auto alternate = gfx::CreateRenderTarget(80, 48, true);
+    ASSERT_NE(scratch, gfx::kNullTexture);
+    ASSERT_NE(differently_mapped_scratch, gfx::kNullTexture);
+    ASSERT_NE(alternate, gfx::kNullTexture);
+    const auto main_mapping = gfx::GetLogicalMapping(scratch);
+    const auto other_mapping = gfx::GetLogicalMapping(differently_mapped_scratch);
+    ASSERT_TRUE(main_mapping.scale_x != other_mapping.scale_x || main_mapping.scale_y != other_mapping.scale_y ||
+                main_mapping.offset_x != other_mapping.offset_x || main_mapping.offset_y != other_mapping.offset_y ||
+                main_mapping.pixel_width != other_mapping.pixel_width || main_mapping.pixel_height != other_mapping.pixel_height);
+    const auto pixel_differences = [&](const std::vector<uint8_t> &actual, const std::vector<uint8_t> &expected) {
+        const size_t          width = std::max<uint32_t>(fixture.width, 1u);
+        size_t                differing_pixels = 0;
+        std::array<size_t, 4> channels = {};
+        std::string           first;
+        for (size_t i = 0; i + 3 < std::min(actual.size(), expected.size()); i += 4) {
+            bool different = false;
+            for (size_t channel = 0; channel < channels.size(); ++channel) {
+                if (actual[i + channel] != expected[i + channel]) {
+                    ++channels[channel];
+                    different = true;
+                }
+            }
+            if (!different) {
+                continue;
+            }
+            if (differing_pixels < 8) {
+                first += std::format(" ({},{}) actual={}/{}/{}/{} expected={}/{}/{}/{}",
+                                     (i / 4) % width, (i / 4) / width,
+                                     actual[i], actual[i + 1], actual[i + 2], actual[i + 3],
+                                     expected[i], expected[i + 1], expected[i + 2], expected[i + 3]);
+            }
+            ++differing_pixels;
+        }
+        return std::format("sizes={}/{} differing_pixels={} rgba_channels={}/{}/{}/{} shared_mapping={}/{}/{}/{}/{}/{} independent_mapping={}/{}/{}/{}/{}/{} first:{}",
+                           actual.size(), expected.size(), differing_pixels, channels[0], channels[1], channels[2], channels[3],
+                           main_mapping.scale_x, main_mapping.scale_y, main_mapping.offset_x, main_mapping.offset_y,
+                           main_mapping.pixel_width, main_mapping.pixel_height,
+                           other_mapping.scale_x, other_mapping.scale_y, other_mapping.offset_x, other_mapping.offset_y,
+                           other_mapping.pixel_width, other_mapping.pixel_height, first);
+    };
+    const std::vector<gfx::Vertex3D> vertices = {
+        {{-.08f, -.06f, .5f}}, {{.08f, -.06f, .5f}}, {{0, .08f, .5f}}};
+    const auto mesh = gfx::CreateMesh(vertices, kTriangle);
+    ASSERT_NE(mesh, gfx::kNullMesh);
+    constexpr std::array cases = {
+        Interference::None, Interference::RgbAlphaReader, Interference::MainAlphaWrite, Interference::ScratchWrite,
+        Interference::ChangedExtent, Interference::UnknownMiddleBody, Interference::ChangedDestination,
+        Interference::ChangedSourceMapping, Interference::PartialScissor};
+    for (const auto interference : cases) {
+        for (const bool consume_alpha : {false, true}) {
+            SCOPED_TRACE(std::format("interference {} consume alpha {}", static_cast<int>(interference), consume_alpha));
+            auto record = [&](float pose, bool bounded) {
+                gfx::BeginRecording();
+                const uint8_t background[4] = {19, 37, 53, 93};
+                gfx::Clear(true, background, true, 0);
+                const auto full = gfx::VisibleLogicalRect(gfx::kMainTarget);
+                gfx::SetRenderTarget(alternate);
+                const uint8_t other_background[4] = {41, 71, 23, 191};
+                gfx::Clear(true, other_background, true, 0);
+                const uint8_t poison[4] = {117, 83, 41, 127};
+                for (const auto source : {scratch, differently_mapped_scratch}) {
+                    gfx::SetRenderTarget(source);
+                    gfx::Clear(true, poison, false, 0);
+                }
+                gfx::SetRenderTarget(gfx::kMainTarget);
+                const auto alpha_reader = [&](gfx::TextureHandle target) {
+                    gfx::SetRenderTarget(target);
+                    const auto     extent = gfx::VisibleLogicalRect(target);
+                    gfx::DrawState state;
+                    state.blend = true;
+                    state.alpha.c = 1;
+                    state.color_write_mask = gfx::kWriteRed | gfx::kWriteGreen | gfx::kWriteBlue;
+                    const auto quad = Quad(extent.x, extent.y, extent.w, extent.h, {83, 19, 109, 128});
+                    gfx::Draw2D(gfx::Primitive::Quads, quad, {}, state);
+                };
+                const auto body = [&](size_t index) {
+                    const bool middle = index == 1;
+                    const auto destination = middle && interference == Interference::ChangedDestination ? alternate : gfx::kMainTarget;
+                    const auto source = middle && interference == Interference::ChangedSourceMapping ? differently_mapped_scratch : scratch;
+                    auto       extent = gfx::VisibleLogicalRect(destination);
+                    if (middle && interference == Interference::ChangedExtent) {
+                        extent.x += extent.w * .5f;
+                        extent.w *= .5f;
+                    }
+                    gfx::SetRenderTarget(destination);
+                    if (bounded) {
+                        gfx::BeginPresentationRegion(source, extent, 1.0f);
+                    }
+                    gfx::SetRenderTarget(source);
+                    const uint8_t empty[4] = {};
+                    gfx::Clear(true, empty, false, 0, &extent, &extent);
+                    constexpr std::array<std::array<float, 2>, 3> centers = {
+                        {{-.55f, -.4f}, {.45f, .35f}, {.55f, -.35f}}
+                    };
+                    auto transform = gfx::IdentityMeshTransform();
+                    transform.model[12] = centers[index][0] + .045f * pose;
+                    transform.model[13] = centers[index][1] + .025f * pose;
+                    gfx::MeshConstants constants{};
+                    std::memcpy(constants.mvp, transform.model, sizeof constants.mvp);
+                    constants.diffuse[0] = .75f;
+                    constants.diffuse[1] = .375f;
+                    constants.diffuse[2] = .625f;
+                    constants.diffuse[3] = .75f;
+                    gfx::SetInterpKey(100 + index);
+                    if (middle && interference == Interference::UnknownMiddleBody) {
+                        gfx::DrawMeshImmediate(vertices, kTriangle, constants, {}, {}, &transform);
+                    } else {
+                        gfx::DrawMesh(mesh, 0, 3, constants, {}, {}, &transform);
+                    }
+                    gfx::SetRenderTarget(destination);
+                    const gfx::TextureBinding binding{.texture = source, .filter = gfx::Filter::Linear};
+                    gfx::DrawState            state;
+                    state.blend = true;
+                    if (interference == Interference::PartialScissor) {
+                        state.scissor = true;
+                        state.extend_scissor = index == 2;
+                        state.scissor_rect = index == 2 ? gfx::LogicalRect{0, 2, 64, 44} : gfx::LogicalRect{0, 4, 64, 40};
+                    }
+                    auto edge = state;
+                    edge.color_write_mask = gfx::kWriteRed | gfx::kWriteGreen | gfx::kWriteBlue;
+                    const auto copy = [&](float dx, float dy, const gfx::DrawState &draw_state) {
+                        const auto                quad = Quad(extent.x + dx, extent.y + dy, extent.w, extent.h, {128, 128, 128, 128},
+                                                              extent.x, extent.y, extent.x + extent.w, extent.y + extent.h);
+                        const gfx::Presentation2D presentation{.vertices = quad, .state = draw_state, .bounded_region = bounded};
+                        gfx::Draw2D(gfx::Primitive::Quads, quad, binding, draw_state, &presentation);
+                    };
+                    copy(.75f, 0, edge);
+                    copy(-.75f, 0, edge);
+                    copy(0, .75f, edge);
+                    copy(0, -.75f, edge);
+                    if (bounded) {
+                        auto reset = state;
+                        reset.blend = false;
+                        reset.color_write_mask = gfx::kWriteAlpha;
+                        const auto                quad = Quad(extent.x, extent.y, extent.w, extent.h, {0, 0, 0, 0});
+                        const gfx::Presentation2D presentation{
+                            .vertices = quad, .state = reset, .presentation_only = true, .region_alpha_reset = true};
+                        gfx::Draw2D(gfx::Primitive::Quads, quad, {}, reset, &presentation);
+                    }
+                    copy(0, 0, state);
+                    if (bounded) {
+                        gfx::EndPresentationRegion(true);
+                    }
+                };
+                body(0);
+                if (interference == Interference::RgbAlphaReader || interference == Interference::PartialScissor) {
+                    alpha_reader(gfx::kMainTarget);
+                } else if (interference == Interference::MainAlphaWrite) {
+                    gfx::DrawState state;
+                    state.color_write_mask = gfx::kWriteAlpha;
+                    const auto quad = Quad(full.x + 5.25f, full.y + 2.25f, 3.5f, 3.5f, {0, 0, 0, 127});
+                    gfx::Draw2D(gfx::Primitive::Quads, quad, {}, state);
+                } else if (interference == Interference::ScratchWrite) {
+                    gfx::SetRenderTarget(scratch);
+                    gfx::Clear(true, poison, false, 0);
+                    gfx::SetRenderTarget(gfx::kMainTarget);
+                }
+                body(1);
+                if (interference == Interference::PartialScissor) {
+                    alpha_reader(gfx::kMainTarget);
+                }
+                if (interference == Interference::UnknownMiddleBody || interference == Interference::ChangedDestination ||
+                    interference == Interference::ChangedSourceMapping || interference == Interference::PartialScissor) {
+                    body(2);
+                }
+                if (consume_alpha) {
+                    alpha_reader(alternate);
+                    alpha_reader(gfx::kMainTarget);
+                }
+                gfx::SetRenderTarget(gfx::kMainTarget);
+                return gfx::EndRecording();
+            };
+            auto render = [&](const gfx::DisplayList &list, const gfx::DisplayList *previous, bool canonical) {
+                EXPECT_TRUE(gfx::RenderList(list, .5f, {.canonical = canonical, .previous = previous, .present = !canonical}));
+                Sample result;
+                result.bounded_regions = gfx::detail::g.counters.bounded_presentation_regions;
+                EXPECT_TRUE(gfx::ReadbackFrame(result.main, fixture.width, fixture.height));
+                uint32_t width = 0;
+                uint32_t height = 0;
+                EXPECT_TRUE(gfx::ReadbackTexture(alternate, result.alternate, width, height));
+                return result;
+            };
+            const auto before = record(0, false);
+            const auto reference = record(1, false);
+            const auto optimized = record(1, true);
+            const auto canonical_reference = render(*reference, nullptr, true);
+            const auto canonical_optimized = render(*optimized, nullptr, true);
+            EXPECT_EQ(canonical_optimized.main, canonical_reference.main);
+            EXPECT_EQ(canonical_optimized.alternate, canonical_reference.alternate);
+            const auto display_reference = render(*reference, before.get(), false);
+            const auto display_optimized = render(*optimized, before.get(), false);
+            EXPECT_EQ(display_optimized.main, display_reference.main)
+                << pixel_differences(display_optimized.main, display_reference.main);
+            EXPECT_EQ(display_optimized.alternate, display_reference.alternate);
+            bool zero_alpha = false;
+            bool nonzero_alpha = false;
+            for (size_t i = 3; i < display_reference.main.size(); i += 4) {
+                zero_alpha |= display_reference.main[i] == 0;
+                nonzero_alpha |= display_reference.main[i] != 0;
+            }
+            EXPECT_TRUE(zero_alpha);
+            EXPECT_TRUE(nonzero_alpha);
+            EXPECT_EQ(display_reference.bounded_regions, 0u);
+            EXPECT_GT(display_optimized.bounded_regions, 0u);
+        }
+    }
+    gfx::DestroyMesh(mesh);
+    gfx::DestroyTexture(scratch);
+    gfx::DestroyTexture(differently_mapped_scratch);
+    gfx::DestroyTexture(alternate);
+}
+
+TEST(GfxSkinBounds, PositiveWeightSumsScaleBoneUnionAboutOrigin) {
+    const std::vector<gfx::Vertex3D> positions = {
+        {{-5, -3, -2}}, {{-2, -1, -1}}, {{-4, -2, -1.5f}}};
+    gfx::Prog0Palette palette{};
+    for (uint32_t bone = 0; bone < gfx::kProg0Bones; ++bone) {
+        SetBone(palette, bone, kIdentityRows);
+    }
+    SetBone(palette, 0, {1, 0, 0, -10, 0, 1, 0, -7, 0, 0, 1, -3});
+    SetBone(palette, 1, {0, -1, 0, -20, 1, 0, 0, -11, 0, 0, 1, -5});
+    const std::array<std::array<float, 4>, 6> weights{
+        {{.3f, .7f, 0, 0}, {.4f, .6f, 0, 0}, {.25f, .25f, .25f, .25f}, {.5f, 0, 0, 0}, {1, .5f, 0, 0}, {0, 0, 0, 0}}
+    };
+    for (const auto &weight : weights) {
+        gfx::detail::Mesh mesh;
+        const auto        packed = Skinned(positions, weight, {0, 1, 0, 1});
+        gfx::detail::SetMeshSkinBounds(mesh, packed, kTriangle);
+        ASSERT_TRUE(mesh.skin_bounds_known);
+        std::array<float, 3> lo, hi;
+        ASSERT_TRUE(gfx::detail::SkinnedMeshPositionBounds(mesh, palette, lo, hi));
+        for (const auto &vertex : positions) {
+            for (size_t axis = 0; axis < 3; ++axis) {
+                float actual = 0;
+                for (size_t influence = 0; influence < 4; ++influence) {
+                    const auto &row = palette.bones[influence % 2][axis];
+                    float       term = row[3] * weight[influence];
+                    for (size_t column = 0; column < 3; ++column) {
+                        term += row[column] * (vertex.position[column] * weight[influence]);
+                    }
+                    actual += term;
+                }
+                EXPECT_LE(lo[axis], actual);
+                EXPECT_GE(hi[axis], actual);
+            }
+        }
+    }
+}
+
+TEST(GfxSkinBounds, ValidatesPackedWeightsAndAllReferencedBones) {
+    const std::vector<gfx::Vertex3D> positions = {
+        {{-1, 0, .5f}}, {{1, 0, .5f}}, {{0, 1, .5f}}};
+    gfx::detail::Mesh                         mesh;
+    const std::array<std::array<float, 4>, 4> invalid{
+        {{-.1f, 1, 0, 0}, {1.1f, 0, 0, 0}, {INFINITY, 0, 0, 0}, {NAN, 0, 0, 0}}
+    };
+    for (const auto &weights : invalid) {
+        gfx::detail::SetMeshSkinBounds(mesh, Skinned(positions, weights, {0, 1, 0, 0}), kTriangle);
+        EXPECT_FALSE(mesh.skin_bounds_known);
+    }
+    gfx::detail::SetMeshSkinBounds(mesh, positions, kTriangle);
+    EXPECT_FALSE(mesh.skin_bounds_known);
+    gfx::detail::SetMeshSkinBounds(mesh, Skinned(positions, {1, 0, 0, 0}, {255, 1, 0, 0}), kTriangle);
+    ASSERT_TRUE(mesh.skin_bounds_known);
+    EXPECT_NE(mesh.skin_bones & (uint32_t{1} << 31), 0u);
+    gfx::Prog0Palette palette{};
+    for (uint32_t bone = 0; bone < gfx::kProg0Bones; ++bone) {
+        SetBone(palette, bone, kIdentityRows);
+    }
+    palette.bones[31][0][3] = 300;
+    std::array<float, 3> lo, hi;
+    ASSERT_TRUE(gfx::detail::SkinnedMeshPositionBounds(mesh, palette, lo, hi));
+    EXPECT_LE(lo[0], 299);
+    EXPECT_GE(hi[0], 301);
+    palette.bones[1][0][0] = INFINITY;
+    EXPECT_FALSE(gfx::detail::SkinnedMeshPositionBounds(mesh, palette, lo, hi));
+}
+
+TEST(GfxSkinBounds, GuardsCancellationUnderflowAndEyeCrossings) {
+    const std::vector<gfx::Vertex3D> positions(3, gfx::Vertex3D{
+                                                      .position = {1000000, 0, .5f}
+    });
+    gfx::detail::Mesh                mesh;
+    gfx::detail::SetMeshSkinBounds(mesh, Skinned(positions, {.5f, .5f, 0, 0}, {0, 0, 0, 0}), kTriangle);
+    gfx::Prog0Palette palette{};
+    for (uint32_t bone = 0; bone < gfx::kProg0Bones; ++bone) {
+        SetBone(palette, bone, kIdentityRows);
+    }
+    palette.bones[0][0][3] = -1000000;
+    std::array<float, 3> lo, hi;
+    ASSERT_TRUE(gfx::detail::SkinnedMeshPositionBounds(mesh, palette, lo, hi));
+    EXPECT_LT(lo[0], -1);
+    EXPECT_GT(hi[0], 1);
+    const float                      tiny = std::numeric_limits<float>::denorm_min();
+    const std::vector<gfx::Vertex3D> subnormal(3, gfx::Vertex3D{
+                                                      .position = {tiny, 0, 0}
+    });
+    gfx::detail::SetMeshSkinBounds(mesh, Skinned(subnormal, {.5f, 0, 0, 0}, {0, 0, 0, 0}), kTriangle);
+    palette.bones[0][0][0] = 1.0e30f;
+    palette.bones[0][0][3] = 0;
+    ASSERT_TRUE(gfx::detail::SkinnedMeshPositionBounds(mesh, palette, lo, hi));
+    EXPECT_LE(lo[0], 0);
+    EXPECT_GT(hi[0], tiny * 1.0e30f);
+    gfx::MeshConstants constants{};
+    Identity(constants.mvp);
+    constants.mvp[15] = tiny;
+    const gfx::LogicalMapping mapping{.scale_x = 1, .scale_y = 1, .offset_x = 0, .offset_y = 0, .pixel_width = 64, .pixel_height = 48};
+    EXPECT_FALSE(gfx::detail::ProjectPresentationBounds(lo, hi, constants, mapping));
+    constants.mvp[15] = 1;
+    constants.mvp[3] = 1;
+    const std::vector<gfx::Vertex3D> crossing = {
+        {{-2, 0, .5f}}, {{2, 0, .5f}}, {{0, 1, .5f}}};
+    gfx::detail::SetMeshSkinBounds(mesh, Skinned(crossing, {.3f, .7f, 0, 0}, {0, 0, 0, 0}), kTriangle);
+    SetBone(palette, 0, kIdentityRows);
+    ASSERT_TRUE(gfx::detail::SkinnedMeshPositionBounds(mesh, palette, lo, hi));
+    EXPECT_FALSE(gfx::detail::ProjectPresentationBounds(lo, hi, constants, mapping));
+}
+
+TEST(GfxGpuMeshDc2, VertexUpdatesRetireSkinBounds) {
+    GfxFixture                       fixture(64, 48);
+    const std::vector<gfx::Vertex3D> positions = {
+        {{-1, 0, .5f}}, {{1, 0, .5f}}, {{0, 1, .5f}}};
+    const auto packed = Skinned(positions, {.3f, .7f, 0, 0}, {0, 1, 0, 0});
+    const auto handle = gfx::CreateMesh(packed, kTriangle);
+    ASSERT_NE(handle, gfx::kNullMesh);
+    ASSERT_TRUE(gfx::detail::LookupMesh(handle)->skin_bounds_known);
+    ASSERT_TRUE(gfx::UpdateMeshVertices(handle, 0, packed));
+    EXPECT_FALSE(gfx::detail::LookupMesh(handle)->skin_bounds_known);
+    gfx::DestroyMesh(handle);
 }

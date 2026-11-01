@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <memory_resource>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -595,10 +597,79 @@ bool SameSurface(const MeshEntry &a, const MeshEntry &b) {
     return true;
 }
 
-bool SameHandedness(const Mat4 &a, const Mat4 &b) {
-    const float sign_a = Dot(Column(a, 0), Cross(Column(a, 1), Column(a, 2)));
-    const float sign_b = Dot(Column(b, 0), Cross(Column(b, 1), Column(b, 2)));
-    return (sign_a < 0.0f) == (sign_b < 0.0f);
+/**
+ * Identifies the necessary surface and orientation conditions for a mesh match.
+ */
+struct MatchSurface {
+    InterpKey     key = 0;                  /**< Recorded instance family. */
+    MeshHandle    mesh = kNullMesh;         /**< Immutable geometry identity, or immediate geometry. */
+    TextureHandle texture = kNullTexture;   /**< Surface image identity. */
+    TextureHandle palette = kNullTexture;   /**< Indexed surface palette identity. */
+    uint32_t      first_index = 0;          /**< First index of the recorded part. */
+    uint32_t      index_count = 0;          /**< Index count of the recorded part. */
+    Filter        filter = Filter::Nearest; /**< Surface sampling filter. */
+    Wrap          wrap_u = Wrap::Repeat;    /**< Horizontal texture addressing. */
+    Wrap          wrap_v = Wrap::Repeat;    /**< Vertical texture addressing. */
+    bool          ignore_alpha = false;     /**< Surface alpha interpretation. */
+    bool          prog0 = false;            /**< Whether the draw uses the Prog0 vertex layout. */
+    bool          mirrored = false;         /**< Whether the model determinant compares below zero. */
+
+    /**
+     * Compares the necessary matching conditions without geometric approximations.
+     */
+    bool operator==(const MatchSurface &) const = default;
+};
+
+/**
+ * Hashes the exact necessary conditions of a mesh match.
+ */
+struct MatchSurfaceHash {
+    /**
+     * Combines integral surface identities and precomputed orientation.
+     */
+    size_t operator()(const MatchSurface &surface) const noexcept {
+        uint64_t   hash = 1469598103934665603ULL;
+        const auto append = [&](uint64_t value) { hash = (hash ^ value) * 1099511628211ULL; };
+        append(surface.key);
+        append(surface.mesh);
+        append(surface.texture);
+        append(surface.palette);
+        append(surface.first_index);
+        append(surface.index_count);
+        append(static_cast<uint64_t>(surface.filter) |
+               static_cast<uint64_t>(surface.wrap_u) << 8 |
+               static_cast<uint64_t>(surface.wrap_v) << 16 |
+               static_cast<uint64_t>(surface.ignore_alpha) << 24 |
+               static_cast<uint64_t>(surface.prog0) << 25 |
+               static_cast<uint64_t>(surface.mirrored) << 26);
+        hash ^= hash >> 33;
+        hash *= 0xff51afd7ed558ccdULL;
+        hash ^= hash >> 33;
+        hash *= 0xc4ceb9fe1a85ec53ULL;
+        hash ^= hash >> 33;
+        return std::hash<uint64_t>{}(hash);
+    }
+};
+
+using MatchCandidates = std::pmr::unordered_map<MatchSurface, std::pmr::vector<int32_t>, MatchSurfaceHash>;
+
+/**
+ * Computes each eligible draw's surface identity and model orientation once.
+ */
+std::vector<MatchSurface> MatchSurfaces(const DisplayList &list) {
+    std::vector<MatchSurface> surfaces(list.records.size());
+    for (size_t index = 0; index < list.records.size(); ++index) {
+        const MeshRecord &record = list.records[index];
+        if (record.key == 0 || !record.has_transform) {
+            continue;
+        }
+        const auto &mesh = std::get<MeshEntry>(list.entries[record.entry]);
+        const float sign = Dot(Column(record.model, 0), Cross(Column(record.model, 1), Column(record.model, 2)));
+        surfaces[index] = {record.key, mesh.mesh, mesh.binding.texture, mesh.binding.palette,
+                           mesh.first_index, mesh.index_count, mesh.binding.filter, mesh.binding.wrap_u,
+                           mesh.binding.wrap_v, mesh.binding.ignore_alpha, mesh.prog0 >= 0, sign < 0.0f};
+    }
+    return surfaces;
 }
 
 bool SamePartGeometry(const MeshEntry &a, const MeshEntry &b, const MeshRecord &record,
@@ -634,32 +705,35 @@ bool SamePartGeometry(const MeshEntry &a, const MeshEntry &b, const MeshRecord &
     return true;
 }
 
-bool SameInstanceFace(const DisplayList &list, const DisplayList &previous, int32_t index, int32_t candidate) {
+bool SameInstanceFace(const DisplayList &list, const DisplayList &previous, int32_t index, int32_t candidate,
+                      bool mirrored, bool earlier_mirrored) {
     const auto &a = std::get<MeshEntry>(list.entries[list.records[index].entry]);
     const auto &b = std::get<MeshEntry>(previous.entries[previous.records[candidate].entry]);
     // Normal and mirrored sky passes share an origin and surface. An opposite reflection
     // cannot interpolate; keep each pass with its own handedness before comparing distance.
-    const Mat4 &model_a = list.records[index].model;
-    const Mat4 &model_b = previous.records[candidate].model;
-    return SameHandedness(model_a, model_b) && SameSurface(a, b) &&
+    return mirrored == earlier_mirrored && SameSurface(a, b) &&
            SamePartGeometry(a, b, list.records[index], previous.records[candidate]);
 }
 
 // Each place with the previous draw that stood exactly there, then what is left with the nearest
 // previous place nothing stood still at, within a step.
 void MatchInstanced(const DisplayList &list, const DisplayList &previous, const KeyDraws &draws,
-                    const KeyDraws &before, std::vector<int32_t> &match) {
-    std::vector<bool> stood(before.records.size(), false);
+                    const std::vector<MatchSurface> &surfaces, const std::vector<MatchSurface> &earlier_surfaces,
+                    const MatchCandidates &candidates, std::vector<bool> &claimed, std::vector<int32_t> &match) {
     for (int32_t index : draws.records) {
         const MeshRecord &record = list.records[index];
         if (record.no_interpolation) {
             continue;
         }
-        for (size_t i = 0; i < before.records.size(); i++) {
-            if (!stood[i] && previous.records[before.records[i]].model == record.model &&
-                SameInstanceFace(list, previous, index, before.records[i])) {
-                stood[i] = true;
-                match[index] = before.records[i];
+        const auto found = candidates.find(surfaces[index]);
+        if (found == candidates.end()) {
+            continue;
+        }
+        for (int32_t candidate : found->second) {
+            if (!claimed[candidate] && previous.records[candidate].model == record.model &&
+                SameInstanceFace(list, previous, index, candidate, surfaces[index].mirrored, earlier_surfaces[candidate].mirrored)) {
+                claimed[candidate] = true;
+                match[index] = candidate;
                 break;
             }
         }
@@ -669,17 +743,21 @@ void MatchInstanced(const DisplayList &list, const DisplayList &previous, const 
         if (record.no_interpolation || match[index] >= 0) {
             continue;
         }
+        const auto found = candidates.find(surfaces[index]);
+        if (found == candidates.end()) {
+            continue;
+        }
         float nearest = std::min(kInstanceStep, record.teleport_distance);
-        for (size_t i = 0; i < before.records.size(); i++) {
-            float moved = Moved(previous.records[before.records[i]].model, record.model);
-            if (!stood[i] && moved <= nearest && SameInstanceFace(list, previous, index, before.records[i])) {
+        for (int32_t candidate : found->second) {
+            float moved = Moved(previous.records[candidate].model, record.model);
+            if (!claimed[candidate] && moved <= nearest &&
+                SameInstanceFace(list, previous, index, candidate, surfaces[index].mirrored, earlier_surfaces[candidate].mirrored)) {
                 nearest = moved;
-                match[index] = before.records[i];
+                match[index] = candidate;
             }
         }
         if (match[index] >= 0) {
-            auto found = std::find(before.records.begin(), before.records.end(), match[index]);
-            stood[static_cast<size_t>(found - before.records.begin())] = true;
+            claimed[match[index]] = true;
         }
     }
 }
@@ -721,6 +799,19 @@ void BuildMatches(const DisplayList &list, const DisplayList &previous) {
 
     std::unordered_map<InterpKey, KeyDraws> before = DrawsByKey(previous);
     std::unordered_map<InterpKey, KeyDraws> now = DrawsByKey(list);
+    const auto                              earlier_surfaces = MatchSurfaces(previous);
+    const auto                              surfaces = MatchSurfaces(list);
+    // Candidate nodes and their lists expire together; keep their small allocations in one arena.
+    std::pmr::monotonic_buffer_resource match_storage;
+    MatchCandidates                     candidates{&match_storage};
+    candidates.reserve(previous.records.size());
+    for (size_t index = 0; index < previous.records.size(); ++index) {
+        if (earlier_surfaces[index].key != 0) {
+            // Bucket insertion retains the original candidate order, including distance ties.
+            candidates[earlier_surfaces[index]].push_back(static_cast<int32_t>(index));
+        }
+    }
+    std::vector<bool> claimed(previous.records.size(), false);
     for (const auto *keys : {&before, &now}) {
         for (const auto &[key, draws] : *keys) {
             if (draws.instanced) {
@@ -734,21 +825,23 @@ void BuildMatches(const DisplayList &list, const DisplayList &previous) {
             continue;
         }
         if (g_instanced_keys.contains(key)) {
-            MatchInstanced(list, previous, draws, it->second, cache.match);
+            MatchInstanced(list, previous, draws, surfaces, earlier_surfaces, candidates, claimed, cache.match);
             continue;
         }
         // Pair occurrences within each surface, not the entire model. A culled or inserted
         // part must not shift every later part away from its own predecessor.
-        std::vector<bool> claimed(it->second.records.size(), false);
         for (int32_t index : draws.records) {
             const MeshRecord &record = list.records[index];
-            for (size_t face = 0; face < it->second.records.size(); ++face) {
-                const int32_t     candidate = it->second.records[face];
+            const auto        found = candidates.find(surfaces[index]);
+            if (found == candidates.end()) {
+                continue;
+            }
+            for (int32_t candidate : found->second) {
                 const MeshRecord &earlier = previous.records[candidate];
-                if (claimed[face] || !SameInstanceFace(list, previous, index, candidate)) {
+                if (claimed[candidate] || !SameInstanceFace(list, previous, index, candidate, surfaces[index].mirrored, earlier_surfaces[candidate].mirrored)) {
                     continue;
                 }
-                claimed[face] = true;
+                claimed[candidate] = true;
                 if (!record.no_interpolation && !(Moved(earlier.model, record.model) > record.teleport_distance)) {
                     cache.match[index] = candidate;
                     cache.blend[index] =
@@ -1000,26 +1093,61 @@ void SetBoneRows(const Mat4 &m, float (&rows)[3][4]) {
     }
 }
 
+/**
+ * Reuses an exact consecutive MVP product within one display preparation.
+ */
+struct MvpProduct {
+    Mat4 world_to_clip = {}; /**< Exact outer matrix of the preceding product. */
+    Mat4 model = {};         /**< Exact model matrix of the preceding product. */
+    Mat4 local = {};         /**< Exact local matrix of the preceding product. */
+    Mat4 value = {};         /**< Previously computed right-associated product. */
+    bool valid = false;      /**< All key matrices and the output are initialized. */
+
+    /**
+     * Copies the matching product or evaluates the original multiplication grouping.
+     */
+    bool Resolve(const Mat4 &world, const Mat4 &model_input, const Mat4 &local_input, Mat4 &out) {
+        const bool hit = valid && std::memcmp(world_to_clip.data(), world.data(), sizeof world_to_clip) == 0 &&
+                         std::memcmp(model.data(), model_input.data(), sizeof model) == 0 &&
+                         std::memcmp(local.data(), local_input.data(), sizeof local) == 0;
+        if (!hit) {
+            std::memcpy(world_to_clip.data(), world.data(), sizeof world_to_clip);
+            std::memcpy(model.data(), model_input.data(), sizeof model);
+            std::memcpy(local.data(), local_input.data(), sizeof local);
+            value = Multiply(world, Multiply(model_input, local_input));
+            valid = true;
+        }
+        std::memcpy(out.data(), value.data(), sizeof value);
+        return hit;
+    }
+};
+
 // Re-bases a block recorded at view_b and model_b onto view_i and model_i. The clip goes through
 // inverse(eye_b) so the game's left factor (fit * world clip, or the view) is kept whichever of the two
 // clip_or_view holds. False, block untouched, when either eye transform is singular.
 // The eye transforms MoveProg0 last derived, kept for the draws that follow with the same matrices: a
 // visual's faces are drawn one after another under one transform.
 struct Prog0Rebase {
-    Mat4 view_b = {};
-    Mat4 view_i = {};
-    Mat4 middle = {};
-    Mat4 model_b = {};
-    Mat4 model_i = {};
-    bool valid = false;
-    bool invertible = false;
-    Mat4 back_b = {};    // inverse of the tick's eye transform
-    Mat4 eye_i = {};     // the interpolated eye transform
-    Mat4 to_object = {}; // the tick's eye space back to the interpolated object space
+    Mat4     view_b = {};
+    Mat4     view_i = {};
+    Mat4     middle = {};
+    Mat4     model_b = {};
+    Mat4     model_i = {};
+    bool     valid = false;
+    bool     invertible = false;
+    Mat4     back_b = {};         // inverse of the tick's eye transform
+    Mat4     eye_i = {};          // the interpolated eye transform
+    Mat4     to_object = {};      // the tick's eye space back to the interpolated object space
+    uint64_t generation = 0;      /**< Identity of the current derived eye transforms. */
+    uint64_t clip_generation = 0; /**< Derived transforms used by the cached clip product. */
+    Mat4     clip_source = {};    /**< Exact original clip matrix of the preceding product. */
+    Mat4     clip_value = {};     /**< Previously computed left-associated clip product. */
+    bool     clip_valid = false;  /**< The cached clip product belongs to a successful rebase. */
 };
 
 bool MoveProg0(const MeshRecord &record, const Mat4 &view_b, const Mat4 &view_i, const Mat4 &model_i,
-               Prog0Constants &block, Prog0Rebase &rebase) {
+               Prog0Constants &block, Prog0Rebase &rebase, bool &clip_reused) {
+    clip_reused = false;
     if (!rebase.valid || rebase.view_b != view_b || rebase.view_i != view_i || rebase.middle != record.middle ||
         rebase.model_b != record.model || rebase.model_i != model_i) {
         rebase.view_b = view_b;
@@ -1028,6 +1156,8 @@ bool MoveProg0(const MeshRecord &record, const Mat4 &view_b, const Mat4 &view_i,
         rebase.model_b = record.model;
         rebase.model_i = model_i;
         rebase.valid = true;
+        ++rebase.generation;
+        rebase.clip_valid = false;
         Mat4 eye_b = Multiply(Multiply(view_b, record.middle), record.model);
         rebase.eye_i = Multiply(Multiply(view_i, record.middle), model_i);
         Mat4 back_i = {};
@@ -1039,8 +1169,15 @@ bool MoveProg0(const MeshRecord &record, const Mat4 &view_b, const Mat4 &view_i,
     if (!rebase.invertible) {
         return false;
     }
-    Mat4 clip = Multiply(Multiply(ToMat4(block.clip_or_view), rebase.back_b), rebase.eye_i);
-    std::memcpy(block.clip_or_view, clip.data(), sizeof block.clip_or_view);
+    clip_reused = rebase.clip_valid && rebase.clip_generation == rebase.generation &&
+                  std::memcmp(rebase.clip_source.data(), block.clip_or_view, sizeof block.clip_or_view) == 0;
+    if (!clip_reused) {
+        std::memcpy(rebase.clip_source.data(), block.clip_or_view, sizeof block.clip_or_view);
+        rebase.clip_value = Multiply(Multiply(rebase.clip_source, rebase.back_b), rebase.eye_i);
+        rebase.clip_generation = rebase.generation;
+        rebase.clip_valid = true;
+    }
+    std::memcpy(block.clip_or_view, rebase.clip_value.data(), sizeof block.clip_or_view);
 
     // The camera is an object-space point: it goes to eye space under the tick's transform and back
     // under the interpolated one. A projective middle leaves w != 1, so the point is homogenised.
@@ -1066,38 +1203,58 @@ bool MoveProg0(const MeshRecord &record, const Mat4 &view_b, const Mat4 &view_i,
     return true;
 }
 
-enum class InterpolationPhase : size_t { Matches, Cameras, Sprites, Quads, Reset, Meshes, Poses, Count };
+enum class InterpolationPhase : size_t {
+    Matches,
+    Cameras,
+    Sprites,
+    Quads,
+    Reset,
+    Meshes,
+    Poses,
+    Count
+};
 
 struct InterpolationPhases {
     using Clock = std::chrono::steady_clock;
     static constexpr size_t kPhaseCount = static_cast<size_t>(InterpolationPhase::Count);
-    bool enabled = [] {
+    bool                    enabled = [] {
         static const bool setting = [] {
             const char *value = std::getenv("KZ_PERF_INTERPOLATE_PHASES");
             return value != nullptr && std::strcmp(value, "1") == 0;
         }();
         return setting;
     }();
-    Clock::time_point last = enabled ? Clock::now() : Clock::time_point{};
+    Clock::time_point               last = enabled ? Clock::now() : Clock::time_point{};
     std::array<double, kPhaseCount> milliseconds = {};
-    uint32_t palette_blends = 0;
+    uint32_t                        palette_blends = 0;
+    uint32_t                        palette_reuses = 0;
+    uint32_t                        mvp_hits = 0;
+    uint32_t                        mvp_misses = 0;
+    uint32_t                        clip_hits = 0;
+    uint32_t                        clip_misses = 0;
 
     void Mark(InterpolationPhase phase) {
-        if (!enabled) return;
+        if (!enabled) {
+            return;
+        }
         const auto now = Clock::now();
         milliseconds[static_cast<size_t>(phase)] = std::chrono::duration<double, std::milli>(now - last).count();
         last = now;
     }
 
     void Record(const DisplayList &list, const MatchCache &cache, const Overrides &out, bool cache_miss) const {
-        if (!enabled) return;
+        if (!enabled) {
+            return;
+        }
+
         struct Aggregate {
-            uint64_t instance = 0;
-            uint32_t count = 0;
-            uint32_t misses = 0;
+            uint64_t                        instance = 0;
+            uint32_t                        count = 0;
+            uint32_t                        misses = 0;
             std::array<double, kPhaseCount> milliseconds = {};
-            std::array<double, 8> counts = {};
+            std::array<double, 13>          counts = {};
         };
+
         static Aggregate aggregate;
         if (aggregate.instance != g.renderer_instance) {
             aggregate = {};
@@ -1105,7 +1262,9 @@ struct InterpolationPhases {
         }
         aggregate.count++;
         aggregate.misses += cache_miss ? 1u : 0u;
-        for (size_t i = 0; i < kPhaseCount; ++i) aggregate.milliseconds[i] += milliseconds[i];
+        for (size_t i = 0; i < kPhaseCount; ++i) {
+            aggregate.milliseconds[i] += milliseconds[i];
+        }
         aggregate.counts[0] += static_cast<double>(list.records.size());
         aggregate.counts[1] += static_cast<double>(list.cameras.size());
         aggregate.counts[2] += static_cast<double>(cache.draws_2d.size());
@@ -1113,11 +1272,20 @@ struct InterpolationPhases {
         aggregate.counts[4] += static_cast<double>(palette_blends);
         aggregate.counts[5] += static_cast<double>(out.palettes.size());
         aggregate.counts[6] += static_cast<double>(out.prog0.size());
-        for (const auto &vertices : out.vertices) aggregate.counts[7] += static_cast<double>(vertices.size());
-        if (aggregate.count != 120) return;
+        for (const auto &vertices : out.vertices) {
+            aggregate.counts[7] += static_cast<double>(vertices.size());
+        }
+        aggregate.counts[8] += static_cast<double>(palette_reuses);
+        aggregate.counts[9] += static_cast<double>(mvp_hits);
+        aggregate.counts[10] += static_cast<double>(mvp_misses);
+        aggregate.counts[11] += static_cast<double>(clip_hits);
+        aggregate.counts[12] += static_cast<double>(clip_misses);
+        if (aggregate.count != 120) {
+            return;
+        }
         const double scale = 1.0 / aggregate.count;
         kz::Logf(kz::LogLevel::Info, "gfx",
-                 "interpolate phases calls={} hit={} miss={} match={:.3f} camera={:.3f} sprites={:.3f} quads={:.3f} reset={:.3f} meshes={:.3f} poses={:.3f} ms; records={:.1f} cameras={:.1f} pairs_2d={:.1f} source_palettes={:.1f} palette_blends={:.1f} palettes={:.1f} prog0={:.1f} vertices={:.1f}",
+                 "interpolate phases calls={} hit={} miss={} match={:.3f} camera={:.3f} sprites={:.3f} quads={:.3f} reset={:.3f} meshes={:.3f} poses={:.3f} ms; records={:.1f} cameras={:.1f} pairs_2d={:.1f} source_palettes={:.1f} palette_blends={:.1f} palettes={:.1f} prog0={:.1f} vertices={:.1f} palette_reuses={:.1f} mvp_hits={:.1f} mvp_misses={:.1f} clip_hits={:.1f} clip_misses={:.1f}",
                  aggregate.count, aggregate.count - aggregate.misses, aggregate.misses,
                  aggregate.milliseconds[0] * scale, aggregate.milliseconds[1] * scale,
                  aggregate.milliseconds[2] * scale, aggregate.milliseconds[3] * scale,
@@ -1126,16 +1294,46 @@ struct InterpolationPhases {
                  aggregate.counts[1] * scale, aggregate.counts[2] * scale,
                  aggregate.counts[3] * scale, aggregate.counts[4] * scale,
                  aggregate.counts[5] * scale, aggregate.counts[6] * scale,
-                 aggregate.counts[7] * scale);
+                 aggregate.counts[7] * scale, aggregate.counts[8] * scale,
+                 aggregate.counts[9] * scale, aggregate.counts[10] * scale,
+                 aggregate.counts[11] * scale, aggregate.counts[12] * scale);
         aggregate = {};
         aggregate.instance = g.renderer_instance;
+    }
+};
+
+/**
+ * Identifies identical bone interpolation inputs within one display preparation.
+ */
+struct PaletteBlendKey {
+    int32_t  before;   /**< Palette index in the preceding display list. */
+    int32_t  after;    /**< Palette index in the current display list. */
+    uint32_t teleport; /**< Exact bits of the draw's bone teleport threshold. */
+
+    /**
+     * Compares every input that can change a bone interpolation result.
+     */
+    bool operator==(const PaletteBlendKey &) const = default;
+};
+
+/**
+ * Hashes the complete input identity of one bone interpolation.
+ */
+struct PaletteBlendHash {
+    /**
+     * Combines palette identities and the exact teleport threshold into a lookup hash.
+     */
+    size_t operator()(const PaletteBlendKey &key) const noexcept {
+        const uint64_t pair = static_cast<uint64_t>(static_cast<uint32_t>(key.before)) << 32 |
+                              static_cast<uint32_t>(key.after);
+        return std::hash<uint64_t>{}(pair ^ (static_cast<uint64_t>(key.teleport) * 0x9e3779b97f4a7c15ULL));
     }
 };
 
 void Interpolated(const DisplayList &list, const DisplayList &previous, float alpha, Overrides &out) {
     KZ_PROFILE_ZONE("Kazarov Interpolated");
     InterpolationPhases phases;
-    const bool cache_miss = list.cache.previous_serial != previous.serial;
+    const bool          cache_miss = list.cache.previous_serial != previous.serial;
     if (cache_miss) {
         BuildMatches(list, previous);
     }
@@ -1190,12 +1388,19 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
     out.prog0.clear();
     out.palette_index.assign(list.records.size(), -1);
     out.palettes.clear();
-    const Mat4 *last_before = nullptr;
-    const Mat4 *last_after = nullptr;
-    Mat4        last_model;
-    Mat3        last_delta = {};
-    bool        last_turned = false;
-    Prog0Rebase rebase;
+    std::unordered_map<PaletteBlendKey, int32_t, PaletteBlendHash> palette_blends;
+    if (!list.palettes.empty()) {
+        palette_blends.reserve(list.palettes.size());
+    }
+    std::optional<PaletteBlendKey> last_palette_key;
+    int32_t                        last_palette_index = -1;
+    const Mat4                    *last_before = nullptr;
+    const Mat4                    *last_after = nullptr;
+    Mat4                           last_model;
+    Mat3                           last_delta = {};
+    bool                           last_turned = false;
+    Prog0Rebase                    rebase;
+    MvpProduct                     mvp_product;
     // Draws under one camera share their world-to-clip matrix; it is rebuilt only when the camera,
     // projection or middle matrix changes.
     std::optional<uint32_t> clip_camera;
@@ -1242,21 +1447,46 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
                 const MeshEntry &earlier = std::get<MeshEntry>(previous.entries[previous.records[match].entry]);
                 if (earlier.prog0 >= 0 && earlier.palette >= 0 &&
                     (previous.prog0_blocks[static_cast<size_t>(earlier.prog0)].flags & kProg0Skinned) != 0) {
-                    const Prog0Palette &newest_palette = list.palettes[static_cast<size_t>(mesh->palette)];
-                    Prog0Palette       &blended = out.palettes.emplace_back();
-                    if (phases.enabled) phases.palette_blends++;
-                    BlendProg0Bones(previous.palettes[static_cast<size_t>(earlier.palette)], newest_palette, alpha,
-                                    record.teleport_distance, blended);
-                    if (std::memcmp(&blended, &newest_palette, sizeof blended) != 0) {
-                        out.palette_index[mesh->record] = static_cast<int32_t>(out.palettes.size() - 1);
+                    const PaletteBlendKey key{earlier.palette, mesh->palette, std::bit_cast<uint32_t>(record.teleport_distance)};
+                    int32_t               blended_index = -1;
+                    if (last_palette_key && *last_palette_key == key) {
+                        blended_index = last_palette_index;
+                        if (phases.enabled) {
+                            phases.palette_reuses++;
+                        }
+                    } else if (const auto found = palette_blends.find(key); found != palette_blends.end()) {
+                        blended_index = found->second;
+                        if (phases.enabled) {
+                            phases.palette_reuses++;
+                        }
                     } else {
-                        out.palettes.pop_back();
+                        const Prog0Palette &newest_palette = list.palettes[static_cast<size_t>(mesh->palette)];
+                        Prog0Palette       &blended = out.palettes.emplace_back();
+                        if (phases.enabled) {
+                            phases.palette_blends++;
+                        }
+                        BlendProg0Bones(previous.palettes[static_cast<size_t>(earlier.palette)], newest_palette, alpha,
+                                        record.teleport_distance, blended);
+                        if (std::memcmp(&blended, &newest_palette, sizeof blended) != 0) {
+                            blended_index = static_cast<int32_t>(out.palettes.size() - 1);
+                        } else {
+                            out.palettes.pop_back();
+                        }
+                        palette_blends.emplace(key, blended_index);
                     }
+                    last_palette_key = key;
+                    last_palette_index = blended_index;
+                    out.palette_index[mesh->record] = blended_index;
                 }
             }
             if (move) {
                 Prog0Constants &block = out.prog0.emplace_back(newest);
-                if (MoveProg0(record, list.cameras[record.camera], views[record.camera], model, block, rebase)) {
+                bool            clip_reused = false;
+                if (MoveProg0(record, list.cameras[record.camera], views[record.camera], model, block, rebase, clip_reused)) {
+                    if (phases.enabled) {
+                        phases.clip_hits += clip_reused ? 1u : 0u;
+                        phases.clip_misses += clip_reused ? 0u : 1u;
+                    }
                     out.prog0_index[mesh->record] = static_cast<int32_t>(out.prog0.size() - 1);
                 } else {
                     out.prog0.pop_back();
@@ -1273,7 +1503,12 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
             world_to_clip = Multiply(Multiply(record.projection, views[record.camera]), record.middle);
         }
         MeshConstants constants = mesh->constants;
-        Mat4          mvp = Multiply(world_to_clip, Multiply(model, record.local));
+        Mat4          mvp;
+        const bool    mvp_reused = mvp_product.Resolve(world_to_clip, model, record.local, mvp);
+        if (phases.enabled) {
+            phases.mvp_hits += mvp_reused ? 1u : 0u;
+            phases.mvp_misses += mvp_reused ? 0u : 1u;
+        }
         std::memcpy(constants.mvp, mvp.data(), sizeof(constants.mvp));
         if (turned) {
             for (int c = 0; c < 3; c++) {
@@ -1576,6 +1811,693 @@ void TraceInterpolation(const DisplayList &list, const DisplayList *previous, co
     std::fclose(file);
 }
 
+// The draw's Vu_prog0 block, as the replay sees it.
+const Prog0Constants *ReplayProg0(const MeshEntry &e, const DisplayList &list, const Overrides *overrides) {
+    const Prog0Constants *prog0 = e.prog0 >= 0 ? &list.prog0_blocks[static_cast<size_t>(e.prog0)] : nullptr;
+    if (prog0 != nullptr && overrides != nullptr && overrides->prog0_index[e.record] >= 0) {
+        prog0 = &overrides->prog0[static_cast<size_t>(overrides->prog0_index[e.record])];
+    }
+    return prog0;
+}
+
+/**
+ * Selects the same immutable or interpolated palette that the draw sends to the shader.
+ */
+const Prog0Palette *ReplayPalette(const MeshEntry &entry, const DisplayList &list, const Overrides *overrides) {
+    const Prog0Palette *palette = entry.palette >= 0 ? &list.palettes[static_cast<size_t>(entry.palette)] : nullptr;
+    if (palette != nullptr && overrides != nullptr && overrides->palette_index[entry.record] >= 0) {
+        palette = &overrides->palettes[static_cast<size_t>(overrides->palette_index[entry.record])];
+    }
+    return palette;
+}
+
+void ReplayMesh(const MeshEntry &e, const DisplayList &list, bool canonical, const Overrides *overrides,
+                const DrawState &state) {
+    const MeshConstants *constants = &e.constants;
+    if (overrides != nullptr && overrides->index[e.record] >= 0) {
+        constants = &overrides->constants[overrides->index[e.record]];
+    }
+    const Prog0Constants *prog0 = ReplayProg0(e, list, overrides);
+    const Prog0Palette   *palette = ReplayPalette(e, list, overrides);
+    TextureBinding        binding = GrabbedBinding(e.binding, canonical);
+    if (e.mesh != kNullMesh) {
+        if (prog0 != nullptr) {
+            DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, state, nullptr, palette);
+        } else {
+            DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, state);
+        }
+    } else {
+        std::span<const Vertex3D> vertices = e.vertices;
+        if (overrides != nullptr && overrides->vertex_index[e.record] >= 0) {
+            vertices = overrides->vertices[overrides->vertex_index[e.record]];
+        }
+        if (prog0 != nullptr) {
+            DrawMeshImmediateProg0(vertices, e.indices, *constants, *prog0, binding, state, nullptr, palette);
+        } else {
+            DrawMeshImmediate(vertices, e.indices, *constants, binding, state);
+        }
+    }
+}
+
+bool OcclusionPrepassEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_OCCLUSION_PREPASS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+// The least vertex alpha, in GS units, a prog0 draw's Vu_prog0 lighting can give, or a negative value when no bound is
+// known: lights, point lights and specular only add to the ambient (or unlit) alpha when their alphas are not negative,
+// and per-vertex colour can lower it.
+float Prog0AlphaLowerBound(const Prog0Constants &p0, uint32_t face) {
+    if ((face & kProg0FaceColor) != 0) {
+        return -1.0f;
+    }
+    const bool unlit = (p0.flags & kProg0Unlit) != 0 || (face & kProg0FaceNoNormal) != 0;
+    if (!unlit) {
+        for (int light = 0; light < 4; light++) {
+            if (!(p0.light_color[light][3] >= 0.0f) ||
+                ((p0.flags & kProg0PointLights) != 0 && !(p0.point_color[light][3] >= 0.0f))) {
+                return -1.0f;
+            }
+        }
+        if ((p0.flags & (kProg0Real | kProg0PointLights)) == kProg0Real && !(p0.specular[3] >= 0.0f)) {
+            return -1.0f;
+        }
+    }
+    const float base = unlit ? p0.object_color[3] : p0.ambient[3];
+    const float lower = base * p0.diffuse[3];
+    // The vertex shader truncates alpha to a whole GS unit.
+    return base >= 0.0f && p0.diffuse[3] >= 0.0f && std::isfinite(lower) ? std::floor(std::min(lower, 255.0f)) : -1.0f;
+}
+
+// Whether a draw samples an RGBA texture whose every texel has full alpha, so its alpha is the vertex alpha.
+bool SamplesOpaqueTexture(const TextureBinding &binding) {
+    if (binding.texture == kNullTexture || binding.texture == kMainTarget || binding.texture == kPreviousFrame ||
+        binding.ignore_alpha) {
+        return false;
+    }
+    const Texture *texture = LookupTexture(binding.texture);
+    return texture != nullptr && !texture->render_target && texture->desc.format == TextureFormat::Rgba8 &&
+           texture->desc.has_alpha && texture->image.mips > 0 && texture->image.mips <= 32 &&
+           texture->opaque_alpha_mips == (uint64_t{1} << texture->image.mips) - 1;
+}
+
+// A draw whose colour and depth replace whatever lies behind it on the main target.
+bool Occludes(const MeshEntry &e, const DisplayList &list, const Overrides *overrides) {
+    const DrawState &state = e.state;
+    if (!state.depth_write || (state.depth_test != DepthTest::GEqual && state.depth_test != DepthTest::Always) ||
+        state.stencil_test || state.color_write_mask != kWriteRgba ||
+        (e.mesh == kNullMesh && (e.vertices.empty() || e.indices.empty()))) {
+        return false;
+    }
+    const Prog0Constants *prog0 = ReplayProg0(e, list, overrides);
+    const bool            textured = e.binding.texture != kNullTexture;
+    // The least alpha the draw's fragments can have, in GS units, when it is known.
+    float least = -1.0f;
+    if (prog0 != nullptr && (!textured || SamplesOpaqueTexture(e.binding))) {
+        least = Prog0AlphaLowerBound(*prog0, state.prog0_face);
+    }
+    const bool alpha_tests = state.alpha_test && state.alpha_func != AlphaFunc::Always &&
+                             !(state.alpha_func == AlphaFunc::GEqual && (state.alpha_ref == 0 || least >= state.alpha_ref));
+    if (alpha_tests) {
+        return false;
+    }
+    // A source-over blend of alpha one or more is its source.
+    return !state.blend || (state.alpha.a == 0 && state.alpha.b == 1 && state.alpha.c == 0 && state.alpha.d == 1 && least >= 128.0f);
+}
+
+/**
+ * The opening stretch of a replay on the main target, from its clear up to the first entry that can observe the
+ * target's contents before the frame ends. Drawing the stretch's occluders' depth first lets the depth test reject
+ * what they will cover.
+ */
+struct OcclusionPlan {
+    size_t              start = 0;          /**< First entry after the clear; the pre-pass runs before it. */
+    size_t              first_occluder = 0; /**< Entries before it, from start, lie behind every occluder. */
+    std::vector<size_t> occluders;          /**< Occluding draws in replay order. */
+
+    // Whether a draw before every occluder may test against them, since an occluder covering it replaces it.
+    [[nodiscard]] bool Background(size_t index) const {
+        return !occluders.empty() && index >= start && index < first_occluder;
+    }
+};
+
+OcclusionPlan PlanOcclusion(const DisplayList &list, const Overrides *overrides) {
+    OcclusionPlan plan;
+    if (!OcclusionPrepassEnabled()) {
+        return plan;
+    }
+    TextureHandle target = kMainTarget;
+    bool          open = false;
+    for (size_t index = 0; index < list.entries.size(); index++) {
+        const Entry &entry = list.entries[index];
+        if (!open) {
+            if (const auto *target_entry = std::get_if<TargetEntry>(&entry)) {
+                target = target_entry->target;
+                continue;
+            }
+            const auto *clear = std::get_if<ClearEntry>(&entry);
+            // A full clear of the main target's depth to the far value gives the depth the pre-pass starts from.
+            if (clear != nullptr && target == kMainTarget && clear->depth && !clear->has_rect && clear->z == 0.0f &&
+                !clear->stencil) {
+                open = true;
+                plan.start = index + 1;
+                continue;
+            }
+            if (std::holds_alternative<MeshEntry>(entry) || std::holds_alternative<Draw2DEntry>(entry)) {
+                return {};
+            }
+            continue;
+        }
+        const auto *mesh = std::get_if<MeshEntry>(&entry);
+        const auto *sprite = std::get_if<Draw2DEntry>(&entry);
+        const bool  stencils = (mesh != nullptr && mesh->state.stencil_test) || (sprite != nullptr && sprite->state.stencil_test);
+        if ((mesh == nullptr && sprite == nullptr && !std::holds_alternative<UpdateTextureEntry>(entry)) || stencils) {
+            break;
+        }
+        if (mesh != nullptr && Occludes(*mesh, list, overrides)) {
+            if (plan.occluders.empty()) {
+                plan.first_occluder = index;
+            }
+            plan.occluders.push_back(index);
+        }
+    }
+    if (plan.occluders.empty()) {
+        return {};
+    }
+    return plan;
+}
+
+// A background draw tested against the occluders drawn ahead of it: where one covers it, it is replaced anyway.
+DrawState BehindOccluders(const DrawState &state) {
+    DrawState tested = state;
+    if (tested.depth_test == DepthTest::Always && !tested.depth_write) {
+        tested.depth_test = DepthTest::GEqual;
+    }
+    return tested;
+}
+
+// Draws the occluders' depth alone, in their order and with their own tests.
+void DrawOccluderDepth(const OcclusionPlan &plan, const DisplayList &list, bool canonical, const Overrides *overrides) {
+    KZ_PROFILE_ZONE("Kazarov occlusion prepass");
+    for (const size_t index : plan.occluders) {
+        const auto &e = std::get<MeshEntry>(list.entries[index]);
+        DrawState   depth_only = e.state;
+        depth_only.color_write_mask = 0;
+        ReplayMesh(e, list, canonical, overrides, depth_only);
+    }
+}
+
+/**
+ * Shares one proven source rectangle between a presentation group's clear and every composite.
+ */
+struct PresentationCoverage {
+    LogicalRect rect = {};
+    LogicalRect clear_rect = {};
+    bool        bounded = false;
+};
+
+/**
+ * Identifies the first condition preventing a presentation region from being bounded.
+ */
+enum class CoverageFailure : size_t {
+    Ineligible,
+    Composite,
+    Mesh,
+    Update,
+    RigidBounds,
+    SkinBounds,
+    Palette,
+    SkinTransform,
+    Projection,
+    Incomplete,
+    Count,
+};
+
+/**
+ * Summarizes region eligibility, coverage and CPU cost without changing presentation policy.
+ */
+void RecordCoveragePhases(const DisplayList &list, const std::vector<PresentationCoverage> &coverage,
+                          const std::vector<bool> &valid, const std::vector<bool> &skin,
+                          const std::vector<CoverageFailure> &failures, double milliseconds) {
+    using Clock = std::chrono::steady_clock;
+    constexpr size_t failure_count = static_cast<size_t>(CoverageFailure::Count);
+
+    /**
+     * Accumulates one second of presentation-region diagnostic samples.
+     */
+    struct Aggregate {
+        uint64_t                            instance = 0;  /**< Renderer lifetime owning these samples. */
+        Clock::time_point                   started = {};  /**< Beginning of the reporting window. */
+        uint32_t                            calls = 0;     /**< Number of sampled coverage resolutions. */
+        double                              cpu = 0;       /**< Total coverage-resolution CPU milliseconds. */
+        double                              cpu_max = 0;   /**< Largest coverage-resolution CPU sample. */
+        uint64_t                            rigid = 0;     /**< Proven rigid regions smaller than their full extent. */
+        uint64_t                            skinned = 0;   /**< Proven skinned regions smaller than their full extent. */
+        uint64_t                            full = 0;      /**< Proven regions that occupy their full visible extent. */
+        uint64_t                            regions = 0;   /**< Total considered presentation regions. */
+        double                              ratio = 0;     /**< Sum of region-to-full-area ratios. */
+        std::array<uint64_t, failure_count> failures = {}; /**< Counts grouped by the first fallback reason. */
+    };
+
+    static Aggregate aggregate;
+    const auto       now = Clock::now();
+    if (aggregate.instance != g.renderer_instance) {
+        aggregate = {};
+        aggregate.instance = g.renderer_instance;
+        aggregate.started = now;
+    }
+    ++aggregate.calls;
+    aggregate.cpu += milliseconds;
+    aggregate.cpu_max = std::max(aggregate.cpu_max, milliseconds);
+    for (size_t i = 0; i < coverage.size(); ++i) {
+        ++aggregate.regions;
+        if (!valid[i]) {
+            ++aggregate.failures[static_cast<size_t>(failures[i])];
+        } else if (!coverage[i].bounded) {
+            ++aggregate.full;
+        } else if (skin[i]) {
+            ++aggregate.skinned;
+        } else {
+            ++aggregate.rigid;
+        }
+        const auto  &extent = list.presentation_regions[i].extent;
+        const double full = static_cast<double>(extent.w) * extent.h;
+        const auto  &rect = coverage[i].rect;
+        const double area = static_cast<double>(rect.w) * rect.h;
+        aggregate.ratio += std::isfinite(full) && full > 0 && std::isfinite(area) ? std::clamp(area / full, 0.0, 1.0) : 1.0;
+    }
+    if (now - aggregate.started < std::chrono::seconds{1}) {
+        return;
+    }
+    const double scale = 1.0 / aggregate.calls;
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "presentation regions n={} cpu={:.3f}/{:.3f} ms regions={:.1f} rigid={:.1f} skin={:.1f} full={:.1f} fallback={:.1f} roi={:.3f}; reasons ineligible={} composite={} mesh={} update={} rigid_bounds={} skin_bounds={} palette={} skin_transform={} projection={} incomplete={}",
+             aggregate.calls, aggregate.cpu * scale, aggregate.cpu_max, aggregate.regions * scale,
+             aggregate.rigid * scale, aggregate.skinned * scale, aggregate.full * scale,
+             (aggregate.regions - aggregate.rigid - aggregate.skinned - aggregate.full) * scale,
+             aggregate.regions > 0 ? aggregate.ratio / aggregate.regions : 0,
+             aggregate.failures[0], aggregate.failures[1], aggregate.failures[2], aggregate.failures[3],
+             aggregate.failures[4], aggregate.failures[5], aggregate.failures[6], aggregate.failures[7],
+             aggregate.failures[8], aggregate.failures[9]);
+    aggregate = {};
+    aggregate.instance = g.renderer_instance;
+    aggregate.started = now;
+}
+
+/**
+ * Validates the alpha-preserving source-over composites that permit a bounded scratch image.
+ */
+bool RegionCompositeEligible(const Draw2DEntry &draw, const PresentationRegion &region) {
+    const auto source = GetTextureInfo(region.source);
+    // Frame samples use target coordinates; ordinary images may use UI extension instead.
+    if (!source || (!source->shares_main_depth && !source->frame_target)) {
+        return false;
+    }
+    const DrawState &state = draw.presentation_state;
+    if (draw.primitive != Primitive::Quads || draw.presentation_vertices.size() != 4 ||
+        state.depth_test != DepthTest::Always || state.depth_write || state.stencil_test ||
+        state.cull != CullMode::None ||
+        (state.alpha_test && state.alpha_func != AlphaFunc::Always && !(state.alpha_func == AlphaFunc::GEqual && state.alpha_ref == 0))) {
+        return false;
+    }
+    if (draw.region_alpha_reset) {
+        if (!draw.presentation_only || draw.binding.texture != kNullTexture || state.blend || state.color_write_mask != kWriteAlpha) {
+            return false;
+        }
+    } else if (draw.presentation_only || draw.binding.texture != region.source || draw.binding.ignore_alpha || draw.binding.palette != kNullTexture || draw.binding.wrap_u != Wrap::Clamp || draw.binding.wrap_v != Wrap::Clamp || !state.blend ||
+               state.alpha.a != 0 || state.alpha.b != 1 || state.alpha.c != 0 || state.alpha.d != 1) {
+        return false;
+    }
+    const auto &vertices = draw.presentation_vertices;
+    const float x0 = region.extent.x;
+    const float y0 = region.extent.y;
+    const float x1 = x0 + region.extent.w;
+    const float y1 = y0 + region.extent.h;
+    const float dx = draw.region_alpha_reset ? 0.0f : vertices[0].x - vertices[0].u;
+    const float dy = draw.region_alpha_reset ? 0.0f : vertices[0].y - vertices[0].v;
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        const float x = i == 1 || i == 2 ? x1 : x0;
+        const float y = i >= 2 ? y1 : y0;
+        const auto &vertex = vertices[i];
+        if (vertex.x != x + dx || vertex.y != y + dy ||
+            (!draw.region_alpha_reset && (vertex.u != x || vertex.v != y)) ||
+            (draw.region_alpha_reset && vertex.color[3] != 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Resolves immutable geometry with the matrices and bone palettes used by this display replay.
+ */
+std::vector<PresentationCoverage> ResolvePresentationCoverage(const DisplayList &list, const Overrides *overrides) {
+    const size_t count = list.presentation_regions.size();
+    if (count == 0) {
+        return {};
+    }
+    static const bool profile = [] {
+        const char *setting = std::getenv("KZ_PERF_PRESENTATION_REGIONS");
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+    }();
+    const auto                        started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::vector<PresentationCoverage> coverage(count);
+    std::vector<bool>                 valid(count), seen(count, false), alpha_reset(count, false), alpha_body(count, false);
+    std::vector<bool>                 skin(profile ? count : 0, false);
+    std::vector<CoverageFailure>      failures(profile ? count : 0, CoverageFailure::Ineligible);
+    const auto                        invalidate = [&](size_t index, CoverageFailure reason) {
+        if (profile && valid[index]) {
+            failures[index] = reason;
+        }
+        valid[index] = false;
+    };
+    for (size_t i = 0; i < count; ++i) {
+        const auto &region = list.presentation_regions[i];
+        coverage[i].rect = region.extent;
+        coverage[i].clear_rect = region.extent;
+        valid[i] = region.eligible && !region.invalid && std::isfinite(region.padding) && region.padding >= 0.0f &&
+                   std::isfinite(region.extent.x) && std::isfinite(region.extent.y) &&
+                   std::isfinite(region.extent.w) && std::isfinite(region.extent.h) &&
+                   region.extent.w > 0.0f && region.extent.h > 0.0f;
+    }
+    std::unordered_set<MeshHandle> updated;
+    for (const Entry &entry : list.entries) {
+        if (const auto *update = std::get_if<UpdateMeshEntry>(&entry)) {
+            updated.insert(update->mesh);
+        }
+    }
+    for (const Entry &entry : list.entries) {
+        if (const auto *draw = std::get_if<Draw2DEntry>(&entry); draw != nullptr && draw->presentation_region >= 0) {
+            const size_t index = static_cast<size_t>(draw->presentation_region);
+            if (index >= count) {
+                continue;
+            }
+            if (valid[index] && !RegionCompositeEligible(*draw, list.presentation_regions[index])) {
+                invalidate(index, CoverageFailure::Composite);
+            }
+            alpha_reset[index] = alpha_reset[index] || draw->region_alpha_reset;
+            alpha_body[index] = alpha_body[index] || (!draw->region_alpha_reset && (draw->presentation_state.color_write_mask & kWriteAlpha) != 0);
+        }
+        const auto *entry_mesh = std::get_if<MeshEntry>(&entry);
+        if (entry_mesh == nullptr || entry_mesh->presentation_region < 0) {
+            continue;
+        }
+        const size_t index = static_cast<size_t>(entry_mesh->presentation_region);
+        if (index >= count || !valid[index]) {
+            continue;
+        }
+        const Mesh           *mesh = entry_mesh->mesh != kNullMesh ? LookupMesh(entry_mesh->mesh) : nullptr;
+        const Prog0Constants *prog0 = ReplayProg0(*entry_mesh, list, overrides);
+        if (mesh == nullptr) {
+            invalidate(index, CoverageFailure::Mesh);
+            continue;
+        }
+        if (updated.contains(entry_mesh->mesh)) {
+            invalidate(index, CoverageFailure::Update);
+            continue;
+        }
+        std::array<float, 3> position_min = mesh->bounds_min;
+        std::array<float, 3> position_max = mesh->bounds_max;
+        if (prog0 != nullptr && (prog0->flags & kProg0Skinned) != 0) {
+            if (profile) {
+                skin[index] = true;
+            }
+            const Prog0Palette *palette = ReplayPalette(*entry_mesh, list, overrides);
+            if (!mesh->skin_bounds_known) {
+                invalidate(index, CoverageFailure::SkinBounds);
+                continue;
+            }
+            if (!g.config.prog0_meshes || palette == nullptr) {
+                invalidate(index, CoverageFailure::Palette);
+                continue;
+            }
+            if (!SkinnedMeshPositionBounds(*mesh, *palette, position_min, position_max)) {
+                invalidate(index, CoverageFailure::SkinTransform);
+                continue;
+            }
+        } else if (!mesh->bounds_known) {
+            invalidate(index, CoverageFailure::RigidBounds);
+            continue;
+        }
+        const MeshConstants *constants = &entry_mesh->constants;
+        if (overrides != nullptr && overrides->index[entry_mesh->record] >= 0) {
+            constants = &overrides->constants[static_cast<size_t>(overrides->index[entry_mesh->record])];
+        }
+        const auto bounds = ProjectPresentationBounds(position_min, position_max, *constants,
+                                                      list.presentation_regions[index].mapping);
+        if (!bounds) {
+            invalidate(index, CoverageFailure::Projection);
+            continue;
+        }
+        if (!seen[index]) {
+            coverage[index].rect = *bounds;
+            seen[index] = true;
+        } else {
+            auto       &rect = coverage[index].rect;
+            const float right = std::max(rect.x + rect.w, bounds->x + bounds->w);
+            const float bottom = std::max(rect.y + rect.h, bounds->y + bounds->h);
+            rect.x = std::min(rect.x, bounds->x);
+            rect.y = std::min(rect.y, bounds->y);
+            rect.w = std::nextafter(right - rect.x, INFINITY);
+            rect.h = std::nextafter(bottom - rect.y, INFINITY);
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const auto &region = list.presentation_regions[i];
+        if (!valid[i] || !seen[i] || !alpha_reset[i] || !alpha_body[i]) {
+            if (valid[i]) {
+                invalidate(i, CoverageFailure::Incomplete);
+            }
+            coverage[i].rect = region.extent;
+            continue;
+        }
+        const auto  bounds = coverage[i].rect;
+        const float gutter_x = 1.0f / region.mapping.scale_x;
+        const float gutter_y = 1.0f / region.mapping.scale_y;
+        const float padding_x = std::max(region.padding, gutter_x);
+        const float padding_y = std::max(region.padding, gutter_y);
+        const float left = std::clamp(std::floor(bounds.x - padding_x), region.extent.x, region.extent.x + region.extent.w);
+        const float top = std::clamp(std::floor(bounds.y - padding_y), region.extent.y, region.extent.y + region.extent.h);
+        const float right = std::clamp(std::ceil(bounds.x + bounds.w + padding_x), region.extent.x, region.extent.x + region.extent.w);
+        const float bottom = std::clamp(std::ceil(bounds.y + bounds.h + padding_y), region.extent.y, region.extent.y + region.extent.h);
+        coverage[i].rect = {.x = left, .y = top, .w = std::max(0.0f, right - left), .h = std::max(0.0f, bottom - top)};
+        coverage[i].bounded = coverage[i].rect.x != region.extent.x || coverage[i].rect.y != region.extent.y ||
+                              coverage[i].rect.w != region.extent.w || coverage[i].rect.h != region.extent.h;
+        // Linear samples at the composite boundary need a cleared source-texel gutter, not stale earlier outlines.
+        const float clear_left = std::max(region.extent.x, std::nextafter(left - gutter_x, -INFINITY));
+        const float clear_top = std::max(region.extent.y, std::nextafter(top - gutter_y, -INFINITY));
+        const float clear_right = std::min(region.extent.x + region.extent.w, std::nextafter(right + gutter_x, INFINITY));
+        const float clear_bottom = std::min(region.extent.y + region.extent.h, std::nextafter(bottom + gutter_y, INFINITY));
+        coverage[i].clear_rect = {.x = clear_left, .y = clear_top, .w = clear_right - clear_left, .h = clear_bottom - clear_top};
+    }
+    if (profile) {
+        RecordCoveragePhases(list, coverage, valid, skin, failures,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+    }
+    return coverage;
+}
+
+/**
+ * Identifies the exact destination domain whose alpha was reset to zero.
+ */
+struct AlphaResetDomain {
+    TextureHandle  target = kMainTarget;   /**< Destination image identity. */
+    LogicalRect    extent{};               /**< Logical area covered by the original reset. */
+    LogicalMapping source{};               /**< Source mapping used to bound the following body. */
+    LogicalMapping destination{};          /**< Mapping used to rasterize the reset and body. */
+    bool           scissor = false;        /**< Whether only the scissor intersection has proven zero alpha. */
+    LogicalRect    scissor_rect{};         /**< Logical clipping area retained by every reused reset. */
+    bool           extend_scissor = false; /**< Whether target edge extension widens the clipping area. */
+};
+
+/**
+ * Selects destination-alpha footprint reuse for exact executable comparisons.
+ */
+bool AlphaFootprintEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_PRESENTATION_ALPHA_FOOTPRINT");
+        return setting == nullptr || std::strcmp(setting, "0") != 0;
+    }();
+    return enabled;
+}
+
+/**
+ * Compares all logical-to-pixel mapping inputs without approximations.
+ */
+bool SameMapping(const LogicalMapping &a, const LogicalMapping &b) {
+    return a.scale_x == b.scale_x && a.scale_y == b.scale_y &&
+           a.offset_x == b.offset_x && a.offset_y == b.offset_y &&
+           a.pixel_width == b.pixel_width && a.pixel_height == b.pixel_height;
+}
+
+/**
+ * Validates finite positive mappings for destination-alpha coverage tracking.
+ */
+bool AlphaMappingValid(const LogicalMapping &mapping) {
+    return std::isfinite(mapping.scale_x) && mapping.scale_x > 0 &&
+           std::isfinite(mapping.scale_y) && mapping.scale_y > 0 &&
+           std::isfinite(mapping.offset_x) && std::isfinite(mapping.offset_y) &&
+           mapping.pixel_width != 0 && mapping.pixel_height != 0;
+}
+
+/**
+ * Compares the complete domain in which alpha is known to be zero outside its footprint.
+ */
+bool SameAlphaDomain(const AlphaResetDomain &a, const AlphaResetDomain &b) {
+    return a.target == b.target && a.extent.x == b.extent.x && a.extent.y == b.extent.y &&
+           a.extent.w == b.extent.w && a.extent.h == b.extent.h &&
+           SameMapping(a.source, b.source) && SameMapping(a.destination, b.destination) &&
+           a.scissor == b.scissor && a.extend_scissor == b.extend_scissor &&
+           (!a.scissor || (a.scissor_rect.x == b.scissor_rect.x && a.scissor_rect.y == b.scissor_rect.y &&
+                           a.scissor_rect.w == b.scissor_rect.w && a.scissor_rect.h == b.scissor_rect.h));
+}
+
+/**
+ * Establishes the exact clipped source-over domain used by a recognized alpha reset or body.
+ */
+std::optional<AlphaResetDomain> AlphaDomainFor(const Draw2DEntry &draw, const PresentationRegion &region,
+                                               const DrawState &state) {
+    const auto destination = GetLogicalMapping(CurrentRenderTarget());
+    if (!RegionCompositeEligible(draw, region) || state.depth_test != DepthTest::Always ||
+        state.depth_write || state.stencil_test || !AlphaMappingValid(region.mapping) ||
+        !AlphaMappingValid(destination) || !std::isfinite(region.extent.x + region.extent.w) ||
+        !std::isfinite(region.extent.y + region.extent.h)) {
+        return std::nullopt;
+    }
+    if (state.scissor && (!std::isfinite(state.scissor_rect.x) || !std::isfinite(state.scissor_rect.y) ||
+                          !std::isfinite(state.scissor_rect.w) || !std::isfinite(state.scissor_rect.h) ||
+                          !std::isfinite(state.scissor_rect.x + state.scissor_rect.w) ||
+                          !std::isfinite(state.scissor_rect.y + state.scissor_rect.h) ||
+                          state.scissor_rect.w < 0 || state.scissor_rect.h < 0)) {
+        return std::nullopt;
+    }
+    for (const auto &vertex : draw.presentation_vertices) {
+        if (!std::isfinite(vertex.z) || vertex.z < 0 || vertex.z > 1 ||
+            vertex.z != draw.presentation_vertices[0].z ||
+            (!draw.region_alpha_reset && (vertex.x != vertex.u || vertex.y != vertex.v))) {
+            return std::nullopt;
+        }
+    }
+    return AlphaResetDomain{CurrentRenderTarget(), region.extent, region.mapping, destination,
+                            state.scissor, state.scissor_rect, state.extend_scissor};
+}
+
+/**
+ * Retains alpha writes inside one proven reset domain until an unknown writer invalidates it.
+ */
+struct AlphaFootprint {
+    std::optional<AlphaResetDomain>     domain;              /**< Exact area known to be zero outside dirty pixels. */
+    std::optional<std::array<float, 4>> dirty;               /**< Conservative left, top, right and bottom of later alpha writes. */
+    uint32_t                            full_resets = 0;     /**< Resets requiring their original full quad. */
+    uint32_t                            prior_resets = 0;    /**< Resets restricted to the preceding alpha footprint. */
+    uint32_t                            empty_resets = 0;    /**< Redundant resets skipped while the domain remains zero. */
+    uint32_t                            unknown_resets = 0;  /**< Full resets outside the supported proof. */
+    uint32_t                            invalidations = 0;   /**< Unknown writers retiring the active proof. */
+    double                              reset_pixels = 0;    /**< Conservative reset quad area after footprint restriction. */
+    double                              original_pixels = 0; /**< Corresponding original full reset quad area. */
+
+    /**
+     * Discards knowledge when an untracked write can change the retained image's alpha.
+     */
+    void Invalidate(TextureHandle target) {
+        if (domain && domain->target == target) {
+            ++invalidations;
+            domain.reset();
+            dirty.reset();
+        }
+    }
+
+    /**
+     * Unions actual bounded destination vertices with a conservative rasterization margin.
+     */
+    void Include(const AlphaResetDomain &current, std::span<const Vertex2D> vertices) {
+        if (!domain || !SameAlphaDomain(*domain, current) || vertices.size() != 4) {
+            Invalidate(current.target);
+            return;
+        }
+        const float full_right = current.extent.x + current.extent.w;
+        const float full_bottom = current.extent.y + current.extent.h;
+        const auto &mapping = current.destination;
+        double      max_x = 0, max_y = 0;
+        for (const auto &vertex : vertices) {
+            if (!std::isfinite(vertex.x) || !std::isfinite(vertex.y)) {
+                Invalidate(current.target);
+                return;
+            }
+            max_x = std::max(max_x, std::abs(static_cast<double>(vertex.x)));
+            max_y = std::max(max_y, std::abs(static_cast<double>(vertex.y)));
+        }
+        const double magnitude_x = max_x * mapping.scale_x + std::abs(static_cast<double>(mapping.offset_x)) + mapping.pixel_width;
+        const double magnitude_y = max_y * mapping.scale_y + std::abs(static_cast<double>(mapping.offset_y)) + mapping.pixel_height;
+        if (std::max(magnitude_x, magnitude_y) > std::numeric_limits<float>::max() / 64.0) {
+            Invalidate(current.target);
+            return;
+        }
+        constexpr double roundoff = 32.0 * std::numeric_limits<float>::epsilon();
+        const double     padding_x = (2.0 + roundoff * magnitude_x) / mapping.scale_x;
+        const double     padding_y = (2.0 + roundoff * magnitude_y) / mapping.scale_y;
+        const float      left = std::max(current.extent.x, std::nextafter(static_cast<float>(std::max(static_cast<double>(current.extent.x), vertices[0].x - padding_x)), -INFINITY));
+        const float      top = std::max(current.extent.y, std::nextafter(static_cast<float>(std::max(static_cast<double>(current.extent.y), vertices[0].y - padding_y)), -INFINITY));
+        const float      right = std::min(full_right, std::nextafter(static_cast<float>(std::min(static_cast<double>(full_right), vertices[2].x + padding_x)), INFINITY));
+        const float      bottom = std::min(full_bottom, std::nextafter(static_cast<float>(std::min(static_cast<double>(full_bottom), vertices[2].y + padding_y)), INFINITY));
+        if (left > right || top > bottom) {
+            Invalidate(current.target);
+            return;
+        }
+        if (dirty) {
+            (*dirty)[0] = std::min((*dirty)[0], left);
+            (*dirty)[1] = std::min((*dirty)[1], top);
+            (*dirty)[2] = std::max((*dirty)[2], right);
+            (*dirty)[3] = std::max((*dirty)[3], bottom);
+        } else {
+            dirty = std::array{left, top, right, bottom};
+        }
+    }
+};
+
+/**
+ * Reports alpha reset coverage without changing renderer counter interfaces.
+ */
+void RecordAlphaFootprint(const AlphaFootprint &footprint) {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_PERF_PRESENTATION_REGIONS");
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+    }();
+    if (!enabled) {
+        return;
+    }
+    static uint64_t                              instance = 0;
+    static std::chrono::steady_clock::time_point started;
+    static std::array<uint64_t, 5>               counts{};
+    static double                                reset_pixels = 0, original_pixels = 0;
+    const auto                                   now = std::chrono::steady_clock::now();
+    if (instance != g.renderer_instance) {
+        instance = g.renderer_instance;
+        started = now;
+        counts = {};
+        reset_pixels = original_pixels = 0;
+    }
+    counts[0] += footprint.full_resets;
+    counts[1] += footprint.prior_resets;
+    counts[2] += footprint.empty_resets;
+    counts[3] += footprint.unknown_resets;
+    counts[4] += footprint.invalidations;
+    reset_pixels += footprint.reset_pixels;
+    original_pixels += footprint.original_pixels;
+    if (now - started < std::chrono::seconds{1}) {
+        return;
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx", "alpha footprint enabled={} full={} prior={} empty={} unknown={} invalidations={} quad_pixel_ratio={:.5f}",
+             AlphaFootprintEnabled(), counts[0], counts[1], counts[2], counts[3], counts[4],
+             original_pixels > 0 ? reset_pixels / original_pixels : 1.0);
+    counts = {};
+    reset_pixels = original_pixels = 0;
+    started = now;
+}
+
 void Replay(const DisplayList &list, bool canonical, const Overrides *overrides, bool host = false,
             bool tint = false, InterpKey suppressed_2d_key = 0) {
     AssertDeviceThread(__func__);
@@ -1595,7 +2517,17 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
     if (canonical && ReplayBucketsEnabled()) {
         buckets.emplace();
     }
-    for (const Entry &entry : list.entries) {
+    const OcclusionPlan occlusion = PlanOcclusion(list, overrides);
+    const auto          presentation_coverage = !canonical ? ResolvePresentationCoverage(list, overrides) : std::vector<PresentationCoverage>{};
+    AlphaFootprint      alpha_footprint;
+    for (const auto &coverage : presentation_coverage) {
+        g.counters.bounded_presentation_regions += coverage.bounded ? 1u : 0u;
+    }
+    for (size_t index = 0; index < list.entries.size(); index++) {
+        const Entry &entry = list.entries[index];
+        if (!occlusion.occluders.empty() && index == occlusion.start) {
+            DrawOccluderDepth(occlusion, list, canonical, overrides);
+        }
         tls.interpolation_tint = 0;
         std::visit(
             [&](const auto &e) {
@@ -1604,15 +2536,39 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                     buckets->Enter(BucketFor(e));
                 }
                 if constexpr (std::is_same_v<T, Draw2DEntry>) {
+                    if (canonical && e.presentation_only) {
+                        return;
+                    }
+                    const PresentationCoverage *coverage = !canonical && e.presentation_region >= 0 &&
+                                                                   static_cast<size_t>(e.presentation_region) < presentation_coverage.size()
+                                                               ? &presentation_coverage[static_cast<size_t>(e.presentation_region)]
+                                                               : nullptr;
+                    if (e.region_alpha_reset && (coverage == nullptr || !coverage->bounded)) {
+                        alpha_footprint.Invalidate(CurrentRenderTarget());
+                        return;
+                    }
                     if (!canonical && suppressed_2d_key != 0 && e.target == kMainTarget &&
                         e.interpolation.key == suppressed_2d_key) {
                         return;
                     }
                     std::span<const Vertex2D> vertices = e.vertices;
+                    std::array<Vertex2D, 4>   bounded_vertices;
                     const DrawState          *state = &e.state;
                     UiSide                    side = e.side;
                     if (!canonical && !e.presentation_vertices.empty()) {
                         vertices = e.presentation_vertices;
+                        if (coverage != nullptr && coverage->bounded && !e.region_alpha_reset && vertices.size() == 4) {
+                            for (size_t i = 0; i < bounded_vertices.size(); ++i) {
+                                const auto &source = vertices[i];
+                                auto       &vertex = bounded_vertices[i];
+                                vertex = source;
+                                vertex.u = coverage->rect.x + (i == 1 || i == 2 ? coverage->rect.w : 0.0f);
+                                vertex.v = coverage->rect.y + (i >= 2 ? coverage->rect.h : 0.0f);
+                                vertex.x = vertex.u + (source.x - source.u);
+                                vertex.y = vertex.v + (source.y - source.v);
+                            }
+                            vertices = bounded_vertices;
+                        }
                         state = &e.presentation_state;
                         // Composite replacements are in target space, independent of the original UI box.
                         side = {};
@@ -1625,46 +2581,59 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         tls.interpolation_tint = overrides && overrides->sprites.contains(&e) ? 4 : (e.state.depth_test == DepthTest::Always || e.state.screen_space) ? 3
                                                                                                                                                                       : 2;
                     }
-                    Draw2DSided(e.primitive, vertices, GrabbedBinding(e.binding, canonical), *state, side);
+                    const DrawState                 tested = occlusion.Background(index) ? BehindOccluders(*state) : *state;
+                    std::optional<AlphaResetDomain> alpha_domain;
+                    if (!canonical && !tint && AlphaFootprintEnabled() && coverage != nullptr && coverage->bounded &&
+                        (tested.color_write_mask & kWriteAlpha) != 0) {
+                        alpha_domain = AlphaDomainFor(e, list.presentation_regions[static_cast<size_t>(e.presentation_region)], tested);
+                    }
+                    if (e.region_alpha_reset && alpha_domain) {
+                        const bool reuse = alpha_footprint.domain && SameAlphaDomain(*alpha_footprint.domain, *alpha_domain);
+                        const auto previous_dirty = reuse ? alpha_footprint.dirty : std::nullopt;
+                        alpha_footprint.domain = alpha_domain;
+                        alpha_footprint.dirty.reset();
+                        const double pixel_scale = static_cast<double>(alpha_domain->destination.scale_x) * alpha_domain->destination.scale_y;
+                        alpha_footprint.original_pixels += static_cast<double>(alpha_domain->extent.w) * alpha_domain->extent.h * pixel_scale;
+                        if (reuse) {
+                            if (!previous_dirty) {
+                                ++alpha_footprint.empty_resets;
+                                return;
+                            }
+                            ++alpha_footprint.prior_resets;
+                            alpha_footprint.reset_pixels += static_cast<double>((*previous_dirty)[2] - (*previous_dirty)[0]) * ((*previous_dirty)[3] - (*previous_dirty)[1]) * pixel_scale;
+                            for (size_t i = 0; i < bounded_vertices.size(); ++i) {
+                                bounded_vertices[i] = vertices[i];
+                                bounded_vertices[i].x = (*previous_dirty)[i == 1 || i == 2 ? 2 : 0];
+                                bounded_vertices[i].y = (*previous_dirty)[i >= 2 ? 3 : 1];
+                            }
+                            vertices = bounded_vertices;
+                        } else {
+                            ++alpha_footprint.full_resets;
+                            alpha_footprint.reset_pixels += static_cast<double>(alpha_domain->extent.w) * alpha_domain->extent.h * pixel_scale;
+                        }
+                    } else if ((tested.color_write_mask & kWriteAlpha) != 0 && !alpha_domain) {
+                        if (e.region_alpha_reset) {
+                            ++alpha_footprint.unknown_resets;
+                        }
+                        alpha_footprint.Invalidate(CurrentRenderTarget());
+                    }
+                    Draw2DSided(e.primitive, vertices, GrabbedBinding(e.binding, canonical), tested, side, nullptr,
+                                e.region_alpha_reset || (coverage != nullptr && coverage->bounded));
+                    if (!e.region_alpha_reset && (tested.color_write_mask & kWriteAlpha) != 0 && alpha_domain) {
+                        alpha_footprint.Include(*alpha_domain, vertices);
+                    }
                 } else if constexpr (std::is_same_v<T, MeshEntry>) {
+                    if ((e.state.color_write_mask & kWriteAlpha) != 0) {
+                        alpha_footprint.Invalidate(CurrentRenderTarget());
+                    }
                     if (tint && !canonical && CurrentRenderTarget() == kMainTarget) {
                         tls.interpolation_tint = MeshTint(e, list, overrides);
                     }
-                    const MeshConstants *constants = &e.constants;
-                    if (overrides != nullptr && overrides->index[e.record] >= 0) {
-                        constants = &overrides->constants[overrides->index[e.record]];
-                    }
-                    const Prog0Constants *prog0 =
-                        e.prog0 >= 0 ? &list.prog0_blocks[static_cast<size_t>(e.prog0)] : nullptr;
-                    if (prog0 != nullptr && overrides != nullptr && overrides->prog0_index[e.record] >= 0) {
-                        prog0 = &overrides->prog0[static_cast<size_t>(overrides->prog0_index[e.record])];
-                    }
-                    const Prog0Palette *palette =
-                        e.palette >= 0 ? &list.palettes[static_cast<size_t>(e.palette)] : nullptr;
-                    if (palette != nullptr && overrides != nullptr && overrides->palette_index[e.record] >= 0) {
-                        palette = &overrides->palettes[static_cast<size_t>(overrides->palette_index[e.record])];
-                    }
-                    TextureBinding binding = GrabbedBinding(e.binding, canonical);
-                    if (e.mesh != kNullMesh) {
-                        if (prog0 != nullptr) {
-                            DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, e.state,
-                                          nullptr, palette);
-                        } else {
-                            DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, e.state);
-                        }
-                    } else {
-                        std::span<const Vertex3D> vertices = e.vertices;
-                        if (overrides != nullptr && overrides->vertex_index[e.record] >= 0) {
-                            vertices = overrides->vertices[overrides->vertex_index[e.record]];
-                        }
-                        if (prog0 != nullptr) {
-                            DrawMeshImmediateProg0(vertices, e.indices, *constants, *prog0, binding, e.state,
-                                                   nullptr, palette);
-                        } else {
-                            DrawMeshImmediate(vertices, e.indices, *constants, binding, e.state);
-                        }
-                    }
+                    ReplayMesh(e, list, canonical, overrides, occlusion.Background(index) ? BehindOccluders(e.state) : e.state);
                 } else if constexpr (std::is_same_v<T, ClearEntry>) {
+                    if (!e.stencil && e.color) {
+                        alpha_footprint.Invalidate(CurrentRenderTarget());
+                    }
                     if (e.stencil) {
                         ClearStencil(e.stencil_value, e.has_rect ? &e.rect : nullptr);
                     } else {
@@ -1672,12 +2641,18 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                                                       ? &e.presentation_rect
                                                   : e.has_rect ? &e.rect
                                                                : nullptr;
+                        if (!canonical && e.presentation_region >= 0 && static_cast<size_t>(e.presentation_region) < presentation_coverage.size()) {
+                            rect = &presentation_coverage[static_cast<size_t>(e.presentation_region)].clear_rect;
+                        }
                         // Keep the caller's scratch clear even when the copy is bounded. A
                         // shifted, filtered outline copy samples beyond its scissor's texels;
                         // narrowing the clear to that scissor leaks the previous part's image.
                         Clear(e.color, e.rgba, e.depth, e.z, rect);
                     }
                 } else if constexpr (std::is_same_v<T, DepthPlanesEntry>) {
+                    if ((e.state.color_write_mask & kWriteAlpha) != 0) {
+                        alpha_footprint.Invalidate(CurrentRenderTarget());
+                    }
                     ExecuteDepthPlanes(e.planes, e.quad, GrabbedBinding(e.binding, canonical), e.state);
                 } else if constexpr (std::is_same_v<T, DepthCopyEntry>) {
                     ExecuteDepthCopy(e.source);
@@ -1706,6 +2681,8 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         ReadDepth(e.id, e.rect.x, e.rect.y, e.rect.w, e.rect.h);
                     }
                 } else if constexpr (std::is_same_v<T, CopyEntry>) {
+                    alpha_footprint.domain.reset();
+                    alpha_footprint.dirty.reset();
                     GrabAgain(e);
                 } else if constexpr (std::is_same_v<T, UpdateMeshEntry>) {
                     // A range rewritten more than once holds the tick's last rewrite, so each takes its own.
@@ -1729,6 +2706,9 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
         buckets->Finish();
         RecordReplayBuckets(*buckets);
     }
+    if (!canonical) {
+        RecordAlphaFootprint(alpha_footprint);
+    }
     // The meshes hold the tick's pose again for whoever draws them next.
     if (!canonical && overrides != nullptr) {
         for (const auto &[update, pose] : overrides->poses) {
@@ -1744,6 +2724,90 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
 }
 
 } // namespace
+
+std::optional<LogicalRect> ProjectPresentationBounds(const std::array<float, 3> &bounds_min,
+                                                     const std::array<float, 3> &bounds_max,
+                                                     const MeshConstants        &constants,
+                                                     const LogicalMapping       &mapping) {
+    if (mapping.pixel_width == 0 || mapping.pixel_height == 0 ||
+        !(mapping.scale_x > 0.0f) || !(mapping.scale_y > 0.0f) ||
+        !std::isfinite(mapping.scale_x) || !std::isfinite(mapping.scale_y) ||
+        !std::isfinite(mapping.offset_x) || !std::isfinite(mapping.offset_y)) {
+        return std::nullopt;
+    }
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(bounds_min[axis]) || !std::isfinite(bounds_max[axis]) || bounds_min[axis] > bounds_max[axis]) {
+            return std::nullopt;
+        }
+    }
+    for (float value : constants.mvp) {
+        if (!std::isfinite(value)) {
+            return std::nullopt;
+        }
+    }
+    double           left = INFINITY;
+    double           top = INFINITY;
+    double           right = -INFINITY;
+    double           bottom = -INFINITY;
+    constexpr double error_factor = 8.0 * std::numeric_limits<float>::epsilon();
+    for (uint32_t corner = 0; corner < 8; ++corner) {
+        const double position[4] = {
+            (corner & 1) != 0 ? bounds_max[0] : bounds_min[0],
+            (corner & 2) != 0 ? bounds_max[1] : bounds_min[1],
+            (corner & 4) != 0 ? bounds_max[2] : bounds_min[2], 1.0};
+        double        clip[3] = {};
+        double        error[3] = {};
+        constexpr int rows[3] = {0, 1, 3};
+        for (size_t row = 0; row < 3; ++row) {
+            double magnitude = 0.0;
+            double input_magnitude = 1.0;
+            for (size_t column = 0; column < 4; ++column) {
+                const double coefficient = constants.mvp[column * 4 + rows[row]];
+                const double term = coefficient * position[column];
+                clip[row] += term;
+                magnitude += std::abs(term);
+                input_magnitude += std::abs(coefficient) + std::abs(position[column]);
+            }
+            error[row] = magnitude * error_factor + 8.0 * std::numeric_limits<float>::min() * input_magnitude;
+            if (!std::isfinite(clip[row]) || !std::isfinite(error[row]) ||
+                !(magnitude < static_cast<double>(std::numeric_limits<float>::max()) / 64.0)) {
+                return std::nullopt;
+            }
+        }
+        const double w_min = clip[2] - error[2];
+        const double w_max = clip[2] + error[2];
+        if (!(w_min > 0.0) || !std::isfinite(w_max)) {
+            return std::nullopt;
+        }
+        // Positive W makes projected extrema occur at box corners; interval quotients also cover shader rounding.
+        for (size_t axis = 0; axis < 2; ++axis) {
+            const double numerator[2] = {clip[axis] - error[axis], clip[axis] + error[axis]};
+            const double denominator[2] = {w_min, w_max};
+            for (double n : numerator) {
+                for (double w : denominator) {
+                    const double pixels = (n / w + 1.0) * (axis == 0 ? mapping.pixel_width : mapping.pixel_height) * 0.5;
+                    const double logical = (pixels - (axis == 0 ? mapping.offset_x : mapping.offset_y)) /
+                                           (axis == 0 ? mapping.scale_x : mapping.scale_y);
+                    if (!std::isfinite(logical) || std::abs(logical) > std::numeric_limits<float>::max() * 0.25) {
+                        return std::nullopt;
+                    }
+                    if (axis == 0) {
+                        left = std::min(left, logical);
+                        right = std::max(right, logical);
+                    } else {
+                        top = std::min(top, logical);
+                        bottom = std::max(bottom, logical);
+                    }
+                }
+            }
+        }
+    }
+    const float x = std::nextafter(static_cast<float>(left), -INFINITY);
+    const float y = std::nextafter(static_cast<float>(top), -INFINITY);
+    const float x_end = std::nextafter(static_cast<float>(right), INFINITY);
+    const float y_end = std::nextafter(static_cast<float>(bottom), INFINITY);
+    return LogicalRect{.x = x, .y = y, .w = std::nextafter(x_end - x, INFINITY), .h = std::nextafter(y_end - y, INFINITY)};
+}
 
 Mat4 Multiply(const Mat4 &a, const Mat4 &b) {
     Mat4 out;
@@ -1930,7 +2994,17 @@ void RecordEntry(Entry &&entry) {
         if (!CanRecordBinding(draw->binding)) {
             return;
         }
-        NoteMainDraw(list);
+        if (!draw->presentation_only) {
+            NoteMainDraw(list);
+        }
+        if (list.active_presentation_region >= 0 && g.record_target == list.presentation_regions[list.active_presentation_region].source) {
+            list.presentation_regions[list.active_presentation_region].invalid = true;
+        }
+        if (list.active_presentation_region >= 0 &&
+            draw->binding.texture == list.presentation_regions[list.active_presentation_region].source &&
+            draw->presentation_region != list.active_presentation_region) {
+            list.presentation_regions[list.active_presentation_region].invalid = true;
+        }
         if (draw->state.depth_test != DepthTest::Always && !draw->state.screen_space) {
             draw->scene = list.scene;
         }
@@ -1948,6 +3022,10 @@ void RecordEntry(Entry &&entry) {
             return;
         }
         NoteMainDraw(list);
+    }
+    if (list.active_presentation_region >= 0 &&
+        !std::holds_alternative<Draw2DEntry>(entry) && !std::holds_alternative<TargetEntry>(entry)) {
+        list.presentation_regions[list.active_presentation_region].invalid = true;
     }
     list.entries.push_back(std::move(entry));
 }
@@ -1995,6 +3073,12 @@ void RecordMesh(MeshEntry &&entry, const MeshTransform *transform, const Prog0Co
             entry.palette = PoolIndex(list.palettes, *palette);
         }
     }
+    if (list.active_presentation_region >= 0) {
+        entry.presentation_region = list.active_presentation_region;
+        if (g.record_target != list.presentation_regions[list.active_presentation_region].source) {
+            list.presentation_regions[list.active_presentation_region].invalid = true;
+        }
+    }
     entry.record = static_cast<uint32_t>(list.records.size());
     record.entry = static_cast<uint32_t>(list.entries.size());
     list.records.push_back(record);
@@ -2007,7 +3091,17 @@ void RecordClear(const ClearEntry &entry) {
         (!entry.has_rect || CoversLogicalFrame(entry.rect))) {
         list.main_cleared = true;
     }
-    list.entries.push_back(entry);
+    ClearEntry recorded = entry;
+    if (list.active_presentation_region >= 0) {
+        auto &region = list.presentation_regions[list.active_presentation_region];
+        if (g.record_target != region.source || entry.stencil || entry.depth || !entry.color ||
+            std::ranges::any_of(entry.rgba, [](uint8_t value) { return value != 0; })) {
+            region.invalid = true;
+        } else {
+            recorded.presentation_region = list.active_presentation_region;
+        }
+    }
+    list.entries.push_back(recorded);
 }
 
 void RecordDoomedTexture(TextureHandle handle) { g.list->doomed_textures.push_back(handle); }
@@ -2021,6 +3115,7 @@ using namespace detail;
 DisplayList::DisplayList()
     : entries(ListPayloadResource(*this)), records(ListPayloadResource(*this)), cameras(ListPayloadResource(*this)),
       scenes(ListPayloadResource(*this)), prog0_blocks(ListPayloadResource(*this)), palettes(ListPayloadResource(*this)),
+      presentation_regions(ListPayloadResource(*this)),
       target_scenes(ListKeyResource(*this)), doomed_textures(ListPayloadResource(*this)),
       doomed_meshes(ListPayloadResource(*this)), occurrences(ListKeyResource(*this)),
       occurrences_2d(ListKeyResource(*this)), tagged_2d(ListPayloadResource(*this)) {}
@@ -2074,6 +3169,28 @@ bool CurrentNoInterpolation() { return g.interp_no_interpolation; }
 void SetInterp2D(Interp2D interpolation) { g.interp_2d = interpolation; }
 
 Interp2D CurrentInterp2D() { return g.interp_2d; }
+
+void BeginPresentationRegion(TextureHandle source, const LogicalRect &extent, float padding) {
+    if (!RecordingCalls()) {
+        return;
+    }
+    DisplayList  &list = *g.list;
+    const int32_t parent = list.active_presentation_region;
+    if (parent >= 0) {
+        list.presentation_regions[parent].invalid = true;
+    }
+    list.active_presentation_region = static_cast<int32_t>(list.presentation_regions.size());
+    list.presentation_regions.push_back({.source = source, .extent = extent, .padding = padding, .mapping = GetLogicalMapping(source), .parent = parent});
+}
+
+void EndPresentationRegion(bool eligible) {
+    if (!RecordingCalls() || g.list->active_presentation_region < 0) {
+        return;
+    }
+    auto &region = g.list->presentation_regions[g.list->active_presentation_region];
+    region.eligible = eligible && !region.invalid;
+    g.list->active_presentation_region = region.parent;
+}
 
 void BeginRecording(RecordingKind kind) {
     if (g.list != nullptr) {
@@ -2139,6 +3256,116 @@ void CutCameraInterpolation() {
     }
 }
 
+namespace detail {
+
+bool DeferredCanonicalOverlaySafe(const DisplayList *overlay) {
+    if (overlay == nullptr) {
+        return true;
+    }
+    if (overlay->instance != g.renderer_instance) {
+        return false;
+    }
+    const auto safe_state = [](const DrawState &state) {
+        return state.depth_test == DepthTest::Always && !state.depth_write && !state.stencil_test;
+    };
+    for (const auto &entry : overlay->entries) {
+        if (const auto *target = std::get_if<TargetEntry>(&entry)) {
+            if (target->target != kMainTarget) {
+                return false;
+            }
+        } else if (const auto *draw = std::get_if<Draw2DEntry>(&entry)) {
+            if (draw->target != kMainTarget || draw->binding.texture != kNullTexture ||
+                draw->scene != -1 || draw->presentation_region != -1 || draw->presentation_only ||
+                !safe_state(draw->state) ||
+                (!draw->presentation_vertices.empty() && !safe_state(draw->presentation_state))) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace detail
+
+namespace {
+
+/**
+ * Rejects recorded writes that would change the prior main image before its retirement.
+ */
+bool CanonicalPreservesPrior(const DisplayList &list) {
+    for (const auto &entry : list.entries) {
+        if (const auto *copy = std::get_if<CopyEntry>(&entry); copy != nullptr && copy->dst == kPreviousFrame) {
+            return false;
+        }
+        if (const auto *target = std::get_if<TargetEntry>(&entry); target != nullptr && target->target == kPreviousFrame) {
+            return false;
+        }
+        if (const auto *draw = std::get_if<Draw2DEntry>(&entry); draw != nullptr && draw->target == kPreviousFrame) {
+            return false;
+        }
+        if (const auto *update = std::get_if<UpdateTextureEntry>(&entry); update != nullptr && update->texture == kPreviousFrame) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Replays one canonical list with optional bounded precommit retirement.
+ */
+bool ReplayCanonicalList(const DisplayList &list, const CanonicalCommitTransaction *transaction = nullptr) {
+    const bool timing = ReplayPhasesEnabled();
+    const auto start = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (!OpenListFrame(true, false, false, 0.0, transaction != nullptr)) {
+        return false;
+    }
+    const auto opened = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    {
+        const MeshAlphaDiagnosticReplay diagnostic;
+        Replay(list, true, nullptr);
+    }
+    const auto replayed = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    CloseListFrame(true, false, transaction);
+    if (timing) {
+        const auto closed = std::chrono::steady_clock::now();
+        RecordReplayPhases({std::chrono::duration<double, std::milli>(opened - start).count(),
+                            std::chrono::duration<double, std::milli>(replayed - opened).count(),
+                            std::chrono::duration<double, std::milli>(closed - replayed).count()});
+    }
+    return true;
+}
+
+} // namespace
+
+bool RenderCanonicalBeforeCommit(const DisplayList &next, const CanonicalImageToken &prior,
+                                 const DisplayList *prior_overlay, const std::function<void()> &before_commit) {
+    if (!before_commit || GameFrameOpen() || RecordingCalls()) {
+        return false;
+    }
+    bool rendered = false;
+    RunOnRenderThread([&] {
+        if (g.device == VK_NULL_HANDLE || next.instance != g.renderer_instance || g.canonical_commit_pending ||
+            !CanonicalPreservesPrior(next) || !DeferredCanonicalOverlaySafe(prior_overlay)) {
+            return;
+        }
+        auto current = CaptureCanonicalImage();
+        if (!current || *current != prior || !PrepareCanonicalTargets()) {
+            return;
+        }
+        current = CaptureCanonicalImage();
+        if (!current || *current != prior) {
+            return;
+        }
+        const CanonicalCommitTransaction transaction{prior, prior_overlay, &before_commit,
+                                                     g.renderer_instance, g.canonical_target_generation,
+                                                     g.canonical_commit_serial, g.main_current};
+        rendered = ReplayCanonicalList(next, &transaction);
+    });
+    return rendered;
+}
+
 bool RenderList(const DisplayList &list, float alpha, const RenderOptions &options) {
     KZ_PROFILE_ZONE("Kazarov RenderList");
     if (list.instance != g.renderer_instance || g.device == VK_NULL_HANDLE) {
@@ -2151,30 +3378,13 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
     }
     bool rendered = false;
     RunOnRenderThread([&] {
+        if (g.canonical_commit_pending &&
+            (options.canonical || !CanonicalEndpointScopeActive() || !options.host || !options.present ||
+             options.previous != nullptr || options.overlay != nullptr || &list != g.deferred_prior_overlay)) {
+            return;
+        }
         if (options.canonical) {
-            if (ReplayPhasesEnabled()) {
-                const auto start = std::chrono::steady_clock::now();
-                OpenListFrame(true, false, false);
-                const auto opened = std::chrono::steady_clock::now();
-                {
-                    const MeshAlphaDiagnosticReplay diagnostic;
-                    Replay(list, true, nullptr);
-                }
-                const auto replayed = std::chrono::steady_clock::now();
-                CloseListFrame(true, false);
-                const auto closed = std::chrono::steady_clock::now();
-                RecordReplayPhases({std::chrono::duration<double, std::milli>(opened - start).count(),
-                                    std::chrono::duration<double, std::milli>(replayed - opened).count(),
-                                    std::chrono::duration<double, std::milli>(closed - replayed).count()});
-            } else {
-                OpenListFrame(true, false, false);
-                {
-                    const MeshAlphaDiagnosticReplay diagnostic;
-                    Replay(list, true, nullptr);
-                }
-                CloseListFrame(true, false);
-            }
-            rendered = true;
+            rendered = ReplayCanonicalList(list);
             return;
         }
         if (!g.canonical_newest) {

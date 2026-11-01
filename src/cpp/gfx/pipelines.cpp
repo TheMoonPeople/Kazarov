@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -7,6 +9,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -262,6 +265,10 @@ void SaveCache(const std::filesystem::path &path, const std::vector<uint8_t> &in
         std::error_code error;
         if (path.has_parent_path()) {
             std::filesystem::create_directories(path.parent_path(), error);
+            if (trace && error) {
+                kz::Logf(kz::LogLevel::Info, "gfx", "perf init: pipeline cache parent {} mkdir_error={} message={}",
+                         PathsDisplay(path.parent_path()), error.value(), error.message());
+            }
         }
         if (FilesWrite(path, data.data(), size, true) != FilesResult::kWritten) {
             Error("cannot write the pipeline cache to %s", PathsDisplay(path).c_str());
@@ -275,6 +282,117 @@ void SaveCache(const std::filesystem::path &path, const std::vector<uint8_t> &in
                  std::chrono::duration<double, std::milli>(finished - serialized).count());
     }
 }
+
+/**
+ * Owns the Vulkan inputs needed to create one deferred graphics pipeline.
+ */
+struct PipelineRecipe {
+    VkGraphicsPipelineCreateInfo                   info{};         /**< Complete description of the deferred pipeline. */
+    VkPipelineRenderingCreateInfo                  rendering{};    /**< Rendering attachment metadata for the pipeline. */
+    VkFormat                                       color_format{}; /**< Color attachment format referenced by the rendering metadata. */
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages = {
+        VkPipelineShaderStageCreateInfo{.stage = VK_SHADER_STAGE_VERTEX_BIT},
+        VkPipelineShaderStageCreateInfo{.stage = VK_SHADER_STAGE_FRAGMENT_BIT}}; /**< Owned descriptions of the active shader stages. */
+    std::array<VkSpecializationInfo, 2>                  specialization{};       /**< Specialization metadata for each shader stage. */
+    std::array<std::vector<VkSpecializationMapEntry>, 2> entries{};              /**< Owned specialization constant mappings. */
+    std::array<std::vector<uint8_t>, 2>                  data{};                 /**< Owned specialization constant values. */
+    VkPipelineVertexInputStateCreateInfo                 vertex{};               /**< Vertex input layout for the pipeline. */
+    std::vector<VkVertexInputBindingDescription>         bindings;               /**< Owned vertex buffer binding descriptions. */
+    std::vector<VkVertexInputAttributeDescription>       attributes;             /**< Owned vertex attribute descriptions. */
+    VkPipelineInputAssemblyStateCreateInfo               assembly{};             /**< Primitive assembly configuration. */
+    VkPipelineViewportStateCreateInfo                    viewport{};             /**< Dynamic viewport and scissor counts. */
+    VkPipelineRasterizationStateCreateInfo               raster{};               /**< Rasterization configuration. */
+    VkPipelineMultisampleStateCreateInfo                 multisample;            /**< Sample coverage configuration. */
+    VkPipelineDepthStencilStateCreateInfo                depth{};                /**< Depth and stencil configuration. */
+    VkPipelineColorBlendStateCreateInfo                  blend{};                /**< Color blending configuration. */
+    std::vector<VkPipelineColorBlendAttachmentState>     attachments;            /**< Owned per-attachment blending descriptions. */
+    VkPipelineDynamicStateCreateInfo                     dynamic{};              /**< Metadata describing dynamic draw state. */
+    std::vector<VkDynamicState>                          dynamic_states;         /**< Owned dynamic state declarations. */
+
+    /**
+     * Copies the regular pipeline description and all of its referenced storage.
+     */
+    explicit PipelineRecipe(const VkGraphicsPipelineCreateInfo &description)
+        : info(description), rendering(*static_cast<const VkPipelineRenderingCreateInfo *>(description.pNext)),
+          color_format(*rendering.pColorAttachmentFormats), multisample(*description.pMultisampleState) {
+        rendering.pColorAttachmentFormats = &color_format;
+        info.pNext = &rendering;
+        for (uint32_t i = 0; i < info.stageCount; i++) {
+            stages[i] = info.pStages[i];
+            if (const VkSpecializationInfo *source = stages[i].pSpecializationInfo) {
+                specialization[i] = *source;
+                entries[i].assign(source->pMapEntries, source->pMapEntries + source->mapEntryCount);
+                const auto *bytes = static_cast<const uint8_t *>(source->pData);
+                data[i].assign(bytes, bytes + source->dataSize);
+                specialization[i].pMapEntries = entries[i].data();
+                specialization[i].pData = data[i].data();
+                stages[i].pSpecializationInfo = &specialization[i];
+            }
+        }
+        info.pStages = stages.data();
+        vertex = *info.pVertexInputState;
+        bindings.assign(vertex.pVertexBindingDescriptions,
+                        vertex.pVertexBindingDescriptions + vertex.vertexBindingDescriptionCount);
+        attributes.assign(vertex.pVertexAttributeDescriptions,
+                          vertex.pVertexAttributeDescriptions + vertex.vertexAttributeDescriptionCount);
+        vertex.pVertexBindingDescriptions = bindings.data();
+        vertex.pVertexAttributeDescriptions = attributes.data();
+        info.pVertexInputState = &vertex;
+        assembly = *info.pInputAssemblyState;
+        info.pInputAssemblyState = &assembly;
+        viewport = *info.pViewportState;
+        info.pViewportState = &viewport;
+        raster = *info.pRasterizationState;
+        info.pRasterizationState = &raster;
+        info.pMultisampleState = &multisample;
+        depth = *info.pDepthStencilState;
+        info.pDepthStencilState = &depth;
+        blend = *info.pColorBlendState;
+        attachments.assign(blend.pAttachments, blend.pAttachments + blend.attachmentCount);
+        blend.pAttachments = attachments.data();
+        info.pColorBlendState = &blend;
+        dynamic = *info.pDynamicState;
+        dynamic_states.assign(dynamic.pDynamicStates, dynamic.pDynamicStates + dynamic.dynamicStateCount);
+        dynamic.pDynamicStates = dynamic_states.data();
+        info.pDynamicState = &dynamic;
+    }
+
+    /**
+     * Keeps referenced Vulkan storage attached to its original owner.
+     */
+    PipelineRecipe(const PipelineRecipe &) = delete;
+
+    /**
+     * Prevents replacing storage referenced by an existing description.
+     */
+    PipelineRecipe &operator=(const PipelineRecipe &) = delete;
+};
+
+/**
+ * Keeps deferred pipeline descriptions and their shader modules alive until renderer shutdown.
+ */
+struct PipelineRecipes {
+    std::vector<std::unique_ptr<PipelineRecipe>> pipelines;          /**< Descriptions awaiting first use by each pipeline index. */
+    std::array<VkShaderModule, 5>                modules{};          /**< Shader modules referenced by deferred descriptions. */
+    bool                                         save_cache = false; /**< Whether shutdown persists compiled pipeline cache data. */
+    std::vector<uint8_t>                         initial_cache;      /**< Cache bytes loaded before deferred pipeline creation. */
+
+    /**
+     * Releases shader modules while the renderer's device is still alive.
+     */
+    ~PipelineRecipes() {
+        for (VkShaderModule module : modules) {
+            if (module != VK_NULL_HANDLE) {
+                vkDestroyShaderModule(g.device, module, nullptr);
+            }
+        }
+    }
+};
+
+/**
+ * Owns the deferred descriptions for the current renderer instance.
+ */
+std::unique_ptr<PipelineRecipes> g_pipeline_recipes;
 
 struct PipelineDesc {
     PipelineFamily family;
@@ -498,10 +616,12 @@ void LogShaderStats() {
         return;
     }
     const bool                                           all = g.perf.stats == "*";
-    const std::array<std::pair<uint32_t, VkPipeline>, 4> extras = {
+    const std::array<std::pair<uint32_t, VkPipeline>, 6> extras = {
         {
          {kNearSafeFogScope, g.near_safe_fog_pipelines[0]},
          {kNearSafeFogAlphaScope, g.near_safe_fog_pipelines[1]},
+         {kProg0NearSafeFogAlphaScope, g.prog0_near_safe_fog_pipelines[0]},
+         {kProg0NearSafeFogBlendScope, g.prog0_near_safe_fog_pipelines[1]},
          {kDepthPlanesScope, g.depth_planes_pipeline},
          {kZeroAlphaNoopScope, g.zero_alpha_noop_pipeline},
          }
@@ -585,6 +705,11 @@ void CreatePipelines() {
     BuildBlendTable();
 
     const bool                trace_init = std::getenv("KZ_PERF_INIT_TRACE") != nullptr;
+    const char               *prewarm_setting = std::getenv("KZ_PIPELINE_PREWARM");
+    const bool                first_use_default = g.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ||
+                                                  std::getenv("KZ_PIPELINES_LAZY") != nullptr;
+    const bool                prewarm = prewarm_setting != nullptr ? std::strcmp(prewarm_setting, "0") != 0
+                                                                   : !first_use_default;
     const bool                disable_cache = std::getenv("KZ_PIPELINE_CACHE_DISABLE") != nullptr;
     std::vector<uint8_t>      initial = disable_cache ? std::vector<uint8_t>{} : LoadCache(g.config.pipeline_cache);
     const auto                loaded = trace_init ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -811,11 +936,17 @@ void CreatePipelines() {
 
     std::vector<VkPipelineShaderStageCreateInfo> stages(total * 2);
     std::vector<VkGraphicsPipelineCreateInfo>    infos(total);
-    uint32_t                                     creation_count = 0;
-    auto                                         describe = [&](uint32_t index, uint32_t family, VkShaderModule fragment,
-                                                                const VkSpecializationInfo                *fragment_spec,
-                                                                const VkPipelineColorBlendStateCreateInfo *blend_state,
-                                                                const VkPipelineDynamicStateCreateInfo    *dynamic_state) {
+    if (!prewarm) {
+        g_pipeline_recipes = std::make_unique<PipelineRecipes>();
+        g_pipeline_recipes->pipelines.resize(total);
+        g_pipeline_recipes->modules = {draw2d_module, mesh_module, frag_module, frag_single_module, prog0_module};
+        g_pipeline_recipes->save_cache = !disable_cache;
+    }
+    uint32_t creation_count = 0;
+    auto     describe = [&](uint32_t index, uint32_t family, VkShaderModule fragment,
+                            const VkSpecializationInfo                *fragment_spec,
+                            const VkPipelineColorBlendStateCreateInfo *blend_state,
+                            const VkPipelineDynamicStateCreateInfo    *dynamic_state) {
         creation_count++;
         VkPipelineShaderStageCreateInfo *stage = &stages[index * 2];
         stage[0] = {};
@@ -852,6 +983,9 @@ void CreatePipelines() {
         if (!g.perf.stats.empty() && (g.perf.stats == "*" || DescribePipeline(index).find(g.perf.stats) != std::string::npos)) {
             info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
                           VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+        }
+        if (!prewarm) {
+            g_pipeline_recipes->pipelines[index] = std::make_unique<PipelineRecipe>(info);
         }
     };
     for (uint32_t family = 0; family < family_count; family++) {
@@ -911,7 +1045,15 @@ void CreatePipelines() {
         return result;
     };
     uint32_t workers = std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
-    {
+    if (const char *setting = std::getenv("KZ_PIPELINE_COMPILER_THREADS"); setting != nullptr) {
+        uint32_t    worker_limit = 0;
+        const char *end = setting + std::strlen(setting);
+        const auto  parsed = std::from_chars(setting, end, worker_limit);
+        if (parsed.ec == std::errc{} && parsed.ptr == end && worker_limit != 0) {
+            workers = std::min(workers, worker_limit);
+        }
+    }
+    if (prewarm) {
         // std::thread rather than std::jthread, which Android's libc++ keeps experimental.
         std::vector<std::thread> threads;
         for (uint32_t i = 0; i < workers; i++) {
@@ -952,16 +1094,27 @@ void CreatePipelines() {
     Check(failure, "vkCreateGraphicsPipelines");
     const auto compiled = trace_init ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (NearSafeFogEnabled() && g.blend_slot_count > 4) {
-        for (uint32_t variant = 0; variant < 2; variant++) {
-            const AlphaVariant alpha = variant == 0 ? kAlphaVariantNone : kAlphaVariantGEqual;
-            const uint32_t     features = kColorFeatureCount + 1;
-            const uint32_t     base = PipelineIndex(kFamilyMesh, 4, kTextureRgba, alpha, features);
-            g.near_safe_fog_bases[variant] = base;
-            Specialization data = spec_data[kFamilyMesh][kTextureRgba][alpha][features];
+        const char *prog0_override = std::getenv("KZ_PROG0_FOG_NEAR_SAFE");
+        const bool  prog0_enabled = g.config.prog0_meshes && (prog0_override == nullptr || std::strcmp(prog0_override, "0") != 0);
+        for (uint32_t variant = 0; variant < 4; variant++) {
+            const bool prog0 = variant >= 2;
+            if (prog0 && !prog0_enabled) {
+                continue;
+            }
+            const uint32_t       local_variant = prog0 ? variant - 2 : variant;
+            const PipelineFamily family = prog0 ? kFamilyMeshProg0 : kFamilyMesh;
+            const uint32_t       blend = prog0 && local_variant == 0 ? 0 : 4;
+            const AlphaVariant   alpha = prog0 ? (local_variant == 0 ? kAlphaVariantGEqual : kAlphaVariantNone)
+                                               : (local_variant == 0 ? kAlphaVariantNone : kAlphaVariantGEqual);
+            const uint32_t       features = kColorFeatureCount + 1;
+            const uint32_t       base = PipelineIndex(family, blend, kTextureRgba, alpha, features);
+            auto                &base_slot = prog0 ? g.prog0_near_safe_fog_bases[local_variant] : g.near_safe_fog_bases[local_variant];
+            base_slot = base;
+            Specialization data = spec_data[family][kTextureRgba][alpha][features];
             data.near_safe_mesh_fog = VK_TRUE;
             const char *reciprocal = std::getenv("KZ_FOG_NEAR_RECIPROCAL");
-            data.near_safe_reciprocal = reciprocal != nullptr && std::strcmp(reciprocal, "1") == 0 ? VK_TRUE : VK_FALSE;
-            VkSpecializationInfo fragment_info = spec_info[kFamilyMesh][kTextureRgba][alpha][features];
+            data.near_safe_reciprocal = !prog0 && reciprocal != nullptr && std::strcmp(reciprocal, "1") == 0 ? VK_TRUE : VK_FALSE;
+            VkSpecializationInfo fragment_info = spec_info[family][kTextureRgba][alpha][features];
             fragment_info.pData = &data;
             VkPipelineShaderStageCreateInfo near_stages[] = {stages[base * 2], stages[base * 2 + 1]};
             near_stages[1].pSpecializationInfo = &fragment_info;
@@ -979,8 +1132,10 @@ void CreatePipelines() {
                 Check(create_pipeline(create, pipeline),
                       "vkCreateGraphicsPipelines near-safe fog");
             };
-            create_near_pipeline(variant == 0 ? kNearSafeFogScope : kNearSafeFogAlphaScope,
-                                 g.near_safe_fog_pipelines[variant]);
+            const uint32_t scope = prog0 ? (local_variant == 0 ? kProg0NearSafeFogAlphaScope : kProg0NearSafeFogBlendScope)
+                                         : (local_variant == 0 ? kNearSafeFogScope : kNearSafeFogAlphaScope);
+            auto          &pipeline = prog0 ? g.prog0_near_safe_fog_pipelines[local_variant] : g.near_safe_fog_pipelines[local_variant];
+            create_near_pipeline(scope, pipeline);
         }
     }
     if (g.dynamic_color_write_mask) {
@@ -1057,14 +1212,16 @@ void CreatePipelines() {
         LogShaderStats();
     }
 
-    vkDestroyShaderModule(g.device, draw2d_module, nullptr);
-    vkDestroyShaderModule(g.device, mesh_module, nullptr);
-    vkDestroyShaderModule(g.device, frag_module, nullptr);
-    vkDestroyShaderModule(g.device, frag_single_module, nullptr);
-    if (prog0_module != VK_NULL_HANDLE) {
-        vkDestroyShaderModule(g.device, prog0_module, nullptr);
+    if (prewarm) {
+        vkDestroyShaderModule(g.device, draw2d_module, nullptr);
+        vkDestroyShaderModule(g.device, mesh_module, nullptr);
+        vkDestroyShaderModule(g.device, frag_module, nullptr);
+        vkDestroyShaderModule(g.device, frag_single_module, nullptr);
+        if (prog0_module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(g.device, prog0_module, nullptr);
+        }
     }
-    if (!disable_cache && (initial.empty() || cache_unconfirmed.load(std::memory_order_relaxed) != 0)) {
+    if (prewarm && !disable_cache && (initial.empty() || cache_unconfirmed.load(std::memory_order_relaxed) != 0)) {
         SaveCache(g.config.pipeline_cache, initial);
     }
     g.pipeline_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -1077,10 +1234,40 @@ void CreatePipelines() {
                  milliseconds(start, loaded), milliseconds(loaded, cache_created),
                  milliseconds(cache_created, described), milliseconds(described, compiled), cache_unconfirmed.load(), initial.size());
     }
-    kz::Logf(kz::LogLevel::Info, "gfx", "{} pipelines ready in {:.2f} s", creation_count, g.pipeline_seconds);
+    if (!prewarm && g.config.progress) {
+        g.config.progress(creation_count, creation_count);
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx", "{} pipelines {} in {:.2f} s", creation_count,
+             prewarm ? "ready" : "described for first use", g.pipeline_seconds);
+    if (g_pipeline_recipes) {
+        g_pipeline_recipes->initial_cache = std::move(initial);
+    }
+}
+
+/**
+ * Creates a deferred regular pipeline on first use by the renderer thread.
+ */
+VkPipeline PipelineByIndex(uint32_t index) {
+    VkPipeline &pipeline = g.pipelines.at(index);
+    if (pipeline == VK_NULL_HANDLE) {
+        const auto &recipe = g_pipeline_recipes->pipelines.at(index);
+        Check(vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &recipe->info, nullptr, &pipeline),
+              "vkCreateGraphicsPipelines on demand");
+        g_pipeline_recipes->pipelines[index].reset();
+        if (!g.perf.stats.empty()) {
+            LogShaderStats();
+        }
+    }
+    return pipeline;
 }
 
 void DestroyPipelines() {
+    if (g_pipeline_recipes) {
+        if (g_pipeline_recipes->save_cache) {
+            SaveCache(g.config.pipeline_cache, g_pipeline_recipes->initial_cache);
+        }
+        g_pipeline_recipes.reset();
+    }
     for (VkPipeline pipeline : g.pipelines) {
         vkDestroyPipeline(g.device, pipeline, nullptr);
     }
@@ -1093,6 +1280,13 @@ void DestroyPipelines() {
         }
     }
     g.near_safe_fog_bases.fill(UINT32_MAX);
+    for (VkPipeline &pipeline : g.prog0_near_safe_fog_pipelines) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(g.device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+    g.prog0_near_safe_fog_bases.fill(UINT32_MAX);
     if (g.zero_alpha_noop_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(g.device, g.zero_alpha_noop_pipeline, nullptr);
         g.zero_alpha_noop_pipeline = VK_NULL_HANDLE;
@@ -1119,6 +1313,9 @@ std::string DescribePipeline(uint32_t index) {
     }
     if (index == kNearSafeFogScope || index == kNearSafeFogAlphaScope) {
         return index == kNearSafeFogScope ? "mesh-fog-near-safe" : "mesh-fog-near-safe-atest>=";
+    }
+    if (index == kProg0NearSafeFogAlphaScope || index == kProg0NearSafeFogBlendScope) {
+        return index == kProg0NearSafeFogAlphaScope ? "prog0-fog-near-safe-atest>=" : "prog0-fog-near-safe-blend";
     }
     const uint32_t families = FamilyCount();
     const uint32_t colour =

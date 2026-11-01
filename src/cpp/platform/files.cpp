@@ -13,19 +13,43 @@
 #endif
 
 #include <cerrno>
+#ifdef __SWITCH__
+extern "C" {
+#include <switch/runtime/devices/fs_dev.h>
+}
+#endif
 #endif
 
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <random>
 
 namespace fs = std::filesystem;
 
 namespace {
 
+/**
+ * Generates a candidate staging filename for exclusive file publication.
+ */
 fs::path TempPath(const fs::path &path) {
-    static std::mt19937_64 random{std::random_device{}()};
-    char                   suffix[24];
-    std::snprintf(suffix, sizeof(suffix), ".%016llx.tmp", static_cast<unsigned long long>(random()));
+    static std::mt19937_64 random{[] {
+        // The clock also varies seeds on platforms with a deterministic random_device fallback.
+        const auto    timestamp = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::seed_seq seed{std::random_device{}(), static_cast<std::uint32_t>(timestamp),
+                           static_cast<std::uint32_t>(timestamp >> 32)};
+        return std::mt19937_64{seed};
+    }()};
+    static std::mutex      random_mutex;
+    std::uint64_t          value;
+    {
+        std::scoped_lock lock{random_mutex};
+        value = random();
+    }
+    char suffix[24];
+    std::snprintf(suffix, sizeof(suffix), ".%016llx.tmp", static_cast<unsigned long long>(value));
     fs::path temp = path;
     temp += suffix;
     return temp;
@@ -124,8 +148,31 @@ std::size_t ReadRegular(const fs::path &path, char *data, std::size_t size) {
 using File = int;
 const File kNoFile = -1;
 
+/**
+ * Reports an opted-in file failure while preserving the failing operation's errno.
+ */
+void TraceWriteFailure(const char *stage, const char *path = "") {
+    const int saved_errno = errno;
+    if (std::getenv("KZ_PERF_INIT_TRACE") != nullptr) {
+#ifdef __SWITCH__
+        const auto last_result = fsdevGetLastResult();
+        const bool mounted = fsdevGetDeviceFileSystem("sdmc") != nullptr;
+        std::fprintf(stderr, "perf init: file failure stage=%s path=%s errno=%d sdmc_mounted=%d last_fs_result=0x%08x\n",
+                     stage, path, saved_errno, mounted, static_cast<unsigned int>(last_result));
+#else
+        std::fprintf(stderr, "perf init: file failure stage=%s path=%s errno=%d\n", stage, path, saved_errno);
+#endif
+        std::fflush(stderr);
+    }
+    errno = saved_errno;
+}
+
 File CreateExclusive(const fs::path &path) {
-    return open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    const File file = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (file == kNoFile) {
+        TraceWriteFailure("open", path.c_str());
+    }
+    return file;
 }
 
 bool Taken() {
@@ -144,6 +191,7 @@ bool WriteAll(File file, const char *data, std::size_t size) {
             continue;
         }
         if (written <= 0) {
+            TraceWriteFailure("write");
             return false;
         }
         data += written;
@@ -180,7 +228,14 @@ bool SyncFile(File file) {
 
 bool SyncAndClose(File file) {
     bool synced = SyncFile(file);
-    return close(file) == 0 && synced;
+    if (!synced) {
+        TraceWriteFailure("fsync");
+    }
+    const bool closed = close(file) == 0;
+    if (!closed) {
+        TraceWriteFailure("close");
+    }
+    return closed && synced;
 }
 
 void Remove(const fs::path &path) {
@@ -224,10 +279,13 @@ int RenameReplacing(const fs::path &temp, const fs::path &path) {
     fs::path backup = TempPath(path);
     bool     moved = rename(path.c_str(), backup.c_str()) == 0;
     if (!moved && errno != ENOENT) {
+        TraceWriteFailure("rename-backup", path.c_str());
         return -1;
     }
     if (rename(temp.c_str(), path.c_str()) != 0) {
+        TraceWriteFailure("rename-publish", path.c_str());
         if (moved && rename(backup.c_str(), path.c_str()) != 0) {
+            TraceWriteFailure("rename-restore", path.c_str());
             std::fprintf(stderr, "files: previous contents remain at %s; could not restore %s\n", backup.c_str(),
                          path.c_str());
         }

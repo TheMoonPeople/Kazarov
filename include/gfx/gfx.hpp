@@ -227,14 +227,65 @@ struct FrameTimings {
     uint64_t           passes = 0;   // dynamic-rendering spans in scoped frames
 };
 
-void         SetFrameTimingEnabled(bool enabled);
-bool         FrameTimingEnabled();
+void SetFrameTimingEnabled(bool enabled);
+bool FrameTimingEnabled();
+/**
+ * Reports successful activation of the native VI-vsync presentation gate.
+ */
+bool VsyncGateActive();
+/**
+ * Reports successful activation of native prior-presentation feedback pacing.
+ */
+bool PresentedGateActive();
+/**
+ * Samples prior-presentation readiness once under device ownership without waiting for later feedback.
+ */
+bool PresentedGateReady();
+
 FrameTimings TakeFrameTimings();
 
 /**
  * Reports and clears accumulated CPU, GPU and presentation timing samples for an interval.
  */
 void LogFrameTimings(double elapsed_seconds);
+
+/**
+ * Identifies completed marked presentation attempts at a measurement boundary.
+ */
+struct PresentMarkerSnapshot {
+    bool     enabled = false;       /**< Whether per-presentation output markers are enabled. */
+    uint64_t renderer_instance = 0; /**< Renderer lifetime containing the sequence. */
+    uint64_t last_sequence = 0;     /**< Sequence of the last successfully queued marked image. */
+    uint64_t accepted = 0;          /**< Successfully queued marked images in this renderer lifetime. */
+    uint64_t failed = 0;            /**< Marked presentation attempts rejected by the swapchain. */
+    int64_t  last_present_ns = 0;   /**< Steady-clock time when the last accepted present returned. */
+    int64_t  boundary_ns = 0;       /**< Steady-clock time of this synchronized snapshot. */
+};
+
+/**
+ * Reads a consistent marker sequence boundary without submitting device work.
+ */
+PresentMarkerSnapshot GetPresentMarkerSnapshot();
+
+/**
+ * Reads the native display-history clock, or zero when collection is disabled or unsupported.
+ */
+uint64_t PresentationHistoryClockNs();
+
+/**
+ * Starts bounded native presentation-history collection at a measurement boundary.
+ */
+void BeginPresentationHistory(uint64_t boundary_ns);
+
+/**
+ * Marks the end of a native presentation-history measurement without dropping queued frames.
+ */
+void EndPresentationHistory(uint64_t boundary_ns);
+
+/**
+ * Drains and reports native presentation history while the caller holds the render lease.
+ */
+void LogPresentationHistory();
 
 // Anisotropic filtering of linearly filtered meshes: 0 or 1 is off, otherwise 2, 4, 8 or 16 samples
 // (a value in between takes the level below it). Takes effect from the next draw.
@@ -244,6 +295,12 @@ bool BeginFrame();
 void EndFrame();
 // Inside BeginFrame/EndFrame or BeginRecording/EndRecording.
 bool InFrame();
+// Device thread: whether at most `presents` submitted presents are still running on the GPU, checked without waiting.
+// A present waits for an earlier present to finish, so a caller can defer one until this holds.
+bool GpuPresentsPendingAtMost(uint32_t presents);
+// Async: queues device work for the render thread and returns at once; it runs before any later lease or device call
+// from another thread. Off and Lockstep, or on the device thread, it runs before returning.
+void RunOnRenderThreadAsync(std::function<void()> fn);
 // Validation-layer messages seen so far (validation and performance types, warning or worse).
 uint32_t ValidationMessageCount();
 uint32_t PipelineCount();
@@ -673,7 +730,19 @@ bool InvertAffineTransform(const float matrix[16], float inverse[16]);
 struct Presentation2D {
     std::span<const Vertex2D> vertices;
     DrawState                 state;
+    bool                      bounded_region = false;     /**< Uses its active presentation region's resolved texture rectangle. */
+    bool                      presentation_only = false;  /**< Omits this draw from the authored canonical image. */
+    bool                      region_alpha_reset = false; /**< Restores full-area destination alpha only when the group is bounded. */
 };
+
+/**
+ * Starts a recording-local group whose rigid meshes bound its presentation clear and composites.
+ */
+void BeginPresentationRegion(TextureHandle source, const LogicalRect &extent, float padding);
+/**
+ * Ends the active presentation group, retaining full coverage unless its composites permit bounding.
+ */
+void EndPresentationRegion(bool eligible);
 
 void Draw2D(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &texture,
             const DrawState &state, const Presentation2D *presentation = nullptr);
@@ -972,6 +1041,14 @@ std::optional<CanonicalImageToken> CaptureCanonicalImage();
  * Presents the exact latest committed image, optionally compositing a host-only overlay.
  */
 bool PresentCanonicalImage(const CanonicalImageToken &token, const DisplayList *overlay = nullptr);
+
+/**
+ * Submits a canonical list before one guarded retirement of the exact prior image.
+ * The callback may only present prior with prior_overlay; the new image commits on scope exit.
+ * Returns false without replay or callback when preservation or frame-state checks reject it.
+ */
+bool RenderCanonicalBeforeCommit(const DisplayList &next, const CanonicalImageToken &prior,
+                                 const DisplayList *prior_overlay, const std::function<void()> &before_commit);
 
 struct DisplayListStats {
     uint32_t draws_2d;

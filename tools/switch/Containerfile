@@ -9,6 +9,8 @@
 # Both are installed under /opt/switch, ahead of devkitPro's portlibs (whose Mesa is 20.1).
 # Built by tools/switch/build.sh with Docker or another OCI-compatible runtime.
 
+FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS rust-tools
+
 FROM docker.io/devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
 
 ARG BUILD_JOBS=4
@@ -32,7 +34,7 @@ RUN test "${BUILD_JOBS}" -gt 0
 # Debian 12 has all three at 15, which Mesa 26 accepts. Its Meson (1.0) is too old for Mesa 26.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl git ninja-build pkg-config flex bison python3-pip python3-venv \
+        ca-certificates git ninja-build pkg-config flex bison python3-pip python3-venv \
         python3-mako python3-yaml python3-packaging python3-ply \
         llvm-15-dev clang-15 libclang-15-dev libclc-15-dev libclc-15 llvm-spirv-15 libllvmspirvlib-15-dev \
         build-essential cmake \
@@ -42,22 +44,54 @@ RUN apt-get update \
     && ln -sf /usr/bin/clang-15 /usr/local/bin/clang \
     && ln -sf /usr/bin/llvm-spirv-15 /usr/local/bin/llvm-spirv
 
+# Source-only target libraries use verified upstream archives when portlibs has no suitable package.
+RUN <<'SH'
+cat > /usr/local/bin/fetch-source <<'PY'
+#!/usr/bin/env python3
+import hashlib
+import pathlib
+import shutil
+import sys
+import time
+import urllib.request
+url, digest, destination = sys.argv[1:]
+path = pathlib.Path(destination)
+partial = path.with_name(path.name + '.partial')
+for attempt in range(5):
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response, partial.open('wb') as output:
+            shutil.copyfileobj(response, output)
+        break
+    except (OSError, TimeoutError):
+        partial.unlink(missing_ok=True)
+        if attempt == 4:
+            raise
+        time.sleep(2 ** attempt)
+with partial.open('rb') as source:
+    actual = hashlib.file_digest(source, 'sha256').hexdigest()
+if actual.lower() != digest.lower():
+    raise SystemExit(f'SHA-256 mismatch for {url}: {actual}')
+partial.replace(path)
+PY
+chmod +x /usr/local/bin/fetch-source
+SH
+
 # Japanese retail text uses CP932; newlib does not provide an iconv implementation.
 ARG LIBICONV_VERSION=1.18
 ARG LIBICONV_SHA256=3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8
-RUN curl -sSfL "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-${LIBICONV_VERSION}.tar.gz" -o /tmp/libiconv.tar.gz \
-    && echo "${LIBICONV_SHA256}  /tmp/libiconv.tar.gz" | sha256sum -c - \
+RUN fetch-source "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-${LIBICONV_VERSION}.tar.gz" \
+    "${LIBICONV_SHA256}" /tmp/libiconv.tar.gz \
     && mkdir /tmp/libiconv \
     && tar -xzf /tmp/libiconv.tar.gz -C /tmp/libiconv --strip-components=1 \
     && cd /tmp/libiconv \
     && CC=aarch64-none-elf-gcc AR=aarch64-none-elf-ar RANLIB=aarch64-none-elf-ranlib \
         CFLAGS="-O2 -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIC -ftls-model=local-exec" \
         ./configure --host=aarch64-none-elf --prefix=${SWITCH_PREFIX} --disable-shared --enable-static --disable-nls \
-    && make -C libcharset -j"${BUILD_JOBS}" \
+    && make lib/localcharset.h -j"${BUILD_JOBS}" \
     && make -C lib -j"${BUILD_JOBS}" \
     && make -C libcharset install-lib \
     && make -C lib install-lib \
-    && cp include/iconv.h ${SWITCH_PREFIX}/include/ \
+    && cp include/iconv.h.inst ${SWITCH_PREFIX}/include/iconv.h \
     && rm -rf /tmp/libiconv /tmp/libiconv.tar.gz
 
 # The portlibs FFmpeg enables GPL components; games use Kazarov's minimal LGPL-only build.
@@ -74,8 +108,9 @@ RUN git clone --depth 1 --branch ${GLSLANG_TAG} https://github.com/KhronosGroup/
     && rm -rf /tmp/glslang
 
 # NVK's compiler (NAK) is Rust: a pinned nightly with rust-src, since the Switch's std is built from it.
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
-    && rustup toolchain install ${RUST_NIGHTLY} --profile minimal --component rust-src --component rustfmt \
+COPY --from=rust-tools /usr/local/cargo/ /opt/rust/cargo/
+COPY --from=rust-tools /usr/local/rustup/ /opt/rust/rustup/
+RUN rustup toolchain install ${RUST_NIGHTLY} --profile minimal --component rust-src --component rustfmt \
     && rustup target add --toolchain ${RUST_NIGHTLY} aarch64-unknown-linux-gnu \
     && rustup default ${RUST_NIGHTLY} \
     && LIBCLANG_PATH=/usr/lib/llvm-15/lib cargo install --locked bindgen-cli --version ${BINDGEN_VERSION} \
@@ -104,6 +139,7 @@ RUN git clone --depth 1 --branch ${SPIRV_SDK_TAG} https://github.com/KhronosGrou
 COPY patches/mesa-switch-dock-mode.patch /tmp/mesa-switch-dock-mode.patch
 COPY patches/mesa-switch-shader-va-fallback.patch /tmp/mesa-switch-shader-va-fallback.patch
 COPY patches/mesa-switch-no-elf.patch /tmp/mesa-switch-no-elf.patch
+COPY patches/mesa-switch-compressed-depth-stencil.patch /tmp/mesa-switch-compressed-depth-stencil.patch
 COPY build-mesa.sh /tmp/build-mesa.sh
 COPY bindgen-switch-wrapper.sh /tmp/bindgen-switch-wrapper.sh
 COPY rustc-switch-wrapper.sh /tmp/rustc-switch-wrapper.sh
@@ -123,8 +159,9 @@ RUN cargo install --locked cbindgen --version ${CBINDGEN_VERSION} \
     && git -C /tmp/mesa apply /tmp/mesa-switch-shader-va-fallback.patch \
     && git -C /tmp/mesa apply --check /tmp/mesa-switch-no-elf.patch \
     && git -C /tmp/mesa apply /tmp/mesa-switch-no-elf.patch \
-    && curl -sSfL -o /tmp/mesa.tar.xz https://archive.mesa3d.org/mesa-26.2.4.tar.xz \
-    && echo "${MESA_TARBALL_SHA256}  /tmp/mesa.tar.xz" | sha256sum -c - \
+    && git -C /tmp/mesa apply --check /tmp/mesa-switch-compressed-depth-stencil.patch \
+    && git -C /tmp/mesa apply /tmp/mesa-switch-compressed-depth-stencil.patch \
+    && fetch-source https://archive.mesa3d.org/mesa-26.2.4.tar.xz "${MESA_TARBALL_SHA256}" /tmp/mesa.tar.xz \
     && tar -xJf /tmp/mesa.tar.xz -C /tmp/mesa/subprojects --strip-components=2 mesa-26.2.4/subprojects/packagefiles \
     && rm /tmp/mesa.tar.xz \
     && cp /tmp/bindgen-switch-wrapper.sh /tmp/mesa/bindgen-switch-wrapper.sh \

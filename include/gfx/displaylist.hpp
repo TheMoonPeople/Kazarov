@@ -33,18 +33,21 @@ struct UiSide {
 };
 
 struct Draw2DEntry {
-    Primitive             primitive;
+    Primitive                  primitive;
     std::pmr::vector<Vertex2D> vertices{RecordingResource()};
-    TextureBinding        binding;
-    DrawState             state;
-    UiSide                side;
+    TextureBinding             binding;
+    DrawState                  state;
+    UiSide                     side;
     // DisplayList::scenes: the scene a draw that tests depth (a 3D sprite) stands in, or -1.
-    int32_t scene = -1;
-    Interp2D              interpolation;
-    uint32_t              occurrence = 0;
-    TextureHandle         target = kMainTarget;
+    int32_t                    scene = -1;
+    Interp2D                   interpolation;
+    uint32_t                   occurrence = 0;
+    TextureHandle              target = kMainTarget;
     std::pmr::vector<Vertex2D> presentation_vertices{RecordingResource()};
-    DrawState             presentation_state;
+    DrawState                  presentation_state;
+    int32_t                    presentation_region = -1;
+    bool                       presentation_only = false;
+    bool                       region_alpha_reset = false;
 };
 
 // The projection and camera the meshes around a 3D sprite were drawn with, and where the target's
@@ -58,17 +61,18 @@ struct SpriteScene {
 
 // One record of DisplayList::meshes per entry.
 struct MeshEntry {
-    MeshHandle            mesh = kNullMesh; // kNullMesh: immediate, vertices and indices below
-    uint32_t              first_index = 0;
-    uint32_t              index_count = 0;
+    MeshHandle                 mesh = kNullMesh; // kNullMesh: immediate, vertices and indices below
+    uint32_t                   first_index = 0;
+    uint32_t                   index_count = 0;
     std::pmr::vector<Vertex3D> vertices{RecordingResource()};
     std::pmr::vector<uint32_t> indices{RecordingResource()};
-    MeshConstants         constants;
-    TextureBinding        binding;
-    DrawState             state;
-    uint32_t              record = 0;
-    int32_t               prog0 = -1;    // index into DisplayList::prog0_blocks, or -1 for a plain draw
-    int32_t               palette = -1;  // index into DisplayList::palettes, or -1
+    MeshConstants              constants;
+    TextureBinding             binding;
+    DrawState                  state;
+    uint32_t                   record = 0;
+    int32_t                    prog0 = -1;   // index into DisplayList::prog0_blocks, or -1 for a plain draw
+    int32_t                    palette = -1; // index into DisplayList::palettes, or -1
+    int32_t                    presentation_region = -1;
 };
 
 struct ClearEntry {
@@ -82,6 +86,20 @@ struct ClearEntry {
     LogicalRect rect = {};
     bool        has_presentation_rect = false;
     LogicalRect presentation_rect = {};
+    int32_t     presentation_region = -1;
+};
+
+/**
+ * A recording-local scratch target and the coverage shared by its display clear and composites.
+ */
+struct PresentationRegion {
+    TextureHandle  source = kNullTexture; /**< Scratch image containing the outlined meshes. */
+    LogicalRect    extent = {};           /**< Full visible logical rectangle used when no bound is proven. */
+    float          padding = 0.0f;        /**< Logical sampling and outline-tap margin around projected geometry. */
+    LogicalMapping mapping = {};          /**< Source target's logical viewport when its meshes were recorded. */
+    int32_t        parent = -1;           /**< Enclosing group while this group is recorded, or -1. */
+    bool           eligible = false;      /**< Composite states preserve all effects outside their bounded RGB coverage. */
+    bool           invalid = false;       /**< Recording contains source writes whose geometry cannot be bounded. */
 };
 
 struct TargetEntry {
@@ -89,7 +107,11 @@ struct TargetEntry {
 };
 
 struct CopyEntry {
-    enum Kind : uint8_t { Copy, Blit, Snapshot } kind;
+    enum Kind : uint8_t {
+        Copy,
+        Blit,
+        Snapshot
+    } kind;
 
     TextureHandle src;
     Rect          src_rect;
@@ -99,14 +121,14 @@ struct CopyEntry {
 };
 
 struct UpdateTextureEntry {
-    TextureHandle        texture;
-    uint32_t             mip, x, y, w, h;
+    TextureHandle             texture;
+    uint32_t                  mip, x, y, w, h;
     std::pmr::vector<uint8_t> pixels{RecordingResource()};
 };
 
 struct UpdateMeshEntry {
-    MeshHandle            mesh;
-    uint32_t              first;
+    MeshHandle                 mesh;
+    uint32_t                   first;
     std::pmr::vector<Vertex3D> vertices{RecordingResource()};
 };
 
@@ -164,26 +186,28 @@ struct Rewrites {
 
 // What a display render of a list against one predecessor reuses from frame to frame.
 struct MatchCache {
-    std::vector<std::array<uint32_t, 2> > draws_2d; // matched entry indices, newest then previous
-    uint64_t             previous_serial = 0;
-    std::vector<int32_t> match;   // per record, the previous list's record, or -1
-    std::vector<bool>    blend;   // per record, whether its immediate vertices moved since the match's
-    std::vector<int32_t> cameras; // per camera, the previous list's, or -1
-    std::optional<Rewrites> rewrites; // of the finished list, built on first display render
+    std::vector<std::array<uint32_t, 2>> draws_2d; // matched entry indices, newest then previous
+    uint64_t                             previous_serial = 0;
+    std::vector<int32_t>                 match;    // per record, the previous list's record, or -1
+    std::vector<bool>                    blend;    // per record, whether its immediate vertices moved since the match's
+    std::vector<int32_t>                 cameras;  // per camera, the previous list's, or -1
+    std::optional<Rewrites>              rewrites; // of the finished list, built on first display render
 };
 
 } // namespace detail
 
 struct DisplayList {
-    std::pmr::monotonic_buffer_resource   recording_storage; /**< Owns recorded command storage. */
-    uint64_t                              instance = 0;
-    uint64_t                              serial = 0;
-    std::pmr::vector<detail::Entry>       entries;
-    std::pmr::vector<detail::MeshRecord>  records;
-    std::pmr::vector<detail::Mat4>        cameras;
-    std::pmr::vector<detail::SpriteScene> scenes;
-    std::pmr::vector<Prog0Constants>      prog0_blocks;
-    std::pmr::vector<Prog0Palette>        palettes;
+    std::pmr::monotonic_buffer_resource          recording_storage; /**< Owns recorded command storage. */
+    uint64_t                                     instance = 0;
+    uint64_t                                     serial = 0;
+    std::pmr::vector<detail::Entry>              entries;
+    std::pmr::vector<detail::MeshRecord>         records;
+    std::pmr::vector<detail::Mat4>               cameras;
+    std::pmr::vector<detail::SpriteScene>        scenes;
+    std::pmr::vector<Prog0Constants>             prog0_blocks;
+    std::pmr::vector<Prog0Palette>               palettes;
+    std::pmr::vector<detail::PresentationRegion> presentation_regions;
+    int32_t                                      active_presentation_region = -1;
     // While recording: the scene of the last mesh drawn on the current target, or -1, and on each
     // target drawn into so far (the fire's texture is blended between the map and its sprites).
     int32_t                                         scene = -1;
@@ -213,7 +237,8 @@ namespace detail {
 // draw.cpp
 // Draw2D with the sides its anchor chose.
 void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &binding,
-                 const DrawState &state, UiSide side, const Presentation2D *presentation = nullptr);
+                 const DrawState &state, UiSide side, const Presentation2D *presentation = nullptr,
+                 bool target_space = false);
 
 // Draws a DrawDepthPlanes2D call on the device thread, in one pass per pixel where it can and plane by plane
 // where it cannot.
@@ -230,6 +255,14 @@ void RecordMesh(MeshEntry &&entry, const MeshTransform *transform, const Prog0Co
 void RecordClear(const ClearEntry &entry);
 void RecordDoomedTexture(TextureHandle handle);
 void RecordDoomedMesh(MeshHandle handle);
+
+/**
+ * Projects an immutable rigid mesh box through its effective display matrix with positive clip W.
+ */
+std::optional<LogicalRect> ProjectPresentationBounds(const std::array<float, 3> &bounds_min,
+                                                     const std::array<float, 3> &bounds_max,
+                                                     const MeshConstants        &constants,
+                                                     const LogicalMapping       &mapping);
 
 // Interpolation, exposed for tests through the pure functions below.
 Mat4 Multiply(const Mat4 &a, const Mat4 &b);

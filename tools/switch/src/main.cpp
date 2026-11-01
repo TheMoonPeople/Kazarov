@@ -51,6 +51,7 @@ int SwitchMain(int argc, const char **argv, SwitchRunFunction run) {
     setenv("KZ_DEPTH_PLANES", "1", 0);
     setenv("KZ_FOG_NEAR_RECIPROCAL", "1", 0);
     setenv("KZ_INLINE_MESH_DISPATCH", "1", 0);
+    setenv("KZ_OCCLUSION_PREPASS", "1", 0);
     const std::uint32_t romfs_result = romfsMountSelf("romfs");
 
     std::vector<std::string> words;

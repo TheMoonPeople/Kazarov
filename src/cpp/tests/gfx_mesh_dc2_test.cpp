@@ -2,25 +2,28 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "gfx/context.hpp"
+#include "gfx/displaylist.hpp"
 #include "tests/gfx_fixture.hpp"
 
 using namespace dc::test;
 
 namespace {
 
-constexpr int kWidth = 64;
-constexpr int kHeight = 48;
-const std::array<uint8_t, 4> kClear = {0, 0, 0, 0x80};
-const std::vector<uint32_t> kTriangle = {0, 1, 2};
+constexpr int                   kWidth = 64;
+constexpr int                   kHeight = 48;
+const std::array<uint8_t, 4>    kClear = {0, 0, 0, 0x80};
+const std::vector<uint32_t>     kTriangle = {0, 1, 2};
 constexpr std::array<float, 12> kIdentityBone = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
 
 GfxOptions Prog0Options() {
@@ -64,7 +67,7 @@ void SetFog(float (&fog)[4], float near_w, float far_w, float near_value, float 
 struct Prog0Draw {
     gfx::MeshConstants  mesh;
     gfx::Prog0Constants prog0;
-    gfx::Prog0Palette   palette; // read only by a kProg0Skinned draw
+    gfx::Prog0Palette   palette;  // read only by a kProg0Skinned draw
     uint32_t            face = 0; // Prog0Face, sent as the DrawState's prog0_face
 };
 
@@ -96,10 +99,12 @@ gfx::MeshConstants ChronicleLit() {
 }
 
 gfx::Vertex3D Vert(std::array<float, 3> position, std::array<float, 3> normal, std::array<uint8_t, 4> color = {}) {
-    return {{position[0], position[1], position[2]},
-            {normal[0], normal[1], normal[2]},
-            {0.0f, 0.0f},
-            {color[0], color[1], color[2], color[3]}};
+    return {
+        {position[0], position[1], position[2]},
+        {normal[0], normal[1], normal[2]},
+        {0.0f, 0.0f},
+        {color[0], color[1], color[2], color[3]}
+    };
 }
 
 std::vector<gfx::Vertex3D> ScreenVertices(std::array<float, 3> normal, std::array<uint8_t, 4> color = {}) {
@@ -189,7 +194,7 @@ Prog0Draw FourLights() {
 
 gfx::TextureHandle RgbQuadTexture() {
     gfx::TextureHandle texture = gfx::CreateTexture(gfx::TextureDesc{2, 2});
-    const uint8_t texels[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+    const uint8_t      texels[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
     EXPECT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 2, 2, texels));
     return texture;
 }
@@ -264,19 +269,19 @@ TEST(GfxGpuMeshDc2, PlainMeshesIgnoreTheProg0Pipelines) {
 }
 
 TEST(GfxGpuMeshDc2, PlainDrawWithProg0FlagDrawsPlain) {
-    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    GfxFixture         fixture(kWidth, kHeight, 1.0f, Prog0Options());
     gfx::MeshConstants plain = ChronicleLit();
     Render(fixture, ScreenVertices({0, 0, 1}), kTriangle, plain);
     const std::array<uint8_t, 4> expected = fixture.Pixel(fixture.width / 2, fixture.height / 2);
-    gfx::MeshConstants flagged = plain;
+    gfx::MeshConstants           flagged = plain;
     flagged.flags |= gfx::kMeshProg0;
     Render(fixture, ScreenVertices({0, 0, 1}), kTriangle, flagged);
     EXPECT_EQ(fixture.Pixel(fixture.width / 2, fixture.height / 2), expected);
 }
 
 TEST(GfxGpuMeshDc2, IndexedProg0MeshMatchesImmediate) {
-    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    const Prog0Draw c = FourLights();
+    GfxFixture                       fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    const Prog0Draw                  c = FourLights();
     const std::vector<gfx::Vertex3D> vertices = ScreenVertices({0, 0, 1});
     Render(fixture, vertices, kTriangle, c);
     const std::array<uint8_t, 4> immediate = fixture.Pixel(fixture.width / 2, fixture.height / 2);
@@ -290,8 +295,8 @@ TEST(GfxGpuMeshDc2, IndexedProg0MeshMatchesImmediate) {
 }
 
 TEST(GfxGpuMeshDc2, RecordedProg0DrawReplaysThroughRenderList) {
-    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    const Prog0Draw c = FourLights();
+    GfxFixture                       fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    const Prog0Draw                  c = FourLights();
     const std::vector<gfx::Vertex3D> vertices = ScreenVertices({0, 0, 1});
     Render(fixture, vertices, kTriangle, c);
     const std::array<uint8_t, 4> direct = fixture.Pixel(fixture.width / 2, fixture.height / 2);
@@ -311,7 +316,7 @@ TEST(GfxGpuMeshDc2, RecordedProg0DrawReplaysThroughRenderList) {
 
 TEST(GfxGpuMeshDc2, FourDirectionalLightsSaturate) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(0);
+    Prog0Draw  c = Prog0(0);
     Set(c.prog0.ambient, {200, 200, 200, 128});
     SetDirectional(c.prog0, 0, {0, 0, 1}, {100, 100, 100, 0});
     Render(fixture, ScreenVertices({0, 0, 1}), kTriangle, c);
@@ -320,7 +325,7 @@ TEST(GfxGpuMeshDc2, FourDirectionalLightsSaturate) {
 
 TEST(GfxGpuMeshDc2, LightsTurnIntoModelSpace) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(0);
+    Prog0Draw  c = Prog0(0);
     Set(c.prog0.model_world, {0, 2, 0, 0, -2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1});
     SetDirectional(c.prog0, 0, {1, 0, 0}, {100, 0, 0, 0});
     Render(fixture, ScreenVertices({0, -1, 0}), kTriangle, c);
@@ -339,7 +344,7 @@ TEST(GfxGpuMeshDc2, Unlit) {
 
 TEST(GfxGpuMeshDc2, PointLights) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0PointLights);
+    Prog0Draw  c = Prog0(gfx::kProg0PointLights);
     UseTinyMvp(c.mesh.mvp);
     Set(c.prog0.ambient, {10, 10, 10, 0});
     SetPoint(c.prog0, 0, {0, 0, 2, 1}, {128, 0, 0, 0});
@@ -353,7 +358,7 @@ TEST(GfxGpuMeshDc2, PointLights) {
 
 TEST(GfxGpuMeshDc2, RealSpecular) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0Real);
+    Prog0Draw  c = Prog0(gfx::kProg0Real);
     UseTinyMvp(c.mesh.mvp);
     Set(c.prog0.diffuse, {0.25f, 0.25f, 0.25f, 1});
     Set(c.prog0.specular, {1, 1, 1, 1});
@@ -373,7 +378,7 @@ TEST(GfxGpuMeshDc2, RealSpecular) {
 
 TEST(GfxGpuMeshDc2, VertexColour) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0Unlit, gfx::kProg0FaceColor);
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit, gfx::kProg0FaceColor);
     Set(c.prog0.object_color, {100, 100, 100, 128});
     Render(fixture, ScreenVertices({0, 0, 1}, {64, 64, 64, 128}), kTriangle, c);
     EXPECT_TRUE(Centre(fixture, 50, 50, 50));
@@ -389,7 +394,7 @@ TEST(GfxGpuMeshDc2, VertexColour) {
 }
 
 TEST(GfxGpuMeshDc2, RefSphere) {
-    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    GfxFixture         fixture(kWidth, kHeight, 1.0f, Prog0Options());
     gfx::TextureHandle texture = RgbQuadTexture();
     ASSERT_NE(texture, gfx::kNullTexture);
     gfx::TextureBinding binding = NearestBinding(texture);
@@ -405,7 +410,7 @@ TEST(GfxGpuMeshDc2, RefSphere) {
 }
 
 TEST(GfxGpuMeshDc2, RefSphereIgnoresSkinning) {
-    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    GfxFixture         fixture(kWidth, kHeight, 1.0f, Prog0Options());
     gfx::TextureHandle texture = RgbQuadTexture();
     ASSERT_NE(texture, gfx::kNullTexture);
     gfx::TextureBinding binding = NearestBinding(texture);
@@ -423,7 +428,7 @@ TEST(GfxGpuMeshDc2, RefSphereIgnoresSkinning) {
 
 TEST(GfxGpuMeshDc2, Skinning) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0Unlit | gfx::kProg0Skinned);
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit | gfx::kProg0Skinned);
     Set(c.prog0.object_color, {200, 200, 200, 128});
     SetBone(c.palette, 0, kIdentityBone);
     SetBone(c.palette, 1, {1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0});
@@ -434,7 +439,7 @@ TEST(GfxGpuMeshDc2, Skinning) {
 
 TEST(GfxGpuMeshDc2, SkinnedNormals) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0Skinned);
+    Prog0Draw  c = Prog0(gfx::kProg0Skinned);
     SetBone(c.palette, 0, kIdentityBone);
     SetDirectional(c.prog0, 0, {0, 0, 1}, {100, 100, 100, 0});
     Render(fixture, Skinned(ScreenVertices({0, 0, 1}), {1, 0, 0, 0}, {0, 0, 0, 0}), kTriangle, c);
@@ -444,7 +449,7 @@ TEST(GfxGpuMeshDc2, SkinnedNormals) {
 // prog0.md 10.6, bone-3 sub-case (O-8).
 TEST(GfxGpuMeshDc2, SkinnedFourthInfluenceNormal) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0Skinned);
+    Prog0Draw  c = Prog0(gfx::kProg0Skinned);
     SetBone(c.palette, 3, kIdentityBone);
     const std::vector<gfx::Vertex3D> vertices = Skinned(ScreenVertices({0, 0, 1}), {0, 0, 0, 1}, {0, 0, 0, 3});
     // O-8: influence 3's z term reads column 1, so the retail normal is (0, 1, 0).
@@ -458,7 +463,7 @@ TEST(GfxGpuMeshDc2, SkinnedFourthInfluenceNormal) {
 
 TEST(GfxGpuMeshDc2, ScissorClipsToClipOrView) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0Unlit | gfx::kProg0Scissor);
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit | gfx::kProg0Scissor);
     Set(c.prog0.object_color, {200, 200, 200, 128});
     Set(c.prog0.clip_or_view, {2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
     Render(fixture, ScreenVertices({0, 0, 1}), kTriangle, c);
@@ -476,11 +481,11 @@ TEST(GfxGpuMeshDc2, Prog0CullModeFollowsFlagAndMirror) {
     Set(mirrored.prog0.model_world, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1});
     EXPECT_EQ(gfx::Prog0CullMode(mirrored.prog0), gfx::CullMode::Front);
 
-    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    GfxFixture                       fixture(kWidth, kHeight, 1.0f, Prog0Options());
     const std::vector<gfx::Vertex3D> triangle = {Vert({0.0f, 0.0f, 0.5f}, {0, 0, 1}),
                                                  Vert({0.5f, 0.0f, 0.5f}, {0, 0, 1}),
                                                  Vert({0.0f, 0.5f, 0.5f}, {0, 0, 1})};
-    Prog0Draw c = Prog0(gfx::kProg0Unlit | gfx::kProg0Cull);
+    Prog0Draw                        c = Prog0(gfx::kProg0Unlit | gfx::kProg0Cull);
     Set(c.prog0.object_color, {200, 200, 200, 128});
     gfx::DrawState state;
     state.cull = gfx::Prog0CullMode(c.prog0);
@@ -500,7 +505,7 @@ TEST(GfxGpuMeshDc2, Prog0CullModeFollowsFlagAndMirror) {
 
 TEST(GfxGpuMeshDc2, Fog) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0Unlit);
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
     Set(c.prog0.object_color, {255, 255, 255, 128});
     SetFog(c.prog0.fog, 10, 1000, 255, 0);
     gfx::DrawState state;
@@ -519,7 +524,7 @@ TEST(GfxGpuMeshDc2, Fog) {
 
 TEST(GfxGpuMeshDc2, EditorFogSaturatesAtFarValue) {
     GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    Prog0Draw c = Prog0(gfx::kProg0Unlit);
+    Prog0Draw  c = Prog0(gfx::kProg0Unlit);
     Set(c.prog0.object_color, {255, 255, 255, 128});
     SetFog(c.prog0.fog, 10, 1000, 0, 255);
     SetWMvp(c.mesh.mvp, 100);
@@ -1375,4 +1380,654 @@ TEST(GfxGpuMeshDc2, IndexedNearSafeFogMatchesImmediateReconstruction) {
         }
         gfx::DestroyTexture(texture);
     }
+}
+
+TEST(GfxMeshDc2, Prog0NearSafeFogRejectsUnsafeAndNonfiniteInputs) {
+    gfx::detail::Mesh mesh;
+    mesh.bounds_known = true;
+    mesh.bounds_normal_inputs = true;
+    mesh.bounds_min = {-1, -1, 2};
+    mesh.bounds_max = {3, 3, 6};
+    auto draw = Unlit(gfx::kProg0Unlit);
+    SetWMvp(draw.mesh.mvp, 1);
+    Set(draw.prog0.fog, {180, 255, 0, -60});
+    const auto safe = [&] { return gfx::detail::Prog0FogIsNearSafe(mesh, draw.mesh, draw.prog0); };
+    ASSERT_TRUE(safe());
+
+    mesh.bounds_known = false;
+    EXPECT_FALSE(safe());
+    mesh.bounds_known = true;
+    mesh.bounds_normal_inputs = false;
+    EXPECT_FALSE(safe());
+    mesh.bounds_normal_inputs = true;
+    draw.prog0.flags |= gfx::kProg0Skinned;
+    EXPECT_FALSE(safe());
+    draw.prog0.flags &= ~gfx::kProg0Skinned;
+    draw.prog0.fog[3] = 0;
+    EXPECT_FALSE(safe());
+    draw.prog0.fog[3] = -60;
+
+    for (float value : {std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::max()}) {
+        SCOPED_TRACE(value);
+        draw.prog0.fog[0] = value;
+        EXPECT_FALSE(safe());
+        draw.prog0.fog[0] = 180;
+        draw.mesh.mvp[15] = value;
+        EXPECT_FALSE(safe());
+        draw.mesh.mvp[15] = 1;
+    }
+    draw.mesh.mvp[14] = 1;
+    EXPECT_FALSE(safe());
+    draw.mesh.mvp[14] = std::nextafter(1.0f, 0.0f);
+    EXPECT_FALSE(safe());
+    draw.mesh.mvp[14] = 1.0f - .001f;
+    EXPECT_TRUE(safe());
+    draw.mesh.mvp[14] = 1.001f;
+    EXPECT_FALSE(safe());
+    SetWMvp(draw.mesh.mvp, std::ldexp(1.0f, -22));
+    EXPECT_FALSE(safe());
+    SetWMvp(draw.mesh.mvp, std::ldexp(1.0f, -127));
+    EXPECT_FALSE(safe());
+    for (bool tiny_position : {false, true}) {
+        SCOPED_TRACE(tiny_position);
+        const float x = std::ldexp(1.0f, tiny_position ? -127 : 125);
+        mesh.bounds_min = {x, 0, 0};
+        mesh.bounds_max = mesh.bounds_min;
+        mesh.bounds_normal_inputs = !tiny_position;
+        std::memset(draw.mesh.mvp, 0, sizeof draw.mesh.mvp);
+        draw.mesh.mvp[3] = std::ldexp(1.0f, tiny_position ? 125 : -127);
+        draw.mesh.mvp[15] = .1f;
+        draw.mesh.mvp[14] = .2f;
+        // Flushing either multiplicand changes W from .35 to .1, crossing the near plane.
+        EXPECT_FALSE(safe());
+    }
+}
+
+TEST(GfxGpuMeshDc2, Prog0NearSafeFogPreservesFullRgbaAgainstUpdatedMeshReference) {
+    if (!gfx::detail::NearSafeFogEnabled()) {
+        GTEST_SKIP() << "Requires KZ_FOG_NEAR_SAFE=1 before process startup";
+    }
+    GfxFixture                   fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    const std::array<uint8_t, 4> clear = {17, 29, 43, 71};
+    const auto                   texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
+    ASSERT_NE(texture, gfx::kNullTexture);
+    std::array<uint32_t, 16> texels;
+    for (size_t i = 0; i < texels.size(); ++i) {
+        texels[i] = Rgba(211, 83, 147, std::array<uint8_t, 4>{0, 63, 127, 255}[i % 4]);
+    }
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 4, 4, texels.data()));
+    const auto binding = NearestBinding(texture);
+    /**
+     * Selects a clip configuration independently of fog parameters.
+     */
+    enum class Projection {
+        Perspective,
+        FarClip,
+        NearClip,
+        EyeCrossing,
+        UnitW,
+        NearBoundary,
+        SmallW,
+        SubnormalW
+    };
+
+    /**
+     * Defines expected immutable geometry eligibility and whether visible fragments are required.
+     */
+    struct Case {
+        const char          *name;           /**< Diagnostic description. */
+        Projection           projection;     /**< Actual uploaded clip matrix. */
+        std::array<float, 4> fog;            /**< Prog0 fog coefficients. */
+        bool                 safe;           /**< Whether the immutable proof should succeed. */
+        bool                 visible = true; /**< Whether the projection must produce visible RGB. */
+    };
+
+    const std::array cases{
+        Case{"perspective", Projection::Perspective, {180, 255, 0, -60}, true},
+        Case{"far crossing retains vertex fog", Projection::FarClip, {180, 255, 0, -60}, true},
+        Case{"visible near crossing", Projection::NearClip, {180, 255, 0, -60}, false},
+        Case{"eye crossing", Projection::EyeCrossing, {180, 255, 0, -60}, false},
+        Case{"constant fog layout", Projection::UnitW, {100.9f, 100.8f, 100.7f, 0}, false},
+        Case{"below integer", Projection::UnitW, {std::nextafter(128.0f, 0.0f), 255, 0, -1}, true},
+        Case{"at integer", Projection::UnitW, {128, 255, 0, -1}, true},
+        Case{"above integer", Projection::UnitW, {std::nextafter(128.0f, 256.0f), 255, 0, -1}, true},
+        Case{"upper clamp", Projection::UnitW, {400, 155.75f, 20.25f, -1}, true},
+        Case{"lower clamp", Projection::UnitW, {-100, 155.75f, 20.25f, -1}, true},
+        Case{"near equality", Projection::NearBoundary, {180, 255, 0, -60}, false},
+        Case{"small positive W", Projection::SmallW, {128, 255, 0, -64 * std::ldexp(1.0f, -22)}, false},
+        Case{"subnormal positive W", Projection::SubnormalW, {128, 255, 0, -64 * std::ldexp(1.0f, -127)}, false, false}
+    };
+    for (bool lit : {false, true}) {
+        for (bool blend : {false, true}) {
+            for (bool alpha_test : {false, true}) {
+                for (const auto &test : cases) {
+                    SCOPED_TRACE(test.name);
+                    SCOPED_TRACE(lit ? "lit" : "unlit");
+                    SCOPED_TRACE(blend ? "b4 source-over" : "b0 overwrite");
+                    SCOPED_TRACE(alpha_test ? "GEqual cutout" : "no alpha test");
+                    auto draw = lit ? FourLights() : Unlit(gfx::kProg0Unlit);
+                    std::copy(test.fog.begin(), test.fog.end(), draw.prog0.fog);
+                    std::memset(draw.mesh.mvp, 0, sizeof draw.mesh.mvp);
+                    draw.mesh.mvp[0] = draw.mesh.mvp[5] = draw.mesh.mvp[11] = 1;
+                    draw.mesh.mvp[10] = .5f;
+                    auto vertices = ScreenVertices({0, 0, 1}, {123, 211, 157, 113});
+                    vertices[0].position[2] = test.projection == Projection::EyeCrossing ? -.5f : 2;
+                    vertices[1].position[2] = 4;
+                    vertices[2].position[2] = 6;
+                    vertices[1].uv[0] = vertices[2].uv[1] = 4;
+                    switch (test.projection) {
+                        case Projection::FarClip:
+                            draw.mesh.mvp[14] = -1.5f;
+                            break;
+                        case Projection::NearClip:
+                            draw.mesh.mvp[14] = 1.5f;
+                            break;
+                        case Projection::UnitW:
+                        case Projection::NearBoundary:
+                            SetWMvp(draw.mesh.mvp, 1);
+                            if (test.projection == Projection::NearBoundary) {
+                                draw.mesh.mvp[14] = 1;
+                            }
+                            break;
+                        case Projection::SmallW:
+                        case Projection::SubnormalW:
+                            SetWMvp(draw.mesh.mvp, std::ldexp(1.0f, test.projection == Projection::SmallW ? -22 : -127));
+                            break;
+                        default:
+                            break;
+                    }
+                    gfx::DrawState state;
+                    state.blend = blend;
+                    state.alpha = {0, 1, 0, 1, 0};
+                    state.alpha_test = alpha_test;
+                    state.alpha_func = gfx::AlphaFunc::GEqual;
+                    state.alpha_ref = 1;
+                    state.fog = true;
+                    state.fog_color[0] = 20;
+                    state.fog_color[1] = 40;
+                    state.fog_color[2] = 70;
+                    const auto mesh = gfx::CreateMesh(vertices, kTriangle);
+                    const auto reference_mesh = gfx::CreateMesh(vertices, kTriangle);
+                    ASSERT_NE(mesh, gfx::kNullMesh);
+                    ASSERT_NE(reference_mesh, gfx::kNullMesh);
+                    ASSERT_TRUE(gfx::UpdateMeshVertices(reference_mesh, 0, vertices));
+                    ASSERT_FALSE(gfx::detail::LookupMesh(reference_mesh)->bounds_known);
+                    ASSERT_FALSE(gfx::detail::LookupMesh(reference_mesh)->bounds_normal_inputs);
+                    EXPECT_EQ(gfx::detail::Prog0FogIsNearSafe(*gfx::detail::LookupMesh(mesh), draw.mesh, draw.prog0), test.safe);
+                    const auto render = [&](gfx::MeshHandle handle, bool specialized) {
+                        fixture.Frame(clear, [&] {
+                            const auto before = gfx::detail::g.counters.near_safe_prog0_fog;
+                            gfx::DrawMeshProg0(handle, 0, 3, draw.mesh, draw.prog0, binding, state);
+                            EXPECT_EQ(gfx::detail::g.counters.near_safe_prog0_fog - before, specialized ? 1u : 0u);
+                        });
+                    };
+                    render(reference_mesh, false);
+                    const auto reference = fixture.pixels;
+                    const bool supported_pipeline = (!blend && alpha_test) || (blend && !alpha_test);
+                    render(mesh, test.safe && supported_pipeline);
+                    EXPECT_EQ(fixture.pixels, reference);
+                    if (test.visible) {
+                        size_t changed = 0;
+                        for (size_t i = 0; i + 3 < reference.size(); i += 4) {
+                            changed += reference[i] != clear[0] || reference[i + 1] != clear[1] || reference[i + 2] != clear[2] ? 1u : 0u;
+                        }
+                        EXPECT_GT(changed, 0u);
+                    }
+                    if (test.projection == Projection::Perspective) {
+                        ASSERT_TRUE(gfx::UpdateMeshVertices(mesh, 0, vertices));
+                        EXPECT_FALSE(gfx::detail::Prog0FogIsNearSafe(*gfx::detail::LookupMesh(mesh), draw.mesh, draw.prog0));
+                        render(mesh, false);
+                        EXPECT_EQ(fixture.pixels, reference);
+                    }
+                    gfx::DestroyMesh(reference_mesh);
+                    gfx::DestroyMesh(mesh);
+                }
+            }
+        }
+    }
+    auto skin_draw = Unlit(gfx::kProg0Unlit | gfx::kProg0Skinned);
+    SetWMvp(skin_draw.mesh.mvp, 1);
+    Set(skin_draw.prog0.fog, {180, 255, 0, -60});
+    for (uint32_t bone = 0; bone < gfx::kProg0Bones; ++bone) {
+        SetBone(skin_draw.palette, bone, kIdentityBone);
+    }
+    const auto skin_vertices = Skinned(ScreenVertices({0, 0, 1}), {1, 0, 0, 0}, {0, 0, 0, 0});
+    const auto skin_mesh = gfx::CreateMesh(skin_vertices, kTriangle);
+    const auto skin_reference = gfx::CreateMesh(skin_vertices, kTriangle);
+    ASSERT_NE(skin_mesh, gfx::kNullMesh);
+    ASSERT_NE(skin_reference, gfx::kNullMesh);
+    ASSERT_TRUE(gfx::UpdateMeshVertices(skin_reference, 0, skin_vertices));
+    EXPECT_FALSE(gfx::detail::Prog0FogIsNearSafe(*gfx::detail::LookupMesh(skin_mesh), skin_draw.mesh, skin_draw.prog0));
+    gfx::DrawState skin_state;
+    skin_state.fog = true;
+    skin_state.alpha_test = true;
+    skin_state.alpha_func = gfx::AlphaFunc::GEqual;
+    skin_state.alpha_ref = 1;
+    const auto render_skin = [&](gfx::MeshHandle handle) {
+        fixture.Frame(clear, [&] {
+            gfx::DrawMeshProg0(handle, 0, 3, skin_draw.mesh, skin_draw.prog0, binding, skin_state, nullptr, &skin_draw.palette);
+            EXPECT_EQ(gfx::detail::g.counters.near_safe_prog0_fog, 0u);
+        });
+    };
+    render_skin(skin_reference);
+    const auto skin_expected = fixture.pixels;
+    render_skin(skin_mesh);
+    EXPECT_EQ(fixture.pixels, skin_expected);
+    gfx::DestroyMesh(skin_reference);
+    gfx::DestroyMesh(skin_mesh);
+    auto interior_vertices = ScreenVertices({0, 0, 1});
+    interior_vertices.push_back(Vert({std::ldexp(1.0f, -127), 0, .5f}, {0, 0, 1}));
+    const auto interior_mesh = gfx::CreateMesh(interior_vertices, kTriangle);
+    ASSERT_NE(interior_mesh, gfx::kNullMesh);
+    const auto *interior_bounds = gfx::detail::LookupMesh(interior_mesh);
+    ASSERT_NE(interior_bounds, nullptr);
+    EXPECT_TRUE(interior_bounds->bounds_known);
+    EXPECT_FALSE(interior_bounds->bounds_normal_inputs);
+    auto interior_draw = Unlit(gfx::kProg0Unlit);
+    SetWMvp(interior_draw.mesh.mvp, 1);
+    Set(interior_draw.prog0.fog, {180, 255, 0, -60});
+    EXPECT_FALSE(gfx::detail::Prog0FogIsNearSafe(*interior_bounds, interior_draw.mesh, interior_draw.prog0));
+    gfx::DestroyMesh(interior_mesh);
+    gfx::DestroyTexture(texture);
+}
+
+TEST(GfxGpuMeshDc2, Prog0NearSafeFogUsesActualInterpolatedMvp) {
+    if (!gfx::detail::NearSafeFogEnabled()) {
+        GTEST_SKIP() << "Requires KZ_FOG_NEAR_SAFE=1 before process startup";
+    }
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
+    auto       vertices = ScreenVertices({0, 0, 1});
+    vertices[0].position[2] = 2;
+    vertices[1].position[2] = 4;
+    vertices[2].position[2] = 6;
+    const auto mesh = gfx::CreateMesh(vertices, kTriangle);
+    const auto reference_mesh = gfx::CreateMesh(vertices, kTriangle);
+    ASSERT_NE(mesh, gfx::kNullMesh);
+    ASSERT_NE(reference_mesh, gfx::kNullMesh);
+    ASSERT_TRUE(gfx::UpdateMeshVertices(reference_mesh, 0, vertices));
+    const auto texture = gfx::CreateTexture({2, 2, gfx::TextureFormat::Rgba8, 1, true});
+    ASSERT_NE(texture, gfx::kNullTexture);
+    const std::array<uint32_t, 4> texels = {Rgba(255, 255, 255, 191), Rgba(255, 255, 255, 191),
+                                            Rgba(255, 255, 255, 191), Rgba(255, 255, 255, 191)};
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 2, 2, texels.data()));
+    const auto                   binding = NearestBinding(texture);
+    const std::array<uint8_t, 4> clear = {17, 29, 43, 71};
+    for (bool current_safe : {false, true}) {
+        SCOPED_TRACE(current_safe);
+        const auto record = [&](gfx::MeshHandle handle, bool current) {
+            auto transform = gfx::IdentityMeshTransform();
+            transform.model[14] = current == current_safe ? 4.0f : 0.0f;
+            std::fill_n(transform.projection, 16, 0);
+            transform.projection[0] = transform.projection[5] = transform.projection[11] = 1;
+            transform.projection[10] = .5f;
+            transform.projection[14] = 1.5f;
+            auto draw = Unlit(gfx::kProg0Unlit);
+            Set(draw.prog0.fog, {180, 255, 0, -60});
+            gfx::detail::Mat4 projection;
+            gfx::detail::Mat4 model;
+            std::memcpy(projection.data(), transform.projection, sizeof projection);
+            std::memcpy(model.data(), transform.model, sizeof model);
+            const auto mvp = gfx::detail::Multiply(projection, model);
+            std::memcpy(draw.mesh.mvp, mvp.data(), sizeof draw.mesh.mvp);
+            gfx::DrawState state;
+            state.blend = true;
+            state.alpha = {0, 1, 0, 1, 0};
+            state.fog = true;
+            state.fog_color[0] = 20;
+            state.fog_color[1] = 40;
+            state.fog_color[2] = 70;
+            gfx::BeginRecording();
+            gfx::Clear(true, clear.data(), true, 0);
+            gfx::SetInterpKey(511);
+            gfx::DrawMeshProg0(handle, 0, 3, draw.mesh, draw.prog0, binding, state, &transform);
+            return gfx::EndRecording();
+        };
+        const auto previous = record(mesh, false);
+        const auto current = record(mesh, true);
+        const auto reference_previous = record(reference_mesh, false);
+        const auto reference = record(reference_mesh, true);
+        ASSERT_NE(previous, nullptr);
+        ASSERT_NE(current, nullptr);
+        ASSERT_NE(reference_previous, nullptr);
+        ASSERT_NE(reference, nullptr);
+        for (float alpha : {.1f, .5f, .9f}) {
+            SCOPED_TRACE(alpha);
+            ASSERT_TRUE(gfx::RenderList(*reference, 1, {.canonical = true}));
+            ASSERT_TRUE(gfx::RenderList(*reference, alpha, {.previous = reference_previous.get(), .present = true}));
+            EXPECT_EQ(gfx::detail::g.counters.near_safe_prog0_fog, 0u);
+            ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+            const auto expected = fixture.pixels;
+            ASSERT_TRUE(gfx::RenderList(*current, 1, {.canonical = true}));
+            ASSERT_TRUE(gfx::RenderList(*current, alpha, {.previous = previous.get(), .present = true}));
+            const float translation = current_safe ? 4 * alpha : 4 * (1 - alpha);
+            EXPECT_EQ(gfx::detail::g.counters.near_safe_prog0_fog, translation > 1 ? 1u : 0u);
+            ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+            EXPECT_EQ(fixture.pixels, expected);
+            ASSERT_EQ(current->cache.match.size(), 1u);
+            EXPECT_GE(current->cache.match[0], 0);
+            size_t changed = 0;
+            for (size_t i = 0; i + 3 < expected.size(); i += 4) {
+                changed += expected[i] != clear[0] || expected[i + 1] != clear[1] || expected[i + 2] != clear[2] ? 1u : 0u;
+            }
+            EXPECT_GT(changed, 0u);
+        }
+    }
+    gfx::DestroyTexture(texture);
+    gfx::DestroyMesh(reference_mesh);
+    gfx::DestroyMesh(mesh);
+}
+
+TEST(GfxGpuMeshDc2, SharedPaletteBlendsPreserveThresholdsAndCallLifetime) {
+    GfxFixture fixture(192, 144, 1.0f, Prog0Options());
+    const auto vertices = Skinned({Vert({-.07f, -.07f, .5f}, {0, 0, 1}),
+                                   Vert({.07f, -.07f, .5f}, {0, 0, 1}),
+                                   Vert({0, .07f, .5f}, {0, 0, 1})},
+                                  {1, 0, 0, 0}, {0, 0, 0, 0});
+    const auto mesh = gfx::CreateMesh(vertices, kTriangle);
+    ASSERT_NE(mesh, gfx::kNullMesh);
+
+    /**
+     * Selects a palette pair and the record conditions under which it may interpolate.
+     */
+    struct Case {
+        size_t before;                /**< Palette variant in the preceding list. */
+        size_t after;                 /**< Palette variant in the current list. */
+        float  threshold;             /**< Per-bone teleport cutoff. */
+        bool   before_palette = true; /**< Whether the earlier record supplied skin data. */
+        bool   before_skinned = true; /**< Whether the earlier shader performed skinning. */
+        bool   matched = true;        /**< Whether both records share an interpolation identity. */
+    };
+
+    const std::array cases{
+        Case{0, 0, 200},
+        Case{0, 0, 200},
+        Case{0, 0, .05f},
+        Case{0, 0, 200},
+        Case{1, 0, 200},
+        Case{0, 1, 200},
+        Case{0, 0, 200},
+        Case{0, 0, -1},
+        Case{0, 0, -1},
+        Case{0, 0, 200, false},
+        Case{0, 0, 200, true, false},
+        Case{0, 0, 200, true, true, false},
+        Case{2, 2, 200},
+        Case{2, 2, 200},
+        Case{0, 0, 0.0f},
+        Case{0, 0, -0.0f}
+    };
+    auto material = [](size_t index, bool skinned) {
+        auto draw = Unlit(skinned ? gfx::kProg0Skinned : 0);
+        draw.prog0.diffuse[0] = draw.prog0.diffuse[1] = draw.prog0.diffuse[2] = 1;
+        draw.prog0.object_color[0] = static_cast<float>(70 + index * 7);
+        draw.prog0.object_color[1] = 135;
+        draw.prog0.object_color[2] = 190;
+        return draw;
+    };
+    auto transform_for = [](size_t index) {
+        auto transform = gfx::IdentityMeshTransform();
+        transform.local[12] = -.72f + static_cast<float>(index % 4) * .48f;
+        transform.local[13] = -.72f + static_cast<float>(index / 4) * .48f;
+        return transform;
+    };
+    for (int generation = 0; generation < 2; ++generation) {
+        std::array<gfx::Prog0Palette, 3> before{};
+        std::array<gfx::Prog0Palette, 3> after{};
+        for (size_t variant = 0; variant < before.size(); ++variant) {
+            for (uint32_t bone = 0; bone < gfx::kProg0Bones; ++bone) {
+                SetBone(before[variant], bone, kIdentityBone);
+                SetBone(after[variant], bone, kIdentityBone);
+            }
+            const float from = -.16f + .07f * static_cast<float>(variant + generation);
+            const float to = variant == 2 ? from : .16f - .04f * static_cast<float>(variant + generation);
+            const float angle_before = -.3f + .08f * static_cast<float>(variant) + .11f * static_cast<float>(generation);
+            const float angle_after = variant == 2 ? angle_before : .45f - .07f * static_cast<float>(variant) + .09f * static_cast<float>(generation);
+            const float c0 = std::cos(angle_before);
+            const float s0 = std::sin(angle_before);
+            const float c1 = std::cos(angle_after);
+            const float s1 = std::sin(angle_after);
+            SetBone(before[variant], 0, {c0, -s0, 0, from, s0, c0, 0, 0, 0, 0, 1, 0});
+            SetBone(after[variant], 0, {c1, -s1, 0, to, s1, c1, 0, 0, 0, 0, 1, 0});
+        }
+        auto record = [&](bool current) {
+            gfx::BeginRecording();
+            gfx::Clear(true, kClear.data(), true, 0);
+            for (size_t i = 0; i < cases.size(); ++i) {
+                const auto &test = cases[i];
+                const bool  skin = current || test.before_skinned;
+                auto        draw = material(i, skin);
+                const auto  transform = transform_for(i);
+                std::copy(std::begin(transform.local), std::end(transform.local), draw.mesh.mvp);
+                gfx::SetInterpKey(1 + i + (!current && !test.matched ? 1000 : 0), false, test.threshold);
+                const auto *palette = !current && !test.before_palette ? nullptr : &(current ? after[test.after] : before[test.before]);
+                gfx::DrawMeshProg0(mesh, 0, 3, draw.mesh, draw.prog0, {}, {}, &transform, palette);
+            }
+            return gfx::EndRecording();
+        };
+        const auto previous = record(false);
+        const auto current = record(true);
+        ASSERT_NE(previous, nullptr);
+        ASSERT_NE(current, nullptr);
+        for (const float alpha : {.25f, .75f, .5f, .25f}) {
+            fixture.Frame(kClear, [&] {
+                for (size_t i = 0; i < cases.size(); ++i) {
+                    const auto &test = cases[i];
+                    auto        draw = material(i, true);
+                    const auto  transform = transform_for(i);
+                    std::copy(std::begin(transform.local), std::end(transform.local), draw.mesh.mvp);
+                    auto palette = after[test.after];
+                    if (test.before_palette && test.before_skinned && test.matched) {
+                        gfx::detail::BlendProg0Bones(before[test.before], after[test.after], alpha, test.threshold, palette);
+                    }
+                    gfx::DrawMeshProg0(mesh, 0, 3, draw.mesh, draw.prog0, {}, {}, &transform, &palette);
+                }
+            });
+            const auto expected = fixture.pixels;
+            ASSERT_TRUE(gfx::RenderList(*current, 1, {.canonical = true}));
+            ASSERT_TRUE(gfx::RenderList(*current, alpha, {.previous = previous.get(), .present = true}));
+            ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+            EXPECT_EQ(fixture.pixels, expected) << "generation " << generation << " alpha " << alpha;
+        }
+    }
+    gfx::DestroyMesh(mesh);
+}
+
+TEST(GfxGpuMeshDc2, MatrixProductsPreservePerDrawStateAcrossExactReuse) {
+    using gfx::detail::Mat4;
+    /**
+     * Changes one matrix input or selects a different per-draw shader path.
+     */
+    enum class Variant {
+        Base,
+        Plain,
+        Clip,
+        Local,
+        Projection,
+        Middle,
+        Model,
+        View,
+        SignedZero,
+        Singular
+    };
+    constexpr std::array variants = {
+        Variant::Base, Variant::Base, Variant::Plain, Variant::Clip, Variant::Local, Variant::Local,
+        Variant::Projection, Variant::Base, Variant::Middle, Variant::Middle, Variant::Model, Variant::View,
+        Variant::Base, Variant::SignedZero, Variant::SignedZero, Variant::Singular, Variant::Base, Variant::Plain};
+    GfxFixture                 fixture(200, 160, 1.0f, Prog0Options());
+    std::vector<gfx::Vertex3D> vertices;
+    std::vector<uint32_t>      indices;
+    for (size_t i = 0; i < variants.size(); ++i) {
+        const float x = -.8f + .4f * static_cast<float>(i % 5);
+        const float y = -.7f + .466f * static_cast<float>(i / 5);
+        for (const auto &point : std::array<std::array<float, 2>, 3>{
+                 {{-.045f, -.04f}, {.045f, -.04f}, {0, .05f}}
+        }) {
+            indices.push_back(static_cast<uint32_t>(vertices.size()));
+            vertices.push_back(Vert({x + point[0], y + point[1], .5f}, {0, 0, 1}));
+        }
+    }
+    const auto mesh = gfx::CreateMesh(vertices, indices);
+    ASSERT_NE(mesh, gfx::kNullMesh);
+    const auto matrix = [](const float *data) {
+        Mat4 result;
+        std::memcpy(result.data(), data, sizeof result);
+        return result;
+    };
+    for (int generation = 0; generation < 2; ++generation) {
+        const auto transform_for = [&](Variant variant, bool current, bool breaker) {
+            auto transform = gfx::IdentityMeshTransform();
+            transform.model[12] = (current ? .035f : -.025f) + .005f * static_cast<float>(generation);
+            transform.model[13] = current ? -.02f : .01f;
+            transform.view[12] = (current ? .06f : -.04f) + .015f * static_cast<float>(generation);
+            switch (variant) {
+                case Variant::Local:
+                    transform.local[13] = -.03f;
+                    break;
+                case Variant::Projection:
+                    transform.projection[0] = .95f;
+                    transform.projection[5] = 1.02f;
+                    break;
+                case Variant::Middle:
+                    transform.middle[4] = .05f;
+                    break;
+                case Variant::Model:
+                    transform.model[12] += .035f;
+                    break;
+                case Variant::View:
+                    transform.view[12] += .15f;
+                    break;
+                case Variant::SignedZero:
+                    transform.local[1] = std::bit_cast<float>(0x80000000u);
+                    break;
+                case Variant::Singular:
+                    transform.middle[10] = 0;
+                    break;
+                default:
+                    break;
+            }
+            if (breaker) {
+                transform.model[12] += 100.0f;
+            }
+            return transform;
+        };
+        const auto record = [&](bool current, bool break_cache) {
+            gfx::BeginRecording();
+            gfx::Clear(true, kClear.data(), true, 0);
+            for (size_t i = 0; i < variants.size(); ++i) {
+                const auto emit = [&](bool breaker) {
+                    const auto transform = transform_for(variants[i], current, breaker);
+                    auto       draw = FourLights();
+                    draw.prog0.flags = gfx::kProg0Clip | (i % 2 == 0 ? gfx::kProg0Real : gfx::kProg0PointLights);
+                    Set(draw.prog0.object_color, {45.0f + 5.0f * static_cast<float>(i), 160.0f - 3.0f * static_cast<float>(i),
+                                                  70.0f + 3.0f * static_cast<float>(i), 128});
+                    Set(draw.prog0.diffuse, {.35f, .45f, .55f, 1});
+                    Set(draw.prog0.eye, {.1f * static_cast<float>(i), -.2f, 2});
+                    SetPoint(draw.prog0, 0, {.1f * static_cast<float>(i % 4) - .15f, .2f, 1.4f, 3}, {25, 70, 45, 0});
+                    std::memcpy(draw.prog0.model_world, transform.model, sizeof transform.model);
+                    Identity(draw.prog0.clip_or_view);
+                    if (variants[i] == Variant::Clip) {
+                        draw.prog0.clip_or_view[0] = 1.2f;
+                        draw.prog0.clip_or_view[12] = .6f;
+                    }
+                    if (variants[i] == Variant::Plain) {
+                        draw.mesh = ChronicleLit();
+                        draw.mesh.normal_matrix[8] = .1f * static_cast<float>(i % 3);
+                        draw.mesh.diffuse[0] = .25f + .02f * static_cast<float>(i);
+                        draw.mesh.diffuse[1] = .6f;
+                    }
+                    const auto world_to_clip = gfx::detail::Multiply(
+                        gfx::detail::Multiply(matrix(transform.projection), matrix(transform.view)), matrix(transform.middle));
+                    const auto mvp = gfx::detail::Multiply(world_to_clip,
+                                                           gfx::detail::Multiply(matrix(transform.model), matrix(transform.local)));
+                    std::memcpy(draw.mesh.mvp, mvp.data(), sizeof draw.mesh.mvp);
+                    gfx::DrawState state;
+                    state.color_write_mask = breaker ? 0 : gfx::kWriteRgba;
+                    state.depth_write = false;
+                    state.stencil_test = false;
+                    gfx::SetInterpKey((breaker ? 10000 : 100) + i);
+                    const auto first = static_cast<uint32_t>(i * 3);
+                    if (!breaker && variants[i] == Variant::Plain) {
+                        gfx::DrawMesh(mesh, first, 3, draw.mesh, {}, state, &transform);
+                    } else {
+                        gfx::DrawMeshProg0(mesh, first, 3, draw.mesh, draw.prog0, {}, state, &transform);
+                    }
+                };
+                if (break_cache) {
+                    emit(true);
+                }
+                emit(false);
+            }
+            return gfx::EndRecording();
+        };
+        const auto previous = record(false, false);
+        const auto current = record(true, false);
+        const auto reference_previous = record(false, true);
+        const auto reference = record(true, true);
+        ASSERT_EQ(current->records.size(), variants.size());
+        ASSERT_EQ(reference->records.size(), variants.size() * 2);
+        const auto &first = current->records[0];
+        const auto &repeat = current->records[1];
+        EXPECT_EQ(first.camera, repeat.camera);
+        EXPECT_EQ(std::memcmp(first.model.data(), repeat.model.data(), sizeof first.model), 0);
+        EXPECT_EQ(std::memcmp(first.local.data(), repeat.local.data(), sizeof first.local), 0);
+        EXPECT_EQ(std::memcmp(first.middle.data(), repeat.middle.data(), sizeof first.middle), 0);
+        EXPECT_EQ(std::memcmp(first.projection.data(), repeat.projection.data(), sizeof first.projection), 0);
+        const auto &first_entry = std::get<gfx::detail::MeshEntry>(current->entries[first.entry]);
+        const auto &repeat_entry = std::get<gfx::detail::MeshEntry>(current->entries[repeat.entry]);
+        ASSERT_GE(first_entry.prog0, 0);
+        ASSERT_GE(repeat_entry.prog0, 0);
+        const auto &first_block = current->prog0_blocks[static_cast<size_t>(first_entry.prog0)];
+        const auto &repeat_block = current->prog0_blocks[static_cast<size_t>(repeat_entry.prog0)];
+        EXPECT_EQ(std::memcmp(first_block.clip_or_view, repeat_block.clip_or_view, sizeof first_block.clip_or_view), 0);
+        EXPECT_NE(std::memcmp(first_block.object_color, repeat_block.object_color, sizeof first_block.object_color), 0);
+        EXPECT_EQ(std::bit_cast<uint32_t>(current->records[12].local[1]), 0u);
+        EXPECT_EQ(std::bit_cast<uint32_t>(current->records[13].local[1]), 0x80000000u);
+        EXPECT_EQ(std::memcmp(current->records[13].local.data(), current->records[14].local.data(), sizeof first.local), 0);
+        for (size_t i = 0; i < variants.size(); ++i) {
+            const auto &breaker = reference->records[i * 2];
+            const auto &real = reference->records[i * 2 + 1];
+            EXPECT_EQ(breaker.camera, real.camera);
+            EXPECT_NE(std::memcmp(breaker.model.data(), real.model.data(), sizeof real.model), 0);
+            EXPECT_GT(std::fabs(breaker.model[12] - real.model[12]), 99.0f);
+            const auto &entry = std::get<gfx::detail::MeshEntry>(reference->entries[breaker.entry]);
+            EXPECT_EQ(entry.state.color_write_mask, 0);
+            EXPECT_FALSE(entry.state.depth_write);
+            EXPECT_FALSE(entry.state.stencil_test);
+            EXPECT_GE(entry.prog0, 0);
+        }
+        for (const float alpha : {.25f, .75f, .5f, .25f}) {
+            ASSERT_TRUE(gfx::RenderList(*reference, 1, {.canonical = true}));
+            ASSERT_TRUE(gfx::RenderList(*reference, alpha, {.previous = reference_previous.get(), .present = true}));
+            ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+            const auto expected = fixture.pixels;
+            size_t     colored_pixels = 0;
+            for (size_t i = 0; i + 3 < expected.size(); i += 4) {
+                colored_pixels += expected[i] != 0 || expected[i + 1] != 0 || expected[i + 2] != 0 ? 1u : 0u;
+            }
+            EXPECT_GT(colored_pixels, 0u);
+            ASSERT_TRUE(gfx::RenderList(*current, 1, {.canonical = true}));
+            ASSERT_TRUE(gfx::RenderList(*current, alpha, {.previous = previous.get(), .present = true}));
+            ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+            EXPECT_EQ(fixture.pixels, expected) << "generation " << generation << " alpha " << alpha;
+            ASSERT_EQ(current->cache.match.size(), variants.size());
+            for (const auto match : current->cache.match) {
+                EXPECT_GE(match, 0);
+            }
+            ASSERT_EQ(reference->cache.match.size(), variants.size() * 2);
+            for (const auto match : reference->cache.match) {
+                EXPECT_GE(match, 0);
+            }
+            for (size_t i = 0; i < variants.size(); ++i) {
+                Mat4 breaker_model;
+                Mat4 real_model;
+                ASSERT_TRUE(gfx::detail::InterpolateAffine(reference_previous->records[i * 2].model,
+                                                           reference->records[i * 2].model, alpha, breaker_model));
+                ASSERT_TRUE(gfx::detail::InterpolateAffine(reference_previous->records[i * 2 + 1].model,
+                                                           reference->records[i * 2 + 1].model, alpha, real_model));
+                EXPECT_GT(std::fabs(breaker_model[12] - real_model[12]), 99.0f);
+            }
+        }
+    }
+    gfx::DestroyMesh(mesh);
 }

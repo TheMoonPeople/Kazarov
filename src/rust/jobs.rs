@@ -59,7 +59,11 @@ where
 }
 
 /// Builds a pool of `workers` threads whose stacks fit deep converter call paths.
-pub fn worker_pool(workers: usize, name: &'static str, stack: usize) -> CoreResult<rayon::ThreadPool> {
+pub fn worker_pool(
+    workers: usize,
+    name: &'static str,
+    stack: usize,
+) -> CoreResult<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .stack_size(stack)
@@ -86,7 +90,13 @@ mod tests {
 
     #[test]
     fn interleaves_classes_largest_first() {
-        let jobs = vec![Probe(0, 1), Probe(0, 9), Probe(1, 5), Probe(2, 2), Probe(1, 7)];
+        let jobs = vec![
+            Probe(0, 1),
+            Probe(0, 9),
+            Probe(1, 5),
+            Probe(2, 2),
+            Probe(1, 7),
+        ];
         let order: Vec<(usize, u64)> = interleave(jobs, 3)
             .into_iter()
             .map(|job| (job.0, job.1))
@@ -98,14 +108,19 @@ mod tests {
     fn stops_at_the_first_error() {
         let pool = worker_pool(1, "test", 1 << 20).unwrap();
         let seen = Mutex::new(Vec::new());
-        let result = run_interleaved(&pool, vec![Probe(0, 3), Probe(0, 2), Probe(0, 1)], 1, |job| {
-            seen.lock().unwrap().push(job.1);
-            if job.1 == 2 {
-                Err(CoreError("stop".into()))
-            } else {
-                Ok(())
-            }
-        });
+        let result = run_interleaved(
+            &pool,
+            vec![Probe(0, 3), Probe(0, 2), Probe(0, 1)],
+            1,
+            |job| {
+                seen.lock().unwrap().push(job.1);
+                if job.1 == 2 {
+                    Err(CoreError("stop".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
         assert!(result.is_err());
         assert_eq!(*seen.lock().unwrap(), [3, 2]);
     }
