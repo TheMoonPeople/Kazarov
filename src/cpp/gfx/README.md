@@ -10,6 +10,7 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
 - `RendererInit(window, config)` creates the device, the swapchain, the main targets and every
   pipeline (below). `config.pipeline_cache` defaults to `save/pipeline_cache.bin`;
   `config.progress(done, total)` is called on the calling thread while pipelines compile.
+  `KZ_PIPELINE_COMPILER_THREADS` caps compiler concurrency at a positive integer; the default is up to eight hardware threads.
 - `BeginFrame()` / `EndFrame()` bracket a frame drawn as it is called. Four frames are in flight:
   a tick submits a canonical render and its display renders, so the GPU may run two ticks behind.
   `BeginFrame` returns false when there is nothing to draw to (minimised); draws are then dropped and

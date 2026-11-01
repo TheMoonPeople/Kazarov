@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -555,7 +556,7 @@ void LogShaderStats() {
             std::vector<VkPipelineExecutableInternalRepresentationKHR> irs(
                 ir_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
             representations(g.device, &executable, &ir_count, irs.data());
-            std::vector<std::vector<char>> texts(ir_count);
+            std::vector<std::vector<char> > texts(ir_count);
             for (uint32_t r = 0; r < ir_count; r++) {
                 texts[r].resize(irs[r].dataSize + 1);
                 irs[r].pData = texts[r].data();
@@ -911,6 +912,14 @@ void CreatePipelines() {
         return result;
     };
     uint32_t workers = std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
+    if (const char *setting = std::getenv("KZ_PIPELINE_COMPILER_THREADS"); setting != nullptr) {
+        uint32_t    worker_limit = 0;
+        const char *end = setting + std::strlen(setting);
+        const auto  parsed = std::from_chars(setting, end, worker_limit);
+        if (parsed.ec == std::errc{} && parsed.ptr == end && worker_limit != 0) {
+            workers = std::min(workers, worker_limit);
+        }
+    }
     {
         // std::thread rather than std::jthread, which Android's libc++ keeps experimental.
         std::vector<std::thread> threads;
