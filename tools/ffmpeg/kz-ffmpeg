@@ -13,6 +13,7 @@ scripts/build/kz-ffmpeg launches this shared FFmpeg tool; the image uses it dire
 
 import argparse
 import hashlib
+from http.client import HTTPException
 import json
 import os
 import shlex
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -133,12 +135,24 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
-def download(dest):
-    try:
-        with urllib.request.urlopen(URL) as resp, open(dest, 'wb') as f:
-            shutil.copyfileobj(resp, f)
-    except OSError as err:
-        sys.exit(f'kz-ffmpeg: cannot download {URL}: {err}')
+def download(dest, sha):
+    partial = dest.with_name(dest.name + '.partial')
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(URL, timeout=120) as resp, partial.open('wb') as output:
+                shutil.copyfileobj(resp, output)
+            got = sha256_of(partial)
+            if got != sha:
+                raise ValueError(f'sha256 mismatch: expected {sha}, got {got}')
+            partial.replace(dest)
+            return
+        except (OSError, HTTPException, ValueError) as err:
+            partial.unlink(missing_ok=True)
+            if attempt == 4:
+                sys.exit(f'kz-ffmpeg: cannot download {URL} after five attempts: {err}')
+            print(f'kz-ffmpeg: download failed ({err}); retrying attempt {attempt + 2}/5',
+                  file=sys.stderr)
+            time.sleep(2 ** attempt)
 
 
 def extract(tarball, into):
@@ -210,7 +224,7 @@ def main():
             tarball = Path(args.tarball)
         else:
             tarball = tmp / f'ffmpeg-{VERSION}.tar.xz'
-            download(tarball)
+            download(tarball, sha)
         got = sha256_of(tarball)
         if got != sha:
             sys.exit(f'kz-ffmpeg: {tarball} sha256 mismatch: expected {sha}, got {got}')
