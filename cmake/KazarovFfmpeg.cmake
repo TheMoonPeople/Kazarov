@@ -1,5 +1,5 @@
 # Links FFmpeg's format, codec, resampling and scaling libraries as kz::ffmpeg: the static tree kz-ffmpeg builds
-# (Linux, macOS) or BtbN's win64-lgpl-shared archive (Windows, DLLs). Only LGPL builds are acceptable
+# (Linux, macOS), or its windows-x64 DLLs (Windows). Only LGPL builds are acceptable
 # inputs; a GPL or nonfree libavcodec must never reach a Kazarov consumer.
 
 include_guard(GLOBAL)

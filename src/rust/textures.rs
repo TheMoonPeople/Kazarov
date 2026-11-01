@@ -376,9 +376,7 @@ pub(super) fn legacy_document_path(key: &str) -> CoreResult<String> {
 fn dc1_document_path(key: &str) -> CoreResult<String> {
     let leaf = key.rsplit('/').next().unwrap_or(key);
     let source_name = leaf.split('#').next().unwrap_or(leaf);
-    let Some((_, extension)) = source_name
-        .rsplit_once('.')
-    else {
+    let Some((_, extension)) = source_name.rsplit_once('.') else {
         return legacy_document_path(key);
     };
     let extension = extension.to_ascii_lowercase();
@@ -390,8 +388,13 @@ fn dc1_document_path(key: &str) -> CoreResult<String> {
     } else {
         let source_end = key.find('#').unwrap_or(key.len());
         let source = &key[..source_end];
-        let projected = format!("{}{}", source.strip_suffix(&format!(".{extension}"))
-            .ok_or_else(|| fail("invalid DC1 texture source extension"))?, ".img");
+        let projected = format!(
+            "{}{}",
+            source
+                .strip_suffix(&format!(".{extension}"))
+                .ok_or_else(|| fail("invalid DC1 texture source extension"))?,
+            ".img"
+        );
         format!("{projected}{}", &key[source_end..])
     };
     let path = legacy_document_path(&projected_key)?;
@@ -402,11 +405,11 @@ fn dc1_document_path(key: &str) -> CoreResult<String> {
 }
 fn dc1_texture_extension(extension: &str) -> bool {
     matches!(extension, "img" | "tm2" | "im2" | "im3" | "tim2")
-        || ["img", "tm2"]
-            .iter()
-            .any(|base| extension.strip_prefix(base).is_some_and(|suffix| {
-                !suffix.is_empty() && suffix.bytes().all(|byte| byte == b'_')
-            }))
+        || ["img", "tm2"].iter().any(|base| {
+            extension
+                .strip_prefix(base)
+                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte == b'_'))
+        })
 }
 fn legacy_document_path_for(key: &str, dc1_profile: bool) -> CoreResult<String> {
     if dc1_profile {
@@ -466,10 +469,13 @@ fn document_path_for(key: &str, dc1_profile: bool) -> CoreResult<String> {
 
 fn has_extension_container(key: &str) -> bool {
     let components: Vec<_> = key.split('/').filter(|part| !part.is_empty()).collect();
-    components.iter().take(components.len().saturating_sub(1)).any(|part| {
-        let base = part.split('#').next().unwrap_or(part);
-        base.rsplit_once('.').is_some()
-    })
+    components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|part| {
+            let base = part.split('#').next().unwrap_or(part);
+            base.rsplit_once('.').is_some()
+        })
 }
 
 fn dc1_source_tag(key: &str) -> String {
@@ -799,14 +805,18 @@ fn parse_dc1_fixed_texture_wrapper(b: &[u8]) -> CoreResult<Option<(String, Vec<P
         .collect();
     if offsets.len() != 1 {
         if offsets.len() > 1 {
-            return Err(fail("DC1 fixed texture wrapper contains multiple complete TIM2 images"));
+            return Err(fail(
+                "DC1 fixed texture wrapper contains multiple complete TIM2 images",
+            ));
         }
         return Ok(None);
     }
     let texture = &b[offsets[0]..];
     let pictures = parse_tim2(texture, false, false)?;
     if pictures.len() != 1 {
-        return Err(fail("DC1 fixed texture wrapper must contain one TIM2 picture"));
+        return Err(fail(
+            "DC1 fixed texture wrapper must contain one TIM2 picture",
+        ));
     }
     Ok(Some((encoded(&name_bytes[..name_end]), pictures)))
 }
@@ -1230,24 +1240,18 @@ impl Unit {
             || original.starts_with(b"IM3\0")
         {
             let parsed = parse_img(original);
-            if self.dc1_profile && original.starts_with(b"IMG\0") && parsed.is_err() {
-                if let Some((name, pictures)) = parse_dc1_fixed_texture_wrapper(original)? {
-                    let source_idx = self.sources.len();
-                    let metadata = json!({"block":0,"swizzled":false,"clamp":0,"no_image":false});
-                    let entries = self.convert_pictures(
-                        write,
-                        key,
-                        &name,
-                        pictures,
-                        &metadata,
-                        0,
-                        source_idx,
-                        0,
-                    )?;
-                    self.sources
-                        .push(json!({"source":key,"kind":"img","entries":entries}));
-                    return Ok(None);
-                }
+            if self.dc1_profile
+                && original.starts_with(b"IMG\0")
+                && parsed.is_err()
+                && let Some((name, pictures)) = parse_dc1_fixed_texture_wrapper(original)?
+            {
+                let source_idx = self.sources.len();
+                let metadata = json!({"block":0,"swizzled":false,"clamp":0,"no_image":false});
+                let entries = self
+                    .convert_pictures(write, key, &name, pictures, &metadata, 0, source_idx, 0)?;
+                self.sources
+                    .push(json!({"source":key,"kind":"img","entries":entries}));
+                return Ok(None);
             }
             let (kind, mut entries) = parsed?;
             if kind == "img3" {
@@ -2067,14 +2071,20 @@ pub fn verify_tree(textures: &Path) -> CoreResult<()> {
             let path = entry.path();
             let kind = entry.file_type()?;
             if kind.is_symlink() {
-                return Err(fail(format!("texture tree contains a symbolic link: {}", path.display())));
+                return Err(fail(format!(
+                    "texture tree contains a symbolic link: {}",
+                    path.display()
+                )));
             }
             if kind.is_dir() {
                 pending.push(path);
             } else if kind.is_file() {
                 files.push(path);
             } else {
-                return Err(fail(format!("texture tree contains a non-file entry: {}", path.display())));
+                return Err(fail(format!(
+                    "texture tree contains a non-file entry: {}",
+                    path.display()
+                )));
             }
         }
     }
@@ -2093,17 +2103,23 @@ pub fn verify_tree(textures: &Path) -> CoreResult<()> {
                 || !document["groups"].is_array()
                 || !document["entries"].is_array()
             {
-                return Err(fail(format!("invalid schema 3 texture document: {relative}")));
+                return Err(fail(format!(
+                    "invalid schema 3 texture document: {relative}"
+                )));
             }
             let data_path = format!("textures/{relative}");
             let assets = picture_assets(&data_path, &document)?;
             documents.push((data_path, assets));
         } else if relative.to_ascii_lowercase().ends_with(".png") {
             if !png_paths.insert(format!("textures/{relative}").to_ascii_lowercase()) {
-                return Err(fail(format!("duplicate case-insensitive PNG path: {relative}")));
+                return Err(fail(format!(
+                    "duplicate case-insensitive PNG path: {relative}"
+                )));
             }
         } else {
-            return Err(fail(format!("unsupported file in texture tree: {relative}")));
+            return Err(fail(format!(
+                "unsupported file in texture tree: {relative}"
+            )));
         }
     }
     let mut referenced = BTreeSet::new();
@@ -2111,7 +2127,9 @@ pub fn verify_tree(textures: &Path) -> CoreResult<()> {
         for asset in assets {
             let key = asset.to_ascii_lowercase();
             if !png_paths.contains(&key) {
-                return Err(fail(format!("missing PNG {asset} referenced by {document_path}")));
+                return Err(fail(format!(
+                    "missing PNG {asset} referenced by {document_path}"
+                )));
             }
             referenced.insert(key);
         }
@@ -2141,14 +2159,25 @@ pub fn verify_tree(textures: &Path) -> CoreResult<()> {
             || color_type != png::ColorType::Rgba
             || bit_depth != png::BitDepth::Eight
         {
-            return Err(fail(format!("texture PNG is not nonempty RGBA8: {}", path.display())));
+            return Err(fail(format!(
+                "texture PNG is not nonempty RGBA8: {}",
+                path.display()
+            )));
         }
-        let mut pixels = vec![0; decoder.output_buffer_size().ok_or_else(|| fail("PNG is too large"))?];
+        let mut pixels = vec![
+            0;
+            decoder
+                .output_buffer_size()
+                .ok_or_else(|| fail("PNG is too large"))?
+        ];
         let frame = decoder
             .next_frame(&mut pixels)
             .map_err(|error| fail(format!("cannot decode PNG {}: {error}", path.display())))?;
         if frame.width != width || frame.height != height {
-            return Err(fail(format!("texture PNG dimensions changed while decoding: {}", path.display())));
+            return Err(fail(format!(
+                "texture PNG dimensions changed while decoding: {}",
+                path.display()
+            )));
         }
     }
     Ok(())
@@ -2173,13 +2202,7 @@ fn convert_tree_profile(
             } else {
                 super::archive::SourceTree::directory(raw)?
             };
-            convert_source_with_profile_progress(
-                &source,
-                output,
-                jobs,
-                &Phase::noop(),
-                dc1_profile,
-            )
+            convert_source_with_profile_progress(&source, output, jobs, &Phase::noop(), dc1_profile)
         })
 }
 
@@ -2758,12 +2781,18 @@ mod tests {
         assert!(output.join("data/chara/hero.chr").is_file());
         assert!(output.join("data/textures/chara/hero_0.png").is_file());
         assert!(output.join("data/textures/chara/hero_1.png").is_file());
-        assert!(output
-            .join("data/textures/chara/hero-embedded-offset-16.json")
-            .is_file());
-        assert!(output
-            .join(format!("data/textures/chara/hero-embedded-offset-{second_offset}.json"))
-            .is_file());
+        assert!(
+            output
+                .join("data/textures/chara/hero-embedded-offset-16.json")
+                .is_file()
+        );
+        assert!(
+            output
+                .join(format!(
+                    "data/textures/chara/hero-embedded-offset-{second_offset}.json"
+                ))
+                .is_file()
+        );
         let png = png::Decoder::new(std::io::Cursor::new(
             fs::read(output.join("data/textures/chara/hero_0.png")).unwrap(),
         ));
@@ -2772,13 +2801,13 @@ mod tests {
         let info = reader.next_frame(&mut pixels).unwrap();
         assert_eq!((info.width, info.height), (2, 2));
         assert_eq!(&pixels[..4], &[4, 0, 0, 128]);
-        assert!(!fs::read_dir(&output)
-            .unwrap()
-            .any(|entry| entry
+        assert!(!fs::read_dir(&output).unwrap().any(|entry| {
+            entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".texture-stage-")));
+                .starts_with(".texture-stage-")
+        }));
     }
     #[test]
     fn runtime_document_preserves_groups_pictures_canvas_and_sampling() {
@@ -3094,7 +3123,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(item_document["entries"][0]["name"], "tokinoob");
-        assert_eq!(item_document["entries"][0]["pictures"][0]["animation"], "copy_variant");
+        assert_eq!(
+            item_document["entries"][0]["pictures"][0]["animation"],
+            "copy_variant"
+        );
         let reference = item_document["entries"][0]["pictures"][0]["levels"][0]
             .as_str()
             .unwrap();
@@ -3105,8 +3137,8 @@ mod tests {
         let png = png::Decoder::new(std::io::BufReader::new(
             std::fs::File::open(referenced_png).unwrap(),
         ))
-            .read_info()
-            .unwrap();
+        .read_info()
+        .unwrap();
         assert_eq!((png.info().width, png.info().height), (2, 2));
         let source_after = fs::read(raw.join("dun/item/main_data/tokinoob.img")).unwrap();
         assert_eq!(Sha256::digest(source_after), wrapper_hash);

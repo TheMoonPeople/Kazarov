@@ -700,7 +700,10 @@ void CreatePipelines() {
 
     const bool                trace_init = std::getenv("KZ_PERF_INIT_TRACE") != nullptr;
     const char               *prewarm_setting = std::getenv("KZ_PIPELINE_PREWARM");
-    const bool                prewarm = prewarm_setting == nullptr || std::strcmp(prewarm_setting, "0") != 0;
+    const bool                first_use_default = g.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ||
+                                                  std::getenv("KZ_PIPELINES_LAZY") != nullptr;
+    const bool                prewarm = prewarm_setting != nullptr ? std::strcmp(prewarm_setting, "0") != 0
+                                                                   : !first_use_default;
     const bool                disable_cache = std::getenv("KZ_PIPELINE_CACHE_DISABLE") != nullptr;
     std::vector<uint8_t>      initial = disable_cache ? std::vector<uint8_t>{} : LoadCache(g.config.pipeline_cache);
     const auto                loaded = trace_init ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

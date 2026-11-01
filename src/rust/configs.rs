@@ -143,6 +143,28 @@ fn string_argument(b: &[u8]) -> Value {
     argument
 }
 
+/// Decodes the string arguments a game's own reader gives as raw bytes in hex
+/// (`{"type":"string","bytes":"..."}`) as Shift-JIS, as this module decodes Dark Cloud 2's.
+pub(crate) fn decode_string_arguments(document: &mut Value) -> CoreResult<()> {
+    for statement in document["commands"].as_array_mut().into_iter().flatten() {
+        for argument in statement["args"].as_array_mut().into_iter().flatten() {
+            let Some(text) = argument.get("bytes").and_then(Value::as_str) else {
+                continue;
+            };
+            if text.len() % 2 != 0 {
+                return Err(fail("odd-length string argument bytes"));
+            }
+            let bytes = (0..text.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&text[at..at + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| fail("string argument bytes are not hex"))?;
+            *argument = string_argument(&bytes);
+        }
+    }
+    Ok(())
+}
+
 fn preprocess(raw: &[u8]) -> Vec<u8> {
     let mut b = raw.to_vec();
     let mut at = 0;

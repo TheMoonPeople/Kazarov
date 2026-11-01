@@ -676,8 +676,9 @@ compiling every combination at startup. This limits software-driver memory use i
 CI while retaining every specialization and the same logical `PipelineCount()`.
 Vulkan descriptions own their backing data, and their shader modules remain alive
 until renderer shutdown. Helper pipelines still compile during initialization.
-The default prewarms every pipeline; `KZ_PIPELINE_COMPILER_THREADS` limits its
-compiler workers. The optional first-use mode runs on the render thread and saves
+CPU rasterizers and `KZ_PIPELINES_LAZY` default to first-use creation; other devices
+prewarm every pipeline. `KZ_PIPELINE_PREWARM` explicitly overrides this default, and
+`KZ_PIPELINE_COMPILER_THREADS` limits compiler workers. The optional first-use mode runs on the render thread and saves
 its populated Vulkan pipeline cache at shutdown.
 
 Untextured colour pipelines keep fog and simple-colour specialization but share
