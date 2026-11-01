@@ -558,38 +558,36 @@ TEST_P(GfxGpuColorWriteMask, GEqualFiltersAroundQuantizedReferences) {
 
     struct Boundary {
         uint8_t reference;
-        uint8_t alpha;
         float   before;
+        float   at_or_above;
         float   after;
     };
 
+    // Vulkan guarantees only four fractional bits for filtering weights.
     constexpr std::array boundaries = {
-        Boundary{1,   0,   1.4921875f, 1.5f      },
-        Boundary{64,  126, 1.0f,       1.0078125f},
-        Boundary{127, 252, 0.5078125f, 0.515625f },
+        Boundary{1,   0.5f,    0.5625f, 0.625f },
+        Boundary{64,  0.6875f, 0.75f,   0.8125f},
+        Boundary{127, 0.9375f, 1.0f,    1.0625f},
+        Boundary{128, 0.9375f, 1.0f,    1.0625f},
     };
-    std::array<gfx::TextureHandle, boundaries.size()> textures;
-    for (size_t i = 0; i < boundaries.size(); i++) {
-        textures[i] = gfx::CreateTexture({2, 1, gfx::TextureFormat::Rgba8, 1, true});
-        const uint32_t pixels[] = {
-            Rgba(240, 64, 0, boundaries[i].alpha),
-            Rgba(240, 64, 0, static_cast<uint8_t>(boundaries[i].alpha + 1)),
-        };
-        ASSERT_TRUE(gfx::UpdateTexture(textures[i], 0, 0, 0, 2, 1, pixels));
-    }
+    const auto     texture = gfx::CreateTexture({2, 1, gfx::TextureFormat::Rgba8, 1, true});
+    const uint32_t pixels[] = {Rgba(240, 64, 0, 0), Rgba(240, 64, 0, 255)};
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 2, 1, pixels));
     fixture.Frame({10, 20, 30, 0x80}, [&] {
         for (size_t i = 0; i < boundaries.size(); i++) {
             gfx::TextureBinding binding;
-            binding.texture = textures[i];
+            binding.texture = texture;
             binding.filter = gfx::Filter::Linear;
             gfx::DrawState state;
             state.alpha_test = true;
             state.alpha_func = gfx::AlphaFunc::GEqual;
             state.alpha_ref = boundaries[i].reference;
-            for (int column = 0; column < 2; column++) {
-                const float u = column == 0 ? boundaries[i].before : boundaries[i].after;
-                auto        quad = Quad(static_cast<float>(column * 200), static_cast<float>(i * 100), 200, 100,
-                                        {128, 128, 128, 128}, u, 0.5f, u, 0.5f);
+            const std::array coordinates = {boundaries[i].before, boundaries[i].at_or_above, boundaries[i].after};
+            for (size_t column = 0; column < coordinates.size(); column++) {
+                const float u = coordinates[column];
+                // Full vertex alpha makes the midpoint exactly 127.5 GS units, which GEQUAL against 128 accepts.
+                auto quad = Quad(static_cast<float>(column * 200), static_cast<float>(i * 100), 200, 100,
+                                 {128, 128, 128, 255}, u, 0.5f, u, 0.5f);
                 gfx::Draw2D(gfx::Primitive::Quads, quad, binding, state);
             }
         }
@@ -598,6 +596,7 @@ TEST_P(GfxGpuColorWriteMask, GEqualFiltersAroundQuantizedReferences) {
         const int y = static_cast<int>(i * 100 + 50);
         EXPECT_TRUE(fixture.PixelNear(100, y, 10, 20, 30));
         EXPECT_TRUE(fixture.PixelNear(300, y, 240, 64, 0, 1));
+        EXPECT_TRUE(fixture.PixelNear(500, y, 240, 64, 0, 1));
     }
 }
 
