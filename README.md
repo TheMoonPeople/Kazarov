@@ -180,12 +180,12 @@ Built locally from the Kazarov root, with `docker build --platform linux/amd64 -
 
 - Tag: the first 12 hex digits of the SHA-256 of the `image/`, `tools/ffmpeg/` and `.dockerignore` Git object IDs, or `dirty-<hash>` when those inputs have uncommitted changes or there is no commit, where `<hash>` covers the path and content of each image input (`kazarov.cmd` uses plain `dirty`, which is always rebuilt). The image carries the label `org.themoonpeople.kazarov.image=<tag>`.
 - `/opt/kazarov/image-id` holds the tag. The last layer writes it, so a changed image id rebuilds the objects and an unchanged one rebuilds nothing.
-- Base: `debian:trixie-slim`, `linux/amd64` only, because wibo needs an x86_64 kernel.
+- Base: digest-pinned `debian:trixie-slim`, `linux/amd64` only, because wibo needs an x86_64 kernel.
 - Contents:
   - wibo, pinned by digest. Runs the Metrowerks compiler and linker.
   - SatansFiddle, built from source at a pinned revision with four patches from `image/patches/`. Its tests are in `/usr/local/libexec/satansfiddle-tests/`.
   - binutils-mips-ps2-decompals v0.10 in `/usr/local/binutils-mips-ps2-decompals`.
-  - clang, lld and llvm 23 from apt.llvm.org; clangd 22.1.6; objdiff-cli v3.7.3.
+  - clang, clangd, clang-format, clang-tidy, lld and llvm 23 from the signed apt.llvm.org repository; checksum-verified objdiff-cli v3.7.3.
   - `/opt/venv` with pycdlib, splat64[mips], libclang, graphviz, toml and levenshtein.
   - m2c and mwccps2-debugger at pinned commits in `/opt/kazarov/`.
   - gdb, lldb-19, cmake, ninja, and the libraries the PC port links against.
