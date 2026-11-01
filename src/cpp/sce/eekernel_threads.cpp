@@ -23,6 +23,13 @@
 #include "platform/clock.hpp"
 #include "sce/threads.hpp"
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) && !defined(_WIN32)
+#include <sanitizer/common_interface_defs.h>
+#define KZ_ASAN_FIBERS 1
+#endif
+#endif
+
 // PS2 threads are fibers on the main OS thread. The game's threads are cooperative and the window, SDL and
 // the Vulkan queue must stay on one thread, so no OS thread is ever created.
 
@@ -88,6 +95,31 @@ _kz_fiber_trampoline:
 
 namespace {
 
+/**
+ * Describes a cooperative stack to AddressSanitizer while it is suspended.
+ */
+struct SanitizerStack {
+#if defined(KZ_ASAN_FIBERS)
+    void           *fake_stack = nullptr; /**< Saved sanitizer frame storage for this stack. */
+    const void     *bottom = nullptr;     /**< Lowest address of the stack mapping. */
+    std::size_t     size = 0;             /**< Complete stack mapping extent. */
+    SanitizerStack *previous = nullptr;   /**< Stack that yielded to this context. */
+#endif
+};
+
+/**
+ * Completes the sanitizer's transition onto the currently executing stack.
+ */
+void FinishStackSwitch(SanitizerStack &stack) {
+#if defined(KZ_ASAN_FIBERS)
+    if (stack.previous != nullptr) {
+        __sanitizer_finish_switch_fiber(stack.fake_stack, &stack.previous->bottom, &stack.previous->size);
+    }
+#else
+    static_cast<void>(stack);
+#endif
+}
+
 constexpr std::size_t kStackSize = 1024 * 1024;
 constexpr int         kMainThreadId = 1;
 
@@ -102,7 +134,7 @@ void RunEntry();
 
 #if defined(_WIN32)
 
-struct Context {
+struct Context : SanitizerStack {
     void *fiber = nullptr;
 };
 
@@ -118,6 +150,7 @@ void ContextInitMain(Context &c) {
 }
 
 void ContextCreate(Context &c) {
+    static_cast<SanitizerStack &>(c) = {};
     c.fiber = CreateFiber(kStackSize, FiberStart, nullptr);
     if (c.fiber == nullptr) {
         kz::Abort("eekernel", "CreateFiber failed");
@@ -138,7 +171,7 @@ void ContextDestroy(Context &c) {
 #elif defined(KZ_ARM64_FIBERS)
 
 // A suspended thread is its stack pointer: kz_fiber_switch left the saved registers there.
-struct Context {
+struct Context : SanitizerStack {
     void *sp = nullptr;
     void *stack = nullptr;
 };
@@ -146,6 +179,7 @@ struct Context {
 void ContextInitMain(Context &) {}
 
 void ContextCreate(Context &c) {
+    static_cast<SanitizerStack &>(c) = {};
     c.stack = std::malloc(kStackSize);
     if (c.stack == nullptr) {
         kz::Abort("eekernel", "out of memory for a thread stack");
@@ -158,6 +192,10 @@ void ContextCreate(Context &c) {
     std::memset(frame, 0, 0xa0);
     frame[0x58 / sizeof(std::uintptr_t)] = reinterpret_cast<std::uintptr_t>(&kz_fiber_trampoline);
     c.sp = frame;
+#if defined(KZ_ASAN_FIBERS)
+    c.bottom = c.stack;
+    c.size = kStackSize;
+#endif
 }
 
 void ContextSwitch(Context &prev, Context &next) {
@@ -172,7 +210,7 @@ void ContextDestroy(Context &c) {
 
 #else
 
-struct Context {
+struct Context : SanitizerStack {
     ucontext_t uc{};
     void      *stack = nullptr;
 };
@@ -180,6 +218,7 @@ struct Context {
 void ContextInitMain(Context &) {}
 
 void ContextCreate(Context &c) {
+    static_cast<SanitizerStack &>(c) = {};
     c.stack = std::malloc(kStackSize);
     if (c.stack == nullptr) {
         kz::Abort("eekernel", "out of memory for a thread stack");
@@ -190,6 +229,10 @@ void ContextCreate(Context &c) {
     c.uc.uc_stack.ss_sp = c.stack;
     c.uc.uc_stack.ss_size = kStackSize;
     c.uc.uc_link = nullptr;
+#if defined(KZ_ASAN_FIBERS)
+    c.bottom = c.stack;
+    c.size = kStackSize;
+#endif
     makecontext(&c.uc, RunEntry, 0);
 }
 
@@ -323,7 +366,14 @@ void Run(Scheduler &s, Thread *next) {
             kz::Abort("eekernel_threads", "thread switch inside ClockPump (a tick callback or pump hook called a "
                                           "switching kernel call)");
         }
+#if defined(KZ_ASAN_FIBERS)
+        next->context.previous = &prev->context;
+        // Returning workers never resume this stack; retire its fake stack at the final switch.
+        auto **fake_stack = prev->state == State::Dormant ? nullptr : &prev->context.fake_stack;
+        __sanitizer_start_switch_fiber(fake_stack, next->context.bottom, next->context.size);
+#endif
         ContextSwitch(prev->context, next->context);
+        FinishStackSwitch(prev->context);
     }
 }
 
@@ -332,6 +382,7 @@ void Run(Scheduler &s, Thread *next) {
 void RunEntry() {
     Scheduler &s = Sched();
     Thread    *self = s.running;
+    FinishStackSwitch(self->context);
     self->entry(self->arg);
 
     self->state = State::Dormant;

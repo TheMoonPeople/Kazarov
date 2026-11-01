@@ -350,8 +350,8 @@ VkRect2D Intersect(const VkRect2D &a, const VkRect2D &b) {
     };
 }
 
-// Letterboxed, the bars keep what they hold: nothing drawn or cleared on the main target reaches past the frame.
-bool ClipsToFrame(TextureHandle target) { return target == kMainTarget && !FillsWindow(); }
+// Game draws and clears stay inside the letterboxed frame; host overlays can use the bars.
+bool ClipsToFrame(TextureHandle target) { return target == kMainTarget && !FillsWindow() && !tls.host_draws; }
 
 VkRect2D FramePixels(const LogicalMapping &mapping) { return PixelRect(mapping, LogicalFrame(kMainTarget)); }
 
