@@ -53,6 +53,8 @@ endfunction()
 function(kz_switch_nro target)
     # Consumers may assemble object libraries through TARGET_OBJECTS, which does not propagate their link dependencies.
     target_link_libraries(${target} PRIVATE z zstd)
+    # Borrow the display opened by libnx startup without reopening or closing its process layers.
+    target_link_options(${target} PRIVATE "LINKER:--wrap=viOpenDisplay")
     cmake_parse_arguments(KZ_NRO "" "NAME;AUTHOR;VERSION;ICON;OUTPUT" "" ${ARGN})
     if(NOT KZ_NRO_NAME)
         set(KZ_NRO_NAME "${KZ_SWITCH_APPLICATION_NAME}")

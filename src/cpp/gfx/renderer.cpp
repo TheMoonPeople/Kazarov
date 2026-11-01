@@ -25,10 +25,61 @@
 #include <android/log.h>
 #endif
 
+#ifdef __SWITCH__
+extern "C" {
+#include <switch/arm/counter.h>
+#include <switch/display/native_window.h>
+#include <switch/display/parcel.h>
+#include <switch/kernel/event.h>
+#include <switch/services/vi.h>
+}
+#endif
+
 #include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
 #include "gfx/profile.hpp"
 #include "kazarov/log.hpp"
+
+#ifdef __SWITCH__
+namespace {
+
+/**
+ * Preserves default-window display metadata before ordinary C++ initialization.
+ */
+struct DefaultDisplayCapture {
+    ViDisplay display;  /**< Successfully opened display metadata, borrowed from its original owner. */
+    bool      captured; /**< The first successful initialized Default display was observed. */
+};
+
+static_assert(std::is_trivially_default_constructible_v<DefaultDisplayCapture> &&
+              std::is_trivially_copyable_v<DefaultDisplayCapture> && std::is_standard_layout_v<DefaultDisplayCapture>);
+/** Startup-safe display observation, independent of resettable renderer state. */
+constinit DefaultDisplayCapture g_default_display_capture{};
+
+} // namespace
+
+extern "C" {
+
+/**
+ * Calls the original libnx display-open implementation through the linker's forwarding symbol.
+ */
+Result __real_viOpenDisplay(const char *name, ViDisplay *display);
+
+/**
+ * Observes initialized default-display metadata without changing the original open operation.
+ */
+Result __wrap_viOpenDisplay(const char *name, ViDisplay *display) {
+    const Result result = __real_viOpenDisplay(name, display);
+    if (!g_default_display_capture.captured && R_SUCCEEDED(result) && name != nullptr && display != nullptr &&
+        display->initialized && std::strcmp(name, "Default") == 0) {
+        g_default_display_capture.display = *display;
+        g_default_display_capture.captured = true;
+    }
+    return result;
+}
+
+} // extern "C"
+#endif
 
 namespace gfx {
 
@@ -53,8 +104,667 @@ std::atomic<bool>       g_timing_enabled{false};
 std::mutex              g_timing_mutex;
 FrameTimings            g_timings;
 TimingClock::time_point g_last_present{};
+/** Protects marker publication against measurement-boundary reads. */
+std::mutex g_present_marker_mutex;
+/** Most recent completed marker presentation and its lifetime counters. */
+PresentMarkerSnapshot g_present_marker;
+/** Device-thread sequence assigned before each marked presentation attempt. */
+uint64_t g_present_marker_sequence = 0;
 // Device thread only: when the frame being recorded opened.
 TimingClock::time_point g_frame_opened{};
+
+/**
+ * Selects per-presentation output markers for capture diagnostics.
+ */
+bool PresentMarkerEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_PERF_PRESENT_MARKER");
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+    }();
+    return enabled;
+}
+
+/**
+ * Records the result of a marked swapchain presentation without emitting per-frame logs.
+ */
+void NotePresentMarker(uint64_t sequence, VkResult result) {
+    if (sequence == 0) {
+        return;
+    }
+    std::lock_guard lock(g_present_marker_mutex);
+    if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+        g_present_marker.last_sequence = sequence;
+        ++g_present_marker.accepted;
+        g_present_marker.last_present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               TimingClock::now().time_since_epoch())
+                                               .count();
+    } else {
+        ++g_present_marker.failed;
+    }
+}
+
+#ifdef __SWITCH__
+/**
+ * Identifies the tracked states returned by the native display history.
+ */
+enum class NativeFrameState : int32_t {
+    Enqueued = 2,
+    Presented = 3
+};
+
+/**
+ * Retains one native frame's queue and presentation timestamps.
+ */
+struct NativeFrameRecord {
+    uint64_t         frame_number = 0;                   /**< Native identifier assigned when the image was queued. */
+    uint64_t         enqueue_ns = 0;                     /**< Native timestamp when the image was queued. */
+    uint64_t         presentation_ns = 0;                /**< Native timestamp when scanout began, or zero while pending. */
+    NativeFrameState state = NativeFrameState::Enqueued; /**< Current tracked producer state. */
+};
+
+/**
+ * Holds one bounded response from the native buffer queue.
+ */
+struct NativeFrameBatch {
+    std::array<NativeFrameRecord, 8> records{};             /**< Maximum history exposed by the native producer. */
+    int32_t                          count = 0;             /**< Number of records returned by the producer. */
+    Result                           result = 0;            /**< Transport or reply-validation result. */
+    int32_t                          producer_status = 0;   /**< Producer operation status before conversion. */
+    bool                             connected = false;     /**< Whether the native window has an active producer connection. */
+    uint32_t                         swap_interval = 0;     /**< Refresh interval configured for the producer. */
+    uint64_t                         query_ns = 0;          /**< Native clock immediately after receiving the response. */
+    uint64_t                         query_duration_ns = 0; /**< Time spent waiting for the history response. */
+};
+
+/**
+ * Reuses fixed public parcel storage for bounded native-history polling.
+ */
+struct NativeFrameReader {
+    Parcel request{}; /**< Outgoing producer request storage. */
+    Parcel reply{};   /**< Incoming bounded history storage. */
+};
+
+/**
+ * Collects a bounded measurement interval without writing logs on presentation threads.
+ */
+struct NativeFrameHistory {
+    bool                           active = false;           /**< Whether queued-image callbacks collect history. */
+    uint64_t                       begin_ns = 0;             /**< Native measurement start timestamp. */
+    uint64_t                       end_ns = 0;               /**< Native measurement end timestamp. */
+    uint64_t                       renderer_instance = 0;    /**< Renderer lifetime owning the measurement. */
+    std::vector<NativeFrameRecord> records;                  /**< Deduplicated records ordered by native identifier. */
+    uint64_t                       last_id = 0;              /**< Highest native identifier observed. */
+    uint64_t                       queries = 0;              /**< Number of native history queries. */
+    uint64_t                       query_total_ns = 0;       /**< Total time spent querying native history. */
+    uint64_t                       query_max_ns = 0;         /**< Longest native history query. */
+    uint64_t                       query_errors = 0;         /**< Failed or malformed native history queries. */
+    uint64_t                       missing_ids = 0;          /**< Native identifiers skipped after the initial history seed. */
+    uint64_t                       conflicts = 0;            /**< Inconsistent timestamps reported for an existing identifier. */
+    uint64_t                       overflow = 0;             /**< Records rejected by the bounded storage limit. */
+    uint64_t                       invalid_clock = 0;        /**< Records inconsistent with the native clock domain. */
+    uint64_t                       stale_history = 0;        /**< Queries whose newest queued image is over a second old. */
+    uint64_t                       invalid_mode = 0;         /**< Queries with an inactive producer or a non-FIFO refresh interval. */
+    uint32_t                       presents_since_query = 0; /**< Accepted presentations since the last history query. */
+};
+
+/** Serializes history updates and measurement boundaries across threads. */
+std::mutex g_native_history_mutex;
+/** Bounded native presentation history for the active measurement. */
+NativeFrameHistory g_native_history;
+
+/**
+ * Selects native display-history diagnostics.
+ */
+bool NativeHistoryEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_PERF_FRAME_HISTORY");
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+    }();
+    return enabled;
+}
+
+/**
+ * Reads the clock used by native display timestamps.
+ */
+uint64_t NativeHistoryClockNs() {
+    return armTicksToNs(armGetSystemTick());
+}
+
+/**
+ * Reads native history without changing tracking flags or presentation settings.
+ */
+NativeFrameBatch ReadNativeFrameHistory(NativeFrameReader &reader) {
+    NativeFrameBatch batch;
+    NWindow         *window = nwindowGetDefault();
+    if (window == nullptr || !nwindowIsValid(window)) {
+        batch.result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        return batch;
+    }
+    enum class BufferQueueCommand : uint32_t {
+        FrameHistory = 17
+    };
+    auto &request = reader.request;
+    auto &reply = reader.reply;
+    parcelCreate(&request);
+    parcelCreate(&reply);
+    parcelWriteInterfaceToken(&request, "android.gui.IGraphicBufferProducer");
+    parcelWriteInt32(&request, static_cast<int32_t>(batch.records.size()));
+    const uint64_t query_begin_ns = NativeHistoryClockNs();
+    mutexLock(&window->mutex);
+    batch.connected = window->is_connected;
+    batch.swap_interval = window->swap_interval;
+    batch.result = parcelTransact(&window->bq, static_cast<uint32_t>(BufferQueueCommand::FrameHistory), &request, &reply);
+    mutexUnlock(&window->mutex);
+    batch.query_ns = NativeHistoryClockNs();
+    batch.query_duration_ns = batch.query_ns - query_begin_ns;
+    if (R_FAILED(batch.result)) {
+        return batch;
+    }
+    if (reply.payload_size < sizeof(int32_t)) {
+        batch.result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        return batch;
+    }
+    batch.producer_status = parcelReadInt32(&reply);
+    batch.result = binderConvertErrorCode(batch.producer_status);
+    if (batch.producer_status != 0) {
+        if (R_SUCCEEDED(batch.result)) {
+            batch.result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        }
+        return batch;
+    }
+    if (reply.payload_size < 2 * sizeof(int32_t)) {
+        batch.result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        return batch;
+    }
+    batch.count = parcelReadInt32(&reply);
+    constexpr size_t record_bytes = 3 * sizeof(uint64_t) + sizeof(int32_t);
+    if (batch.count < 0 || static_cast<size_t>(batch.count) > batch.records.size() ||
+        reply.payload_size - reply.pos < static_cast<size_t>(batch.count) * record_bytes) {
+        batch.result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        return batch;
+    }
+    for (int32_t index = 0; index < batch.count; ++index) {
+        auto   &record = batch.records[static_cast<size_t>(index)];
+        int32_t state = 0;
+        parcelReadData(&reply, &record.frame_number, sizeof record.frame_number);
+        parcelReadData(&reply, &record.enqueue_ns, sizeof record.enqueue_ns);
+        parcelReadData(&reply, &record.presentation_ns, sizeof record.presentation_ns);
+        parcelReadData(&reply, &state, sizeof state);
+        record.state = static_cast<NativeFrameState>(state);
+        if (record.state != NativeFrameState::Presented) {
+            record.presentation_ns = 0;
+        }
+    }
+    return batch;
+}
+
+/**
+ * Reads one history response without retaining polling state.
+ */
+NativeFrameBatch ReadNativeFrameHistory() {
+    NativeFrameReader reader;
+    return ReadNativeFrameHistory(reader);
+}
+
+/**
+ * Merges the native history into a bounded, ordered measurement record.
+ */
+void CollectNativeFrameHistory(bool initial = false) {
+    constexpr size_t max_records = 1024;
+    auto             batch = ReadNativeFrameHistory();
+    auto            &history = g_native_history;
+    ++history.queries;
+    history.query_total_ns += batch.query_duration_ns;
+    history.query_max_ns = std::max(history.query_max_ns, batch.query_duration_ns);
+    history.presents_since_query = 0;
+    if (R_FAILED(batch.result)) {
+        ++history.query_errors;
+        return;
+    }
+    history.invalid_mode += !batch.connected || batch.swap_interval != 1;
+    std::sort(batch.records.begin(), batch.records.begin() + batch.count,
+              [](const auto &left, const auto &right) { return left.frame_number < right.frame_number; });
+    uint64_t latest_enqueue_ns = 0;
+    for (int32_t index = 0; index < batch.count; ++index) {
+        const auto &record = batch.records[static_cast<size_t>(index)];
+        if (record.frame_number == 0 || (record.state != NativeFrameState::Enqueued && record.state != NativeFrameState::Presented)) {
+            continue;
+        }
+        latest_enqueue_ns = std::max(latest_enqueue_ns, record.enqueue_ns);
+        if (record.enqueue_ns == 0 || record.enqueue_ns > batch.query_ns ||
+            record.presentation_ns > batch.query_ns ||
+            (record.presentation_ns != 0 && record.presentation_ns < record.enqueue_ns)) {
+            ++history.invalid_clock;
+        }
+        auto found = std::lower_bound(history.records.begin(), history.records.end(), record.frame_number,
+                                      [](const auto &entry, uint64_t id) { return entry.frame_number < id; });
+        if (found != history.records.end() && found->frame_number == record.frame_number) {
+            if (found->enqueue_ns != record.enqueue_ns ||
+                (found->presentation_ns != 0 && record.presentation_ns != 0 && found->presentation_ns != record.presentation_ns)) {
+                ++history.conflicts;
+            }
+            if (record.state == NativeFrameState::Presented && record.presentation_ns != 0) {
+                *found = record;
+            }
+            continue;
+        }
+        if (!initial && record.frame_number < history.last_id) {
+            ++history.conflicts;
+        }
+        if (!initial && history.last_id != 0 && record.frame_number > history.last_id && record.frame_number - history.last_id > 1) {
+            history.missing_ids += record.frame_number - history.last_id - 1;
+        }
+        history.last_id = std::max(history.last_id, record.frame_number);
+        if (history.records.size() == max_records) {
+            ++history.overflow;
+            continue;
+        }
+        history.records.insert(found, record);
+    }
+    if (latest_enqueue_ns != 0 && batch.query_ns >= latest_enqueue_ns && batch.query_ns - latest_enqueue_ns > 1'000'000'000) {
+        ++history.stale_history;
+    }
+}
+
+/**
+ * Counts measured queued images that still lack a confirmed presentation timestamp.
+ */
+size_t PendingNativeFrames() {
+    const auto &history = g_native_history;
+    return std::ranges::count_if(history.records, [&](const auto &record) {
+        return record.enqueue_ns <= history.end_ns &&
+               (record.state != NativeFrameState::Presented || record.presentation_ns == 0);
+    });
+}
+
+/**
+ * Samples native history after accepted presentations and reports startup capability once.
+ */
+void ProbeSwitchFrameHistory() {
+    if (!NativeHistoryEnabled()) {
+        return;
+    }
+    static uint32_t presents_remaining = 4;
+    if (presents_remaining != 0 && --presents_remaining == 0) {
+        const auto batch = ReadNativeFrameHistory();
+        std::fprintf(stderr, "perf frame history: result=0x%08x producer_status=%d count=%d source=SDL-default-NWindow connected=%d swap_interval=%u native_ns=%llu clock_hz=%llu\n",
+                     batch.result, batch.producer_status, batch.count, batch.connected, batch.swap_interval,
+                     static_cast<unsigned long long>(batch.query_ns), static_cast<unsigned long long>(armGetSystemTickFreq()));
+    }
+    std::lock_guard lock(g_native_history_mutex);
+    if (g_native_history.active && ++g_native_history.presents_since_query >= 2) {
+        CollectNativeFrameHistory();
+    }
+}
+
+/**
+ * Owns an experimental vsync event while borrowing the default window's display lifetime.
+ */
+struct VsyncGate {
+    PresentedFeedbackBudget feedback_budget;            /**< Admission budget shared across idle probes and final waits. */
+    uint64_t                preflight_probes = 0;       /**< Single-query readiness probes. */
+    uint64_t                preflight_pending = 0;      /**< Probes that yielded without queue work. */
+    uint64_t                preflight_total_ns = 0;     /**< Total synchronous preflight cost. */
+    uint64_t                preflight_max_ns = 0;       /**< Longest preflight call. */
+    ViDisplay               display{};                  /**< Default display identifier owned by default_window. */
+    Event                   event{};                    /**< Copied auto-clear vsync event handle. */
+    bool                    vi_ref = false;             /**< Successful service initialization to balance with viExit. */
+    bool                    available = false;          /**< Selected native pacing protocol initialized successfully. */
+    bool                    event_owned = false;        /**< Whether cleanup owns a copied VI event handle. */
+    bool                    presented_feedback = false; /**< Selects prior-Presented feedback instead of a VI event. */
+    bool                    first_queue = true;         /**< Whether the first owned queue still needs a fresh baseline. */
+    NativeFrameReader       reader;                     /**< Reused history request and reply buffers. */
+    uint64_t                expected_id = 0;            /**< Exact latest native ID permitted before the next queue. */
+    uint64_t                expected_enqueue_ns = 0;    /**< Stable enqueue timestamp for that native ID. */
+    uint64_t                last_accepted_id = 0;       /**< Most recent native ID assigned to an accepted owned present. */
+    uint64_t                last_presented_id = 0;      /**< Most recent exact predecessor confirmed Presented. */
+    uint64_t                queries = 0;                /**< History queries made by feedback pacing alone. */
+    uint64_t                query_total_ns = 0;         /**< Total feedback IPC cost. */
+    uint64_t                query_max_ns = 0;           /**< Longest feedback IPC operation. */
+    uint64_t                last_query_ns = 0;          /**< Native clock of the previous feedback response. */
+    uint64_t                sleeps = 0;                 /**< Yielding polling sleeps while a predecessor remains pending. */
+    uint32_t                max_wait_queries = 0;       /**< Largest query count in one pre-present polling interval. */
+    uint64_t                waits = 0;                  /**< Blocking gate attempts before presentation. */
+    uint64_t                timeouts = 0;               /**< Blocking attempts exceeding the diagnostic deadline. */
+    uint64_t                errors = 0;                 /**< Initialization, wait or stale-discard failures. */
+    uint64_t                discards = 0;               /**< Nonblocking stale-signal discard attempts. */
+    uint64_t                stale_signals = 0;          /**< Signals consumed outside the blocking gate. */
+    FrameTimings::Span      wait;                       /**< Lifetime CPU gate costs, excluding queue presentation. */
+};
+
+/** Device-thread gate state, initialized before and released after the render worker. */
+VsyncGate g_vsync_gate;
+/** Publishes successful native-gate activation to presentation policy readers. */
+std::atomic<bool> g_vsync_gate_active{false};
+/** Publishes successful initialization of the prior-Presented mode specifically. */
+std::atomic<bool> g_presented_gate_active{false};
+
+/**
+ * Selects the Switch-only presentation gate for an onscreen diagnostic renderer.
+ */
+bool VsyncGateEnabled() {
+    static const bool requested = [] {
+        const char *setting = std::getenv("KZ_PERF_VSYNC_GATE");
+        const char *feedback = std::getenv("KZ_PERF_PRESENTED_GATE");
+        return (setting != nullptr && std::strcmp(setting, "1") == 0) ||
+               (feedback != nullptr && std::strcmp(feedback, "1") == 0);
+    }();
+    return requested && !g.offscreen;
+}
+
+/**
+ * Reports gate availability and lifetime counters without per-frame logging.
+ */
+void LogVsyncGate(const char *stage, Result result = 0) {
+    if (!VsyncGateEnabled() || !DeviceThreadAllowed()) {
+        return;
+    }
+    const auto &gate = g_vsync_gate;
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "perf vsync gate: stage={} scope=lifetime available={} result=0x{:08x} waits={} timeouts={} errors={} discards={} stale_signals={} wait_ms={:.6f}/{:.6f}/{:.6f} timeout_ns=100000000",
+             stage, gate.available, result, gate.waits, gate.timeouts, gate.errors, gate.discards, gate.stale_signals,
+             gate.wait.Average(), gate.wait.max_ms, gate.wait.total_ms);
+    if (gate.presented_feedback) {
+        kz::Logf(kz::LogLevel::Info, "gfx", "perf presented preflight: scope=lifetime probes={} pending={} total_ns={} max_ns={} poll_budget_ns=100000000 query_limit=128", gate.preflight_probes, gate.preflight_pending, gate.preflight_total_ns, gate.preflight_max_ns);
+        std::fprintf(stderr, "perf presented gate: stage=%s available=%d accepted_id=%llu presented_id=%llu queries=%llu query_total_ns=%llu query_max_ns=%llu sleeps=%llu max_wait_queries=%u poll_budget_ns=100000000 poll_sleep_ns=1000000 query_limit=128\n",
+                     stage, gate.available, static_cast<unsigned long long>(gate.last_accepted_id),
+                     static_cast<unsigned long long>(gate.last_presented_id), static_cast<unsigned long long>(gate.queries),
+                     static_cast<unsigned long long>(gate.query_total_ns), static_cast<unsigned long long>(gate.query_max_ns),
+                     static_cast<unsigned long long>(gate.sleeps), gate.max_wait_queries);
+    }
+}
+
+/**
+ * Releases only the gate's event and VI reference without closing the default display's layers.
+ */
+void CloseVsyncGate() {
+    g_vsync_gate_active.store(false, std::memory_order_release);
+    g_presented_gate_active.store(false, std::memory_order_release);
+    auto &gate = g_vsync_gate;
+    if (gate.event_owned) {
+        eventClose(&gate.event);
+        gate.event_owned = false;
+    }
+    gate.available = false;
+    if (gate.vi_ref) {
+        viExit();
+        gate.vi_ref = false;
+    }
+}
+
+/**
+ * Rejects an opted-in measurement rather than allowing an ungated queue operation.
+ */
+[[noreturn]] void FailVsyncGate(const char *operation, Result result, bool timeout = false) {
+    if (timeout) {
+        ++g_vsync_gate.timeouts;
+    } else {
+        ++g_vsync_gate.errors;
+    }
+    LogVsyncGate(operation, result);
+    std::fprintf(stderr, "perf invalid: native presentation gate mode=%s operation=%s result=0x%08x available=%d waits=%llu timeouts=%llu errors=%llu\n",
+                 g_vsync_gate.presented_feedback ? "prior-presented" : "VI-vsync", operation, result, g_vsync_gate.available,
+                 static_cast<unsigned long long>(g_vsync_gate.waits),
+                 static_cast<unsigned long long>(g_vsync_gate.timeouts),
+                 static_cast<unsigned long long>(g_vsync_gate.errors));
+    std::fflush(stderr);
+    CloseVsyncGate();
+    Fatal("Switch presentation gate %s failed (0x%08x); diagnostic invalid", operation, result);
+}
+
+/**
+ * Reads and validates native feedback without holding the measurement-history mutex.
+ */
+NativeFrameBatch ReadPresentedGateHistory() {
+    auto &gate = g_vsync_gate;
+    auto  batch = ReadNativeFrameHistory(gate.reader);
+    ++gate.queries;
+    gate.query_total_ns += batch.query_duration_ns;
+    gate.query_max_ns = std::max(gate.query_max_ns, batch.query_duration_ns);
+    if (R_FAILED(batch.result)) {
+        FailVsyncGate("history-query", batch.result);
+    }
+    if (!batch.connected || batch.swap_interval != 1 || batch.query_ns == 0 || batch.query_ns < gate.last_query_ns) {
+        FailVsyncGate("history-mode-clock", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    gate.last_query_ns = batch.query_ns;
+    std::sort(batch.records.begin(), batch.records.begin() + batch.count,
+              [](const auto &left, const auto &right) { return left.frame_number < right.frame_number; });
+    uint64_t previous_id = 0;
+    for (int32_t index = 0; index < batch.count; ++index) {
+        const auto &record = batch.records[static_cast<size_t>(index)];
+        if (record.frame_number == 0) {
+            continue;
+        }
+        if (record.frame_number == previous_id || record.frame_number > static_cast<uint64_t>(INT64_MAX)) {
+            FailVsyncGate("history-identifier", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+        }
+        previous_id = record.frame_number;
+        if (record.state != NativeFrameState::Enqueued && record.state != NativeFrameState::Presented) {
+            continue;
+        }
+        if (record.enqueue_ns == 0 || record.enqueue_ns > batch.query_ns ||
+            (record.presentation_ns != 0 &&
+             (record.presentation_ns < record.enqueue_ns || record.presentation_ns > batch.query_ns))) {
+            FailVsyncGate("history-timestamp", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+        }
+    }
+    if (previous_id != 0) {
+        const auto &latest = batch.records[static_cast<size_t>(batch.count - 1)];
+        if (latest.state != NativeFrameState::Enqueued && latest.state != NativeFrameState::Presented) {
+            FailVsyncGate("history-latest-state", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+        }
+    }
+    return batch;
+}
+
+/**
+ * Finds an exact known native frame without treating ring eviction as presentation.
+ */
+const NativeFrameRecord *PresentedGateRecord(const NativeFrameBatch &batch, uint64_t id) {
+    for (int32_t index = 0; index < batch.count; ++index) {
+        const auto &record = batch.records[static_cast<size_t>(index)];
+        if (record.frame_number == id && id != 0 &&
+            (record.state == NativeFrameState::Enqueued || record.state == NativeFrameState::Presented)) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+/**
+ * Returns the greatest nonzero native identifier in a validated, sorted response.
+ */
+uint64_t PresentedGateLatestId(const NativeFrameBatch &batch) {
+    return batch.count == 0 ? 0 : batch.records[static_cast<size_t>(batch.count - 1)].frame_number;
+}
+
+/**
+ * Samples exact predecessor feedback once within the shared admission budget.
+ */
+PresentedFeedbackStatus PollPresentedGate() {
+    auto      &gate = g_vsync_gate;
+    const auto admitted = gate.feedback_budget.BeginQuery(NativeHistoryClockNs());
+    if (admitted == PresentedFeedbackStatus::Timeout) {
+        FailVsyncGate("history-poll-budget", KERNELRESULT(TimedOut), true);
+    }
+    if (admitted == PresentedFeedbackStatus::Invalid) {
+        FailVsyncGate("history-poll-clock", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    gate.max_wait_queries = std::max(gate.max_wait_queries, gate.feedback_budget.queries);
+    const auto     batch = ReadPresentedGateHistory();
+    const uint64_t latest_id = PresentedGateLatestId(batch);
+    if (gate.first_queue && gate.feedback_budget.queries == 1) {
+        gate.expected_id = latest_id;
+        const auto *record = PresentedGateRecord(batch, latest_id);
+        gate.expected_enqueue_ns = record == nullptr ? 0 : record->enqueue_ns;
+    }
+    const auto                        *previous = PresentedGateRecord(batch, gate.expected_id);
+    const PresentedFeedbackObservation observation{
+        .latest_id = latest_id,
+        .predecessor_found = previous != nullptr,
+        .enqueue_ns = previous == nullptr ? 0 : previous->enqueue_ns,
+        .presented = previous != nullptr && previous->state == NativeFrameState::Presented,
+        .presentation_ns = previous == nullptr ? 0 : previous->presentation_ns};
+    const uint64_t end_ns = NativeHistoryClockNs();
+    const auto     status = gate.feedback_budget.Observe(gate.expected_id, gate.expected_enqueue_ns, observation, end_ns);
+    if (status == PresentedFeedbackStatus::Timeout) {
+        FailVsyncGate("history-poll-budget", KERNELRESULT(TimedOut), true);
+    }
+    if (status == PresentedFeedbackStatus::Invalid ||
+        (previous != nullptr && gate.last_presented_id == gate.expected_id &&
+         (previous->state != NativeFrameState::Presented || previous->presentation_ns == 0))) {
+        FailVsyncGate("history-predecessor-protocol", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    if (status == PresentedFeedbackStatus::Ready) {
+        if (previous != nullptr) {
+            gate.last_presented_id = previous->frame_number;
+        }
+        gate.feedback_budget.Reset();
+    }
+    return status;
+}
+
+/**
+ * Waits for exact predecessor feedback while retaining any preceding idle-probe budget.
+ */
+std::array<uint64_t, 2> WaitPresentedGate() {
+    auto &gate = g_vsync_gate;
+    ++gate.waits;
+    const uint64_t begin_ns = NativeHistoryClockNs();
+    for (;;) {
+        if (PollPresentedGate() == PresentedFeedbackStatus::Ready) {
+            const uint64_t end_ns = NativeHistoryClockNs();
+            gate.wait.Add(static_cast<double>(end_ns - begin_ns) / 1.0e6);
+            return {begin_ns, end_ns};
+        }
+        const uint64_t now_ns = NativeHistoryClockNs();
+        if (now_ns < gate.feedback_budget.begin_ns || now_ns - gate.feedback_budget.begin_ns >= 100'000'000) {
+            FailVsyncGate("history-poll-budget", KERNELRESULT(TimedOut), true);
+        }
+        ++gate.sleeps;
+        std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(1'000'000, 100'000'000 - (now_ns - gate.feedback_budget.begin_ns))));
+    }
+}
+
+/**
+ * Associates one successful queue call with exactly one newly assigned native frame.
+ */
+void NotePresentedGateQueue(VkResult result, uint64_t begin_ns, uint64_t end_ns) {
+    auto &gate = g_vsync_gate;
+    if (!gate.presented_feedback || !gate.available) {
+        return;
+    }
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        FailVsyncGate("history-present-result", static_cast<Result>(result));
+    }
+    const auto     batch = ReadPresentedGateHistory();
+    const uint64_t latest_id = PresentedGateLatestId(batch);
+    if (gate.expected_id == static_cast<uint64_t>(INT64_MAX) || latest_id != gate.expected_id + 1) {
+        FailVsyncGate("history-accepted-identifier", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    if (gate.expected_id != 0) {
+        const auto *previous = PresentedGateRecord(batch, gate.expected_id);
+        if (previous == nullptr || previous->enqueue_ns != gate.expected_enqueue_ns ||
+            previous->state != NativeFrameState::Presented || previous->presentation_ns == 0) {
+            FailVsyncGate("history-accepted-predecessor", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+        }
+    }
+    const auto *accepted = PresentedGateRecord(batch, latest_id);
+    if (accepted == nullptr || begin_ns == 0 || end_ns < begin_ns ||
+        accepted->enqueue_ns + 1000 < begin_ns || accepted->enqueue_ns > end_ns + 1000) {
+        FailVsyncGate("history-accepted-call-clock", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    gate.expected_id = latest_id;
+    gate.expected_enqueue_ns = accepted->enqueue_ns;
+    gate.last_accepted_id = latest_id;
+    gate.first_queue = false;
+    gate.feedback_budget.Reset();
+}
+
+/**
+ * Consumes a stale auto-clear signal without waiting for a future refresh.
+ */
+void DiscardVsyncGateSignal() {
+    if (!VsyncGateEnabled() || g_vsync_gate.presented_feedback) {
+        return;
+    }
+    ++g_vsync_gate.discards;
+    const Result result = eventWait(&g_vsync_gate.event, 0);
+    if (R_SUCCEEDED(result)) {
+        ++g_vsync_gate.stale_signals;
+    } else if (result != KERNELRESULT(TimedOut)) {
+        FailVsyncGate("discard", result);
+    }
+}
+
+/**
+ * Borrows observed default-window display metadata and acquires a separate VI reference and vsync event.
+ */
+void InitializeVsyncGate() {
+    g_vsync_gate_active.store(false, std::memory_order_release);
+    g_presented_gate_active.store(false, std::memory_order_release);
+    if (!VsyncGateEnabled()) {
+        return;
+    }
+    g_vsync_gate = {};
+    NWindow *window = nwindowGetDefault();
+    if (window == nullptr || !nwindowIsValid(window)) {
+        FailVsyncGate("default-window", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    if (const char *setting = std::getenv("KZ_PERF_PRESENTED_GATE"); setting != nullptr && std::strcmp(setting, "1") == 0) {
+        g_vsync_gate.presented_feedback = true;
+        ReadPresentedGateHistory();
+        g_vsync_gate.available = true;
+        g_presented_gate_active.store(true, std::memory_order_release);
+        g_vsync_gate_active.store(true, std::memory_order_release);
+        LogVsyncGate("ready");
+        return;
+    }
+    if (!g_default_display_capture.captured || !g_default_display_capture.display.initialized) {
+        FailVsyncGate("default-display-capture", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    g_vsync_gate.display = g_default_display_capture.display;
+    Result result = viInitialize(ViServiceType_Default);
+    if (R_FAILED(result)) {
+        FailVsyncGate("viInitialize", result);
+    }
+    g_vsync_gate.vi_ref = true;
+    result = viGetDisplayVsyncEvent(&g_vsync_gate.display, &g_vsync_gate.event);
+    if (R_FAILED(result)) {
+        FailVsyncGate("viGetDisplayVsyncEvent", result);
+    }
+    g_vsync_gate.available = true;
+    g_vsync_gate.event_owned = true;
+    DiscardVsyncGateSignal();
+    g_vsync_gate_active.store(true, std::memory_order_release);
+    LogVsyncGate("ready");
+}
+
+/**
+ * Consumes one vsync fresh since the previous completed present with a bounded diagnostic wait.
+ */
+std::array<uint64_t, 2> WaitVsyncGate() {
+    if (!VsyncGateEnabled()) {
+        return {};
+    }
+    if (!g_vsync_gate.available) {
+        FailVsyncGate("unavailable", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    if (g_vsync_gate.presented_feedback) {
+        return WaitPresentedGate();
+    }
+    ++g_vsync_gate.waits;
+    const uint64_t begin_ns = NativeHistoryClockNs();
+    const Result   result = eventWait(&g_vsync_gate.event, 100'000'000);
+    const uint64_t end_ns = NativeHistoryClockNs();
+    g_vsync_gate.wait.Add(static_cast<double>(end_ns - begin_ns) / 1.0e6);
+    if (R_FAILED(result)) {
+        FailVsyncGate("wait", result, result == KERNELRESULT(TimedOut));
+    }
+    return {begin_ns, end_ns};
+}
+#endif
 
 // Opt-in CPU spans after the submitted frame's existing canonical/display CPU timer ends.
 enum class FramePhase : size_t {
@@ -79,6 +789,252 @@ bool FramePhasesEnabled() {
         return setting != nullptr && std::strcmp(setting, "1") == 0;
     }();
     return enabled;
+}
+
+/**
+ * Identifies the renderer entry path that submitted a timestamp pair.
+ */
+enum class FrameRole {
+    CanonicalRender,
+    DisplayReplay,
+    CanonicalEndpoint,
+    Direct,
+    Count
+};
+
+/**
+ * Associates a recycled slot with its bounded measurement record.
+ */
+struct FrameRoleReference {
+    uint64_t epoch = 0;    /**< Measurement generation. */
+    uint64_t sequence = 0; /**< Submission order within the measurement. */
+    size_t   index = 0;    /**< Buffered record index when retained. */
+};
+
+/**
+ * Preserves CPU spans and existing GPU timestamps for one submission.
+ */
+struct FrameRoleRecord {
+    FrameRole               role = FrameRole::Direct; /**< Renderer entry path. */
+    uint64_t                sequence = 0;             /**< Submission order within the measurement. */
+    uint64_t                recycled_sequence = 0;    /**< Older submission recycled by this submission's advance. */
+    size_t                  slot = 0;                 /**< In-flight slot at submission. */
+    uint64_t                cpu_begin_ns = 0;         /**< CPU frame start, including display preparation. */
+    uint64_t                acquire_begin_ns = 0;     /**< First swapchain acquire call start. */
+    uint64_t                acquire_end_ns = 0;       /**< Successful acquire completion, including retries. */
+    uint64_t                submit_begin_ns = 0;      /**< Queue submission call start. */
+    uint64_t                submit_end_ns = 0;        /**< Queue submission call completion. */
+    uint64_t                gate_begin_ns = 0;        /**< Optional VI-vsync gate wait start. */
+    uint64_t                gate_end_ns = 0;          /**< Optional VI-vsync gate wait completion. */
+    uint64_t                present_begin_ns = 0;     /**< Queue presentation call start. */
+    uint64_t                present_end_ns = 0;       /**< Queue presentation call completion. */
+    uint64_t                marker_sequence = 0;      /**< Optional output marker attached to this presentation. */
+    uint64_t                advance_begin_ns = 0;     /**< Slot advancement start. */
+    uint64_t                advance_end_ns = 0;       /**< Slot advancement completion. */
+    double                  cpu_ms = 0.0;             /**< Existing CPU frame span before slot advancement. */
+    double                  preparation_ms = 0.0;     /**< Display matching and override preparation. */
+    FramePhaseSample        phases = {};              /**< Cleanup and recycled-slot wait spans. */
+    std::array<uint64_t, 2> ticks = {};               /**< Existing raw GPU query pair on the GPU clock. */
+    bool                    gpu_valid = false;        /**< Existing timestamp harvest completed successfully. */
+    bool                    split_submit = false;     /**< GPU envelope contains an acquire-dependent final-copy submission. */
+    uint64_t                render_end_ticks = 0;     /**< Optional end of acquire-independent replay work. */
+    uint64_t                copy_begin_ticks = 0;     /**< Optional copy start after dependency barriers. */
+};
+
+/**
+ * Retains recording metadata until its slot's normal timestamp harvest.
+ */
+struct FrameRoleSlot {
+    FrameRole          role = FrameRole::Direct; /**< Current recording entry path. */
+    uint64_t           cpu_begin_ns = 0;         /**< CPU frame start, including display preparation. */
+    uint64_t           acquire_begin_ns = 0;     /**< Swapchain acquire call start. */
+    uint64_t           acquire_end_ns = 0;       /**< Swapchain acquire completion. */
+    double             preparation_ms = 0.0;     /**< Display preparation preceding this recording. */
+    FrameRoleReference record;                   /**< Measurement record for this slot's submission. */
+};
+
+/**
+ * Buffers detailed timings between explicit performance measurement boundaries.
+ */
+struct FrameRoleHistory {
+    uint64_t                     epoch = 0;             /**< Measurement generation. */
+    uint64_t                     renderer_instance = 0; /**< Device lifetime sharing the GPU timestamp clock. */
+    uint64_t                     begin_ns = 0;          /**< CPU measurement boundary on the diagnostic clock. */
+    uint64_t                     end_ns = 0;            /**< CPU measurement completion on the diagnostic clock. */
+    uint64_t                     sequence = 0;          /**< Last submission sequence, including overflow. */
+    uint64_t                     overflow = 0;          /**< Records omitted by the bounded buffer. */
+    uint64_t                     conflicts = 0;         /**< Submissions rejected after a device lifetime change. */
+    bool                         logged = true;         /**< Capture has no pending output. */
+    std::vector<FrameRoleRecord> records;               /**< Retained submissions in queue submission order. */
+};
+
+/** Maximum submissions retained for one performance measurement. */
+constexpr size_t kFrameRoleRecordLimit = 4096;
+/** Protects measurement boundaries and buffered records shared with the game thread. */
+std::mutex g_frame_role_mutex;
+/** Bounded capture awaiting its post-measurement output. */
+FrameRoleHistory g_frame_role_history;
+/** Device-thread metadata corresponding to existing in-flight slots. */
+std::array<FrameRoleSlot, kFramesInFlight> g_frame_role_slots;
+/** First acquire call preceding the next frame opening. */
+uint64_t g_role_acquire_begin_ns = 0;
+/** Successful acquire completion preceding the next frame opening. */
+uint64_t g_role_acquire_end_ns = 0;
+/** CPU frame opening on the diagnostic clock. */
+uint64_t g_role_frame_opened_ns = 0;
+/** Canonical-image overlay entry path enclosing display-list replay. */
+bool g_endpoint_role = false;
+
+/**
+ * Marks canonical-image overlay replay without changing the display-list interface.
+ */
+class EndpointRoleScope {
+public:
+    EndpointRoleScope() : previous(g_endpoint_role) { g_endpoint_role = true; }
+
+    ~EndpointRoleScope() { g_endpoint_role = previous; }
+
+    EndpointRoleScope(const EndpointRoleScope &) = delete;
+    EndpointRoleScope &operator=(const EndpointRoleScope &) = delete;
+
+private:
+    bool previous; /**< Enclosing renderer entry path. */
+};
+
+/**
+ * Samples CPU endpoints on the native presentation clock where available.
+ */
+uint64_t FrameRoleClockNs() {
+#ifdef __SWITCH__
+    return NativeHistoryClockNs();
+#else
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(TimingClock::now().time_since_epoch()).count());
+#endif
+}
+
+/**
+ * Retrieves diagnostic metadata for an existing in-flight slot.
+ */
+FrameRoleSlot &FrameRoleState(Frame &frame) {
+    return g_frame_role_slots[static_cast<size_t>(&frame - g.frames.data())];
+}
+
+/**
+ * Updates a retained record while rejecting stale generations and overflow.
+ */
+template <typename Update>
+void UpdateFrameRoleRecord(const FrameRoleReference &reference, Update update) {
+    if (!FramePhasesEnabled() || reference.sequence == 0) {
+        return;
+    }
+    std::lock_guard lock(g_frame_role_mutex);
+    auto           &history = g_frame_role_history;
+    if (!history.logged && reference.epoch == history.epoch && reference.index < history.records.size() &&
+        history.records[reference.index].sequence == reference.sequence) {
+        update(history.records[reference.index]);
+    }
+}
+
+/**
+ * Opens a bounded timing capture at the explicit performance boundary.
+ */
+void BeginFrameRoleHistory() {
+    if (!FramePhasesEnabled()) {
+        return;
+    }
+    std::lock_guard lock(g_frame_role_mutex);
+    auto           &history = g_frame_role_history;
+    ++history.epoch;
+    history.renderer_instance = g.renderer_instance;
+    history.begin_ns = FrameRoleClockNs();
+    history.end_ns = history.sequence = history.overflow = history.conflicts = 0;
+    history.records.clear();
+    history.records.reserve(kFrameRoleRecordLimit);
+    history.logged = false;
+}
+
+/**
+ * Closes the submission window while allowing normal in-flight timestamp harvests.
+ */
+void EndFrameRoleHistory() {
+    if (!FramePhasesEnabled()) {
+        return;
+    }
+    std::lock_guard lock(g_frame_role_mutex);
+    if (!g_frame_role_history.logged) {
+        g_frame_role_history.end_ns = FrameRoleClockNs();
+    }
+}
+
+/**
+ * Carries the renderer entry path and acquisition into a new slot recording.
+ */
+void OpenFrameRole(FrameRole role) {
+    if (!FramePhasesEnabled()) {
+        return;
+    }
+    FrameRoleSlot &slot = FrameRoleState(CurrentFrame());
+    slot = {};
+    slot.role = role;
+    slot.cpu_begin_ns = g_role_frame_opened_ns;
+    slot.acquire_begin_ns = g_role_acquire_begin_ns;
+    slot.acquire_end_ns = g_role_acquire_end_ns;
+    g_role_acquire_begin_ns = g_role_acquire_end_ns = 0;
+}
+
+/**
+ * Associates a queue submission with its bounded timing record.
+ */
+void SubmitFrameRole(Frame &frame, uint64_t begin_ns, uint64_t end_ns) {
+    FrameRoleSlot &slot = FrameRoleState(frame);
+    slot.record = {};
+    std::lock_guard lock(g_frame_role_mutex);
+    auto           &history = g_frame_role_history;
+    if (history.logged || begin_ns < history.begin_ns || (history.end_ns != 0 && begin_ns > history.end_ns)) {
+        return;
+    }
+    if (history.renderer_instance != g.renderer_instance) {
+        ++history.conflicts;
+        return;
+    }
+    slot.record = {.epoch = history.epoch, .sequence = ++history.sequence, .index = history.records.size()};
+    if (history.records.size() == kFrameRoleRecordLimit) {
+        ++history.overflow;
+        return;
+    }
+    history.records.push_back({
+        .role = slot.role,
+        .sequence = slot.record.sequence,
+        .slot = static_cast<size_t>(&frame - g.frames.data()),
+        .cpu_begin_ns = slot.cpu_begin_ns,
+        .acquire_begin_ns = slot.acquire_begin_ns,
+        .acquire_end_ns = slot.acquire_end_ns,
+        .submit_begin_ns = begin_ns,
+        .submit_end_ns = end_ns,
+        .preparation_ms = slot.preparation_ms,
+        .split_submit = frame.split_submit,
+    });
+}
+
+/**
+ * Buffers cleanup spans instead of emitting aggregate logs during a measurement.
+ */
+bool CaptureFrameRolePhases(const FrameRoleReference &reference, const FrameRoleReference &recycled,
+                            const FramePhaseSample &sample, uint64_t begin_ns, uint64_t end_ns) {
+    std::lock_guard lock(g_frame_role_mutex);
+    auto           &history = g_frame_role_history;
+    if (history.logged) {
+        return false;
+    }
+    if (reference.epoch == history.epoch && reference.sequence != 0 && reference.index < history.records.size() &&
+        history.records[reference.index].sequence == reference.sequence) {
+        auto &record = history.records[reference.index];
+        record.phases = sample;
+        record.recycled_sequence = recycled.epoch == history.epoch ? recycled.sequence : 0;
+        record.advance_begin_ns = begin_ns;
+        record.advance_end_ns = end_ns;
+    }
+    return true;
 }
 
 void NoteFramePhase(FramePhaseSample *sample, FramePhase phase, TimingClock::time_point start,
@@ -791,6 +1747,9 @@ bool CreateSwapchain() {
 
 // Offscreen, the frame is the window's pixel size and nothing else follows it.
 bool ResizeOffscreen() {
+    if (g.canonical_commit_pending) {
+        return false;
+    }
     int width = 0;
     int height = 0;
     SDL_GetWindowSizeInPixels(g.window, &width, &height);
@@ -813,6 +1772,9 @@ bool ResizeOffscreen() {
 
 // The main targets follow the swapchain's size, losing their contents.
 void SyncMainTargets() {
+    if (g.canonical_commit_pending) {
+        return;
+    }
     const Image     &main = g.main_color[0];
     const VkExtent2D desired = DesiredMainExtent(g.swapchain.extent, g.config.main_height_limit);
     if (main.width != desired.width || main.height != desired.height) {
@@ -828,6 +1790,9 @@ void SyncMainTargets() {
 // (immediate, or a list's canonical render) syncs them; a display frame blits across the difference.
 bool RecreateSwapchain(bool targets = true) {
     AssertDeviceThread(__func__);
+    if (g.canonical_commit_pending) {
+        return false;
+    }
     if (g.offscreen) {
         return ResizeOffscreen();
     }
@@ -851,15 +1816,16 @@ void CreateFrames() {
         pool.queueFamilyIndex = g.queue_family;
         Check(vkCreateCommandPool(g.device, &pool, nullptr, &frame.pool), "vkCreateCommandPool");
 
-        VkCommandBuffer             buffers[2];
-        VkCommandBufferAllocateInfo allocate = {};
+        std::array<VkCommandBuffer, 3> buffers{};
+        VkCommandBufferAllocateInfo    allocate = {};
         allocate.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocate.commandPool = frame.pool;
         allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocate.commandBufferCount = 2;
-        Check(vkAllocateCommandBuffers(g.device, &allocate, buffers), "vkAllocateCommandBuffers");
+        allocate.commandBufferCount = static_cast<uint32_t>(buffers.size());
+        Check(vkAllocateCommandBuffers(g.device, &allocate, buffers.data()), "vkAllocateCommandBuffers");
         frame.upload_cmd = buffers[0];
         frame.draw_cmd = buffers[1];
+        frame.present_cmd = buffers[2];
 
         VkSemaphoreCreateInfo semaphore = {};
         semaphore.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -920,6 +1886,9 @@ double TimestampPeriod() {
     return reported;
 }
 
+/** Number of retained queries per frame, including optional split boundaries. */
+constexpr uint32_t kFrameTimestampQueryCount = 4;
+
 // A closed pair of timestamps from a frame whose fence has signalled.
 void HarvestTimestamps(Frame &frame) {
     const Frame::Timestamps kind = frame.timestamps;
@@ -928,16 +1897,145 @@ void HarvestTimestamps(Frame &frame) {
         (kind != Frame::Timestamps::Canonical && kind != Frame::Timestamps::Display)) {
         return;
     }
-    const auto slot = static_cast<uint32_t>(&frame - g.frames.data());
-    uint64_t   ticks[2] = {};
-    if (vkGetQueryPoolResults(g.device, g.timestamp_pool, slot * 2, 2, sizeof(ticks), ticks, sizeof(uint64_t),
+    const auto              slot = static_cast<uint32_t>(&frame - g.frames.data());
+    std::array<uint64_t, 4> ticks{};
+    const uint32_t          count = frame.split_timestamps ? 4 : 2;
+    if (vkGetQueryPoolResults(g.device, g.timestamp_pool, slot * kFrameTimestampQueryCount, count, sizeof(ticks), ticks.data(), sizeof(uint64_t),
                               VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
         return;
     }
+    UpdateFrameRoleRecord(FrameRoleState(frame).record, [&](FrameRoleRecord &record) {
+        record.ticks = {ticks[0], ticks[1]};
+        record.render_end_ticks = frame.split_timestamps ? ticks[2] : 0;
+        record.copy_begin_ticks = frame.split_timestamps ? ticks[3] : 0;
+        record.gpu_valid = true;
+    });
     const double ms = static_cast<double>((ticks[1] - ticks[0]) & g.timestamp_mask) * TimestampPeriod() / 1.0e6;
     RecordTiming([&](FrameTimings &timings) {
         (kind == Frame::Timestamps::Canonical ? timings.canonical_gpu : timings.display_gpu).Add(ms);
     });
+}
+
+/**
+ * Prints bounded role timings after measurement without waiting for unharvested GPU work.
+ */
+void LogFrameRoleHistory() {
+    if (!FramePhasesEnabled()) {
+        return;
+    }
+    std::array<uint64_t, 3> split_lifetime{};
+    RunOnRenderThread([&] {
+        split_lifetime = {g.split_replay_timed * 2, g.split_replay_first_submits, g.split_replay_final_submits};
+    });
+    std::lock_guard lock(g_frame_role_mutex);
+    auto           &history = g_frame_role_history;
+    if (history.logged || history.end_ns == 0) {
+        return;
+    }
+    size_t     tail_reads = 0;
+    size_t     tail_unavailable = 0;
+    const bool tail_access = DeviceThreadAllowed() && g.device != VK_NULL_HANDLE && g.timestamp_pool != VK_NULL_HANDLE &&
+                             history.renderer_instance == g.renderer_instance;
+    if (tail_access) {
+        // Read completed pairs without retiring slots or disturbing the ordinary scope harvest.
+        for (size_t slot = 0; slot < g.frames.size(); ++slot) {
+            const Frame &frame = g.frames[slot];
+            const auto  &reference = g_frame_role_slots[slot].record;
+            if (!frame.pending || reference.epoch != history.epoch || reference.sequence == 0 ||
+                reference.index >= history.records.size() ||
+                (frame.timestamps != Frame::Timestamps::Canonical && frame.timestamps != Frame::Timestamps::Display)) {
+                continue;
+            }
+            auto &record = history.records[reference.index];
+            if (record.sequence != reference.sequence || record.gpu_valid ||
+                vkGetFenceStatus(g.device, frame.fence) != VK_SUCCESS) {
+                continue;
+            }
+            ++tail_reads;
+            std::array<uint64_t, 4> ticks = {};
+            const uint32_t          count = frame.split_timestamps ? 4 : 2;
+            if (vkGetQueryPoolResults(g.device, g.timestamp_pool, static_cast<uint32_t>(slot) * kFrameTimestampQueryCount, count, sizeof(ticks),
+                                      ticks.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                record.ticks = {ticks[0], ticks[1]};
+                record.render_end_ticks = frame.split_timestamps ? ticks[2] : 0;
+                record.copy_begin_ticks = frame.split_timestamps ? ticks[3] : 0;
+                record.gpu_valid = true;
+            } else {
+                ++tail_unavailable;
+            }
+        }
+    }
+    history.logged = true;
+    constexpr std::array names = {"canonical-render", "display-replay", "canonical-endpoint", "direct"};
+    static_assert(names.size() == static_cast<size_t>(FrameRole::Count));
+    constexpr std::array span_names = {"cpu", "prepare", "acquire", "submit", "present", "gpu", "gate", "advance", "wait", "fence",
+                                       "depth", "timestamps", "scopes", "deletions", "transients", "command_pool"};
+    using RoleSpans = std::array<FrameTimings::Span, span_names.size()>;
+    std::array<RoleSpans, names.size()> groups = {};
+    size_t                              unresolved = 0;
+    const double                        period = TimestampPeriod();
+    const auto                          span_ms = [](uint64_t begin, uint64_t end) {
+        return begin != 0 && end >= begin ? static_cast<double>(end - begin) / 1.0e6 : 0.0;
+    };
+#ifdef __SWITCH__
+    constexpr const char *cpu_clock = "arm_ns";
+#else
+    constexpr const char *cpu_clock = "steady_ns";
+#endif
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "perf frame roles begin: instance={} begin_ns={} end_ns={} records={} submissions={} overflow={} membership=submit_start timing_enabled={} cpu_clock={} gpu_clock=uncalibrated gpu_tick_mask={} gpu_tick_period_ns={:.9f} submission_accounting=logical_frames queue_submit_calls_per_split_frame=2",
+             history.renderer_instance, history.begin_ns, history.end_ns, history.records.size(), history.sequence,
+             history.overflow, g_timing_enabled.load(std::memory_order_relaxed), cpu_clock, g.timestamp_mask, period);
+    for (const auto &record : history.records) {
+        auto &group = groups[static_cast<size_t>(record.role)];
+        group[0].Add(record.cpu_ms);
+        group[1].Add(record.preparation_ms);
+        if (record.acquire_begin_ns != 0) {
+            group[2].Add(span_ms(record.acquire_begin_ns, record.acquire_end_ns));
+        }
+        group[3].Add(span_ms(record.submit_begin_ns, record.submit_end_ns));
+        if (record.present_begin_ns != 0) {
+            group[4].Add(span_ms(record.present_begin_ns, record.present_end_ns));
+        }
+        if (record.gpu_valid) {
+            group[5].Add(static_cast<double>((record.ticks[1] - record.ticks[0]) & g.timestamp_mask) * period / 1.0e6);
+        } else {
+            ++unresolved;
+        }
+        if (record.gate_begin_ns != 0) {
+            group[6].Add(span_ms(record.gate_begin_ns, record.gate_end_ns));
+        }
+        for (size_t i = 0; i < kFramePhaseCount; ++i) {
+            group[7 + i].Add(record.phases[i]);
+        }
+        kz::Logf(kz::LogLevel::Info, "gfx",
+                 "perf frame role: seq={} role={} slot={} recycled_seq={} marker_seq={} cpu_begin_ns={} cpu_ms={:.6f} prepare_ms={:.6f} acquire_ns={}/{} submit_ns={}/{} gate_ns={}/{} present_ns={}/{} advance_ns={}/{} wait_ms={:.6f} fence_ms={:.6f} depth_ms={:.6f} timestamps_ms={:.6f} scopes_ms={:.6f} deletions_ms={:.6f} transients_ms={:.6f} command_pool_ms={:.6f} gpu_valid={} gpu_ticks={}/{} split_submit={} render_end_ticks={} copy_begin_ticks={}",
+                 record.sequence, names[static_cast<size_t>(record.role)], record.slot, record.recycled_sequence,
+                 record.marker_sequence, record.cpu_begin_ns, record.cpu_ms, record.preparation_ms, record.acquire_begin_ns, record.acquire_end_ns,
+                 record.submit_begin_ns, record.submit_end_ns, record.gate_begin_ns, record.gate_end_ns, record.present_begin_ns, record.present_end_ns,
+                 record.advance_begin_ns, record.advance_end_ns, record.phases[static_cast<size_t>(FramePhase::Wait)],
+                 record.phases[static_cast<size_t>(FramePhase::Fence)], record.phases[static_cast<size_t>(FramePhase::Depth)],
+                 record.phases[static_cast<size_t>(FramePhase::Timestamps)], record.phases[static_cast<size_t>(FramePhase::Scopes)],
+                 record.phases[static_cast<size_t>(FramePhase::Deletions)], record.phases[static_cast<size_t>(FramePhase::Transients)],
+                 record.phases[static_cast<size_t>(FramePhase::CommandPool)], record.gpu_valid, record.ticks[0], record.ticks[1],
+                 record.split_submit, record.render_end_ticks, record.copy_begin_ticks);
+    }
+    for (size_t i = 0; i < groups.size(); ++i) {
+        if (groups[i][0].count == 0) {
+            continue;
+        }
+        std::string spans;
+        for (size_t j = 0; j < span_names.size(); ++j) {
+            const auto &span = groups[i][j];
+            spans += std::format(" {}={}/{:.6f}/{:.6f}/{:.6f}", span_names[j], span.count, span.Average(), span.max_ms, span.total_ms);
+        }
+        kz::Logf(kz::LogLevel::Info, "gfx", "perf frame role summary: role={} count/mean/max/total_ms:{}", names[i], spans);
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "perf frame roles end: records={} overflow={} gpu_unresolved={} instance_conflicts={} tail_reads={} tail_unavailable={} tail_access={} trace_extra_gpu_timestamp_writes=0 trace_extra_gpu_waits=0 split_extra_gpu_timestamp_writes_lifetime={} split_first_queue_calls_lifetime={} split_final_queue_calls_lifetime={}",
+             history.records.size(), history.overflow, unresolved,
+             history.conflicts + static_cast<uint64_t>(history.renderer_instance != g.renderer_instance),
+             tail_reads, tail_unavailable, tail_access, split_lifetime[0], split_lifetime[1], split_lifetime[2]);
 }
 
 constexpr uint32_t kGpuScopeQueries = 2048;
@@ -1099,6 +2197,11 @@ void OpenScopes(VkCommandBuffer cmd, Frame &frame) {
 void OpenTimestamps(VkCommandBuffer cmd) {
     Frame &frame = CurrentFrame();
     frame.timestamps = Frame::Timestamps::None;
+    frame.split_submit = false;
+    frame.split_timestamps = false;
+    if (FramePhasesEnabled()) {
+        g_role_frame_opened_ns = FrameRoleClockNs();
+    }
     if (!Timing()) {
         return;
     }
@@ -1116,7 +2219,7 @@ void OpenTimestamps(VkCommandBuffer cmd) {
             VkQueryPoolCreateInfo info = {};
             info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
             info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            info.queryCount = kFramesInFlight * 2;
+            info.queryCount = kFramesInFlight * kFrameTimestampQueryCount;
             if (vkCreateQueryPool(g.device, &info, nullptr, &g.timestamp_pool) != VK_SUCCESS) {
                 g.timestamp_pool = VK_NULL_HANDLE;
             }
@@ -1126,22 +2229,29 @@ void OpenTimestamps(VkCommandBuffer cmd) {
     if (g.timestamp_pool == VK_NULL_HANDLE) {
         return;
     }
-    vkCmdResetQueryPool(cmd, g.timestamp_pool, g.frame_slot * 2, 2);
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g.timestamp_pool, g.frame_slot * 2);
+    vkCmdResetQueryPool(cmd, g.timestamp_pool, g.frame_slot * kFrameTimestampQueryCount, kFrameTimestampQueryCount);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g.timestamp_pool, g.frame_slot * kFrameTimestampQueryCount);
     frame.timestamps = Frame::Timestamps::Open;
     OpenScopes(cmd, frame);
 }
 
-// Ends the slot's GPU timing after everything its draw commands recorded.
-void CloseTimestamps(VkCommandBuffer cmd, bool display) {
-    Frame &frame = CurrentFrame();
+/**
+ * Closes draw scopes on the command buffer that recorded them.
+ */
+void CloseTimestampScopes(VkCommandBuffer cmd) {
     if (g.scopes_open) {
         MarkGpuScope(cmd, GpuScopeKind::Tail, kMainTarget);
-        frame.scope_passes = g.counters.passes;
+        CurrentFrame().scope_passes = g.counters.passes;
         g.scopes_open = false;
     }
+}
+
+// Ends the GPU envelope after all commands, including an optional acquire gap.
+void CloseTimestamps(VkCommandBuffer cmd, bool display) {
+    Frame &frame = CurrentFrame();
+    CloseTimestampScopes(cmd);
     if (frame.timestamps == Frame::Timestamps::Open) {
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.timestamp_pool, g.frame_slot * 2 + 1);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.timestamp_pool, g.frame_slot * kFrameTimestampQueryCount + 1);
         frame.timestamps = display ? Frame::Timestamps::Display : Frame::Timestamps::Canonical;
     }
 }
@@ -1154,20 +2264,24 @@ void NoteFrameCpu(bool display) {
     const double ms = MillisecondsSince(g_frame_opened);
     g_frame_opened = {};
     RecordTiming([&](FrameTimings &timings) { (display ? timings.display_cpu : timings.canonical_cpu).Add(ms); });
+    UpdateFrameRoleRecord(FrameRoleState(CurrentFrame()).record, [&](FrameRoleRecord &record) { record.cpu_ms = ms; });
 }
 
 // Moves recording to the next slot once the GPU is done with what that slot last submitted.
 void AdvanceSlot() {
     AssertDeviceThread(__func__);
     // Attribute cleanup to the frame just submitted, not the older slot about to be recycled.
-    const Frame::Timestamps kind = CurrentFrame().timestamps;
-    const bool              trace = FramePhasesEnabled() &&
-                                    (kind == Frame::Timestamps::Canonical || kind == Frame::Timestamps::Display);
-    FramePhaseSample        sample = {};
-    const auto              advance_start = trace ? TimingClock::now() : TimingClock::time_point{};
+    const Frame::Timestamps  kind = CurrentFrame().timestamps;
+    const bool               trace = FramePhasesEnabled() &&
+                                     (kind == Frame::Timestamps::Canonical || kind == Frame::Timestamps::Display);
+    FramePhaseSample         sample = {};
+    const auto               advance_start = trace ? TimingClock::now() : TimingClock::time_point{};
+    const uint64_t           advance_begin_ns = trace ? FrameRoleClockNs() : 0;
+    const FrameRoleReference submitted = trace ? FrameRoleState(CurrentFrame()).record : FrameRoleReference{};
     g.frame_slot = (g.frame_slot + 1) % kFramesInFlight;
-    Frame &frame = CurrentFrame();
-    auto   phase_start = trace ? TimingClock::now() : TimingClock::time_point{};
+    Frame                   &frame = CurrentFrame();
+    const FrameRoleReference recycled = trace ? FrameRoleState(frame).record : FrameRoleReference{};
+    auto                     phase_start = trace ? TimingClock::now() : TimingClock::time_point{};
     WaitFrame(frame, trace ? &sample : nullptr);
     if (trace) {
         const auto now = TimingClock::now();
@@ -1192,11 +2306,13 @@ void AdvanceSlot() {
         const auto now = TimingClock::now();
         NoteFramePhase(&sample, FramePhase::CommandPool, phase_start, now);
         NoteFramePhase(&sample, FramePhase::Advance, advance_start, now);
-        NoteFramePhases(kind, sample);
+        if (!CaptureFrameRolePhases(submitted, recycled, sample, advance_begin_ns, FrameRoleClockNs())) {
+            NoteFramePhases(kind, sample);
+        }
     }
 }
 
-void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal) {
+void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal, VkCommandBuffer final_cmd = VK_NULL_HANDLE) {
     AssertDeviceThread(__func__);
     KZ_PROFILE_ZONE("Kazarov Submit");
     Frame                                 &frame = CurrentFrame();
@@ -1229,7 +2345,29 @@ void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal) {
     submit.signalSemaphoreInfoCount = signal != VK_NULL_HANDLE ? 1 : 0;
     submit.pSignalSemaphoreInfos = &signal_info;
     Check(vkResetFences(g.device, 1, &frame.fence), "vkResetFences");
+    const uint64_t            submit_start = FramePhasesEnabled() && with_draw ? FrameRoleClockNs() : 0;
+    VkCommandBufferSubmitInfo final_info{};
+    if (final_cmd != VK_NULL_HANDLE) {
+        // Separate calls prevent Mesa from merging the acquire wait ahead of replay rendering.
+        auto replay = submit;
+        replay.waitSemaphoreInfoCount = 0;
+        replay.signalSemaphoreInfoCount = 0;
+        Check(vkQueueSubmit2(g.queue, 1, &replay, VK_NULL_HANDLE), "vkQueueSubmit2 replay");
+        ++g.split_replay_first_submits;
+        final_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, final_cmd, 0};
+        submit.commandBufferInfoCount = 1;
+        submit.pCommandBufferInfos = &final_info;
+    }
+    // Partial submission cannot fall back or release resources before the final fence.
     Check(vkQueueSubmit2(g.queue, 1, &submit, frame.fence), "vkQueueSubmit2");
+    if (final_cmd != VK_NULL_HANDLE) {
+        ++g.split_replay_final_submits;
+    }
+    if (submit_start != 0) {
+        SubmitFrameRole(frame, submit_start, FrameRoleClockNs());
+    } else if (FramePhasesEnabled() && !with_draw) {
+        FrameRoleState(frame).record = {};
+    }
     frame.pending = true;
     frame.presents = signal != VK_NULL_HANDLE;
 }
@@ -1497,14 +2635,26 @@ std::optional<RenderLease> g_suspend_lease;
 } // namespace
 
 void RendererInit(SDL_Window *window, const RendererConfig &config) {
+    if (DeviceThreadAllowed() && g.canonical_commit_pending) {
+        Error("RendererInit inside a canonical retirement callback");
+        return;
+    }
     static uint64_t instances = 0;
     g_validation_messages.store(0);
     g_resize_pending.store(false);
     g_game_frame_open.store(false);
     g = {};
     g.renderer_instance = ++instances;
+    {
+        std::lock_guard lock(g_present_marker_mutex);
+        g_present_marker = {.enabled = PresentMarkerEnabled(), .renderer_instance = g.renderer_instance};
+        g_present_marker_sequence = 0;
+    }
     g.window = window;
     g.config = config;
+    if (const char *setting = std::getenv("KZ_PERF_SPLIT_REPLAY_SUBMIT")) {
+        g.split_replay_submit = std::strcmp(setting, "1") == 0;
+    }
     if (const char *setting = std::getenv("KZ_MAIN_HEIGHT_LIMIT")) {
         const std::string_view text(setting);
         uint32_t               value = 0;
@@ -1562,10 +2712,17 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
             ? config.render_scale
             : std::max(1.0f, std::round(static_cast<float>(g.swapchain.extent.height) / g.config.logical_height));
     CreatePipelines();
+#ifdef __SWITCH__
+    InitializeVsyncGate();
+#endif
     StartRenderThread(g.config.render_thread);
 }
 
 void RendererShutdown() {
+    if (DeviceThreadAllowed() && g.canonical_commit_pending) {
+        Error("RendererShutdown inside a canonical retirement callback");
+        return;
+    }
     g_suspend_lease.reset();
     // No idle hook call may start once shutdown begins.
     SetRenderIdleHook(nullptr, nullptr);
@@ -1573,6 +2730,9 @@ void RendererShutdown() {
         return;
     }
     StopRenderThread();
+#ifdef __SWITCH__
+    CloseVsyncGate();
+#endif
     EndRecording();
     vkDeviceWaitIdle(g.device);
 #ifdef KZ_PORT_TRACY
@@ -1674,10 +2834,11 @@ void SetPresentMode(PresentMode mode) {
 namespace detail {
 namespace {
 
-bool OpenFrame() {
+bool OpenFrame(FrameRole role = FrameRole::Direct) {
     AssertDeviceThread(__func__);
     BeginCommands(CurrentFrame().draw_cmd);
     OpenTimestamps(CurrentFrame().draw_cmd);
+    OpenFrameRole(role);
 #ifdef KZ_PORT_TRACY
     // Reads back the GPU timestamps of earlier frames; nothing is recorded while profiling is off.
     if (g.tracy_vk != nullptr && profile::Enabled()) {
@@ -1707,8 +2868,11 @@ void FinishFrame() {
 bool AcquireImage(bool targets) {
     AssertDeviceThread(__func__);
     KZ_PROFILE_ZONE("Kazarov AcquireImage");
+    if (FramePhasesEnabled()) {
+        g_role_acquire_begin_ns = g_role_acquire_end_ns = 0;
+    }
     // The idle hook leaves swapchain recreation to the game thread's next recording.
-    if (tls.in_idle_hook && (g_resize_pending.load() || g.swapchain.handle == VK_NULL_HANDLE)) {
+    if ((tls.in_idle_hook || g.canonical_commit_pending) && (g_resize_pending.load() || g.swapchain.handle == VK_NULL_HANDLE)) {
         return false;
     }
     if ((g_resize_pending.load() || g.swapchain.handle == VK_NULL_HANDLE) && !RecreateSwapchain(targets)) {
@@ -1716,14 +2880,16 @@ bool AcquireImage(bool targets) {
         return false;
     }
     const TimingClock::time_point acquire_start = Timing() ? TimingClock::now() : TimingClock::time_point{};
+    const uint64_t                acquire_begin_ns = FramePhasesEnabled() ? FrameRoleClockNs() : 0;
     VkResult                      result = vkAcquireNextImageKHR(g.device, g.swapchain.handle, UINT64_MAX,
                                                                  CurrentFrame().image_available, VK_NULL_HANDLE, &g.image_index);
+    uint64_t                      acquire_end_ns = FramePhasesEnabled() ? FrameRoleClockNs() : 0;
     if (acquire_start != TimingClock::time_point{}) {
         RecordTiming([&](FrameTimings &timings) { timings.acquire.Add(MillisecondsSince(acquire_start)); });
     }
     if (SwapchainLost(result)) {
         // Recreating may submit pending uploads and move to the next slot.
-        if (tls.in_idle_hook) {
+        if (tls.in_idle_hook || g.canonical_commit_pending) {
             g_resize_pending.store(true);
             return false;
         }
@@ -1733,6 +2899,9 @@ bool AcquireImage(bool targets) {
         }
         result = vkAcquireNextImageKHR(g.device, g.swapchain.handle, UINT64_MAX,
                                        CurrentFrame().image_available, VK_NULL_HANDLE, &g.image_index);
+        if (FramePhasesEnabled()) {
+            acquire_end_ns = FrameRoleClockNs();
+        }
     }
     if (result == VK_SUBOPTIMAL_KHR) {
         if (SuboptimalNeedsRecreate()) {
@@ -1742,6 +2911,10 @@ bool AcquireImage(bool targets) {
         Error("vkAcquireNextImageKHR failed (%d)", static_cast<int>(result));
         SubmitUploadsAndWait();
         return false;
+    }
+    if (FramePhasesEnabled()) {
+        g_role_acquire_begin_ns = acquire_begin_ns;
+        g_role_acquire_end_ns = acquire_end_ns;
     }
     return true;
 }
@@ -1766,9 +2939,72 @@ void CopyOrBlitWhole(VkCommandBuffer cmd, VkImage source, VkFormat source_format
                    &region, VK_FILTER_NEAREST);
 }
 
+/**
+ * Writes a per-presentation binary sequence into a small output rectangle for capture diagnostics.
+ */
+uint64_t WritePresentMarker(VkCommandBuffer cmd, VkImage swapchain) {
+    if (!PresentMarkerEnabled()) {
+        return 0;
+    }
+    constexpr uint32_t cell_width = 8;
+    constexpr uint32_t marker_height = 16;
+    constexpr uint32_t sequence_bits = 16;
+    constexpr uint32_t marker_width = (sequence_bits + 2) * cell_width;
+    if (g.swapchain.extent.width < marker_width || g.swapchain.extent.height < marker_height ||
+        (g.swapchain.format != VK_FORMAT_R8G8B8A8_UNORM && g.swapchain.format != VK_FORMAT_R8G8B8A8_SRGB &&
+         g.swapchain.format != VK_FORMAT_B8G8R8A8_UNORM && g.swapchain.format != VK_FORMAT_B8G8R8A8_SRGB)) {
+        return 0;
+    }
+    const uint64_t sequence = ++g_present_marker_sequence;
+    if (sequence == 1) {
+        kz::Logf(kz::LogLevel::Info, "gfx", "present marker: output rectangle 0,0 {}x{}; black/white sync then 16 sequence bits LSB first; first sequence 1",
+                 marker_width, marker_height);
+    }
+    TransientSpan staging = AllocateStaging(marker_width * marker_height * 4);
+    for (uint32_t y = 0; y < marker_height; ++y) {
+        for (uint32_t x = 0; x < marker_width; ++x) {
+            const uint32_t cell = x / cell_width;
+            const bool     white = cell == 1 || (cell >= 2 && ((sequence >> (cell - 2)) & 1) != 0);
+            const size_t   offset = (static_cast<size_t>(y) * marker_width + x) * 4;
+            const uint8_t  value = white ? 255 : 0;
+            staging.data[offset] = value;
+            staging.data[offset + 1] = value;
+            staging.data[offset + 2] = value;
+            staging.data[offset + 3] = 255;
+        }
+    }
+    // The marker overwrites only its rectangle after the full-image transfer has completed.
+    SwapchainBarrier(cmd, swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy region = {};
+    region.bufferOffset = staging.offset;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {marker_width, marker_height, 1};
+    vkCmdCopyBufferToImage(cmd, staging.buffer, swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    return sequence;
+}
+
 void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     AssertDeviceThread(__func__);
     KZ_PROFILE_ZONE("Kazarov PresentImage");
+    const bool replay = tls.display_pass && !g_endpoint_role;
+    g.split_replay_candidates += replay ? 1 : 0;
+    const bool split = replay && g.split_replay_submit;
+    if (split) {
+        ++g.split_replay_selected;
+        frame.split_submit = true;
+        CloseTimestampScopes(cmd);
+        if (frame.timestamps == Frame::Timestamps::Open) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.timestamp_pool,
+                                 g.frame_slot * kFrameTimestampQueryCount + 2);
+            frame.split_timestamps = true;
+            ++g.split_replay_timed;
+        }
+        Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer replay");
+        cmd = frame.present_cmd;
+        BeginCommands(cmd);
+    }
     VkImage swapchain = g.swapchain.images[g.image_index];
     Transition(cmd, source, TransferSrc());
     // Chained to the acquire semaphore, which the submit waits on at the transfer stage.
@@ -1781,11 +3017,16 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstOffsets[1] = {static_cast<int32_t>(g.swapchain.extent.width),
                             static_cast<int32_t>(g.swapchain.extent.height), 1};
+    if (frame.split_timestamps) {
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, g.timestamp_pool,
+                             g.frame_slot * kFrameTimestampQueryCount + 3);
+    }
     {
         KZ_PROFILE_GPU_ZONE(cmd, "Kazarov swapchain blit");
         CopyOrBlitWhole(cmd, source.image, source.format, {source.width, source.height}, swapchain, g.swapchain.format,
                         g.swapchain.extent, region);
     }
+    const uint64_t marker_sequence = WritePresentMarker(cmd, swapchain);
     SwapchainBarrier(cmd, swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE);
@@ -1794,7 +3035,7 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
     VkSemaphore render_finished = g.swapchain.render_finished[g.image_index];
-    Submit(true, frame.image_available, render_finished);
+    Submit(true, frame.image_available, render_finished, split ? frame.present_cmd : VK_NULL_HANDLE);
     g.in_frame = false;
     g_game_frame_open.store(false);
 
@@ -1805,13 +3046,43 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     present.swapchainCount = 1;
     present.pSwapchains = &g.swapchain.handle;
     present.pImageIndices = &g.image_index;
+#ifdef __SWITCH__
+    const auto gate = WaitVsyncGate();
+#endif
     const TimingClock::time_point present_start = Timing() ? TimingClock::now() : TimingClock::time_point{};
     VkResult                      result = VK_SUCCESS;
+    bool                          sample_present_clock = FramePhasesEnabled();
+#ifdef __SWITCH__
+    sample_present_clock |= g_vsync_gate.presented_feedback && g_vsync_gate.available;
+#endif
+    const uint64_t present_begin_ns = sample_present_clock ? FrameRoleClockNs() : 0;
     result = vkQueuePresentKHR(g.queue, &present);
+    const uint64_t present_end_ns = sample_present_clock ? FrameRoleClockNs() : 0;
+#ifdef __SWITCH__
+    DiscardVsyncGateSignal();
+    NotePresentedGateQueue(result, present_begin_ns, present_end_ns);
+#endif
+    NotePresentMarker(marker_sequence, result);
     if (present_start != TimingClock::time_point{}) {
         NotePresent(present_start);
         NoteFrameCpu(true);
     }
+    if (FramePhasesEnabled()) {
+        UpdateFrameRoleRecord(FrameRoleState(frame).record, [&](FrameRoleRecord &record) {
+            record.present_begin_ns = present_begin_ns;
+            record.present_end_ns = present_end_ns;
+            record.marker_sequence = marker_sequence;
+#ifdef __SWITCH__
+            record.gate_begin_ns = gate[0];
+            record.gate_end_ns = gate[1];
+#endif
+        });
+    }
+#ifdef __SWITCH__
+    if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+        ProbeSwitchFrameHistory();
+    }
+#endif
     if (result == VK_SUBOPTIMAL_KHR) {
         if (SuboptimalNeedsRecreate()) {
             g_resize_pending.store(true);
@@ -1867,30 +3138,49 @@ void PrepareRecordingFromCaller() {
     RunOnRenderThread(PrepareRecording);
 }
 
-bool OpenListFrame(bool canonical, bool present, bool base, double preparation_ms) {
+bool PrepareCanonicalTargets() {
+    if (g.canonical_commit_pending || g.device == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (g.offscreen) {
+        return !g_resize_pending.load() || ResizeOffscreen();
+    }
+    if (g_resize_pending.load() || g.swapchain.handle == VK_NULL_HANDLE) {
+        return RecreateSwapchain();
+    }
+    SyncMainTargets();
+    return true;
+}
+
+bool CanonicalEndpointScopeActive() { return g_endpoint_role; }
+
+bool OpenListFrame(bool canonical, bool present, bool base, double preparation_ms, bool canonical_prepared) {
     KZ_PROFILE_ZONE("Kazarov open frame");
     if (canonical) {
-        // The game's state is drawn whether or not the window can show it: later ticks sample it.
-        if (g.offscreen) {
-            if (g_resize_pending.load()) {
-                ResizeOffscreen();
-            }
-        } else if (g_resize_pending.load() || g.swapchain.handle == VK_NULL_HANDLE) {
-            RecreateSwapchain();
-        } else {
-            SyncMainTargets();
+        if (g.canonical_commit_pending || (canonical_prepared ? g_resize_pending.load() : !PrepareCanonicalTargets())) {
+            return false;
         }
-        return OpenFrame();
+        return OpenFrame(FrameRole::CanonicalRender);
     }
-    const auto display_started = Timing() ? TimingClock::now() : TimingClock::time_point{};
+    if (g.canonical_commit_pending && !g_endpoint_role) {
+        return false;
+    }
+    const auto     display_started = Timing() ? TimingClock::now() : TimingClock::time_point{};
+    const uint64_t display_started_ns = FramePhasesEnabled() ? FrameRoleClockNs() : 0;
     if (present && !g.offscreen && !AcquireImage(false)) {
         return false;
     }
-    OpenFrame();
+    OpenFrame(g_endpoint_role ? FrameRole::CanonicalEndpoint : FrameRole::DisplayReplay);
     if (Timing()) {
         RecordTiming([&](FrameTimings &timings) { timings.display_prepare_cpu.Add(preparation_ms); });
         g_frame_opened = display_started - std::chrono::duration_cast<TimingClock::duration>(
                                                std::chrono::duration<double, std::milli>(preparation_ms));
+        if (FramePhasesEnabled()) {
+            auto      &slot = FrameRoleState(CurrentFrame());
+            const auto preparation_ns = static_cast<uint64_t>(preparation_ms * 1.0e6);
+            slot.cpu_begin_ns = preparation_ns <= display_started_ns ? display_started_ns - preparation_ns : 0;
+            slot.preparation_ms = preparation_ms;
+        }
     }
     tls.display_pass = true;
     if (base) {
@@ -1917,7 +3207,42 @@ bool OpenListFrame(bool canonical, bool present, bool base, double preparation_m
     return true;
 }
 
-void CloseListFrame(bool canonical, bool present) {
+namespace {
+
+/**
+ * Commits only the submitted destination after the bounded old-image callback exits.
+ */
+class CanonicalCommitGuard {
+public:
+    explicit CanonicalCommitGuard(const CanonicalCommitTransaction &value) : transaction(value) {}
+
+    ~CanonicalCommitGuard() noexcept {
+        const bool same = g.renderer_instance == transaction.renderer_instance &&
+                          g.canonical_target_generation == transaction.target_generation &&
+                          g.canonical_commit_serial == transaction.commit_serial && g.main_current == transaction.image_index;
+        g.canonical_commit_pending = false;
+        g.deferred_prior_image.reset();
+        g.deferred_prior_overlay = nullptr;
+        g.deferred_endpoint_attempted = false;
+        if (!same) {
+            Fatal("Canonical allocation changed inside its retirement callback");
+        }
+        g.main_current ^= 1;
+        ++g.canonical_commit_serial;
+        g.canonical_newest = true;
+        g.presented_display = false;
+    }
+
+    CanonicalCommitGuard(const CanonicalCommitGuard &) = delete;
+    CanonicalCommitGuard &operator=(const CanonicalCommitGuard &) = delete;
+
+private:
+    const CanonicalCommitTransaction &transaction; /**< Scope-owned destination and prior identity. */
+};
+
+} // namespace
+
+void CloseListFrame(bool canonical, bool present, const CanonicalCommitTransaction *transaction) {
     KZ_PROFILE_ZONE("Kazarov close frame");
     Frame          &frame = CurrentFrame();
     VkCommandBuffer cmd = frame.draw_cmd;
@@ -1930,6 +3255,16 @@ void CloseListFrame(bool canonical, bool present) {
             RecordDepthQueries(cmd);
         }
         SubmitWithoutPresent(cmd, CurrentMainColor());
+        if (transaction != nullptr) {
+            g.canonical_commit_pending = true;
+            g.deferred_prior_image = transaction->prior;
+            g.deferred_prior_overlay = transaction->overlay;
+            g.deferred_endpoint_attempted = false;
+            const CanonicalCommitGuard commit(*transaction);
+            AdvanceSlot();
+            (*transaction->callback)();
+            return;
+        }
         FinishFrame();
         ++g.canonical_commit_serial;
         g.canonical_newest = true;
@@ -1956,6 +3291,9 @@ bool BeginFrame() {
     const bool recording = RecordingCalls();
     bool       opened = false;
     RunOnRenderThread([&] {
+        if (g.canonical_commit_pending) {
+            return;
+        }
         if (g.in_frame || recording) {
             Error("BeginFrame inside a frame");
             opened = true;
@@ -2007,6 +3345,9 @@ bool PresentCanonical() {
     const bool recording = RecordingCalls();
     bool       presented = false;
     RunOnRenderThread([&] {
+        if (g.canonical_commit_pending && !g_endpoint_role) {
+            return;
+        }
         if (!g.canonical_newest || g.in_frame || recording) {
             return;
         }
@@ -2019,7 +3360,7 @@ bool PresentCanonical() {
             return;
         }
         g.presented_display = false;
-        OpenFrame();
+        OpenFrame(FrameRole::CanonicalEndpoint);
         Frame &frame = CurrentFrame();
         PresentImage(frame, frame.draw_cmd, PreviousMainColor());
         g.target = kMainTarget;
@@ -2050,11 +3391,19 @@ bool PresentCanonicalImage(const CanonicalImageToken &token, const DisplayList *
     const bool recording = RecordingCalls();
     bool       presented = false;
     RunOnRenderThread([&] {
+        if (g.canonical_commit_pending) {
+            if (!g.deferred_prior_image || token != *g.deferred_prior_image || overlay != g.deferred_prior_overlay ||
+                g.deferred_endpoint_attempted || !DeferredCanonicalOverlaySafe(overlay)) {
+                return;
+            }
+            g.deferred_endpoint_attempted = true;
+        }
         if (g.device == VK_NULL_HANDLE || !g.canonical_newest || g.in_frame || recording || g_resize_pending.load() ||
             token.renderer_instance != g.renderer_instance || token.target_generation != g.canonical_target_generation ||
             token.commit_serial != g.canonical_commit_serial || token.image_index != (g.main_current ^ 1)) {
             return;
         }
+        const EndpointRoleScope endpoint_scope;
         if (overlay != nullptr) {
             // Device ownership preserves the validated image through the host-only base copy.
             presented = RenderList(*overlay, 1.0f, {.present = true, .host = true});
@@ -2082,6 +3431,156 @@ bool GpuPresentsPendingAtMost(uint32_t presents) {
 void SetFrameTimingEnabled(bool enabled) { g_timing_enabled.store(enabled); }
 
 bool FrameTimingEnabled() { return Timing(); }
+
+bool VsyncGateActive() {
+#ifdef __SWITCH__
+    return g_vsync_gate_active.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+bool PresentedGateActive() {
+#ifdef __SWITCH__
+    return g_presented_gate_active.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+bool PresentedGateReady() {
+#ifdef __SWITCH__
+    if (!PresentedGateActive()) {
+        return true;
+    }
+    if (!detail::DeviceThreadAllowed()) {
+        Fatal("PresentedGateReady requires device ownership");
+    }
+    auto &gate = detail::g_vsync_gate;
+    ++gate.preflight_probes;
+    if (gate.first_queue) {
+        return true;
+    }
+    const uint64_t begin_ns = detail::NativeHistoryClockNs();
+    const bool     ready = detail::PollPresentedGate() == detail::PresentedFeedbackStatus::Ready;
+    const uint64_t end_ns = detail::NativeHistoryClockNs();
+    if (end_ns < begin_ns) {
+        detail::FailVsyncGate("history-preflight-clock", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    const uint64_t elapsed = end_ns - begin_ns;
+    gate.preflight_total_ns += elapsed;
+    gate.preflight_max_ns = std::max(gate.preflight_max_ns, elapsed);
+    gate.preflight_pending += ready ? 0 : 1;
+    return ready;
+#else
+    return true;
+#endif
+}
+
+PresentMarkerSnapshot GetPresentMarkerSnapshot() {
+    std::lock_guard       lock(g_present_marker_mutex);
+    PresentMarkerSnapshot snapshot = g_present_marker;
+    snapshot.boundary_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               TimingClock::now().time_since_epoch())
+                               .count();
+    return snapshot;
+}
+
+uint64_t PresentationHistoryClockNs() {
+#ifdef __SWITCH__
+    return NativeHistoryEnabled() ? NativeHistoryClockNs() : 0;
+#else
+    return 0;
+#endif
+}
+
+void BeginPresentationHistory(uint64_t boundary_ns) {
+    BeginFrameRoleHistory();
+#ifdef __SWITCH__
+    if (!NativeHistoryEnabled() || boundary_ns == 0) {
+        return;
+    }
+    std::lock_guard lock(g_native_history_mutex);
+    g_native_history = {};
+    g_native_history.records.reserve(1024);
+    g_native_history.begin_ns = boundary_ns;
+    g_native_history.renderer_instance = g.renderer_instance;
+    g_native_history.invalid_clock = armGetSystemTickFreq() != 19'200'000;
+    g_native_history.active = true;
+    CollectNativeFrameHistory(true);
+#else
+    static_cast<void>(boundary_ns);
+#endif
+}
+
+void EndPresentationHistory(uint64_t boundary_ns) {
+    EndFrameRoleHistory();
+#ifdef __SWITCH__
+    if (!NativeHistoryEnabled()) {
+        return;
+    }
+    std::lock_guard lock(g_native_history_mutex);
+    if (g_native_history.active) {
+        g_native_history.end_ns = boundary_ns;
+        g_native_history.invalid_clock += boundary_ns <= g_native_history.begin_ns;
+    }
+#else
+    static_cast<void>(boundary_ns);
+#endif
+}
+
+void LogPresentationHistory() {
+#ifdef __SWITCH__
+    // Drain scanout history before diagnostic output extends the parked interval.
+    [] {
+        if (!NativeHistoryEnabled()) {
+            return;
+        }
+        std::lock_guard lock(g_native_history_mutex);
+        auto           &history = g_native_history;
+        if (!history.active || history.end_ns == 0) {
+            return;
+        }
+        const uint64_t drain_until = NativeHistoryClockNs() + 200'000'000;
+        CollectNativeFrameHistory();
+        while (PendingNativeFrames() != 0 && NativeHistoryClockNs() < drain_until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            CollectNativeFrameHistory();
+        }
+        history.active = false;
+        history.conflicts += history.renderer_instance != g.renderer_instance;
+        std::fprintf(stderr, "perf native history begin: instance=%llu begin_ns=%llu end_ns=%llu clock_hz=%llu records=%zu\n",
+                     static_cast<unsigned long long>(history.renderer_instance), static_cast<unsigned long long>(history.begin_ns),
+                     static_cast<unsigned long long>(history.end_ns), static_cast<unsigned long long>(armGetSystemTickFreq()), history.records.size());
+        for (const auto &record : history.records) {
+            std::fprintf(stderr, "perf native frame: frame=%llu enqueue_ns=%llu presentation_ns=%llu state=%d\n",
+                         static_cast<unsigned long long>(record.frame_number), static_cast<unsigned long long>(record.enqueue_ns),
+                         static_cast<unsigned long long>(record.presentation_ns), static_cast<int32_t>(record.state));
+        }
+        std::fprintf(stderr, "perf native history end: records=%zu queries=%llu query_errors=%llu missing_ids=%llu conflicts=%llu overflow=%llu invalid_clock=%llu stale_history=%llu invalid_mode=%llu unresolved=%zu query_total_ns=%llu query_max_ns=%llu\n",
+                     history.records.size(), static_cast<unsigned long long>(history.queries), static_cast<unsigned long long>(history.query_errors),
+                     static_cast<unsigned long long>(history.missing_ids), static_cast<unsigned long long>(history.conflicts),
+                     static_cast<unsigned long long>(history.overflow), static_cast<unsigned long long>(history.invalid_clock),
+                     static_cast<unsigned long long>(history.stale_history),
+                     static_cast<unsigned long long>(history.invalid_mode), PendingNativeFrames(),
+                     static_cast<unsigned long long>(history.query_total_ns), static_cast<unsigned long long>(history.query_max_ns));
+    }();
+    LogVsyncGate("summary");
+    std::fprintf(stderr, "perf prog0 fog: candidates=%llu selected=%llu unknown=%llu skinned=%llu unsafe=%llu\n",
+                 static_cast<unsigned long long>(g.prog0_fog_candidates), static_cast<unsigned long long>(g.prog0_fog_selected),
+                 static_cast<unsigned long long>(g.prog0_fog_unknown), static_cast<unsigned long long>(g.prog0_fog_skinned),
+                 static_cast<unsigned long long>(g.prog0_fog_unsafe));
+#endif
+    RunOnRenderThread([] {
+        if (g.split_replay_submit) {
+            std::fprintf(stderr, "perf replay split submit: enabled=1 candidates=%llu selected=%llu first_submits=%llu final_submits=%llu timed=%llu gpu_envelope_includes_acquire_wait=1 draw_scopes_exclude_final_copy=1\n",
+                         static_cast<unsigned long long>(g.split_replay_candidates), static_cast<unsigned long long>(g.split_replay_selected),
+                         static_cast<unsigned long long>(g.split_replay_first_submits), static_cast<unsigned long long>(g.split_replay_final_submits),
+                         static_cast<unsigned long long>(g.split_replay_timed));
+        }
+    });
+    LogFrameRoleHistory();
+}
 
 FrameTimings TakeFrameTimings() {
     std::lock_guard lock(g_timing_mutex);
@@ -2130,7 +3629,7 @@ void SetFrameLayout(const FrameLayout &layout) {
     // Read on the game thread: the worker must not look at the list the game thread records.
     const bool recording = RecordingCalls();
     RunOnRenderThread([&] {
-        if (g.in_frame || recording) {
+        if (g.in_frame || recording || g.canonical_commit_pending) {
             Error("SetFrameLayout inside a frame");
             return;
         }
@@ -2151,7 +3650,7 @@ void SetRenderScale(float scale) {
     // Read on the game thread: the worker must not look at the list the game thread records.
     const bool recording = RecordingCalls();
     RunOnRenderThread([&] {
-        if (scale <= 0.0f || scale == g.render_scale || g.in_frame || recording) {
+        if (scale <= 0.0f || scale == g.render_scale || g.in_frame || recording || g.canonical_commit_pending) {
             return;
         }
         g.render_scale = scale;

@@ -265,6 +265,10 @@ void SaveCache(const std::filesystem::path &path, const std::vector<uint8_t> &in
         std::error_code error;
         if (path.has_parent_path()) {
             std::filesystem::create_directories(path.parent_path(), error);
+            if (trace && error) {
+                kz::Logf(kz::LogLevel::Info, "gfx", "perf init: pipeline cache parent {} mkdir_error={} message={}",
+                         PathsDisplay(path.parent_path()), error.value(), error.message());
+            }
         }
         if (FilesWrite(path, data.data(), size, true) != FilesResult::kWritten) {
             Error("cannot write the pipeline cache to %s", PathsDisplay(path).c_str());
@@ -612,10 +616,12 @@ void LogShaderStats() {
         return;
     }
     const bool                                           all = g.perf.stats == "*";
-    const std::array<std::pair<uint32_t, VkPipeline>, 4> extras = {
+    const std::array<std::pair<uint32_t, VkPipeline>, 6> extras = {
         {
          {kNearSafeFogScope, g.near_safe_fog_pipelines[0]},
          {kNearSafeFogAlphaScope, g.near_safe_fog_pipelines[1]},
+         {kProg0NearSafeFogAlphaScope, g.prog0_near_safe_fog_pipelines[0]},
+         {kProg0NearSafeFogBlendScope, g.prog0_near_safe_fog_pipelines[1]},
          {kDepthPlanesScope, g.depth_planes_pipeline},
          {kZeroAlphaNoopScope, g.zero_alpha_noop_pipeline},
          }
@@ -1088,16 +1094,27 @@ void CreatePipelines() {
     Check(failure, "vkCreateGraphicsPipelines");
     const auto compiled = trace_init ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (NearSafeFogEnabled() && g.blend_slot_count > 4) {
-        for (uint32_t variant = 0; variant < 2; variant++) {
-            const AlphaVariant alpha = variant == 0 ? kAlphaVariantNone : kAlphaVariantGEqual;
-            const uint32_t     features = kColorFeatureCount + 1;
-            const uint32_t     base = PipelineIndex(kFamilyMesh, 4, kTextureRgba, alpha, features);
-            g.near_safe_fog_bases[variant] = base;
-            Specialization data = spec_data[kFamilyMesh][kTextureRgba][alpha][features];
+        const char *prog0_override = std::getenv("KZ_PROG0_FOG_NEAR_SAFE");
+        const bool  prog0_enabled = g.config.prog0_meshes && (prog0_override == nullptr || std::strcmp(prog0_override, "0") != 0);
+        for (uint32_t variant = 0; variant < 4; variant++) {
+            const bool prog0 = variant >= 2;
+            if (prog0 && !prog0_enabled) {
+                continue;
+            }
+            const uint32_t       local_variant = prog0 ? variant - 2 : variant;
+            const PipelineFamily family = prog0 ? kFamilyMeshProg0 : kFamilyMesh;
+            const uint32_t       blend = prog0 && local_variant == 0 ? 0 : 4;
+            const AlphaVariant   alpha = prog0 ? (local_variant == 0 ? kAlphaVariantGEqual : kAlphaVariantNone)
+                                               : (local_variant == 0 ? kAlphaVariantNone : kAlphaVariantGEqual);
+            const uint32_t       features = kColorFeatureCount + 1;
+            const uint32_t       base = PipelineIndex(family, blend, kTextureRgba, alpha, features);
+            auto                &base_slot = prog0 ? g.prog0_near_safe_fog_bases[local_variant] : g.near_safe_fog_bases[local_variant];
+            base_slot = base;
+            Specialization data = spec_data[family][kTextureRgba][alpha][features];
             data.near_safe_mesh_fog = VK_TRUE;
             const char *reciprocal = std::getenv("KZ_FOG_NEAR_RECIPROCAL");
-            data.near_safe_reciprocal = reciprocal != nullptr && std::strcmp(reciprocal, "1") == 0 ? VK_TRUE : VK_FALSE;
-            VkSpecializationInfo fragment_info = spec_info[kFamilyMesh][kTextureRgba][alpha][features];
+            data.near_safe_reciprocal = !prog0 && reciprocal != nullptr && std::strcmp(reciprocal, "1") == 0 ? VK_TRUE : VK_FALSE;
+            VkSpecializationInfo fragment_info = spec_info[family][kTextureRgba][alpha][features];
             fragment_info.pData = &data;
             VkPipelineShaderStageCreateInfo near_stages[] = {stages[base * 2], stages[base * 2 + 1]};
             near_stages[1].pSpecializationInfo = &fragment_info;
@@ -1115,8 +1132,10 @@ void CreatePipelines() {
                 Check(create_pipeline(create, pipeline),
                       "vkCreateGraphicsPipelines near-safe fog");
             };
-            create_near_pipeline(variant == 0 ? kNearSafeFogScope : kNearSafeFogAlphaScope,
-                                 g.near_safe_fog_pipelines[variant]);
+            const uint32_t scope = prog0 ? (local_variant == 0 ? kProg0NearSafeFogAlphaScope : kProg0NearSafeFogBlendScope)
+                                         : (local_variant == 0 ? kNearSafeFogScope : kNearSafeFogAlphaScope);
+            auto          &pipeline = prog0 ? g.prog0_near_safe_fog_pipelines[local_variant] : g.near_safe_fog_pipelines[local_variant];
+            create_near_pipeline(scope, pipeline);
         }
     }
     if (g.dynamic_color_write_mask) {
@@ -1261,6 +1280,13 @@ void DestroyPipelines() {
         }
     }
     g.near_safe_fog_bases.fill(UINT32_MAX);
+    for (VkPipeline &pipeline : g.prog0_near_safe_fog_pipelines) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(g.device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+    g.prog0_near_safe_fog_bases.fill(UINT32_MAX);
     if (g.zero_alpha_noop_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(g.device, g.zero_alpha_noop_pipeline, nullptr);
         g.zero_alpha_noop_pipeline = VK_NULL_HANDLE;
@@ -1287,6 +1313,9 @@ std::string DescribePipeline(uint32_t index) {
     }
     if (index == kNearSafeFogScope || index == kNearSafeFogAlphaScope) {
         return index == kNearSafeFogScope ? "mesh-fog-near-safe" : "mesh-fog-near-safe-atest>=";
+    }
+    if (index == kProg0NearSafeFogAlphaScope || index == kProg0NearSafeFogBlendScope) {
+        return index == kProg0NearSafeFogAlphaScope ? "prog0-fog-near-safe-atest>=" : "prog0-fog-near-safe-blend";
     }
     const uint32_t families = FamilyCount();
     const uint32_t colour =

@@ -31,22 +31,22 @@ thread_local ThreadFlags tls;
 
 namespace {
 
-std::mutex                         g_mutex;
-std::condition_variable            g_cv;      // worker waits
-std::condition_variable            g_done_cv; // callers wait (Drain, lease)
-std::deque<std::function<void()> > g_queue;
-std::thread                        g_worker;
-std::thread::id                    g_worker_id;
-bool                               g_running = false; // a command is executing
-bool                               g_in_hook = false; // the idle hook is executing
-bool                               g_stop = false;
-bool                               g_leased = false;
-bool                               g_wake = false; // WakeRenderThread ended the idle hook's sleep
-uint32_t                           g_lease_waiters = 0;
-RenderIdleHook                     g_hook = nullptr;
-void                              *g_hook_user = nullptr;
-std::atomic<RenderThreadMode>      g_mode = RenderThreadMode::Off;
-thread_local uint32_t              t_lease_depth = 0;
+std::mutex                        g_mutex;
+std::condition_variable           g_cv;      // worker waits
+std::condition_variable           g_done_cv; // callers wait (Drain, lease)
+std::deque<std::function<void()>> g_queue;
+std::thread                       g_worker;
+std::thread::id                   g_worker_id;
+bool                              g_running = false; // a command is executing
+bool                              g_in_hook = false; // the idle hook is executing
+bool                              g_stop = false;
+bool                              g_leased = false;
+bool                              g_wake = false; // WakeRenderThread ended the idle hook's sleep
+uint32_t                          g_lease_waiters = 0;
+RenderIdleHook                    g_hook = nullptr;
+void                             *g_hook_user = nullptr;
+std::atomic<RenderThreadMode>     g_mode = RenderThreadMode::Off;
+thread_local uint32_t             t_lease_depth = 0;
 
 // Whether the idle hook may run now: Async, with a hook, and no lease held or wanted.
 bool HookWanted() {
@@ -211,6 +211,7 @@ RenderThreadMode ActiveRenderThreadMode() { return g_mode.load(); }
 bool OnRenderThread() { return g_mode.load() == RenderThreadMode::Off || OnWorkerThread() || t_lease_depth > 0; }
 
 RenderLease::RenderLease() {
+    KZ_PROFILE_SITE_ZONE(lease_profile, "Render lease acquisition");
     if (g_mode.load() == RenderThreadMode::Off || !g_worker.joinable() || OnWorkerThread() || t_lease_depth > 0) {
         t_lease_depth++;
         return;

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
@@ -542,14 +543,21 @@ void DestroyDoomedTexture(TextureHandle handle) {
         }
         g.target = kMainTarget;
     }
-    Image image = texture.image;
-    Image depth = texture.depth;
+    Image               image = texture.image;
+    Image               depth = texture.depth;
+    const TextureHandle aem_mask = texture.aem_mask;
     texture.live = false;
     texture.opaque_alpha_mips = 0;
+    texture.nonblack_rgb_mips = 0;
+    texture.aem_mask = kNullTexture;
+    texture.aem_mask_mips = 0;
     texture.depth_copy_dst = false;
     texture.doomed = nullptr;
     texture.image = {};
     texture.depth = {};
+    if (aem_mask != kNullTexture) {
+        DestroyDoomedTexture(aem_mask);
+    }
     DeferDestroy([slot, image, depth]() mutable {
         WriteTextureDescriptor(slot, g.textures[0].image.view);
         DestroyImage(image);
@@ -571,6 +579,7 @@ void DestroyDoomedMesh(MeshHandle handle) {
     Buffer buffer = mesh.buffer;
     mesh.live = false;
     mesh.bounds_known = false;
+    mesh.skin_bounds_known = false;
     mesh.doomed = nullptr;
     mesh.buffer = {};
     DeferDestroy([slot, buffer]() mutable {
@@ -587,7 +596,30 @@ bool NearSafeFogEnabled() {
     return enabled;
 }
 
+bool TexaMaskEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_TEXA_MASK");
+        if (setting != nullptr) {
+            return std::strcmp(setting, "1") == 0;
+        }
+#ifdef __SWITCH__
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return enabled;
+}
+
 namespace {
+
+/**
+ * Rejects nonfinite and flushed-input-sensitive binary32 values without floating comparisons.
+ */
+bool NormalOrZeroFloat(float value) {
+    const uint32_t bits = std::bit_cast<uint32_t>(value) & 0x7fffffffU;
+    return bits == 0 || (bits >= 0x00800000U && bits < 0x7f800000U);
+}
 
 // Interval of c * x over [lo, hi], accumulated into sum, and the largest magnitude one term can reach.
 void AddTerm(double c, double lo, double hi, double &min, double &max, double &magnitude) {
@@ -662,6 +694,188 @@ bool MeshFogIsNearSafe(const Mesh &mesh, const MeshConstants &constants) {
     return true;
 }
 
+bool Prog0FogIsNearSafe(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0) {
+    if (!mesh.bounds_known || !mesh.bounds_normal_inputs ||
+        (prog0.flags & kProg0Skinned) != 0 || prog0.fog[3] == 0.0f) {
+        return false;
+    }
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (!NormalOrZeroFloat(mesh.bounds_min[axis]) || !NormalOrZeroFloat(mesh.bounds_max[axis]) ||
+            mesh.bounds_min[axis] > mesh.bounds_max[axis]) {
+            return false;
+        }
+    }
+    for (float value : constants.mvp) {
+        if (!NormalOrZeroFloat(value)) {
+            return false;
+        }
+    }
+    for (float value : prog0.fog) {
+        if (!NormalOrZeroFloat(value)) {
+            return false;
+        }
+    }
+    const float          *matrix = constants.mvp;
+    std::array<double, 4> magnitude{};
+    for (std::size_t row = 0; row < magnitude.size(); ++row) {
+        double low = matrix[12 + row];
+        double high = low;
+        magnitude[row] = std::abs(low);
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            AddTerm(matrix[axis * 4 + row], mesh.bounds_min[axis], mesh.bounds_max[axis], low, high, magnitude[row]);
+        }
+    }
+    const double limit = static_cast<double>(FLT_MAX) / 64.0;
+    if (std::ranges::any_of(magnitude, [limit](double value) { return !(value < limit); })) {
+        return false;
+    }
+    double w_min = matrix[15], w_max = w_min, w_magnitude = std::abs(w_min);
+    double difference_min = static_cast<double>(matrix[15]) - matrix[14];
+    double difference_max = difference_min, difference_magnitude = std::abs(difference_min);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        AddTerm(matrix[axis * 4 + 3], mesh.bounds_min[axis], mesh.bounds_max[axis], w_min, w_max, w_magnitude);
+        AddTerm(static_cast<double>(matrix[axis * 4 + 3]) - matrix[axis * 4 + 2],
+                mesh.bounds_min[axis], mesh.bounds_max[axis], difference_min, difference_max, difference_magnitude);
+    }
+    // W and Z round independently on the GPU; a small difference cannot supply their error bound.
+    const double ftz_guard = 64.0 * FLT_MIN;
+    const double w_guard = 64.0 * FLT_EPSILON * std::max(1.0, magnitude[3]) + ftz_guard;
+    const double difference_guard = 64.0 * FLT_EPSILON * std::max(1.0, magnitude[3] + magnitude[2]) + ftz_guard;
+    if (!(w_min > w_guard) || !(difference_min > difference_guard)) {
+        return false;
+    }
+    const double w_bottom = w_min - w_guard;
+    const double w_top = w_magnitude + w_guard;
+    const double offset = std::abs(static_cast<double>(prog0.fog[0]));
+    const double scale = std::abs(static_cast<double>(prog0.fog[3]));
+    const double fog_top = std::max({0.0, static_cast<double>(prog0.fog[1]), static_cast<double>(prog0.fog[2])});
+    // Prog0 emits floor(clamp(offset + scale/W)) * W and offset*W + scale, unlike the plain-mesh slots.
+    return fog_top < limit && fog_top * w_top < limit && offset * w_top + scale < limit &&
+           offset + scale / w_bottom < limit;
+}
+
+void SetMeshSkinBounds(Mesh &mesh, std::span<const Vertex3D> vertices, std::span<const uint32_t> indices) {
+    mesh.skin_bounds_known = false;
+    mesh.skin_bones = 0;
+    if (vertices.empty() || vertices.size() % 2 != 0 || indices.empty() ||
+        std::ranges::any_of(indices, [count = vertices.size() / 2](uint32_t index) { return index >= count; })) {
+        return;
+    }
+    std::array<float, 3> lo = {INFINITY, INFINITY, INFINITY};
+    std::array<float, 3> hi = {-INFINITY, -INFINITY, -INFINITY};
+    double               sum_min = INFINITY;
+    double               sum_max = 0.0;
+    uint32_t             bones = 0;
+    for (size_t index = 0; index < vertices.size(); index += 2) {
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const float position = vertices[index].position[axis];
+            if (!std::isfinite(position)) {
+                return;
+            }
+            lo[axis] = std::min(lo[axis], position);
+            hi[axis] = std::max(hi[axis], position);
+        }
+        Prog0Skin skin{};
+        std::memcpy(&skin, &vertices[index + 1], sizeof skin);
+        double sum = 0.0;
+        for (size_t influence = 0; influence < 4; ++influence) {
+            const float weight = skin.weight[influence];
+            if (!std::isfinite(weight) || weight < 0.0f || weight > 1.0f) {
+                return;
+            }
+            sum += static_cast<double>(weight);
+            bones |= uint32_t{1} << std::min<uint32_t>(skin.bone[influence], kProg0Bones - 1);
+        }
+        const double error = 8.0 * std::numeric_limits<double>::epsilon() * sum;
+        sum_min = std::min(sum_min, sum == 0.0 ? 0.0 : std::max(0.0, std::nextafter(sum - error, -INFINITY)));
+        sum_max = std::max(sum_max, sum == 0.0 ? 0.0 : std::nextafter(sum + error, INFINITY));
+    }
+    mesh.skin_bounds_min = lo;
+    mesh.skin_bounds_max = hi;
+    mesh.skin_weight_sum_min = sum_min;
+    mesh.skin_weight_sum_max = sum_max;
+    mesh.skin_bones = bones;
+    mesh.skin_bounds_known = true;
+}
+
+bool SkinnedMeshPositionBounds(const Mesh &mesh, const Prog0Palette &palette,
+                               std::array<float, 3> &bounds_min, std::array<float, 3> &bounds_max) {
+    if (!mesh.skin_bounds_known || mesh.skin_bones == 0 || !std::isfinite(mesh.skin_weight_sum_min) ||
+        !std::isfinite(mesh.skin_weight_sum_max) || mesh.skin_weight_sum_min < 0.0 ||
+        mesh.skin_weight_sum_min > mesh.skin_weight_sum_max) {
+        return false;
+    }
+    constexpr double      limit = static_cast<double>(FLT_MAX) / 64.0;
+    const double          weight_scale = std::max(1.0, mesh.skin_weight_sum_max);
+    std::array<double, 3> max_position;
+    double                position_sum = 0.0;
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(mesh.skin_bounds_min[axis]) || !std::isfinite(mesh.skin_bounds_max[axis]) ||
+            mesh.skin_bounds_min[axis] > mesh.skin_bounds_max[axis]) {
+            return false;
+        }
+        max_position[axis] = std::max(std::abs(static_cast<double>(mesh.skin_bounds_min[axis])),
+                                      std::abs(static_cast<double>(mesh.skin_bounds_max[axis])));
+        if (!(max_position[axis] * weight_scale < limit)) {
+            return false;
+        }
+        position_sum += max_position[axis];
+    }
+    std::array<double, 3> lo = {INFINITY, INFINITY, INFINITY};
+    std::array<double, 3> hi = {-INFINITY, -INFINITY, -INFINITY};
+    std::array<double, 3> magnitude = {};
+    std::array<double, 3> row_sum = {};
+    for (uint32_t bone = 0; bone < kProg0Bones; ++bone) {
+        if ((mesh.skin_bones & (uint32_t{1} << bone)) == 0) {
+            continue;
+        }
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const auto &row = palette.bones[bone][axis];
+            double      absolute_terms = 0.0;
+            double      absolute_row = 0.0;
+            for (size_t column = 0; column < 4; ++column) {
+                if (!std::isfinite(row[column])) {
+                    return false;
+                }
+                absolute_row += std::abs(static_cast<double>(row[column]));
+                absolute_terms += std::abs(static_cast<double>(row[column])) * (column < 3 ? max_position[column] : 1.0);
+            }
+            if (!(absolute_terms * weight_scale < limit)) {
+                return false;
+            }
+            magnitude[axis] = std::max(magnitude[axis], absolute_terms);
+            row_sum[axis] = std::max(row_sum[axis], absolute_row);
+            for (uint32_t corner = 0; corner < 8; ++corner) {
+                double value = row[3];
+                for (size_t column = 0; column < 3; ++column) {
+                    const double position = (corner & (uint32_t{1} << column)) != 0
+                                                ? mesh.skin_bounds_max[column]
+                                                : mesh.skin_bounds_min[column];
+                    value += static_cast<double>(row[column]) * position;
+                }
+                lo[axis] = std::min(lo[axis], value);
+                hi[axis] = std::max(hi[axis], value);
+            }
+        }
+    }
+    for (size_t axis = 0; axis < 3; ++axis) {
+        // Nonnegative weights give a convex bone union, scaled about the origin by their actual sum.
+        const double scaled[4] = {lo[axis] * mesh.skin_weight_sum_min, lo[axis] * mesh.skin_weight_sum_max,
+                                  hi[axis] * mesh.skin_weight_sum_min, hi[axis] * mesh.skin_weight_sum_max};
+        const double rounding = 32.0 * FLT_EPSILON * weight_scale * magnitude[axis];
+        const double underflow = 32.0 * FLT_MIN * (1.0 + position_sum + row_sum[axis] + mesh.skin_weight_sum_max);
+        const double error = rounding + underflow;
+        const double low = *std::min_element(std::begin(scaled), std::end(scaled)) - error;
+        const double high = *std::max_element(std::begin(scaled), std::end(scaled)) + error;
+        if (!std::isfinite(low) || !std::isfinite(high) || !(std::max(std::abs(low), std::abs(high)) < FLT_MAX)) {
+            return false;
+        }
+        bounds_min[axis] = std::nextafter(static_cast<float>(low), -INFINITY);
+        bounds_max[axis] = std::nextafter(static_cast<float>(high), INFINITY);
+    }
+    return true;
+}
+
 } // namespace detail
 
 using namespace detail;
@@ -690,6 +904,9 @@ TextureHandle CreateTexture(const TextureDesc &desc) {
         texture.desc = desc;
         texture.render_target = false;
         texture.opaque_alpha_mips = 0;
+        texture.nonblack_rgb_mips = 0;
+        texture.aem_mask = kNullTexture;
+        texture.aem_mask_mips = 0;
         texture.depth_copy_dst = false;
         texture.shares_main_depth = false;
         texture.frame = false;
@@ -743,6 +960,9 @@ TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height
         texture.desc = TextureDesc{logical_width, logical_height, TextureFormat::Rgba8, 1, has_alpha};
         texture.render_target = true;
         texture.opaque_alpha_mips = 0;
+        texture.nonblack_rgb_mips = 0;
+        texture.aem_mask = kNullTexture;
+        texture.aem_mask_mips = 0;
         texture.depth_copy_dst = false;
         texture.shares_main_depth = share_main_depth;
         texture.frame = frame_target;
@@ -771,9 +991,9 @@ TextureHandle NamedRenderTarget(std::string_view name, uint32_t logical_width, u
     if (existing != kNullTexture) {
         const Texture &texture = *LookupTexture(existing);
         bool           same_size = share_main_depth || (texture.logical_width == logical_width &&
-                                              texture.logical_height == logical_height);
+                                                        texture.logical_height == logical_height);
         bool           same_shape = texture.shares_main_depth == share_main_depth &&
-                          (share_main_depth || texture.frame == frame_target);
+                                    (share_main_depth || texture.frame == frame_target);
         if (same_size && same_shape && texture.desc.has_alpha == has_alpha) {
             return existing;
         }
@@ -845,20 +1065,31 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
     }
 
     RunOnRenderThread([&] {
-        TransientSpan staging = AllocateStaging(static_cast<VkDeviceSize>(row) * h);
+        TransientSpan     staging = AllocateStaging(static_cast<VkDeviceSize>(row) * h);
         static const bool track_alpha = [] {
             const char *setting = std::getenv("KZ_ALPHA_OPAQUE");
             return setting != nullptr && std::strcmp(setting, "1") == 0;
         }();
         const bool inspect_alpha = track_alpha && !texture->render_target && texture->desc.has_alpha &&
                                    texture->desc.format == TextureFormat::Rgba8;
+        const bool inspect_rgb = !texture->render_target && texture->desc.format == TextureFormat::Rgba8;
         bool       opaque = inspect_alpha;
+        bool       nonblack = inspect_rgb;
         for (uint32_t i = 0; i < h; i++) {
             const auto *source = static_cast<const uint8_t *>(pixels) + static_cast<size_t>(i) * stride;
             if (opaque) {
                 for (uint32_t column = 0; column < w; column++) {
                     if (source[static_cast<size_t>(column) * 4 + 3] != 255) {
                         opaque = false;
+                        break;
+                    }
+                }
+            }
+            if (nonblack) {
+                for (uint32_t column = 0; column < w; column++) {
+                    const auto *texel = source + static_cast<size_t>(column) * 4;
+                    if ((texel[0] | texel[1] | texel[2]) == 0) {
+                        nonblack = false;
                         break;
                     }
                 }
@@ -884,7 +1115,38 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
                 texture->opaque_alpha_mips |= bit;
             }
         }
+        if (inspect_rgb) {
+            const uint64_t bit = uint64_t{1} << mip;
+            if (!nonblack) {
+                texture->nonblack_rgb_mips &= ~bit;
+            } else if (x == 0 && y == 0 && w == mip_width && h == mip_height) {
+                texture->nonblack_rgb_mips |= bit;
+            }
+        }
         ToRest(cmd, image);
+        if (TexaMaskEnabled() && inspect_rgb && !texture->desc.has_alpha) {
+            const bool full_mip = x == 0 && y == 0 && w == mip_width && h == mip_height;
+            if (texture->aem_mask == kNullTexture && full_mip &&
+                (!g.free_texture_slots.empty() || g.textures.size() < g.texture_slot_limit)) {
+                texture->aem_mask = CreateTexture({image.width, image.height, TextureFormat::Index8, image.mips, false});
+            }
+            if (texture->aem_mask != kNullTexture) {
+                std::vector<uint8_t> mask(static_cast<size_t>(w) * h);
+                for (uint32_t line = 0; line < h; ++line) {
+                    const auto *source = static_cast<const uint8_t *>(pixels) + static_cast<size_t>(line) * stride;
+                    for (uint32_t column = 0; column < w; ++column) {
+                        const auto *pixel = source + static_cast<size_t>(column) * 4;
+                        mask[static_cast<size_t>(line) * w + column] = (pixel[0] | pixel[1] | pixel[2]) != 0 ? 255 : 0;
+                    }
+                }
+                const uint64_t bit = uint64_t{1} << mip;
+                if (!UpdateTextureImpl(texture->aem_mask, mip, x, y, w, h, mask.data(), 0, false)) {
+                    texture->aem_mask_mips &= ~bit;
+                } else if (full_mip) {
+                    texture->aem_mask_mips |= bit;
+                }
+            }
+        }
     });
     return true;
 }
@@ -974,15 +1236,18 @@ MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32
         mesh.index_count = static_cast<uint32_t>(indices.size());
         mesh.last_draw_use = 0;
         mesh.bounds_known = false;
-        if (NearSafeFogEnabled() && std::all_of(indices.begin(), indices.end(),
-                                                [count = vertices.size()](uint32_t index) { return index < count; })) {
+        mesh.bounds_normal_inputs = false;
+        if (!vertices.empty() && std::all_of(indices.begin(), indices.end(),
+                                             [count = vertices.size()](uint32_t index) { return index < count; })) {
             std::array<float, 3> lo = {INFINITY, INFINITY, INFINITY};
             std::array<float, 3> hi = {-INFINITY, -INFINITY, -INFINITY};
             bool                 finite = true;
+            bool                 normal_inputs = true;
             for (const Vertex3D &vertex : vertices) {
                 for (int axis = 0; axis < 3; axis++) {
                     const float p = vertex.position[axis];
                     finite = finite && std::isfinite(p);
+                    normal_inputs = normal_inputs && NormalOrZeroFloat(p);
                     lo[axis] = std::min(lo[axis], p);
                     hi[axis] = std::max(hi[axis], p);
                 }
@@ -991,8 +1256,10 @@ MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32
                 mesh.bounds_min = lo;
                 mesh.bounds_max = hi;
                 mesh.bounds_known = true;
+                mesh.bounds_normal_inputs = normal_inputs;
             }
         }
+        SetMeshSkinBounds(mesh, vertices, indices);
         mesh.buffer = CreateBuffer(vertex_bytes + index_bytes,
                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -1020,6 +1287,8 @@ bool UpdateMeshVertices(MeshHandle handle, uint32_t first, std::span<const Verte
     }
     RunOnRenderThread([&] {
         mesh->bounds_known = false;
+        mesh->bounds_normal_inputs = false;
+        mesh->skin_bounds_known = false;
         UploadToBuffer(*mesh, first * sizeof(Vertex3D), vertices.data(), vertices.size_bytes());
     });
     return true;

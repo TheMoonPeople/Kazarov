@@ -529,7 +529,7 @@ void PushTextures(VkCommandBuffer cmd, VkPipelineLayout layout, const PushConsta
 bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureBinding &binding,
              const DrawState &state, PushConstants &push, bool ui = false, UiSide side = {},
              std::span<const Vertex2D> vertices = {}, const MeshConstants *mesh_constants = nullptr,
-             const Mesh *static_mesh = nullptr, uint32_t index_count = 0) {
+             const Mesh *static_mesh = nullptr, uint32_t index_count = 0, const Prog0Constants *prog0 = nullptr) {
     if (!g.in_frame) {
         return false;
     }
@@ -617,7 +617,18 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     }
     bool writes_color = (state.color_write_mask & kWriteRgba) != 0;
     // Fog in bit 0 and the TEXA mode above it, as the specialised pipelines index them.
-    uint32_t features = (state.fog ? 1 : 0) + (texa ? (state.texa_aem ? 4 : 2) : 0);
+    // AEM's per-texel black test is constant for a completely initialized nonblack texture.
+    static const bool specialize_nonblack = [] {
+        const char *setting = std::getenv("KZ_TEXA_NONBLACK");
+        return setting == nullptr || std::strcmp(setting, "0") != 0;
+    }();
+    const bool all_nonblack = specialize_nonblack && sampled_texture != nullptr &&
+                              !sampled_texture->render_target && sampled_texture->image.mips > 0 &&
+                              sampled_texture->image.mips <= 32 &&
+                              sampled_texture->nonblack_rgb_mips ==
+                                  ((uint64_t{1} << sampled_texture->image.mips) - 1);
+    const bool aem = state.texa_aem && !all_nonblack;
+    uint32_t   features = (state.fog ? 1 : 0) + (texa ? (aem ? 4 : 2) : 0);
     if (blend.transform == kSourceColor && tls.interpolation_tint == 0) {
         features += kColorFeatureCount;
     }
@@ -639,6 +650,32 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
                 selected_pipeline = g.near_safe_fog_pipelines[variant];
                 scope_pipeline = variant == 0 ? kNearSafeFogScope : kNearSafeFogAlphaScope;
                 break;
+            }
+        }
+    }
+    const bool prog0_fog_candidate = writes_color && family >= kFamilyMeshProg0 && mode == kTextureRgba &&
+                                     features == kColorFeatureCount + 1 &&
+                                     ((blend.slot == 0 && alpha == kAlphaVariantGEqual) ||
+                                      (blend.slot == 4 && alpha == kAlphaVariantNone));
+    if (prog0_fog_candidate && g.prog0_near_safe_fog_pipelines[0] != VK_NULL_HANDLE) {
+        ++g.prog0_fog_candidates;
+        if (family == kFamilyMeshProg0Skinned) {
+            ++g.prog0_fog_skinned;
+        } else if (static_mesh == nullptr || !static_mesh->bounds_known) {
+            ++g.prog0_fog_unknown;
+        } else if (mesh_constants == nullptr || prog0 == nullptr ||
+                   !Prog0FogIsNearSafe(*static_mesh, *mesh_constants, *prog0)) {
+            ++g.prog0_fog_unsafe;
+        } else {
+            for (std::size_t variant = 0; variant < g.prog0_near_safe_fog_pipelines.size(); ++variant) {
+                if (pipeline == g.prog0_near_safe_fog_bases[variant] &&
+                    g.prog0_near_safe_fog_pipelines[variant] != VK_NULL_HANDLE) {
+                    selected_pipeline = g.prog0_near_safe_fog_pipelines[variant];
+                    scope_pipeline = variant == 0 ? kProg0NearSafeFogAlphaScope : kProg0NearSafeFogBlendScope;
+                    ++g.prog0_fog_selected;
+                    ++g.counters.near_safe_prog0_fog;
+                    break;
+                }
             }
         }
     }
@@ -758,7 +795,7 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
         push.flags |= kPushFog;
     }
     if (texa) {
-        push.flags |= kPushTexa | (state.texa_aem ? kPushAem : 0);
+        push.flags |= kPushTexa | (aem ? kPushAem : 0);
     }
     if (!target.has_alpha) {
         push.flags |= kPushOpaqueTarget;
@@ -768,6 +805,16 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     }
     if (binding.filter == Filter::Linear) {
         push.flags |= kPushLinear;
+    }
+    if (texa && aem && binding.filter == Filter::Linear && tls.plane_draw == nullptr &&
+        sampled_texture != nullptr && !sampled_texture->render_target &&
+        sampled_texture->image.mips > 0 && sampled_texture->image.mips <= 32 &&
+        sampled_texture->aem_mask_mips == ((uint64_t{1} << sampled_texture->image.mips) - 1)) {
+        if (Texture *mask = LookupTexture(sampled_texture->aem_mask)) {
+            mask->last_draw_use = g.frame_serial;
+            push.palette_slot = sampled_texture->aem_mask & kSlotMask;
+            push.flags |= kPushAemMask;
+        }
     }
     push.alpha = state.alpha_ref | (static_cast<uint32_t>(state.alpha_func) & 7) << 8 |
                  static_cast<uint32_t>(state.alpha.fix) << 16 | static_cast<uint32_t>(state.texa_ta0) << 24;
@@ -1726,20 +1773,30 @@ void Draw2D(Primitive primitive, std::span<const Vertex2D> vertices, const Textu
 namespace detail {
 
 void Draw2DSided(Primitive primitive, std::span<const Vertex2D> vertices, const TextureBinding &binding,
-                 const DrawState &state, UiSide side, const Presentation2D *presentation) {
+                 const DrawState &state, UiSide side, const Presentation2D *presentation, bool target_space) {
     if (RecordingCalls()) {
         Draw2DEntry entry{primitive, std::pmr::vector<Vertex2D>(vertices.begin(), vertices.end(), RecordingResource()), binding,
                           state, side};
         if (presentation != nullptr) {
             entry.presentation_vertices.assign(presentation->vertices.begin(), presentation->vertices.end());
             entry.presentation_state = presentation->state;
+            entry.presentation_only = presentation->presentation_only;
+            entry.region_alpha_reset = presentation->region_alpha_reset;
+            if (presentation->bounded_region || presentation->region_alpha_reset) {
+                entry.presentation_region = g.list->active_presentation_region;
+            }
         }
         RecordEntry(std::move(entry));
         return;
     }
     RunOnRenderThread([&] {
+        if (target_space) {
+            // Explicit presentation rectangles already include their intended window coverage.
+            DrawPrepared(primitive, vertices, binding, state, false);
+            return;
+        }
         // Depth places a draw among the meshes, and an image of the frame lies where the frame does.
-        bool ui = state.depth_test == DepthTest::Always && !state.depth_write && !SamplesFrame(binding);
+        bool ui = !target_space && state.depth_test == DepthTest::Always && !state.depth_write && !SamplesFrame(binding);
         if (ui && g.target == kMainTarget && (side.x != 0 || side.y != 0)) {
             // An anchored draw is a piece of the HUD, never the frame's cover: nothing flanks it.
             DrawPrepared(primitive, vertices, binding, state, ui, side);
@@ -2199,7 +2256,7 @@ void DrawIndexedMesh(MeshHandle handle, uint32_t first_index, uint32_t index_cou
             phases.emplace(family == kFamilyMesh ? MeshPhaseClass::RetainedPlain : MeshPhaseClass::RetainedProg0);
         }
         if (!Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push,
-                     false, {}, {}, &constants, mesh, index_count)) {
+                     false, {}, {}, &constants, mesh, index_count, prog0)) {
             return;
         }
         if (phases) {
@@ -2269,7 +2326,7 @@ void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint3
             phases.emplace(MeshPhaseClass::Immediate);
         }
         if (!Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push, false, {}, {}, &constants, nullptr,
-                     static_cast<uint32_t>(indices.size()))) {
+                     static_cast<uint32_t>(indices.size()), prog0)) {
             return;
         }
         if (phases) {
@@ -2432,6 +2489,8 @@ bool CopyTexture(TextureHandle src, Rect src_rect, TextureHandle dst, int32_t ds
         MarkUsed(dst_texture);
         if (dst_texture != nullptr) {
             dst_texture->opaque_alpha_mips = 0;
+            dst_texture->nonblack_rgb_mips = 0;
+            dst_texture->aem_mask_mips = 0;
         }
         Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, VK_FILTER_NEAREST);
     });
@@ -2466,6 +2525,8 @@ bool BlitTexture(TextureHandle src, Rect src_rect, TextureHandle dst, Rect dst_r
         MarkUsed(dst_texture);
         if (dst_texture != nullptr) {
             dst_texture->opaque_alpha_mips = 0;
+            dst_texture->nonblack_rgb_mips = 0;
+            dst_texture->aem_mask_mips = 0;
         }
         Transfer(cmd, *src_image, src_offsets, *dst_image, dst_offsets, vk_filter);
     });
