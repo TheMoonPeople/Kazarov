@@ -81,6 +81,7 @@ RUN apt-get update \
         less \
         python3 \
         python3-venv \
+        python3-pytest \
         cmake \
         ninja-build \
         gdb \
@@ -149,7 +150,10 @@ RUN wget --tries=5 --timeout=30 --retry-connrefused -O /usr/local/bin/objdiff-cl
 # imports; m2c vendors its own pycparser.
 RUN python3 -m venv ${VIRTUAL_ENV} \
     && ${VIRTUAL_ENV}/bin/python -m pip install --no-cache-dir \
-        pycdlib "splat64[mips]==0.50.0" libclang "graphviz~=0.20.1" toml levenshtein
+        pycdlib==1.22.0 "splat64[mips]==0.50.0" libclang==18.1.1 graphviz==0.20.3 toml==0.10.2 levenshtein==0.27.5 \
+        colorama==0.4.6 crunch64==0.6.2 intervaltree==3.1.0 n64img==0.3.3 pygfxd==1.0.5 \
+        pylibyaml==0.1.0 pypng==0.20220715.0 pyyaml==6.0.3 rabbitizer==1.16.2 rapidfuzz==3.14.6 \
+        sortedcontainers==2.4.0 spimdisasm==1.42.4 tqdm==4.67.1
 
 # m2c and mwccps2-debugger, pinned by commit.
 RUN mkdir -p /opt/kazarov/m2c /opt/kazarov/mwccps2-debugger \
