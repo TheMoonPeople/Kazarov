@@ -128,9 +128,13 @@ vec4 SampleRgba() {
 }
 
 bool AlphaPasses(float alpha) {
-    int  ref   = kAlphaReference >= 0 ? kAlphaReference : int(pc.alpha & 0xFFu);
-    int  value = int(alpha * 128.0 + 0.5);
-    uint func  = kAlphaFunction >= 0 ? uint(kAlphaFunction) : (pc.alpha >> 8) & 7u;
+    uint func = kAlphaFunction >= 0 ? uint(kAlphaFunction) : (pc.alpha >> 8) & 7u;
+    // Internal RGB-only source-over specialization: tiny positive alpha must survive.
+    if (func == 8u) {
+        return alpha != 0.0;
+    }
+    int ref = kAlphaReference >= 0 ? kAlphaReference : int(pc.alpha & 0xFFu);
+    int value = int(alpha * 128.0 + 0.5);
     switch (func) {
         case 0u:
             return false;

@@ -1,0 +1,30 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0d812b0..0000000 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3447,20 +3447,22 @@ elseif(NINTENDO_SWITCH)
+     CheckEGL()
+-    if(HAVE_OPENGL_EGL)
++    if(HAVE_OPENGL_EGL AND NOT SDL_VULKAN)
+       sdl_link_dependency(opengl LIBS EGL stdc++ glapi drm_nouveau)
+     endif()
+ 
+     if(SDL_VULKAN)
+       set(SDL_VIDEO_VULKAN 1)
+       set(HAVE_VULKAN TRUE)
+-      sdl_link_dependency(vulkan LIBS vulkan_nouveau)
++      # Chronicle links Mesa's loaderless Vulkan archive into the final NRO.
+       if(SDL_RENDER_VULKAN)
+         set(SDL_VIDEO_RENDER_VULKAN 1)
+         set(HAVE_RENDER_VULKAN TRUE)
+       endif()
+     endif()
+ 
+     CheckOpenGLES()
+     CheckOpenGL()
+ 
+-    sdl_compile_options(PRIVATE -DSDL_VIDEO_STATIC_ANGLE)
++    if(NOT SDL_VULKAN)
++      sdl_compile_options(PRIVATE -DSDL_VIDEO_STATIC_ANGLE)
++    endif()
+   endif()

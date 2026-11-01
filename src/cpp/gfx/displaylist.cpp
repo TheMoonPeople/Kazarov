@@ -698,7 +698,7 @@ void BuildMatches(const DisplayList &list, const DisplayList &previous) {
     cache.blend.assign(list.records.size(), false);
     cache.draws_2d.clear();
     if (!list.camera_cut && !list.tagged_2d.empty()) {
-        std::unordered_map<InterpKey, std::vector<uint32_t> > before_2d;
+        std::unordered_map<InterpKey, std::vector<uint32_t>> before_2d;
         for (uint32_t entry : previous.tagged_2d) {
             before_2d[std::get<Draw2DEntry>(previous.entries[entry]).interpolation.key].push_back(entry);
         }
@@ -778,10 +778,10 @@ struct Overrides {
     // The vertex rewrites of meshes a matched draw uses (skinning), between the previous tick's
     // rewrite and this one's.
     std::unordered_map<const UpdateMeshEntry *, std::vector<Vertex3D>> poses;
-    std::vector<int32_t>                                           prog0_index; // per record, into prog0, or -1
-    std::vector<Prog0Constants>                                    prog0;
-    std::vector<int32_t>                                           palette_index; // per record, into palettes, or -1
-    std::vector<Prog0Palette>                                      palettes;
+    std::vector<int32_t>                                               prog0_index; // per record, into prog0, or -1
+    std::vector<Prog0Constants>                                        prog0;
+    std::vector<int32_t>                                               palette_index; // per record, into palettes, or -1
+    std::vector<Prog0Palette>                                          palettes;
 
     // Empties every container, so a reused Overrides holds nothing from its previous frame.
     void Clear() {
@@ -953,8 +953,8 @@ void PosesBetween(const DisplayList &list, const DisplayList &previous, float al
     std::vector<const UpdateMeshEntry *> before = RecordPoses(previous);
     const MatchCache                    &cache = list.cache;
     for (size_t i = 0; i < list.records.size(); i++) {
-        const MeshRecord &record = list.records[i];
-        int32_t           match = cache.match[i];
+        const MeshRecord      &record = list.records[i];
+        int32_t                match = cache.match[i];
         const UpdateMeshEntry *pose = now[i];
         if (match < 0 || pose == nullptr || out.poses.contains(pose)) {
             continue;
@@ -963,10 +963,10 @@ void PosesBetween(const DisplayList &list, const DisplayList &previous, float al
         if (old == nullptr || old->first != pose->first || old->vertices.size() != pose->vertices.size()) {
             continue;
         }
-        const auto                  &a = old->vertices;
-        const auto                  &b = pose->vertices;
-        bool                         same = true;
-        bool                         teleported = false;
+        const auto &a = old->vertices;
+        const auto &b = pose->vertices;
+        bool        same = true;
+        bool        teleported = false;
         for (size_t v = 0; v < b.size() && !teleported; v++) {
             float dx = b[v].position[0] - a[v].position[0];
             float dy = b[v].position[1] - a[v].position[1];
@@ -1066,12 +1066,81 @@ bool MoveProg0(const MeshRecord &record, const Mat4 &view_b, const Mat4 &view_i,
     return true;
 }
 
+enum class InterpolationPhase : size_t { Matches, Cameras, Sprites, Quads, Reset, Meshes, Poses, Count };
+
+struct InterpolationPhases {
+    using Clock = std::chrono::steady_clock;
+    static constexpr size_t kPhaseCount = static_cast<size_t>(InterpolationPhase::Count);
+    bool enabled = [] {
+        static const bool setting = [] {
+            const char *value = std::getenv("KZ_PERF_INTERPOLATE_PHASES");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        return setting;
+    }();
+    Clock::time_point last = enabled ? Clock::now() : Clock::time_point{};
+    std::array<double, kPhaseCount> milliseconds = {};
+    uint32_t palette_blends = 0;
+
+    void Mark(InterpolationPhase phase) {
+        if (!enabled) return;
+        const auto now = Clock::now();
+        milliseconds[static_cast<size_t>(phase)] = std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+    }
+
+    void Record(const DisplayList &list, const MatchCache &cache, const Overrides &out, bool cache_miss) const {
+        if (!enabled) return;
+        struct Aggregate {
+            uint64_t instance = 0;
+            uint32_t count = 0;
+            uint32_t misses = 0;
+            std::array<double, kPhaseCount> milliseconds = {};
+            std::array<double, 8> counts = {};
+        };
+        static Aggregate aggregate;
+        if (aggregate.instance != g.renderer_instance) {
+            aggregate = {};
+            aggregate.instance = g.renderer_instance;
+        }
+        aggregate.count++;
+        aggregate.misses += cache_miss ? 1u : 0u;
+        for (size_t i = 0; i < kPhaseCount; ++i) aggregate.milliseconds[i] += milliseconds[i];
+        aggregate.counts[0] += static_cast<double>(list.records.size());
+        aggregate.counts[1] += static_cast<double>(list.cameras.size());
+        aggregate.counts[2] += static_cast<double>(cache.draws_2d.size());
+        aggregate.counts[3] += static_cast<double>(list.palettes.size());
+        aggregate.counts[4] += static_cast<double>(palette_blends);
+        aggregate.counts[5] += static_cast<double>(out.palettes.size());
+        aggregate.counts[6] += static_cast<double>(out.prog0.size());
+        for (const auto &vertices : out.vertices) aggregate.counts[7] += static_cast<double>(vertices.size());
+        if (aggregate.count != 120) return;
+        const double scale = 1.0 / aggregate.count;
+        kz::Logf(kz::LogLevel::Info, "gfx",
+                 "interpolate phases calls={} hit={} miss={} match={:.3f} camera={:.3f} sprites={:.3f} quads={:.3f} reset={:.3f} meshes={:.3f} poses={:.3f} ms; records={:.1f} cameras={:.1f} pairs_2d={:.1f} source_palettes={:.1f} palette_blends={:.1f} palettes={:.1f} prog0={:.1f} vertices={:.1f}",
+                 aggregate.count, aggregate.count - aggregate.misses, aggregate.misses,
+                 aggregate.milliseconds[0] * scale, aggregate.milliseconds[1] * scale,
+                 aggregate.milliseconds[2] * scale, aggregate.milliseconds[3] * scale,
+                 aggregate.milliseconds[4] * scale, aggregate.milliseconds[5] * scale,
+                 aggregate.milliseconds[6] * scale, aggregate.counts[0] * scale,
+                 aggregate.counts[1] * scale, aggregate.counts[2] * scale,
+                 aggregate.counts[3] * scale, aggregate.counts[4] * scale,
+                 aggregate.counts[5] * scale, aggregate.counts[6] * scale,
+                 aggregate.counts[7] * scale);
+        aggregate = {};
+        aggregate.instance = g.renderer_instance;
+    }
+};
+
 void Interpolated(const DisplayList &list, const DisplayList &previous, float alpha, Overrides &out) {
     KZ_PROFILE_ZONE("Kazarov Interpolated");
-    if (list.cache.previous_serial != previous.serial) {
+    InterpolationPhases phases;
+    const bool cache_miss = list.cache.previous_serial != previous.serial;
+    if (cache_miss) {
         BuildMatches(list, previous);
     }
     const MatchCache &cache = list.cache;
+    phases.Mark(InterpolationPhase::Matches);
 
     std::vector<Mat4> views(list.cameras.size());
     std::vector<bool> moved(list.cameras.size(), false);
@@ -1086,7 +1155,9 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
         }
     }
 
+    phases.Mark(InterpolationPhase::Cameras);
     MoveSprites(list, views, moved, out);
+    phases.Mark(InterpolationPhase::Sprites);
     for (const auto &pair : cache.draws_2d) {
         const auto           &draw = std::get<Draw2DEntry>(list.entries[pair[0]]);
         const auto           &before = std::get<Draw2DEntry>(previous.entries[pair[1]]);
@@ -1110,6 +1181,7 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
         }
     }
 
+    phases.Mark(InterpolationPhase::Quads);
     out.index.assign(list.records.size(), -1);
     out.constants.clear();
     out.vertex_index.assign(list.records.size(), -1);
@@ -1130,6 +1202,7 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
     Mat4                    clip_projection = {};
     Mat4                    clip_middle = {};
     Mat4                    world_to_clip = {};
+    phases.Mark(InterpolationPhase::Reset);
     for (const Entry &entry : list.entries) {
         const MeshEntry *mesh = std::get_if<MeshEntry>(&entry);
         if (mesh == nullptr) {
@@ -1171,6 +1244,7 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
                     (previous.prog0_blocks[static_cast<size_t>(earlier.prog0)].flags & kProg0Skinned) != 0) {
                     const Prog0Palette &newest_palette = list.palettes[static_cast<size_t>(mesh->palette)];
                     Prog0Palette       &blended = out.palettes.emplace_back();
+                    if (phases.enabled) phases.palette_blends++;
                     BlendProg0Bones(previous.palettes[static_cast<size_t>(earlier.palette)], newest_palette, alpha,
                                     record.teleport_distance, blended);
                     if (std::memcmp(&blended, &newest_palette, sizeof blended) != 0) {
@@ -1216,7 +1290,10 @@ void Interpolated(const DisplayList &list, const DisplayList &previous, float al
         out.constants.push_back(constants);
     }
 
+    phases.Mark(InterpolationPhase::Meshes);
     PosesBetween(list, previous, alpha, out);
+    phases.Mark(InterpolationPhase::Poses);
+    phases.Record(list, cache, out, cache_miss);
 }
 
 // A grab of the frame (a copy or blit out of the main target) is taken by the canonical render at
@@ -1304,7 +1381,7 @@ bool CoversDestination(const CopyEntry &entry, const TextureInfo &info) {
     PixelSpan      src_y = MappedSpan(entry.src_rect.y, entry.src_rect.h, src_mapping.scale_y, src_mapping.offset_y,
                                       src_info->pixel_height);
     // A blit stretches whatever the source spans; a copy needs a source at least as large as the destination.
-    bool copy = entry.kind == CopyEntry::Copy;
+    bool    copy = entry.kind == CopyEntry::Copy;
     int32_t need_x = copy ? static_cast<int32_t>(info.pixel_width) : 1;
     int32_t need_y = copy ? static_cast<int32_t>(info.pixel_height) : 1;
     return src_x.high - src_x.low >= need_x && src_y.high - src_y.low >= need_y;
@@ -1350,7 +1427,7 @@ void GrabAgain(const CopyEntry &entry) {
         return;
     }
     std::optional<TextureInfo> info = GetTextureInfo(entry.dst);
-    bool covers = info && CoversDestination(entry, *info);
+    bool                       covers = info && CoversDestination(entry, *info);
     // A self-grab reads the twin it writes, so the twin needs the destination's contents.
     TextureHandle dst = ActivateGrabTwin(entry.dst, entry.src == entry.dst || !covers);
     if (dst == kNullTexture) {
@@ -1499,6 +1576,197 @@ void TraceInterpolation(const DisplayList &list, const DisplayList *previous, co
     std::fclose(file);
 }
 
+// The draw's Vu_prog0 block, as the replay sees it.
+const Prog0Constants *ReplayProg0(const MeshEntry &e, const DisplayList &list, const Overrides *overrides) {
+    const Prog0Constants *prog0 = e.prog0 >= 0 ? &list.prog0_blocks[static_cast<size_t>(e.prog0)] : nullptr;
+    if (prog0 != nullptr && overrides != nullptr && overrides->prog0_index[e.record] >= 0) {
+        prog0 = &overrides->prog0[static_cast<size_t>(overrides->prog0_index[e.record])];
+    }
+    return prog0;
+}
+
+void ReplayMesh(const MeshEntry &e, const DisplayList &list, bool canonical, const Overrides *overrides,
+                const DrawState &state) {
+    const MeshConstants *constants = &e.constants;
+    if (overrides != nullptr && overrides->index[e.record] >= 0) {
+        constants = &overrides->constants[overrides->index[e.record]];
+    }
+    const Prog0Constants *prog0 = ReplayProg0(e, list, overrides);
+    const Prog0Palette   *palette = e.palette >= 0 ? &list.palettes[static_cast<size_t>(e.palette)] : nullptr;
+    if (palette != nullptr && overrides != nullptr && overrides->palette_index[e.record] >= 0) {
+        palette = &overrides->palettes[static_cast<size_t>(overrides->palette_index[e.record])];
+    }
+    TextureBinding binding = GrabbedBinding(e.binding, canonical);
+    if (e.mesh != kNullMesh) {
+        if (prog0 != nullptr) {
+            DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, state, nullptr, palette);
+        } else {
+            DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, state);
+        }
+    } else {
+        std::span<const Vertex3D> vertices = e.vertices;
+        if (overrides != nullptr && overrides->vertex_index[e.record] >= 0) {
+            vertices = overrides->vertices[overrides->vertex_index[e.record]];
+        }
+        if (prog0 != nullptr) {
+            DrawMeshImmediateProg0(vertices, e.indices, *constants, *prog0, binding, state, nullptr, palette);
+        } else {
+            DrawMeshImmediate(vertices, e.indices, *constants, binding, state);
+        }
+    }
+}
+
+bool OcclusionPrepassEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KZ_OCCLUSION_PREPASS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+// The least vertex alpha, in GS units, a prog0 draw's Vu_prog0 lighting can give, or a negative value when no bound is
+// known: lights, point lights and specular only add to the ambient (or unlit) alpha when their alphas are not negative,
+// and per-vertex colour can lower it.
+float Prog0AlphaLowerBound(const Prog0Constants &p0, uint32_t face) {
+    if ((face & kProg0FaceColor) != 0) {
+        return -1.0f;
+    }
+    const bool unlit = (p0.flags & kProg0Unlit) != 0 || (face & kProg0FaceNoNormal) != 0;
+    if (!unlit) {
+        for (int light = 0; light < 4; light++) {
+            if (!(p0.light_color[light][3] >= 0.0f) ||
+                ((p0.flags & kProg0PointLights) != 0 && !(p0.point_color[light][3] >= 0.0f))) {
+                return -1.0f;
+            }
+        }
+        if ((p0.flags & (kProg0Real | kProg0PointLights)) == kProg0Real && !(p0.specular[3] >= 0.0f)) {
+            return -1.0f;
+        }
+    }
+    const float base = unlit ? p0.object_color[3] : p0.ambient[3];
+    const float lower = base * p0.diffuse[3];
+    // The vertex shader truncates alpha to a whole GS unit.
+    return base >= 0.0f && p0.diffuse[3] >= 0.0f && std::isfinite(lower) ? std::floor(std::min(lower, 255.0f)) : -1.0f;
+}
+
+// Whether a draw samples an RGBA texture whose every texel has full alpha, so its alpha is the vertex alpha.
+bool SamplesOpaqueTexture(const TextureBinding &binding) {
+    if (binding.texture == kNullTexture || binding.texture == kMainTarget || binding.texture == kPreviousFrame ||
+        binding.ignore_alpha) {
+        return false;
+    }
+    const Texture *texture = LookupTexture(binding.texture);
+    return texture != nullptr && !texture->render_target && texture->desc.format == TextureFormat::Rgba8 &&
+           texture->desc.has_alpha && texture->image.mips > 0 && texture->image.mips <= 32 &&
+           texture->opaque_alpha_mips == (uint64_t{1} << texture->image.mips) - 1;
+}
+
+// A draw whose colour and depth replace whatever lies behind it on the main target.
+bool Occludes(const MeshEntry &e, const DisplayList &list, const Overrides *overrides) {
+    const DrawState &state = e.state;
+    if (!state.depth_write || (state.depth_test != DepthTest::GEqual && state.depth_test != DepthTest::Always) ||
+        state.stencil_test || state.color_write_mask != kWriteRgba ||
+        (e.mesh == kNullMesh && (e.vertices.empty() || e.indices.empty()))) {
+        return false;
+    }
+    const Prog0Constants *prog0 = ReplayProg0(e, list, overrides);
+    const bool            textured = e.binding.texture != kNullTexture;
+    // The least alpha the draw's fragments can have, in GS units, when it is known.
+    float least = -1.0f;
+    if (prog0 != nullptr && (!textured || SamplesOpaqueTexture(e.binding))) {
+        least = Prog0AlphaLowerBound(*prog0, state.prog0_face);
+    }
+    const bool alpha_tests = state.alpha_test && state.alpha_func != AlphaFunc::Always &&
+                             !(state.alpha_func == AlphaFunc::GEqual && (state.alpha_ref == 0 || least >= state.alpha_ref));
+    if (alpha_tests) {
+        return false;
+    }
+    // A source-over blend of alpha one or more is its source.
+    return !state.blend || (state.alpha.a == 0 && state.alpha.b == 1 && state.alpha.c == 0 && state.alpha.d == 1 && least >= 128.0f);
+}
+
+/**
+ * The opening stretch of a replay on the main target, from its clear up to the first entry that can observe the
+ * target's contents before the frame ends. Drawing the stretch's occluders' depth first lets the depth test reject
+ * what they will cover.
+ */
+struct OcclusionPlan {
+    size_t              start = 0;          /**< First entry after the clear; the pre-pass runs before it. */
+    size_t              first_occluder = 0; /**< Entries before it, from start, lie behind every occluder. */
+    std::vector<size_t> occluders;          /**< Occluding draws in replay order. */
+
+    // Whether a draw before every occluder may test against them, since an occluder covering it replaces it.
+    [[nodiscard]] bool Background(size_t index) const {
+        return !occluders.empty() && index >= start && index < first_occluder;
+    }
+};
+
+OcclusionPlan PlanOcclusion(const DisplayList &list, const Overrides *overrides) {
+    OcclusionPlan plan;
+    if (!OcclusionPrepassEnabled()) {
+        return plan;
+    }
+    TextureHandle target = kMainTarget;
+    bool          open = false;
+    for (size_t index = 0; index < list.entries.size(); index++) {
+        const Entry &entry = list.entries[index];
+        if (!open) {
+            if (const auto *target_entry = std::get_if<TargetEntry>(&entry)) {
+                target = target_entry->target;
+                continue;
+            }
+            const auto *clear = std::get_if<ClearEntry>(&entry);
+            // A full clear of the main target's depth to the far value gives the depth the pre-pass starts from.
+            if (clear != nullptr && target == kMainTarget && clear->depth && !clear->has_rect && clear->z == 0.0f &&
+                !clear->stencil) {
+                open = true;
+                plan.start = index + 1;
+                continue;
+            }
+            if (std::holds_alternative<MeshEntry>(entry) || std::holds_alternative<Draw2DEntry>(entry)) {
+                return {};
+            }
+            continue;
+        }
+        const auto *mesh = std::get_if<MeshEntry>(&entry);
+        const auto *sprite = std::get_if<Draw2DEntry>(&entry);
+        const bool  stencils = (mesh != nullptr && mesh->state.stencil_test) || (sprite != nullptr && sprite->state.stencil_test);
+        if ((mesh == nullptr && sprite == nullptr && !std::holds_alternative<UpdateTextureEntry>(entry)) || stencils) {
+            break;
+        }
+        if (mesh != nullptr && Occludes(*mesh, list, overrides)) {
+            if (plan.occluders.empty()) {
+                plan.first_occluder = index;
+            }
+            plan.occluders.push_back(index);
+        }
+    }
+    if (plan.occluders.empty()) {
+        return {};
+    }
+    return plan;
+}
+
+// A background draw tested against the occluders drawn ahead of it: where one covers it, it is replaced anyway.
+DrawState BehindOccluders(const DrawState &state) {
+    DrawState tested = state;
+    if (tested.depth_test == DepthTest::Always && !tested.depth_write) {
+        tested.depth_test = DepthTest::GEqual;
+    }
+    return tested;
+}
+
+// Draws the occluders' depth alone, in their order and with their own tests.
+void DrawOccluderDepth(const OcclusionPlan &plan, const DisplayList &list, bool canonical, const Overrides *overrides) {
+    KZ_PROFILE_ZONE("Kazarov occlusion prepass");
+    for (const size_t index : plan.occluders) {
+        const auto &e = std::get<MeshEntry>(list.entries[index]);
+        DrawState   depth_only = e.state;
+        depth_only.color_write_mask = 0;
+        ReplayMesh(e, list, canonical, overrides, depth_only);
+    }
+}
+
 void Replay(const DisplayList &list, bool canonical, const Overrides *overrides, bool host = false,
             bool tint = false, InterpKey suppressed_2d_key = 0) {
     AssertDeviceThread(__func__);
@@ -1518,7 +1786,12 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
     if (canonical && ReplayBucketsEnabled()) {
         buckets.emplace();
     }
-    for (const Entry &entry : list.entries) {
+    const OcclusionPlan occlusion = PlanOcclusion(list, overrides);
+    for (size_t index = 0; index < list.entries.size(); index++) {
+        const Entry &entry = list.entries[index];
+        if (!occlusion.occluders.empty() && index == occlusion.start) {
+            DrawOccluderDepth(occlusion, list, canonical, overrides);
+        }
         tls.interpolation_tint = 0;
         std::visit(
             [&](const auto &e) {
@@ -1531,9 +1804,9 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         e.interpolation.key == suppressed_2d_key) {
                         return;
                     }
-                    std::span<const Vertex2D>    vertices = e.vertices;
-                    const DrawState             *state = &e.state;
-                    UiSide                       side = e.side;
+                    std::span<const Vertex2D> vertices = e.vertices;
+                    const DrawState          *state = &e.state;
+                    UiSide                    side = e.side;
                     if (!canonical && !e.presentation_vertices.empty()) {
                         vertices = e.presentation_vertices;
                         state = &e.presentation_state;
@@ -1548,45 +1821,13 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         tls.interpolation_tint = overrides && overrides->sprites.contains(&e) ? 4 : (e.state.depth_test == DepthTest::Always || e.state.screen_space) ? 3
                                                                                                                                                                       : 2;
                     }
-                    Draw2DSided(e.primitive, vertices, GrabbedBinding(e.binding, canonical), *state, side);
+                    const DrawState tested = occlusion.Background(index) ? BehindOccluders(*state) : *state;
+                    Draw2DSided(e.primitive, vertices, GrabbedBinding(e.binding, canonical), tested, side);
                 } else if constexpr (std::is_same_v<T, MeshEntry>) {
                     if (tint && !canonical && CurrentRenderTarget() == kMainTarget) {
                         tls.interpolation_tint = MeshTint(e, list, overrides);
                     }
-                    const MeshConstants *constants = &e.constants;
-                    if (overrides != nullptr && overrides->index[e.record] >= 0) {
-                        constants = &overrides->constants[overrides->index[e.record]];
-                    }
-                    const Prog0Constants *prog0 =
-                        e.prog0 >= 0 ? &list.prog0_blocks[static_cast<size_t>(e.prog0)] : nullptr;
-                    if (prog0 != nullptr && overrides != nullptr && overrides->prog0_index[e.record] >= 0) {
-                        prog0 = &overrides->prog0[static_cast<size_t>(overrides->prog0_index[e.record])];
-                    }
-                    const Prog0Palette *palette =
-                        e.palette >= 0 ? &list.palettes[static_cast<size_t>(e.palette)] : nullptr;
-                    if (palette != nullptr && overrides != nullptr && overrides->palette_index[e.record] >= 0) {
-                        palette = &overrides->palettes[static_cast<size_t>(overrides->palette_index[e.record])];
-                    }
-                    TextureBinding binding = GrabbedBinding(e.binding, canonical);
-                    if (e.mesh != kNullMesh) {
-                        if (prog0 != nullptr) {
-                            DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, e.state,
-                                          nullptr, palette);
-                        } else {
-                            DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, e.state);
-                        }
-                    } else {
-                        std::span<const Vertex3D> vertices = e.vertices;
-                        if (overrides != nullptr && overrides->vertex_index[e.record] >= 0) {
-                            vertices = overrides->vertices[overrides->vertex_index[e.record]];
-                        }
-                        if (prog0 != nullptr) {
-                            DrawMeshImmediateProg0(vertices, e.indices, *constants, *prog0, binding, e.state,
-                                                   nullptr, palette);
-                        } else {
-                            DrawMeshImmediate(vertices, e.indices, *constants, binding, e.state);
-                        }
-                    }
+                    ReplayMesh(e, list, canonical, overrides, occlusion.Background(index) ? BehindOccluders(e.state) : e.state);
                 } else if constexpr (std::is_same_v<T, ClearEntry>) {
                     if (e.stencil) {
                         ClearStencil(e.stencil_value, e.has_rect ? &e.rect : nullptr);
@@ -1829,8 +2070,8 @@ void BlendProg0Bones(const Prog0Palette &before, const Prog0Palette &after, floa
         if (std::memcmp(before.bones[slot], after.bones[slot], sizeof after.bones[slot]) == 0) {
             continue;
         }
-        Mat4 a = BoneMatrix(before.bones[slot]);
-        Mat4 b = BoneMatrix(after.bones[slot]);
+        Mat4  a = BoneMatrix(before.bones[slot]);
+        Mat4  b = BoneMatrix(after.bones[slot]);
         float dx = b[12] - a[12];
         float dy = b[13] - a[13];
         float dz = b[14] - a[14];
@@ -2103,6 +2344,8 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
         if (!g.canonical_newest) {
             return;
         }
+        const bool timing = FrameTimingEnabled();
+        const auto preparation_started = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // Reused across frames for its capacity; RenderList runs on one thread.
         static Overrides overrides;
         overrides.Clear();
@@ -2112,7 +2355,8 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
             KZ_PROFILE_ZONE("Kazarov interpolate");
             Interpolated(list, *options.previous, std::max(alpha, 0.0f), overrides);
         }
-        if (!OpenListFrame(false, options.present, list.needs_base)) {
+        const double preparation_ms = timing ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preparation_started).count() : 0.0;
+        if (!OpenListFrame(false, options.present, list.needs_base, preparation_ms)) {
             return;
         }
         static const bool env_tint = [] {

@@ -630,7 +630,7 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
                             : g.dynamic_color_write_mask ? PipelineIndex(family, blend.slot, mode, alpha, features)
                                                          : NoColorPipelineIndex(family, mode);
     uint32_t     scope_pipeline = pipeline;
-    VkPipeline   selected_pipeline = PipelineAt(pipeline);
+    VkPipeline   selected_pipeline = PipelineByIndex(pipeline);
     if (g.near_safe_fog_pipelines[0] != VK_NULL_HANDLE && family == kFamilyMesh &&
         static_mesh != nullptr && mesh_constants != nullptr) {
         for (uint32_t variant = 0; variant < g.near_safe_fog_pipelines.size(); variant++) {
@@ -641,6 +641,17 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
                 break;
             }
         }
+    }
+    const auto unorm_rgba = [](VkFormat format) {
+        return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM;
+    };
+    if (g.zero_alpha_noop_pipeline != VK_NULL_HANDLE && pipeline == g.zero_alpha_noop_base &&
+        g.dynamic_color_write_mask && !state.depth_write && !state.stencil_test &&
+        (state.color_write_mask & kWriteRgba) == (kWriteRgba & ~kWriteAlpha) &&
+        state.blend && state.alpha.a == 0 && state.alpha.b == 1 && state.alpha.c == 0 && state.alpha.d == 1 &&
+        sampled_texture != nullptr && unorm_rgba(sampled_texture->image.format) && unorm_rgba(target.color->format)) {
+        selected_pipeline = g.zero_alpha_noop_pipeline;
+        scope_pipeline = kZeroAlphaNoopScope;
     }
     if (tls.plane_draw != nullptr) {
         selected_pipeline = g.depth_planes_pipeline;
@@ -1293,8 +1304,10 @@ UiSide AnchoredSide(std::span<const Vertex2D> vertices) {
     float  x = (low_x + high_x) * 0.5f;
     float  y = (low_y + high_y) * 0.5f;
     UiSide side;
-    side.x = x < anchor.left_until ? -1 : x >= anchor.right_from ? 1 : 0;
-    side.y = y < anchor.top_until ? -1 : y >= anchor.bottom_from ? 1 : 0;
+    side.x = x < anchor.left_until ? -1 : x >= anchor.right_from ? 1
+                                                                 : 0;
+    side.y = y < anchor.top_until ? -1 : y >= anchor.bottom_from ? 1
+                                                                 : 0;
     side.scissor = (side.x != 0 || side.y != 0) && anchor.scissor;
     side.max_aspect = anchor.max_aspect;
     return side;
@@ -1499,8 +1512,8 @@ void EndMeshAlphaDiagnosticCanonicalReplay() {
 }
 
 LogicalMapping MainMapping(uint32_t width, uint32_t height) {
-    float w = static_cast<float>(width);
-    float h = static_cast<float>(height);
+    float       w = static_cast<float>(width);
+    float       h = static_cast<float>(height);
     const float logical_w = g.config.logical_width;
     const float logical_h = g.config.logical_height;
     const float aspect = g.config.display_aspect;
@@ -1682,6 +1695,11 @@ LogicalMapping GetLogicalMapping(TextureHandle handle) {
 LogicalMapping GetUiMapping(TextureHandle handle) {
     LogicalMapping mapping = GetLogicalMapping(handle);
     return handle == kMainTarget ? UiMapping(mapping) : mapping;
+}
+
+LogicalMapping GetPresentationMapping(bool ui) {
+    LogicalMapping mapping = MainMapping(g.swapchain.extent.width, g.swapchain.extent.height);
+    return ui ? UiMapping(mapping) : mapping;
 }
 
 LogicalRect VisibleLogicalRect(TextureHandle handle) {

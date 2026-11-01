@@ -1,0 +1,12 @@
+diff --git a/src/nouveau/vulkan/nvk_heap.c b/src/nouveau/vulkan/nvk_heap.c
+--- a/src/nouveau/vulkan/nvk_heap.c
++++ b/src/nouveau/vulkan/nvk_heap.c
+@@ -22,5 +22,8 @@
+ {
+    VkResult result = nvk_mem_arena_init(dev, &heap->arena, mem_flags, map_flags,
+                                         contiguous, NVK_MEM_ARENA_MAX_SIZE);
++   if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && contiguous)
++      result = nvk_mem_arena_init(dev, &heap->arena, mem_flags, map_flags,
++                                  contiguous, NVK_MEM_ARENA_MAX_SIZE >> 2);
+    if (result != VK_SUCCESS)
+       return result;

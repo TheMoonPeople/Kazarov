@@ -102,6 +102,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KAZAROV_FFMPEG_LIB");
     println!("cargo:rerun-if-changed=src/c/movie_mux.c");
     if let Some(include) = std::env::var_os("KAZAROV_FFMPEG_INCLUDE") {
+        let include = PathBuf::from(include);
+        println!("cargo:rerun-if-changed={}", include.display());
         cc::Build::new()
             .file("src/c/movie_mux.c")
             .include(include)

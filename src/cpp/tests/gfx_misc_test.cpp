@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -46,8 +48,8 @@ TEST(GfxMisc, PipelineCache) {
         ASSERT_TRUE(fixture.progress_calls > 0);
         ASSERT_TRUE(fixture.progress_done == fixture.progress_total);
         ASSERT_TRUE(fixture.progress_total == gfx::PipelineCount());
-        ASSERT_TRUE(std::filesystem::exists(cache));
     }
+    ASSERT_TRUE(std::filesystem::exists(cache));
     const auto read_cache = [&] {
         std::ifstream file(cache, std::ios::binary);
         return std::vector<char>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
@@ -114,6 +116,214 @@ TEST(GfxMisc, TextureLimits) {
     uint32_t alpha[3] = {Rgba(0, 0, 0, 0x80), Rgba(0, 0, 0, 0x40), Rgba(0, 0, 0, 0xFF)};
     gfx::ConvertPs2Alpha(alpha, 3);
     ASSERT_TRUE(alpha[0] >> 24 == 0xFF && alpha[1] >> 24 == 0x80 && alpha[2] >> 24 == 0xFF);
+}
+
+TEST(GfxMisc, MainExtentHeightLimitPreservesAspectAndNativeOutput) {
+    const auto expect_extent = [](VkExtent2D output, uint32_t limit, VkExtent2D expected) {
+        const auto actual = gfx::detail::DesiredMainExtent(output, limit);
+        EXPECT_EQ(actual.width, expected.width);
+        EXPECT_EQ(actual.height, expected.height);
+    };
+    expect_extent({1280, 720}, 0, {1280, 720});
+    expect_extent({1280, 720}, 720, {1280, 720});
+    expect_extent({1280, 720}, 1080, {1280, 720});
+    expect_extent({1280, 720}, 480, {848, 477});
+    expect_extent({1920, 1080}, 480, {848, 477});
+    expect_extent({720, 1280}, 480, {270, 480});
+    expect_extent({0, 720}, 480, {0, 720});
+    expect_extent({1280, 0}, 480, {1280, 0});
+
+    for (const VkExtent2D output : {
+             VkExtent2D{721,                                  1283},
+             VkExtent2D{1,                                    1283},
+             VkExtent2D{std::numeric_limits<uint32_t>::max(),
+                        std::numeric_limits<uint32_t>::max() - 1  }
+    }) {
+        SCOPED_TRACE(::testing::Message() << output.width << "x" << output.height);
+        const auto capped = gfx::detail::DesiredMainExtent(output, 480);
+        EXPECT_GT(capped.width, 0u);
+        EXPECT_GT(capped.height, 0u);
+        EXPECT_LE(capped.width, output.width);
+        EXPECT_LE(capped.height, 480u);
+        const auto scaled_width = static_cast<uint64_t>(capped.width) * output.height;
+        const auto scaled_height = static_cast<uint64_t>(capped.height) * output.width;
+        const auto aspect_error = scaled_width > scaled_height ? scaled_width - scaled_height : scaled_height - scaled_width;
+        EXPECT_LE(aspect_error, static_cast<uint64_t>(std::max(output.width, output.height)));
+    }
+}
+
+TEST(GfxMisc, CappedCanonicalEndpointPreservesPixelsAndLifetime) {
+    std::optional<gfx::CanonicalImageToken> first_renderer_token;
+    GfxOptions                              options;
+    options.offscreen = true;
+    options.logical_width = 64;
+    options.logical_height = 48;
+    options.main_height_limit = 480;
+    {
+        GfxFixture fixture(1280, 720, 2.0f, options);
+        gfx::SetFrameLayout({.aspect = gfx::AspectMode::Letterbox, .ui_scale = 1.25f});
+        const auto shared = gfx::CreateRenderTarget(5, 7, true, true);
+        const auto auxiliary = gfx::CreateRenderTarget(16, 8, true);
+        ASSERT_NE(shared, gfx::kNullTexture);
+        ASSERT_NE(auxiliary, gfx::kNullTexture);
+        const auto expect_targets = [&](uint32_t width, uint32_t height) {
+            const auto &context = gfx::detail::g;
+            for (const auto *image : {&context.main_color[0], &context.main_color[1], &context.display_color,
+                                      &context.main_depth, &context.display_depth}) {
+                EXPECT_NE(image->image, VK_NULL_HANDLE);
+                EXPECT_EQ(image->width, width);
+                EXPECT_EQ(image->height, height);
+            }
+            const auto target = gfx::GetTextureInfo(shared);
+            ASSERT_TRUE(target.has_value());
+            EXPECT_TRUE(target->shares_main_depth);
+            EXPECT_EQ(target->pixel_width, width);
+            EXPECT_EQ(target->pixel_height, height);
+        };
+        const auto expect_auxiliary = [&](uint32_t width, uint32_t height) {
+            const auto target = gfx::GetTextureInfo(auxiliary);
+            ASSERT_TRUE(target.has_value());
+            EXPECT_EQ(target->pixel_width, width);
+            EXPECT_EQ(target->pixel_height, height);
+        };
+        expect_targets(848, 477);
+        EXPECT_FLOAT_EQ(gfx::RenderScale(), 2.0f);
+        expect_auxiliary(32, 16);
+        gfx::SetRenderScale(3.0f);
+        expect_targets(848, 477);
+        expect_auxiliary(48, 24);
+        gfx::SetRenderScale(2.0f);
+
+        const auto raster_mapping = gfx::GetLogicalMapping(gfx::kMainTarget);
+        const auto output_mapping = gfx::GetPresentationMapping();
+        const auto ui_mapping = gfx::GetPresentationMapping(true);
+        EXPECT_EQ(raster_mapping.pixel_width, 848u);
+        EXPECT_EQ(raster_mapping.pixel_height, 477u);
+        EXPECT_EQ(output_mapping.pixel_width, 1280u);
+        EXPECT_EQ(output_mapping.pixel_height, 720u);
+        EXPECT_EQ(ui_mapping.pixel_width, 1280u);
+        EXPECT_EQ(ui_mapping.pixel_height, 720u);
+        EXPECT_FLOAT_EQ(output_mapping.scale_x * 32 + output_mapping.offset_x, 640);
+        EXPECT_FLOAT_EQ(output_mapping.scale_y * 24 + output_mapping.offset_y, 360);
+        EXPECT_FLOAT_EQ(ui_mapping.scale_x, output_mapping.scale_x * 1.25f);
+        EXPECT_FLOAT_EQ(ui_mapping.scale_y, output_mapping.scale_y * 1.25f);
+        EXPECT_FLOAT_EQ(ui_mapping.scale_x * 32 + ui_mapping.offset_x, 640);
+        EXPECT_FLOAT_EQ(ui_mapping.scale_y * 24 + ui_mapping.offset_y, 360);
+
+        const std::array<uint8_t, 4> seed_color{13, 29, 47, 73};
+        gfx::BeginRecording();
+        gfx::Clear(true, seed_color.data(), true, 0);
+        const auto seed = gfx::EndRecording();
+        ASSERT_NE(seed, nullptr);
+        EXPECT_FALSE(gfx::CaptureCanonicalImage().has_value());
+        EXPECT_FALSE(gfx::PresentCanonicalImage({}));
+        ASSERT_TRUE(gfx::RenderList(*seed, 1, {.canonical = true}));
+        first_renderer_token = gfx::CaptureCanonicalImage();
+        ASSERT_TRUE(first_renderer_token.has_value());
+
+        gfx::BeginRecording();
+        gfx::Clear(true, seed_color.data(), true, 0);
+        const auto                canonical_quad = Quad(0, 0, 32, 48, {128, 0, 0, 128});
+        const auto                display_quad = Quad(0, 0, 64, 48, {0, 0, 128, 128});
+        const gfx::Presentation2D presentation{display_quad, {}};
+        gfx::Draw2D(gfx::Primitive::Quads, canonical_quad, {}, {}, &presentation);
+        const auto game = gfx::EndRecording();
+        ASSERT_NE(game, nullptr);
+        ASSERT_TRUE(gfx::RenderList(*game, 1, {.canonical = true}));
+        const auto token = gfx::CaptureCanonicalImage();
+        ASSERT_TRUE(token.has_value());
+        EXPECT_NE(token, first_renderer_token);
+        EXPECT_FALSE(gfx::PresentCanonicalImage(*first_renderer_token));
+        ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+        const auto canonical = fixture.pixels;
+        ASSERT_EQ(fixture.width, 848u);
+        ASSERT_EQ(fixture.height, 477u);
+        std::vector<uint8_t> history;
+        uint32_t             history_width = 0;
+        uint32_t             history_height = 0;
+        ASSERT_TRUE(gfx::ReadbackTexture(gfx::kMainTarget, history, history_width, history_height));
+        ASSERT_NE(history, canonical);
+        const auto generation = gfx::detail::g.canonical_target_generation;
+        const auto images = [&] {
+            const auto &context = gfx::detail::g;
+            return std::array{context.main_color[0].image, context.main_color[1].image, context.display_color.image,
+                              context.main_depth.image, context.display_depth.image};
+        };
+        const auto original_images = images();
+        for (int recording = 0; recording < 3; ++recording) {
+            gfx::BeginRecording();
+            EXPECT_FALSE(gfx::CaptureCanonicalImage().has_value());
+            ASSERT_NE(gfx::EndRecording(), nullptr);
+            EXPECT_EQ(images(), original_images);
+            EXPECT_EQ(gfx::detail::g.canonical_target_generation, generation);
+            EXPECT_EQ(gfx::CaptureCanonicalImage(), token);
+        }
+        ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+        EXPECT_EQ(fixture.pixels, canonical);
+        std::vector<uint8_t> retained_history;
+        ASSERT_TRUE(gfx::ReadbackTexture(gfx::kMainTarget, retained_history, history_width, history_height));
+        EXPECT_EQ(retained_history, history);
+
+        ASSERT_TRUE(gfx::RenderList(*game, 1, {.present = true}));
+        ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+        EXPECT_NE(fixture.pixels, canonical);
+        EXPECT_EQ(gfx::CaptureCanonicalImage(), token);
+        ASSERT_TRUE(gfx::PresentCanonicalImage(*token));
+        ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+        EXPECT_EQ(fixture.pixels, canonical);
+
+        gfx::BeginRecording(gfx::RecordingKind::Overlay);
+        const auto overlay_quad = Quad(20, 12, 16, 12, {0, 128, 0, 128});
+        gfx::Draw2D(gfx::Primitive::Quads, overlay_quad, {}, {});
+        const auto overlay = gfx::EndRecording();
+        ASSERT_NE(overlay, nullptr);
+        ASSERT_TRUE(gfx::PresentCanonicalImage(*token, overlay.get()));
+        ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+        EXPECT_NE(fixture.pixels, canonical);
+        ASSERT_TRUE(gfx::ReadbackTexture(gfx::kPreviousFrame, retained_history, history_width, history_height));
+        EXPECT_EQ(retained_history, canonical);
+        ASSERT_TRUE(gfx::PresentCanonicalImage(*token));
+        ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+        EXPECT_EQ(fixture.pixels, canonical);
+
+        ASSERT_TRUE(gfx::RenderList(*seed, 1, {.canonical = true}));
+        const auto before_resize = gfx::CaptureCanonicalImage();
+        ASSERT_TRUE(before_resize.has_value());
+        EXPECT_FALSE(gfx::PresentCanonicalImage(*token));
+        ASSERT_TRUE(SDL_SetWindowSize(WindowHandle(), 960, 720));
+        SDL_PumpEvents();
+        gfx::RendererResize();
+        EXPECT_FALSE(gfx::PresentCanonicalImage(*before_resize));
+        gfx::BeginRecording();
+        ASSERT_NE(gfx::EndRecording(), nullptr);
+        EXPECT_GT(gfx::detail::g.canonical_target_generation, generation);
+        expect_targets(640, 480);
+        EXPECT_FALSE(gfx::CaptureCanonicalImage().has_value());
+        expect_auxiliary(32, 16);
+        ASSERT_TRUE(gfx::RenderList(*seed, 1, {.canonical = true}));
+        const auto before_immediate = gfx::CaptureCanonicalImage();
+        ASSERT_TRUE(before_immediate.has_value());
+        ASSERT_TRUE(gfx::BeginFrame());
+        gfx::Clear(true, seed_color.data(), true, 0);
+        gfx::EndFrame();
+        EXPECT_FALSE(gfx::PresentCanonicalImage(*before_immediate));
+        EXPECT_FALSE(gfx::CaptureCanonicalImage().has_value());
+        gfx::DestroyTexture(auxiliary);
+        gfx::DestroyTexture(shared);
+    }
+    EXPECT_FALSE(gfx::PresentCanonicalImage(*first_renderer_token));
+    options.main_height_limit = 0;
+    {
+        GfxFixture fixture(96, 72, 1.0f, options);
+        gfx::BeginRecording();
+        const std::array<uint8_t, 4> clear{37, 53, 71, 89};
+        gfx::Clear(true, clear.data(), true, 0);
+        const auto first = gfx::EndRecording();
+        ASSERT_NE(first, nullptr);
+        ASSERT_TRUE(gfx::RenderList(*first, 1, {.canonical = true}));
+        ASSERT_TRUE(gfx::CaptureCanonicalImage().has_value());
+        EXPECT_FALSE(gfx::PresentCanonicalImage(*first_renderer_token));
+    }
 }
 
 TEST(GfxMisc, DrawsOutsideAFrameAreDropped) {
@@ -346,40 +556,41 @@ TEST_P(GfxGpuColorWriteMask, ZeroReferenceAlphaTestKeepsTransparentCoverage) {
 TEST_P(GfxGpuColorWriteMask, GEqualFiltersAroundQuantizedReferences) {
     GfxFixture fixture(640, 480, 1.0f, GetParam());
 
+    /**
+     * Pairs an alpha reference with representable rejected and accepted filter samples.
+     */
     struct Boundary {
-        uint8_t reference;
-        uint8_t alpha;
-        float   before;
-        float   after;
+        uint8_t reference;   /**< GS alpha comparison reference. */
+        float   before;      /**< Texture coordinate producing a rejected alpha. */
+        float   at_or_above; /**< Texture coordinate producing an accepted alpha at or above the reference. */
+        float   after;       /**< Texture coordinate producing a higher accepted alpha. */
     };
 
+    // Vulkan guarantees only four fractional bits for filtering weights.
     constexpr std::array boundaries = {
-        Boundary{1,   0,   1.4921875f, 1.5f      },
-        Boundary{64,  126, 1.0f,       1.0078125f},
-        Boundary{127, 252, 0.5078125f, 0.515625f },
+        Boundary{1,   0.5f,    0.5625f, 0.625f },
+        Boundary{64,  0.6875f, 0.75f,   0.8125f},
+        Boundary{127, 0.9375f, 1.0f,    1.0625f},
+        Boundary{128, 0.9375f, 1.0f,    1.0625f},
     };
-    std::array<gfx::TextureHandle, boundaries.size()> textures;
-    for (size_t i = 0; i < boundaries.size(); i++) {
-        textures[i] = gfx::CreateTexture({2, 1, gfx::TextureFormat::Rgba8, 1, true});
-        const uint32_t pixels[] = {
-            Rgba(240, 64, 0, boundaries[i].alpha),
-            Rgba(240, 64, 0, static_cast<uint8_t>(boundaries[i].alpha + 1)),
-        };
-        ASSERT_TRUE(gfx::UpdateTexture(textures[i], 0, 0, 0, 2, 1, pixels));
-    }
+    const auto     texture = gfx::CreateTexture({2, 1, gfx::TextureFormat::Rgba8, 1, true});
+    const uint32_t pixels[] = {Rgba(240, 64, 0, 0), Rgba(240, 64, 0, 255)};
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 2, 1, pixels));
     fixture.Frame({10, 20, 30, 0x80}, [&] {
         for (size_t i = 0; i < boundaries.size(); i++) {
             gfx::TextureBinding binding;
-            binding.texture = textures[i];
+            binding.texture = texture;
             binding.filter = gfx::Filter::Linear;
             gfx::DrawState state;
             state.alpha_test = true;
             state.alpha_func = gfx::AlphaFunc::GEqual;
             state.alpha_ref = boundaries[i].reference;
-            for (int column = 0; column < 2; column++) {
-                const float u = column == 0 ? boundaries[i].before : boundaries[i].after;
-                auto        quad = Quad(static_cast<float>(column * 200), static_cast<float>(i * 100), 200, 100,
-                                        {128, 128, 128, 128}, u, 0.5f, u, 0.5f);
+            const std::array coordinates = {boundaries[i].before, boundaries[i].at_or_above, boundaries[i].after};
+            for (size_t column = 0; column < coordinates.size(); column++) {
+                const float u = coordinates[column];
+                // Full vertex alpha makes the midpoint exactly 127.5 GS units, which GEQUAL against 128 accepts.
+                auto quad = Quad(static_cast<float>(column * 200), static_cast<float>(i * 100), 200, 100,
+                                 {128, 128, 128, 255}, u, 0.5f, u, 0.5f);
                 gfx::Draw2D(gfx::Primitive::Quads, quad, binding, state);
             }
         }
@@ -388,6 +599,7 @@ TEST_P(GfxGpuColorWriteMask, GEqualFiltersAroundQuantizedReferences) {
         const int y = static_cast<int>(i * 100 + 50);
         EXPECT_TRUE(fixture.PixelNear(100, y, 10, 20, 30));
         EXPECT_TRUE(fixture.PixelNear(300, y, 240, 64, 0, 1));
+        EXPECT_TRUE(fixture.PixelNear(500, y, 240, 64, 0, 1));
     }
 }
 
@@ -591,4 +803,139 @@ TEST(GfxMisc, MeshBoundsFollowTheFlagAndAreInvalidatedByUpdates) {
     gfx::MeshHandle            nan_mesh = gfx::CreateMesh(bad, indices);
     ASSERT_NE(nan_mesh, gfx::kNullMesh);
     EXPECT_FALSE(known(nan_mesh));
+}
+
+TEST(GfxMisc, ExactZeroAlphaKeepsSubGsUnitLinearAlpha) {
+    GfxFixture fixture(64, 48, 1, true, 64, 48);
+    if (!gfx::ActiveRendererFeatures().dynamic_color_write_mask) {
+        GTEST_SKIP() << "Partial colour masks unavailable";
+    }
+    ASSERT_NE(gfx::detail::g.zero_alpha_noop_pipeline, VK_NULL_HANDLE);
+    const auto       texture = gfx::CreateTexture({2, 1, gfx::TextureFormat::Rgba8, 1, true});
+    const std::array texels{Rgba(255, 255, 255, 0), Rgba(255, 255, 255, 1)};
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 2, 1, texels.data()));
+    const gfx::TextureBinding binding{.texture = texture, .filter = gfx::Filter::Linear};
+    const auto                quad = Quad(0, 0, 64, 48, {128, 128, 128, 128}, 1.25f, .5f, 1.25f, .5f);
+    gfx::DrawState            state;
+    state.blend = true;
+    state.color_write_mask = gfx::kWriteRed | gfx::kWriteGreen | gfx::kWriteBlue;
+    fixture.Frame({0, 0, 0, 93}, [&] {
+        auto reference = state;
+        reference.stencil_test = true;
+        gfx::Draw2D(gfx::Primitive::Quads, quad, binding, reference);
+    });
+    const auto reference = fixture.pixels;
+    EXPECT_GT(fixture.Pixel(32, 24)[0], 0);
+    fixture.Frame({0, 0, 0, 93}, [&] {
+        gfx::Draw2D(gfx::Primitive::Quads, quad, binding, state);
+        EXPECT_EQ(gfx::detail::g.bound.pipeline, gfx::detail::g.zero_alpha_noop_pipeline);
+    });
+    EXPECT_EQ(fixture.pixels, reference);
+    gfx::DestroyTexture(texture);
+}
+
+TEST(GfxMisc, DeferredOutlineEdgeAlphaPreservesRgbaAndDestinationAlpha) {
+    GfxFixture fixture(96, 48, 1, true, 64, 48);
+    if (!gfx::ActiveRendererFeatures().dynamic_color_write_mask) {
+        GTEST_SKIP() << "Partial colour masks unavailable";
+    }
+    const auto mask = gfx::CreateRenderTarget(64, 48, true, true);
+    ASSERT_NE(mask, gfx::kNullTexture);
+    for (const auto aspect : {gfx::AspectMode::Letterbox, gfx::AspectMode::Fill}) {
+        for (const float ui_scale : {1.0f, 1.3f}) {
+            gfx::SetFrameLayout({.aspect = aspect, .ui_scale = ui_scale});
+            for (const bool consume_alpha : {false, true}) {
+                auto record = [&](bool defer_alpha) {
+                    gfx::BeginRecording();
+                    const uint8_t clear[4] = {19, 37, 53, 93};
+                    gfx::Clear(true, clear, true, 0);
+                    for (int x = 0; x < 64; x += 8) {
+                        const auto background = Quad(static_cast<float>(x), 0, 8, 48,
+                                                     {31, 57, 83, static_cast<uint8_t>(x * 2)});
+                        gfx::Draw2D(gfx::Primitive::Quads, background, {}, {});
+                    }
+                    const auto extent = gfx::VisibleLogicalRect(gfx::kMainTarget);
+                    gfx::SetRenderTarget(mask);
+                    const uint8_t empty[4] = {};
+                    gfx::Clear(true, empty, false, 0);
+                    const float shape_x = aspect == gfx::AspectMode::Fill ? extent.x - .25f : 23.0f;
+                    auto        shape = Quad(shape_x, 12, 11, 23, {63, 91, 127, 128});
+                    gfx::Draw2D(gfx::Primitive::Quads, shape, {}, {});
+                    gfx::SetRenderTarget(gfx::kMainTarget);
+                    const gfx::TextureBinding binding{.texture = mask, .filter = gfx::Filter::Linear};
+                    gfx::DrawState            state;
+                    state.blend = true;
+                    const std::array<std::array<float, 2>, 5> offsets{
+                        {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {0, 0}}
+                    };
+                    for (std::size_t i = 0; i < offsets.size(); ++i) {
+                        const float shift = ui_scale == 1.0f ? 1.0f : .75f;
+                        const float dx = offsets[i][0] * shift;
+                        const float dy = offsets[i][1] * shift;
+                        const auto  quad = Quad(21 + dx, 10 + dy, 15, 27, {80, 60, 0, 128}, 21, 10, 36, 37);
+                        const auto  full = Quad(extent.x + dx, extent.y + dy, extent.w, extent.h,
+                                                {80, 60, 0, 128}, extent.x, extent.y, extent.x + extent.w, extent.y + extent.h);
+                        auto        presentation_state = state;
+                        if (defer_alpha && i + 1 < offsets.size()) {
+                            presentation_state.color_write_mask = gfx::kWriteRed | gfx::kWriteGreen | gfx::kWriteBlue;
+                        }
+                        const gfx::Presentation2D presentation{.vertices = full, .state = presentation_state};
+                        gfx::Draw2D(gfx::Primitive::Quads, quad, binding, state, &presentation);
+                    }
+                    if (consume_alpha) {
+                        auto consumer = state;
+                        consumer.alpha.c = 1;
+                        const auto quad = Quad(extent.x, extent.y, extent.w, extent.h, {128, 19, 83, 128});
+                        gfx::Draw2D(gfx::Primitive::Quads, quad, {}, consumer);
+                    }
+                    return gfx::EndRecording();
+                };
+                auto render = [&](const gfx::DisplayList &list, bool canonical) {
+                    EXPECT_TRUE(gfx::RenderList(list, 1, {.canonical = canonical, .present = !canonical}));
+                    EXPECT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+                    return fixture.pixels;
+                };
+                const auto baseline = record(false);
+                const auto optimized = record(true);
+                const auto canonical = render(*baseline, true);
+                const auto display = render(*baseline, false);
+                EXPECT_EQ(render(*optimized, true), canonical);
+                EXPECT_EQ(render(*optimized, false), display);
+            }
+        }
+    }
+    gfx::DestroyTexture(mask);
+}
+
+TEST(GfxMisc, ZeroAlphaNoopRetainsDepthAndStencilSideEffects) {
+    GfxFixture     fixture(64, 48, 1, true, 64, 48);
+    const auto     texture = gfx::CreateTexture({1, 1, gfx::TextureFormat::Rgba8, 1, true});
+    const uint32_t empty = Rgba(255, 255, 255, 0);
+    ASSERT_TRUE(gfx::UpdateTexture(texture, 0, 0, 0, 1, 1, &empty));
+    const gfx::TextureBinding binding{.texture = texture};
+    const auto                quad = Quad(0, 0, 64, 48, {128, 128, 128, 128}, .5f, .5f, .5f, .5f, .8f);
+    for (const bool stencil : {false, true}) {
+        fixture.Frame({0, 0, 0, 93}, [&] {
+            gfx::DrawState effect;
+            effect.blend = true;
+            effect.color_write_mask = gfx::kWriteRed | gfx::kWriteGreen | gfx::kWriteBlue;
+            effect.depth_write = !stencil;
+            effect.stencil_test = stencil;
+            effect.stencil_front.pass = gfx::StencilOp::Replace;
+            effect.stencil_front.reference = 7;
+            effect.stencil_back = effect.stencil_front;
+            gfx::Draw2D(gfx::Primitive::Quads, quad, binding, effect);
+            EXPECT_NE(gfx::detail::g.bound.pipeline, gfx::detail::g.zero_alpha_noop_pipeline);
+            gfx::DrawState probe;
+            probe.depth_test = stencil ? gfx::DepthTest::Always : gfx::DepthTest::GEqual;
+            probe.stencil_test = stencil;
+            probe.stencil_front.compare = gfx::CompareOp::Equal;
+            probe.stencil_front.reference = 7;
+            probe.stencil_back = probe.stencil_front;
+            const auto blue = Quad(0, 0, 64, 48, {0, 0, 128, 128}, 0, 0, 0, 0, .5f);
+            gfx::Draw2D(gfx::Primitive::Quads, blue, {}, probe);
+        });
+        EXPECT_EQ(fixture.Pixel(32, 24)[2], stencil ? 128 : 0);
+    }
+    gfx::DestroyTexture(texture);
 }

@@ -1,0 +1,73 @@
+# Shared libnx platform support and Mesa/NVK homebrew packaging.
+include_guard(GLOBAL)
+enable_language(C)
+get_filename_component(KZ_SWITCH_DIR "${CMAKE_CURRENT_LIST_DIR}/../tools/switch" ABSOLUTE)
+
+set(CMAKE_PROJECT_simdjson_INCLUDE_BEFORE "${KZ_SWITCH_DIR}/patch_simdjson.cmake")
+set(CMAKE_PROJECT_quill_INCLUDE_BEFORE "${KZ_SWITCH_DIR}/patch_quill.cmake")
+set(QUILL_NO_THREAD_NAME_SUPPORT ON CACHE BOOL "libnx has no pthread thread-name implementation" FORCE)
+if(DEFINED ENV{SWITCH_PREFIX})
+    list(PREPEND CMAKE_PREFIX_PATH "$ENV{SWITCH_PREFIX}")
+    unset(Vulkan_LIBRARY CACHE)
+    unset(Vulkan_INCLUDE_DIR CACHE)
+    set(Vulkan_DIR "$ENV{SWITCH_PREFIX}/lib/cmake/Vulkan")
+    find_package(Vulkan CONFIG REQUIRED)
+endif()
+
+# newlib's POSIX declarations require GNU language mode; PS2 plain char is signed.
+set(CMAKE_CXX_EXTENSIONS ON)
+include_directories(BEFORE SYSTEM "${KZ_SWITCH_DIR}/include")
+add_compile_options("SHELL:-include \"${KZ_SWITCH_DIR}/include/switch_compat.h\"" -fsigned-char)
+add_compile_definitions(_GNU_SOURCE)
+
+if(NOT DEFINED KZ_SWITCH_APPLICATION_NAME)
+    set(KZ_SWITCH_APPLICATION_NAME "game")
+endif()
+if(NOT DEFINED KZ_SWITCH_LOG_FILE)
+    set(KZ_SWITCH_LOG_FILE "game.log")
+endif()
+if(NOT DEFINED KZ_SWITCH_DATA_INSTRUCTIONS)
+    set(KZ_SWITCH_DATA_INSTRUCTIONS "Missing game data. Install the game data beside the application.")
+endif()
+
+function(kz_switch_host target)
+    set_source_files_properties("${KZ_PORT_ROOT}/platform/memory.cpp" PROPERTIES HEADER_FILE_ONLY ON)
+    target_sources(${target} PRIVATE "${KZ_SWITCH_DIR}/src/exit.c" "${KZ_SWITCH_DIR}/src/memory.cpp" "${KZ_SWITCH_DIR}/src/ucontext.cpp"
+        "${KZ_SWITCH_DIR}/src/nxlink.cpp" "${KZ_SWITCH_DIR}/src/thread_affinity.cpp")
+    target_compile_definitions(${target} PRIVATE
+        "KZ_SWITCH_APPLICATION_NAME=\"${KZ_SWITCH_APPLICATION_NAME}\""
+        "KZ_SWITCH_LOG_FILE=\"${KZ_SWITCH_LOG_FILE}\""
+        "KZ_SWITCH_DATA_INSTRUCTIONS=\"${KZ_SWITCH_DATA_INSTRUCTIONS}\"")
+endfunction()
+
+function(kz_switch_runtime target)
+    target_include_directories(${target} SYSTEM PRIVATE "$ENV{DEVKITPRO}/portlibs/switch/include")
+    target_sources(${target} PRIVATE "${KZ_SWITCH_DIR}/src/assert.cpp" "${KZ_SWITCH_DIR}/src/main.cpp")
+    if(EXISTS "${KZ_SWITCH_DIR}/src/zip_archive.cpp")
+        target_sources(${target} PRIVATE "${KZ_SWITCH_DIR}/src/zip_archive.cpp")
+        target_link_libraries(${target} PRIVATE z zstd)
+    endif()
+    target_compile_definitions(${target} PRIVATE "KZ_SWITCH_APPLICATION_NAME=\"${KZ_SWITCH_APPLICATION_NAME}\"")
+endfunction()
+
+function(kz_switch_nro target)
+    # Consumers may assemble object libraries through TARGET_OBJECTS, which does not propagate their link dependencies.
+    target_link_libraries(${target} PRIVATE z zstd)
+    cmake_parse_arguments(KZ_NRO "" "NAME;AUTHOR;VERSION;ICON;OUTPUT" "" ${ARGN})
+    if(NOT KZ_NRO_NAME)
+        set(KZ_NRO_NAME "${KZ_SWITCH_APPLICATION_NAME}")
+    endif()
+    if(NOT KZ_NRO_VERSION)
+        set(KZ_NRO_VERSION "0.1.0")
+    endif()
+    if(NOT KZ_NRO_OUTPUT)
+        set(KZ_NRO_OUTPUT "${CMAKE_BINARY_DIR}/${target}.nro")
+    endif()
+    set(nacp "${CMAKE_BINARY_DIR}/${target}.nacp")
+    nx_generate_nacp("${nacp}" NAME "${KZ_NRO_NAME}" AUTHOR "${KZ_NRO_AUTHOR}" VERSION "${KZ_NRO_VERSION}")
+    set(icon_args)
+    if(KZ_NRO_ICON)
+        set(icon_args ICON "${KZ_NRO_ICON}")
+    endif()
+    nx_create_nro(${target} NACP "${nacp}" ${icon_args} OUTPUT "${KZ_NRO_OUTPUT}")
+endfunction()

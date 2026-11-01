@@ -179,6 +179,18 @@ void StopRenderThread() {
 
 using namespace detail;
 
+void RunOnRenderThreadAsync(std::function<void()> fn) {
+    if (DeviceThreadAllowed() || g_mode.load() != RenderThreadMode::Async) {
+        RunOnRenderThread(fn);
+        return;
+    }
+    Dispatch([fn = std::move(fn)] {
+        tls.in_async_job = true;
+        fn();
+        tls.in_async_job = false;
+    });
+}
+
 std::optional<RenderThreadMode> ParseRenderThreadMode(std::string_view text) {
     std::string lower(text);
     std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });

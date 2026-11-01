@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -12,8 +13,10 @@
 #include <cstring>
 #include <format>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -430,7 +433,7 @@ void PickPhysicalDevice() {
                                                HasExtension(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME));
     if (!g.bindless) {
         kz::Logf(kz::LogLevel::Info, "Vulkan", "each draw pushes its textures: {}",
-                 !bindless_missing.empty()     ? Join(bindless_missing)
+                 !bindless_missing.empty()    ? Join(bindless_missing)
                  : g.config.bindless_textures ? std::string("portability subset")
                                               : std::string("bindless textures turned off"));
     }
@@ -796,9 +799,10 @@ bool ResizeOffscreen() {
         return false;
     }
     VkExtent2D extent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
-    if (extent.width != g.swapchain.extent.width || extent.height != g.swapchain.extent.height) {
+    g.swapchain.extent = extent;
+    const VkExtent2D desired = DesiredMainExtent(extent, g.config.main_height_limit);
+    if (g.main_color[0].width != desired.width || g.main_color[0].height != desired.height) {
         vkDeviceWaitIdle(g.device);
-        g.swapchain.extent = extent;
         DestroyMainTargets();
         CreateMainTargets();
         RecreateSharedTargets();
@@ -809,8 +813,9 @@ bool ResizeOffscreen() {
 
 // The main targets follow the swapchain's size, losing their contents.
 void SyncMainTargets() {
-    const Image &main = g.main_color[0];
-    if (main.width != g.swapchain.extent.width || main.height != g.swapchain.extent.height) {
+    const Image     &main = g.main_color[0];
+    const VkExtent2D desired = DesiredMainExtent(g.swapchain.extent, g.config.main_height_limit);
+    if (main.width != desired.width || main.height != desired.height) {
         vkDeviceWaitIdle(g.device);
         DestroyMainTargets();
         CreateMainTargets();
@@ -896,7 +901,7 @@ void CreateGpuProfiler() {
 #endif
 
 void RunDeletions(Frame &frame) {
-    std::vector<std::function<void()> > deletions;
+    std::vector<std::function<void()>> deletions;
     deletions.swap(frame.deletions);
     for (std::function<void()> &deletion : deletions) {
         deletion();
@@ -1226,6 +1231,7 @@ void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal) {
     Check(vkResetFences(g.device, 1, &frame.fence), "vkResetFences");
     Check(vkQueueSubmit2(g.queue, 1, &submit, frame.fence), "vkQueueSubmit2");
     frame.pending = true;
+    frame.presents = signal != VK_NULL_HANDLE;
 }
 
 void BeginCommands(VkCommandBuffer cmd) {
@@ -1368,14 +1374,34 @@ Image &CurrentMainColor() { return g.main_color[g.main_current]; }
 
 Image &PreviousMainColor() { return g.main_color[g.main_current ^ 1]; }
 
+VkExtent2D DesiredMainExtent(VkExtent2D output, uint32_t height_limit) {
+    if (output.width == 0 || output.height == 0 || height_limit == 0 || height_limit >= output.height) {
+        return output;
+    }
+    const uint32_t divisor = std::gcd(output.width, output.height);
+    const uint32_t unit_width = output.width / divisor;
+    const uint32_t unit_height = output.height / divisor;
+    if (unit_height <= height_limit) {
+        const uint32_t factor = height_limit / unit_height;
+        return {unit_width * factor, unit_height * factor};
+    }
+    const auto width = static_cast<uint32_t>((static_cast<uint64_t>(output.width) * height_limit + output.height / 2) / output.height);
+    return {std::max(1u, width), height_limit};
+}
+
 void CreateMainTargets() {
     AssertDeviceThread(__func__);
     const bool trace_init = std::getenv("KZ_PERF_INIT_TRACE") != nullptr;
     if (trace_init) {
         std::fprintf(stderr, "perf init: allocating main targets\n");
     }
-    uint32_t width = g.swapchain.extent.width;
-    uint32_t height = g.swapchain.extent.height;
+    const VkExtent2D extent = DesiredMainExtent(g.swapchain.extent, g.config.main_height_limit);
+    const uint32_t   width = extent.width;
+    const uint32_t   height = extent.height;
+    ++g.canonical_target_generation;
+    g.canonical_newest = false;
+    kz::Logf(kz::LogLevel::Info, "gfx", "main raster {}x{}, output {}x{}", width, height,
+             g.swapchain.extent.width, g.swapchain.extent.height);
     for (Image &image : g.main_color) {
         image = CreateImage(width, height, 1, kColorFormat,
                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -1431,6 +1457,8 @@ void CreateMainTargets() {
 }
 
 void DestroyMainTargets() {
+    ++g.canonical_target_generation;
+    g.canonical_newest = false;
     for (Image &image : g.main_color) {
         DestroyImage(image);
     }
@@ -1477,6 +1505,14 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
     g.renderer_instance = ++instances;
     g.window = window;
     g.config = config;
+    if (const char *setting = std::getenv("KZ_MAIN_HEIGHT_LIMIT")) {
+        const std::string_view text(setting);
+        uint32_t               value = 0;
+        const auto             parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()) {
+            g.config.main_height_limit = value;
+        }
+    }
     if (const char *setting = std::getenv("KZ_RENDER_THREAD")) {
         if (auto mode = ParseRenderThreadMode(setting)) {
             g.config.render_thread = *mode;
@@ -1649,7 +1685,8 @@ bool OpenFrame() {
     }
 #endif
     g.in_frame = true;
-    if (!tls.in_idle_hook) {
+    // Only a frame the game thread asked for keeps it from recording.
+    if (!tls.in_idle_hook && !tls.in_async_job) {
         g_game_frame_open.store(true);
     }
     g.frame_serial++;
@@ -1711,6 +1748,24 @@ bool AcquireImage(bool targets) {
 
 // Ends the frame's draw commands with source blitted onto the acquired swapchain image, submits
 // and presents.
+// A whole-image nearest blit between images of one size and format is a copy, which skips the 3D engine.
+void CopyOrBlitWhole(VkCommandBuffer cmd, VkImage source, VkFormat source_format, VkExtent2D source_extent,
+                     VkImage destination, VkFormat destination_format, VkExtent2D destination_extent,
+                     const VkImageBlit &region) {
+    if (source_format == destination_format && source_extent.width == destination_extent.width &&
+        source_extent.height == destination_extent.height) {
+        VkImageCopy copy = {};
+        copy.srcSubresource = region.srcSubresource;
+        copy.dstSubresource = region.dstSubresource;
+        copy.extent = {source_extent.width, source_extent.height, 1};
+        vkCmdCopyImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &copy);
+        return;
+    }
+    vkCmdBlitImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                   &region, VK_FILTER_NEAREST);
+}
+
 void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     AssertDeviceThread(__func__);
     KZ_PROFILE_ZONE("Kazarov PresentImage");
@@ -1728,8 +1783,8 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
                             static_cast<int32_t>(g.swapchain.extent.height), 1};
     {
         KZ_PROFILE_GPU_ZONE(cmd, "Kazarov swapchain blit");
-        vkCmdBlitImage(cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+        CopyOrBlitWhole(cmd, source.image, source.format, {source.width, source.height}, swapchain, g.swapchain.format,
+                        g.swapchain.extent, region);
     }
     SwapchainBarrier(cmd, swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -1751,7 +1806,8 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     present.pSwapchains = &g.swapchain.handle;
     present.pImageIndices = &g.image_index;
     const TimingClock::time_point present_start = Timing() ? TimingClock::now() : TimingClock::time_point{};
-    VkResult                      result = vkQueuePresentKHR(g.queue, &present);
+    VkResult                      result = VK_SUCCESS;
+    result = vkQueuePresentKHR(g.queue, &present);
     if (present_start != TimingClock::time_point{}) {
         NotePresent(present_start);
         NoteFrameCpu(true);
@@ -1802,16 +1858,16 @@ void PrepareRecordingFromCaller() {
     // PrepareRecording does nothing unless a resize is pending or, onscreen, the main targets differ
     // from the swapchain. The idle hook never recreates the swapchain, so the extents change only on
     // the game thread; the pending flag is atomic.
-    const Image &main = g.main_color[0];
-    const bool   same_size =
-        main.width == g.swapchain.extent.width && main.height == g.swapchain.extent.height;
+    const Image     &main = g.main_color[0];
+    const VkExtent2D desired = DesiredMainExtent(g.swapchain.extent, g.config.main_height_limit);
+    const bool       same_size = main.width == desired.width && main.height == desired.height;
     if (!g_resize_pending.load() && (g.offscreen || same_size)) {
         return;
     }
     RunOnRenderThread(PrepareRecording);
 }
 
-bool OpenListFrame(bool canonical, bool present, bool base) {
+bool OpenListFrame(bool canonical, bool present, bool base, double preparation_ms) {
     KZ_PROFILE_ZONE("Kazarov open frame");
     if (canonical) {
         // The game's state is drawn whether or not the window can show it: later ticks sample it.
@@ -1826,10 +1882,16 @@ bool OpenListFrame(bool canonical, bool present, bool base) {
         }
         return OpenFrame();
     }
+    const auto display_started = Timing() ? TimingClock::now() : TimingClock::time_point{};
     if (present && !g.offscreen && !AcquireImage(false)) {
         return false;
     }
     OpenFrame();
+    if (Timing()) {
+        RecordTiming([&](FrameTimings &timings) { timings.display_prepare_cpu.Add(preparation_ms); });
+        g_frame_opened = display_started - std::chrono::duration_cast<TimingClock::duration>(
+                                               std::chrono::duration<double, std::milli>(preparation_ms));
+    }
     tls.display_pass = true;
     if (base) {
         VkCommandBuffer cmd = DrawCommands();
@@ -1847,8 +1909,8 @@ bool OpenListFrame(bool canonical, bool present, bool base) {
         region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.dstOffsets[1] = {static_cast<int32_t>(g.display_color.width),
                                 static_cast<int32_t>(g.display_color.height), 1};
-        vkCmdBlitImage(cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.display_color.image,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+        CopyOrBlitWhole(cmd, source.image, source.format, {source.width, source.height}, g.display_color.image,
+                        g.display_color.format, {g.display_color.width, g.display_color.height}, region);
         ToRest(cmd, source);
         ToRest(cmd, g.display_color);
     }
@@ -1869,6 +1931,7 @@ void CloseListFrame(bool canonical, bool present) {
         }
         SubmitWithoutPresent(cmd, CurrentMainColor());
         FinishFrame();
+        ++g.canonical_commit_serial;
         g.canonical_newest = true;
         g.presented_display = false;
         return;
@@ -1947,14 +2010,15 @@ bool PresentCanonical() {
         if (!g.canonical_newest || g.in_frame || recording) {
             return;
         }
-        g.presented_display = false;
         if (g.offscreen) {
+            g.presented_display = false;
             presented = true;
             return;
         }
         if (!AcquireImage(false)) {
             return;
         }
+        g.presented_display = false;
         OpenFrame();
         Frame &frame = CurrentFrame();
         PresentImage(frame, frame.draw_cmd, PreviousMainColor());
@@ -1965,7 +2029,55 @@ bool PresentCanonical() {
     return presented;
 }
 
+std::optional<CanonicalImageToken> CaptureCanonicalImage() {
+    const bool                         recording = RecordingCalls();
+    std::optional<CanonicalImageToken> result;
+    RunOnRenderThread([&] {
+        if (g.device == VK_NULL_HANDLE || !g.canonical_newest || g.in_frame || recording || g_resize_pending.load()) {
+            return;
+        }
+        CanonicalImageToken token;
+        token.renderer_instance = g.renderer_instance;
+        token.target_generation = g.canonical_target_generation;
+        token.commit_serial = g.canonical_commit_serial;
+        token.image_index = g.main_current ^ 1;
+        result = token;
+    });
+    return result;
+}
+
+bool PresentCanonicalImage(const CanonicalImageToken &token, const DisplayList *overlay) {
+    const bool recording = RecordingCalls();
+    bool       presented = false;
+    RunOnRenderThread([&] {
+        if (g.device == VK_NULL_HANDLE || !g.canonical_newest || g.in_frame || recording || g_resize_pending.load() ||
+            token.renderer_instance != g.renderer_instance || token.target_generation != g.canonical_target_generation ||
+            token.commit_serial != g.canonical_commit_serial || token.image_index != (g.main_current ^ 1)) {
+            return;
+        }
+        if (overlay != nullptr) {
+            // Device ownership preserves the validated image through the host-only base copy.
+            presented = RenderList(*overlay, 1.0f, {.present = true, .host = true});
+        } else {
+            presented = PresentCanonical();
+        }
+    });
+    return presented;
+}
+
 bool InFrame() { return GameFrameOpen() || RecordingCalls(); }
+
+bool GpuPresentsPendingAtMost(uint32_t presents) {
+    AssertDeviceThread(__func__);
+    if (g.device == VK_NULL_HANDLE) {
+        return true;
+    }
+    uint32_t pending = 0;
+    for (const Frame &frame : g.frames) {
+        pending += frame.pending && frame.presents && vkGetFenceStatus(g.device, frame.fence) == VK_NOT_READY ? 1 : 0;
+    }
+    return pending <= presents;
+}
 
 void SetFrameTimingEnabled(bool enabled) { g_timing_enabled.store(enabled); }
 
@@ -1978,6 +2090,29 @@ FrameTimings TakeFrameTimings() {
     g_scope_index.clear();
     g_timings.gpu_timestamps = taken.gpu_timestamps;
     return taken;
+}
+
+void LogFrameTimings(double elapsed_seconds) {
+    const FrameTimings timing = TakeFrameTimings();
+    kz::Logf(kz::LogLevel::Info, "gfx", "timing {:.3f}s gpu_total_ms={:.3f} timestamps={}",
+             elapsed_seconds, timing.canonical_gpu.total_ms + timing.display_gpu.total_ms, timing.gpu_timestamps);
+    kz::Logf(kz::LogLevel::Info, "gfx", "timing canonical count={}/{} cpu={:.3f}/{:.3f} gpu={:.3f}/{:.3f}",
+             timing.canonical_cpu.count, timing.canonical_gpu.count, timing.canonical_cpu.Average(), timing.canonical_cpu.max_ms,
+             timing.canonical_gpu.Average(), timing.canonical_gpu.max_ms);
+    kz::Logf(kz::LogLevel::Info, "gfx", "timing display count={}/{} cpu={:.3f}/{:.3f} gpu={:.3f}/{:.3f}",
+             timing.display_cpu.count, timing.display_gpu.count, timing.display_cpu.Average(), timing.display_cpu.max_ms,
+             timing.display_gpu.Average(), timing.display_gpu.max_ms);
+    kz::Logf(kz::LogLevel::Info, "gfx", "timing display prepare count={} cpu={:.3f}/{:.3f}",
+             timing.display_prepare_cpu.count, timing.display_prepare_cpu.Average(), timing.display_prepare_cpu.max_ms);
+    kz::Logf(kz::LogLevel::Info, "gfx", "timing acquire={:.3f} present={:.3f} fence={:.3f} intervals={}/{}/{}/{} sync_waits={}",
+             timing.acquire.Average(), timing.queue_present.Average(), timing.fence_wait.Average(),
+             timing.interval_buckets[0], timing.interval_buckets[1], timing.interval_buckets[2], timing.interval_buckets[3],
+             timing.sync_waits);
+    for (const auto &scope : timing.scopes) {
+        kz::Logf(kz::LogLevel::Info, "gfx", "timing scope {} count={} gpu={:.3f}/{:.3f} total_ms={:.3f} draws={} barriers={}",
+                 scope.name, scope.span.count, scope.span.Average(), scope.span.max_ms, scope.span.total_ms,
+                 scope.draws, scope.barriers);
+    }
 }
 
 RendererFeatures ActiveRendererFeatures() {

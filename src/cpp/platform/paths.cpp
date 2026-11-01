@@ -126,6 +126,14 @@ void PathsReset() {
     save_root.reset();
 }
 
+fs::path PathsWeaklyCanonical(const fs::path &path, std::error_code &error) {
+    if (DeviceRooted(path)) {
+        error.clear();
+        return path.lexically_normal();
+    }
+    return fs::weakly_canonical(path, error);
+}
+
 fs::path PathsExecutable() {
     std::error_code error;
 #if defined(__APPLE__)

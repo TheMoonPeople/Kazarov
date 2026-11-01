@@ -98,6 +98,7 @@ function(kz_port_host_library target)
     list(REMOVE_DUPLICATES vendor_dirs)
 
     set(generated_dir "${CMAKE_BINARY_DIR}/kz_port/generated")
+    file(MAKE_DIRECTORY "${generated_dir}/shaders")
     # Android targets Vulkan 1.3, the renderer's floor; both environments emit SPIR-V 1.6.
     if(ANDROID OR NINTENDO_SWITCH)
         set(shader_env vulkan1.3)

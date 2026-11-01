@@ -97,3 +97,88 @@ TEST(TtfFont, WhatItCannotBuildIsLeftToTheBitmap) {
     EXPECT_FALSE(ttffont::RenderGlyph(U'ß', 40, out.alpha, out.w, out.h, out.x0, out.y0));
     EXPECT_FALSE(ttffont::RenderGlyph(U'~' + 0x1000, 40, out.alpha, out.w, out.h, out.x0, out.y0));
 }
+
+TEST(TtfFont, SeparateScalesStretchTheGlyphAndShiftsMoveIt) {
+    if (!LoadTestFont()) {
+        GTEST_SKIP() << "TEST_FONT is not set";
+    }
+    Rendered square, wide, tall, shifted;
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40.0f, 40.0f, 0.0f, 0.0f, square.alpha, square.w, square.h, square.x0, square.y0));
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 80.0f, 40.0f, 0.0f, 0.0f, wide.alpha, wide.w, wide.h, wide.x0, wide.y0));
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40.0f, 80.0f, 0.0f, 0.0f, tall.alpha, tall.w, tall.h, tall.x0, tall.y0));
+    EXPECT_NEAR(wide.w, 2 * square.w, 2);
+    EXPECT_NEAR(wide.h, square.h, 1);
+    EXPECT_NEAR(tall.h, 2 * square.h, 2);
+    EXPECT_NEAR(tall.w, square.w, 1);
+
+    // The whole-pixel overload is the square one with no shift.
+    Rendered whole;
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40, whole.alpha, whole.w, whole.h, whole.x0, whole.y0));
+    EXPECT_EQ(whole.alpha, square.alpha);
+
+    // Half a pixel right moves the ink half a pixel right: the coverage's centre of mass follows.
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40.0f, 40.0f, 0.5f, 0.0f, shifted.alpha, shifted.w, shifted.h, shifted.x0,
+                                     shifted.y0));
+    auto centre = [](const Rendered &r) {
+        double sum = 0, moment = 0;
+        for (int row = 0; row < r.h; row++) {
+            for (int col = 0; col < r.w; col++) {
+                const double a = r.alpha[static_cast<size_t>(row) * r.w + col];
+                sum += a;
+                moment += a * (r.x0 + col + 0.5);
+            }
+        }
+        return moment / sum;
+    };
+    EXPECT_NEAR(centre(shifted) - centre(square), 0.5, 0.05);
+
+    Rendered out;
+    EXPECT_FALSE(ttffont::RenderGlyph(U'H', 40.0f, 40.0f, 1.0f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
+    EXPECT_FALSE(ttffont::RenderGlyph(U'H', 3.0f, 40.0f, 0.0f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
+}
+
+TEST(TtfFont, AdvancesAreTheFontsOwnInEms) {
+    if (!LoadTestFont()) {
+        GTEST_SKIP() << "TEST_FONT is not set";
+    }
+    float i = 0, m = 0, missing = 0;
+    ASSERT_TRUE(ttffont::GetAdvance(U'i', i));
+    ASSERT_TRUE(ttffont::GetAdvance(U'm', m));
+    EXPECT_GT(i, 0.0f);
+    EXPECT_LE(i, m);
+    EXPECT_LT(m, 2.0f);
+    EXPECT_FALSE(ttffont::GetAdvance(char32_t{0x10FFFD}, missing));
+}
+
+TEST(TtfFont, FacesDrawTheirOwnFontBesideTheDefault) {
+    const char *path = SettingsEnv("TEST_FONT");
+    if (path == nullptr || *path == '\0') {
+        GTEST_SKIP() << "TEST_FONT is not set";
+    }
+    ttffont::Face face;
+    Rendered      out;
+    float         em = 0;
+    EXPECT_FALSE(face.Loaded());
+    EXPECT_FALSE(face.RenderGlyph(U'H', 40.0f, 40.0f, 0.0f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
+    EXPECT_FALSE(face.GetAdvance(U'H', em));
+    EXPECT_FALSE(face.Load("/nonexistent/font.ttf"));
+    ASSERT_TRUE(face.Load(path));
+    ASSERT_TRUE(LoadTestFont());
+
+    // The same file draws the same glyph and advance through a face as through the default font.
+    Rendered from_face;
+    ASSERT_TRUE(face.RenderGlyph(U'H', 40.0f, 30.0f, 0.5f, 0.0f, from_face.alpha, from_face.w, from_face.h,
+                                 from_face.x0, from_face.y0));
+    ASSERT_TRUE(ttffont::RenderGlyph(U'H', 40.0f, 30.0f, 0.5f, 0.0f, out.alpha, out.w, out.h, out.x0, out.y0));
+    EXPECT_EQ(from_face.alpha, out.alpha);
+    EXPECT_EQ(from_face.x0, out.x0);
+    float default_em = 0;
+    ASSERT_TRUE(face.GetAdvance(U'm', em));
+    ASSERT_TRUE(ttffont::GetAdvance(U'm', default_em));
+    EXPECT_EQ(em, default_em);
+
+    // A failed load keeps the face's font, and a face's load leaves the default font where it was.
+    EXPECT_FALSE(face.Load("/nonexistent/font.ttf"));
+    EXPECT_TRUE(face.Loaded());
+    EXPECT_TRUE(ttffont::Loaded());
+}

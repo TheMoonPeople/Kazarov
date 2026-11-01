@@ -24,6 +24,19 @@ function(_kz_ffmpeg_import)
     endif()
     set(KZ_FFMPEG_DIR "${default}" CACHE PATH "FFmpeg tree: include/, lib/ and on Windows bin/")
 
+    if(NINTENDO_SWITCH)
+        set(stamp "${KZ_FFMPEG_DIR}/kz-ffmpeg.json")
+        if(NOT EXISTS "${stamp}")
+            message(FATAL_ERROR "Switch FFmpeg requires Kazarov's LGPL-only build stamp; run kz-ffmpeg --target switch-arm64.")
+        endif()
+        file(READ "${stamp}" build_stamp)
+        string(JSON build_license GET "${build_stamp}" license)
+        if(NOT build_license STREQUAL "License: LGPL version 2.1 or later" OR
+           build_stamp MATCHES "--enable-(gpl|nonfree|version3)")
+            message(FATAL_ERROR "Switch FFmpeg must be built without GPL, nonfree or version-3-only components.")
+        endif()
+    endif()
+
     if(NOT EXISTS "${KZ_FFMPEG_DIR}/include/libavcodec/avcodec.h")
         message(FATAL_ERROR "kz_ffmpeg: no include/libavcodec/avcodec.h under ${KZ_FFMPEG_DIR}. "
             "Linux: the Kazarov image provides /opt/kazarov/ffmpeg. "
@@ -70,6 +83,8 @@ function(_kz_ffmpeg_import)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             find_package(Threads REQUIRED)
             set_property(TARGET kz::avutil PROPERTY INTERFACE_LINK_LIBRARIES Threads::Threads m)
+        elseif(NINTENDO_SWITCH)
+            set_property(TARGET kz::avutil PROPERTY INTERFACE_LINK_LIBRARIES nx pthread m)
         endif()
     endif()
 
@@ -80,7 +95,13 @@ function(_kz_ffmpeg_import)
 
     add_library(kz::ffmpeg INTERFACE IMPORTED GLOBAL)
     set_property(TARGET kz::ffmpeg PROPERTY INTERFACE_LINK_LIBRARIES "kz::avformat;kz::avcodec;kz::swscale;kz::swresample")
-    target_include_directories(kz::ffmpeg SYSTEM INTERFACE "${KZ_FFMPEG_DIR}/include")
+    if(NINTENDO_SWITCH)
+        # User include paths precede devkitPro's broad system path, which also contains FFmpeg headers.
+        set_property(TARGET kz::ffmpeg PROPERTY SYSTEM FALSE)
+        target_include_directories(kz::ffmpeg INTERFACE "${KZ_FFMPEG_DIR}/include")
+    else()
+        target_include_directories(kz::ffmpeg SYSTEM INTERFACE "${KZ_FFMPEG_DIR}/include")
+    endif()
 
     message(STATUS "Kazarov: FFmpeg from ${KZ_FFMPEG_DIR}")
 endfunction()
@@ -96,6 +117,9 @@ function(kz_ffmpeg target)
 
     if(NOT TARGET kz::ffmpeg)
         _kz_ffmpeg_import()
+    endif()
+    if(NINTENDO_SWITCH)
+        target_include_directories(${target} BEFORE ${scope} "${KZ_FFMPEG_DIR}/include")
     endif()
     target_link_libraries(${target} ${scope} kz::ffmpeg)
 endfunction()

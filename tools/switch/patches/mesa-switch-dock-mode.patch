@@ -1,0 +1,43 @@
+--- a/src/vulkan/wsi/wsi_common_switch.c
++++ b/src/vulkan/wsi/wsi_common_switch.c
+@@ -128,12 +128,14 @@
+                                     struct wsi_device *wsi_device,
+                                     VkSurfaceCapabilitiesKHR *caps)
+ {
+-   VkIcdSurfaceVi *surface = (VkIcdSurfaceVi *)icd_surface;
+-   NWindow *nw = (NWindow *)surface->window;
+-
+    uint32_t width = 1280, height = 720;
+-   if (nw && nwindowIsValid(nw))
+-      nwindowGetDimensions(nw, &width, &height);
++   if (appletGetOperationMode() == AppletOperationMode_Handheld) {
++      width = 1280;
++      height = 720;
++   } else {
++      width = 1920;
++      height = 1080;
++   }
+ 
+    /* NWindow permits one dequeued slot. Pin imageCount == minImageCount ==
+     * 3 so Vulkan's imageCount - minImageCount + 1 acquire allowance is
+@@ -293,13 +295,16 @@
+                                           uint32_t *pRectCount,
+                                           VkRect2D *pRects)
+ {
+-   VkIcdSurfaceVi *surface = (VkIcdSurfaceVi *)icd_surface;
+    VK_OUTARRAY_MAKE_TYPED(VkRect2D, out, pRects, pRectCount);
+ 
+    uint32_t width = 1280, height = 720;
+-   NWindow *nw = (NWindow *)surface->window;
+-   if (nw && nwindowIsValid(nw))
+-      nwindowGetDimensions(nw, &width, &height);
++   if (appletGetOperationMode() == AppletOperationMode_Handheld) {
++      width = 1280;
++      height = 720;
++   } else {
++      width = 1920;
++      height = 1080;
++   }
+ 
+    vk_outarray_append_typed(VkRect2D, &out, rect) {
+       *rect = (VkRect2D) {

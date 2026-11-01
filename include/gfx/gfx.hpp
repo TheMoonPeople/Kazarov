@@ -81,9 +81,9 @@ struct RendererConfig {
     const char *app_name = "";
     // The game's 2D space. 2D draws, scissors and main-target rectangles are given in it and mapped
     // to the target, letterboxed on the main target.
-    float logical_width = 640.0f;
-    float logical_height = 480.0f;
-    float display_aspect = 4.0f / 3.0f; // width / height the logical frame is shown at
+    float                 logical_width = 640.0f;
+    float                 logical_height = 480.0f;
+    float                 display_aspect = 4.0f / 3.0f; // width / height the logical frame is shown at
     PresentMode           present_mode = PresentMode::Fifo;
     std::filesystem::path pipeline_cache = "save/pipeline_cache.bin";
     // Pixels per logical texel of render targets; 0 derives it from the window height at init.
@@ -118,6 +118,8 @@ struct RendererConfig {
     // Lowers the texture and mesh tables for tests; 0 is the build maximum, larger values are clamped to it.
     uint32_t texture_slots = 0;
     uint32_t mesh_slots = 0;
+    // Maximum main-scene raster height; zero keeps the output size. The swapchain remains unchanged.
+    uint32_t main_height_limit = 0;
     // KZ_RENDER_THREAD=off|lockstep|async in the environment overrides this.
     RenderThreadMode render_thread = RenderThreadMode::Off;
 };
@@ -196,8 +198,9 @@ struct FrameTimings {
     };
 
     bool gpu_timestamps = false;
-    Span canonical_cpu; // replay and submission of a canonical frame
-    Span display_cpu;   // replay or blit, submission and present of a display frame
+    Span canonical_cpu;       // replay and submission of a canonical frame
+    Span display_cpu;         // preparation, acquire, replay or blit, submission and present of a display frame
+    Span display_prepare_cpu; // matching and interpolation overrides, included in display_cpu
     Span canonical_gpu;
     Span display_gpu;
     Span acquire;       // vkAcquireNextImageKHR
@@ -228,6 +231,11 @@ void         SetFrameTimingEnabled(bool enabled);
 bool         FrameTimingEnabled();
 FrameTimings TakeFrameTimings();
 
+/**
+ * Reports and clears accumulated CPU, GPU and presentation timing samples for an interval.
+ */
+void LogFrameTimings(double elapsed_seconds);
+
 // Anisotropic filtering of linearly filtered meshes: 0 or 1 is off, otherwise 2, 4, 8 or 16 samples
 // (a value in between takes the level below it). Takes effect from the next draw.
 void SetAnisotropy(int samples);
@@ -236,6 +244,12 @@ bool BeginFrame();
 void EndFrame();
 // Inside BeginFrame/EndFrame or BeginRecording/EndRecording.
 bool InFrame();
+// Device thread: whether at most `presents` submitted presents are still running on the GPU, checked without waiting.
+// A present waits for an earlier present to finish, so a caller can defer one until this holds.
+bool GpuPresentsPendingAtMost(uint32_t presents);
+// Async: queues device work for the render thread and returns at once; it runs before any later lease or device call
+// from another thread. Off and Lockstep, or on the device thread, it runs before returning.
+void RunOnRenderThreadAsync(std::function<void()> fn);
 // Validation-layer messages seen so far (validation and performance types, warning or worse).
 uint32_t ValidationMessageCount();
 uint32_t PipelineCount();
@@ -483,9 +497,9 @@ struct DrawState {
     bool      fog = false;
     uint8_t   fog_color[3] = {0, 0, 0};
     // GS TEXA for textures without alpha: AEM makes black texels transparent, TA0 is the rest.
-    bool        texa_aem = true;
-    uint8_t     texa_ta0 = 0x80;
-    bool        scissor = false;
+    bool    texa_aem = true;
+    uint8_t texa_ta0 = 0x80;
+    bool    scissor = false;
     // Frame-edge scissors normally follow Fill. Sliding UI can retain the logical frame.
     bool extend_scissor = true;
     // Infinite extents mean the whole frame, which is only known once RendererInit has run.
@@ -570,23 +584,23 @@ inline constexpr uint32_t kProg0Bones = 32;
 
 // A DrawMeshProg0 draw's inputs as floats. Colours are scaled so 128 is 1.0; the material is on 1.0.
 struct Prog0Constants {
-    float    model_world[16];       // model to world, columns
-    float    light_direction[3][4]; // x, y, z rows: world directions toward the four lights
-    float    light_color[4][4];     // per-light colour
-    float    ambient[4];            // w already multiplied by the object's alpha
-    float    object_color[4];
-    float    eye[4];                // object space
+    float model_world[16];       // model to world, columns
+    float light_direction[3][4]; // x, y, z rows: world directions toward the four lights
+    float light_color[4][4];     // per-light colour
+    float ambient[4];            // w already multiplied by the object's alpha
+    float object_color[4];
+    float eye[4]; // object space
     // World clip * model, or view * model under kProg0RefSphere: the game overlaps the two blocks, so a
     // draw with both clips against the view.
     float    clip_or_view[16];
-    float    diffuse[4];            // material
-    float    specular[4];           // material
-    float    point_light[4][4];     // positions relative to the object origin, world space; w is the power
-    float    point_color[4][4];     // per-light colour
-    float    fog[4];                // offset, near value, far value, scale
-    uint32_t flags = 0;             // Prog0Flags
+    float    diffuse[4];        // material
+    float    specular[4];       // material
+    float    point_light[4][4]; // positions relative to the object origin, world space; w is the power
+    float    point_color[4][4]; // per-light colour
+    float    fog[4];            // offset, near value, far value, scale
+    uint32_t flags = 0;         // Prog0Flags
     uint32_t pad0 = 0;
-    uint32_t specular_power = 0;    // specular exponent
+    uint32_t specular_power = 0; // specular exponent
     uint32_t pad = 0;
 };
 
@@ -596,6 +610,7 @@ struct Prog0Skin {
     float   unused[4];
     uint8_t bone[4]; // slot, the VU's offset / 4
 };
+
 static_assert(sizeof(Prog0Skin) == sizeof(Vertex3D));
 
 // Vu_prog0 culls only under kProg0Cull; a mirroring model_world swaps the faces it keeps.
@@ -604,8 +619,8 @@ inline CullMode Prog0CullMode(const Prog0Constants &constants) {
         return CullMode::None;
     }
     const float *m = constants.model_world;
-    float det = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) +
-                m[8] * (m[1] * m[6] - m[2] * m[5]);
+    float        det = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) +
+                       m[8] * (m[1] * m[6] - m[2] * m[5]);
     return det < 0.0f ? CullMode::Front : CullMode::Back;
 }
 
@@ -623,11 +638,12 @@ struct MeshConstants {
     float    specular[4];
     float    fog[4];           // F = clamp(fog[0] + fog[1] / w, fog[2], fog[3]), GS units 0..255
     float    clip_plane[2][4]; // object space, kept where dot(plane, (p, 1)) >= 0
-    float    world_uv[2][4]; // world x/z rows for terrain sampled across map cells
+    float    world_uv[2][4];   // world x/z rows for terrain sampled across map cells
     uint32_t flags = 0;
     uint32_t light_count = 0;
     uint32_t pad[2] = {};
 };
+
 static_assert(sizeof(MeshConstants) == 400);
 static_assert(offsetof(Prog0Constants, flags) == 464);
 static_assert(sizeof(Prog0Constants) == 480);
@@ -637,6 +653,7 @@ static_assert(sizeof(Prog0Constants) == 480);
 struct Prog0Palette {
     float bones[kProg0Bones][3][4];
 };
+
 static_assert(sizeof(Prog0Palette) == 1536);
 
 // How a mesh draw's mvp was made: projection * view * middle * model * local, column-major. Recorded
@@ -744,8 +761,8 @@ struct LogicalMapping {
     uint32_t pixel_height;
 };
 
-void           SetRenderTarget(TextureHandle target);
-TextureHandle  CurrentRenderTarget();
+void          SetRenderTarget(TextureHandle target);
+TextureHandle CurrentRenderTarget();
 // Where the target's logical space lands: meshes, clears, copies, depth reads, and 2D that tests
 // depth or samples an image of the frame.
 LogicalMapping GetLogicalMapping(TextureHandle target);
@@ -772,20 +789,28 @@ bool CopyMainDepthToTarget(const LogicalRect &source);
 // Where the rest of 2D lands: on the main target the logical mapping scaled by ui_scale about the
 // target's centre, elsewhere the logical mapping.
 LogicalMapping GetUiMapping(TextureHandle target);
+/**
+ * Maps logical coordinates to output pixels independently of the main raster size.
+ */
+LogicalMapping GetPresentationMapping(bool ui = false);
 // The anchor of the 2D drawn from here on that the UI mapping places on the main target.
 void     SetUiAnchor(const UiAnchor &anchor);
 UiAnchor CurrentUiAnchor();
+
 // Sets an anchor for its lifetime and puts back the one it replaced.
 class UiAnchorScope {
 public:
     explicit UiAnchorScope(const UiAnchor &anchor) : previous_(CurrentUiAnchor()) { SetUiAnchor(anchor); }
+
     ~UiAnchorScope() { SetUiAnchor(previous_); }
+
     UiAnchorScope(const UiAnchorScope &) = delete;
     UiAnchorScope &operator=(const UiAnchorScope &) = delete;
 
 private:
     UiAnchor previous_;
 };
+
 // The logical rect the target's pixels show: its logical frame, or with AspectMode::Fill on the main
 // target (and the targets mapped like it) all of the target, past the frame on its wider axis, and
 // on a frame target the main target's horizontal extent (and vertical, on a full-height one).
@@ -914,6 +939,45 @@ struct RenderOptions {
 bool RenderList(const DisplayList &list, float alpha, const RenderOptions &options);
 // Presents the last canonical render as it is (interpolation off, headless runs).
 bool PresentCanonical();
+
+/**
+ * Identifies one committed canonical image without extending its storage lifetime.
+ */
+class CanonicalImageToken {
+public:
+    /**
+     * Creates an empty image identity that cannot be presented.
+     */
+    CanonicalImageToken() = default;
+    /**
+     * Compares complete canonical-image identities.
+     */
+    bool operator==(const CanonicalImageToken &) const = default;
+
+    /**
+     * Checks whether two valid images belong to the same main-target allocation.
+     */
+    bool SharesStorageWith(const CanonicalImageToken &other) const noexcept {
+        return renderer_instance != 0 && renderer_instance == other.renderer_instance && target_generation == other.target_generation;
+    }
+
+private:
+    uint64_t                                  renderer_instance = 0; /**< Renderer lifetime that owns the image. */
+    uint64_t                                  target_generation = 0; /**< Main-target allocation that owns the slot. */
+    uint64_t                                  commit_serial = 0;     /**< Canonical render that produced the pixels. */
+    uint32_t                                  image_index = 0;       /**< Committed main-color slot. */
+    friend std::optional<CanonicalImageToken> CaptureCanonicalImage();
+    friend bool                               PresentCanonicalImage(const CanonicalImageToken &, const DisplayList *);
+};
+
+/**
+ * Captures the latest complete canonical image while it is eligible for presentation.
+ */
+std::optional<CanonicalImageToken> CaptureCanonicalImage();
+/**
+ * Presents the exact latest committed image, optionally compositing a host-only overlay.
+ */
+bool PresentCanonicalImage(const CanonicalImageToken &token, const DisplayList *overlay = nullptr);
 
 struct DisplayListStats {
     uint32_t draws_2d;
