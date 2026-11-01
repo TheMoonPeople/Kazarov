@@ -48,8 +48,8 @@ TEST(GfxMisc, PipelineCache) {
         ASSERT_TRUE(fixture.progress_calls > 0);
         ASSERT_TRUE(fixture.progress_done == fixture.progress_total);
         ASSERT_TRUE(fixture.progress_total == gfx::PipelineCount());
-        ASSERT_TRUE(std::filesystem::exists(cache));
     }
+    ASSERT_TRUE(std::filesystem::exists(cache));
     const auto read_cache = [&] {
         std::ifstream file(cache, std::ios::binary);
         return std::vector<char>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
