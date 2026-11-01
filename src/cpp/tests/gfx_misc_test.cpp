@@ -556,11 +556,14 @@ TEST_P(GfxGpuColorWriteMask, ZeroReferenceAlphaTestKeepsTransparentCoverage) {
 TEST_P(GfxGpuColorWriteMask, GEqualFiltersAroundQuantizedReferences) {
     GfxFixture fixture(640, 480, 1.0f, GetParam());
 
+    /**
+     * Pairs an alpha reference with representable rejected and accepted filter samples.
+     */
     struct Boundary {
-        uint8_t reference;
-        float   before;
-        float   at_or_above;
-        float   after;
+        uint8_t reference;   /**< GS alpha comparison reference. */
+        float   before;      /**< Texture coordinate producing a rejected alpha. */
+        float   at_or_above; /**< Texture coordinate producing an accepted alpha at or above the reference. */
+        float   after;       /**< Texture coordinate producing a higher accepted alpha. */
     };
 
     // Vulkan guarantees only four fractional bits for filtering weights.

@@ -630,7 +630,7 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
                             : g.dynamic_color_write_mask ? PipelineIndex(family, blend.slot, mode, alpha, features)
                                                          : NoColorPipelineIndex(family, mode);
     uint32_t     scope_pipeline = pipeline;
-    VkPipeline   selected_pipeline = g.pipelines[pipeline];
+    VkPipeline   selected_pipeline = PipelineByIndex(pipeline);
     if (g.near_safe_fog_pipelines[0] != VK_NULL_HANDLE && family == kFamilyMesh &&
         static_mesh != nullptr && mesh_constants != nullptr) {
         for (uint32_t variant = 0; variant < g.near_safe_fog_pipelines.size(); variant++) {

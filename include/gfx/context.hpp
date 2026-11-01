@@ -640,12 +640,16 @@ void DestroyDoomedTexture(TextureHandle handle);
 void DestroyDoomedMesh(MeshHandle handle);
 
 // pipelines.cpp
-void     CreatePipelineLayout();
-bool     DepthPlanesEnabled();
-void     CreatePipelines();
-void     DestroyPipelines();
-uint32_t PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, AlphaVariant alpha,
-                       uint32_t fragment_features);
+void CreatePipelineLayout();
+bool DepthPlanesEnabled();
+void CreatePipelines();
+void DestroyPipelines();
+/**
+ * Returns a regular pipeline, creating it on first use when prewarming is disabled.
+ */
+VkPipeline PipelineByIndex(uint32_t index);
+uint32_t   PipelineIndex(PipelineFamily family, uint32_t blend_slot, TextureMode mode, AlphaVariant alpha,
+                         uint32_t fragment_features);
 // Without a dynamic colour write mask: the alpha-testing pipelines that write no colour, after the others.
 uint32_t NoColorPipelineIndex(PipelineFamily family, TextureMode mode);
 // The depth and stencil only pipelines, which have no fragment stage, last.

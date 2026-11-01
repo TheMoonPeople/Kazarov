@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -276,6 +278,117 @@ void SaveCache(const std::filesystem::path &path, const std::vector<uint8_t> &in
                  std::chrono::duration<double, std::milli>(finished - serialized).count());
     }
 }
+
+/**
+ * Owns the Vulkan inputs needed to create one deferred graphics pipeline.
+ */
+struct PipelineRecipe {
+    VkGraphicsPipelineCreateInfo                   info{};         /**< Complete description of the deferred pipeline. */
+    VkPipelineRenderingCreateInfo                  rendering{};    /**< Rendering attachment metadata for the pipeline. */
+    VkFormat                                       color_format{}; /**< Color attachment format referenced by the rendering metadata. */
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages = {
+        VkPipelineShaderStageCreateInfo{.stage = VK_SHADER_STAGE_VERTEX_BIT},
+        VkPipelineShaderStageCreateInfo{.stage = VK_SHADER_STAGE_FRAGMENT_BIT}}; /**< Owned descriptions of the active shader stages. */
+    std::array<VkSpecializationInfo, 2>                  specialization{};       /**< Specialization metadata for each shader stage. */
+    std::array<std::vector<VkSpecializationMapEntry>, 2> entries{};              /**< Owned specialization constant mappings. */
+    std::array<std::vector<uint8_t>, 2>                  data{};                 /**< Owned specialization constant values. */
+    VkPipelineVertexInputStateCreateInfo                 vertex{};               /**< Vertex input layout for the pipeline. */
+    std::vector<VkVertexInputBindingDescription>         bindings;               /**< Owned vertex buffer binding descriptions. */
+    std::vector<VkVertexInputAttributeDescription>       attributes;             /**< Owned vertex attribute descriptions. */
+    VkPipelineInputAssemblyStateCreateInfo               assembly{};             /**< Primitive assembly configuration. */
+    VkPipelineViewportStateCreateInfo                    viewport{};             /**< Dynamic viewport and scissor counts. */
+    VkPipelineRasterizationStateCreateInfo               raster{};               /**< Rasterization configuration. */
+    VkPipelineMultisampleStateCreateInfo                 multisample;            /**< Sample coverage configuration. */
+    VkPipelineDepthStencilStateCreateInfo                depth{};                /**< Depth and stencil configuration. */
+    VkPipelineColorBlendStateCreateInfo                  blend{};                /**< Color blending configuration. */
+    std::vector<VkPipelineColorBlendAttachmentState>     attachments;            /**< Owned per-attachment blending descriptions. */
+    VkPipelineDynamicStateCreateInfo                     dynamic{};              /**< Metadata describing dynamic draw state. */
+    std::vector<VkDynamicState>                          dynamic_states;         /**< Owned dynamic state declarations. */
+
+    /**
+     * Copies the regular pipeline description and all of its referenced storage.
+     */
+    explicit PipelineRecipe(const VkGraphicsPipelineCreateInfo &description)
+        : info(description), rendering(*static_cast<const VkPipelineRenderingCreateInfo *>(description.pNext)),
+          color_format(*rendering.pColorAttachmentFormats), multisample(*description.pMultisampleState) {
+        rendering.pColorAttachmentFormats = &color_format;
+        info.pNext = &rendering;
+        for (uint32_t i = 0; i < info.stageCount; i++) {
+            stages[i] = info.pStages[i];
+            if (const VkSpecializationInfo *source = stages[i].pSpecializationInfo) {
+                specialization[i] = *source;
+                entries[i].assign(source->pMapEntries, source->pMapEntries + source->mapEntryCount);
+                const auto *bytes = static_cast<const uint8_t *>(source->pData);
+                data[i].assign(bytes, bytes + source->dataSize);
+                specialization[i].pMapEntries = entries[i].data();
+                specialization[i].pData = data[i].data();
+                stages[i].pSpecializationInfo = &specialization[i];
+            }
+        }
+        info.pStages = stages.data();
+        vertex = *info.pVertexInputState;
+        bindings.assign(vertex.pVertexBindingDescriptions,
+                        vertex.pVertexBindingDescriptions + vertex.vertexBindingDescriptionCount);
+        attributes.assign(vertex.pVertexAttributeDescriptions,
+                          vertex.pVertexAttributeDescriptions + vertex.vertexAttributeDescriptionCount);
+        vertex.pVertexBindingDescriptions = bindings.data();
+        vertex.pVertexAttributeDescriptions = attributes.data();
+        info.pVertexInputState = &vertex;
+        assembly = *info.pInputAssemblyState;
+        info.pInputAssemblyState = &assembly;
+        viewport = *info.pViewportState;
+        info.pViewportState = &viewport;
+        raster = *info.pRasterizationState;
+        info.pRasterizationState = &raster;
+        info.pMultisampleState = &multisample;
+        depth = *info.pDepthStencilState;
+        info.pDepthStencilState = &depth;
+        blend = *info.pColorBlendState;
+        attachments.assign(blend.pAttachments, blend.pAttachments + blend.attachmentCount);
+        blend.pAttachments = attachments.data();
+        info.pColorBlendState = &blend;
+        dynamic = *info.pDynamicState;
+        dynamic_states.assign(dynamic.pDynamicStates, dynamic.pDynamicStates + dynamic.dynamicStateCount);
+        dynamic.pDynamicStates = dynamic_states.data();
+        info.pDynamicState = &dynamic;
+    }
+
+    /**
+     * Keeps referenced Vulkan storage attached to its original owner.
+     */
+    PipelineRecipe(const PipelineRecipe &) = delete;
+
+    /**
+     * Prevents replacing storage referenced by an existing description.
+     */
+    PipelineRecipe &operator=(const PipelineRecipe &) = delete;
+};
+
+/**
+ * Keeps deferred pipeline descriptions and their shader modules alive until renderer shutdown.
+ */
+struct PipelineRecipes {
+    std::vector<std::unique_ptr<PipelineRecipe>> pipelines;          /**< Descriptions awaiting first use by each pipeline index. */
+    std::array<VkShaderModule, 5>                modules{};          /**< Shader modules referenced by deferred descriptions. */
+    bool                                         save_cache = false; /**< Whether shutdown persists compiled pipeline cache data. */
+    std::vector<uint8_t>                         initial_cache;      /**< Cache bytes loaded before deferred pipeline creation. */
+
+    /**
+     * Releases shader modules while the renderer's device is still alive.
+     */
+    ~PipelineRecipes() {
+        for (VkShaderModule module : modules) {
+            if (module != VK_NULL_HANDLE) {
+                vkDestroyShaderModule(g.device, module, nullptr);
+            }
+        }
+    }
+};
+
+/**
+ * Owns the deferred descriptions for the current renderer instance.
+ */
+std::unique_ptr<PipelineRecipes> g_pipeline_recipes;
 
 struct PipelineDesc {
     PipelineFamily family;
@@ -556,7 +669,7 @@ void LogShaderStats() {
             std::vector<VkPipelineExecutableInternalRepresentationKHR> irs(
                 ir_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
             representations(g.device, &executable, &ir_count, irs.data());
-            std::vector<std::vector<char> > texts(ir_count);
+            std::vector<std::vector<char>> texts(ir_count);
             for (uint32_t r = 0; r < ir_count; r++) {
                 texts[r].resize(irs[r].dataSize + 1);
                 irs[r].pData = texts[r].data();
@@ -586,6 +699,8 @@ void CreatePipelines() {
     BuildBlendTable();
 
     const bool                trace_init = std::getenv("KZ_PERF_INIT_TRACE") != nullptr;
+    const char               *prewarm_setting = std::getenv("KZ_PIPELINE_PREWARM");
+    const bool                prewarm = prewarm_setting == nullptr || std::strcmp(prewarm_setting, "0") != 0;
     const bool                disable_cache = std::getenv("KZ_PIPELINE_CACHE_DISABLE") != nullptr;
     std::vector<uint8_t>      initial = disable_cache ? std::vector<uint8_t>{} : LoadCache(g.config.pipeline_cache);
     const auto                loaded = trace_init ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -812,11 +927,17 @@ void CreatePipelines() {
 
     std::vector<VkPipelineShaderStageCreateInfo> stages(total * 2);
     std::vector<VkGraphicsPipelineCreateInfo>    infos(total);
-    uint32_t                                     creation_count = 0;
-    auto                                         describe = [&](uint32_t index, uint32_t family, VkShaderModule fragment,
-                                                                const VkSpecializationInfo                *fragment_spec,
-                                                                const VkPipelineColorBlendStateCreateInfo *blend_state,
-                                                                const VkPipelineDynamicStateCreateInfo    *dynamic_state) {
+    if (!prewarm) {
+        g_pipeline_recipes = std::make_unique<PipelineRecipes>();
+        g_pipeline_recipes->pipelines.resize(total);
+        g_pipeline_recipes->modules = {draw2d_module, mesh_module, frag_module, frag_single_module, prog0_module};
+        g_pipeline_recipes->save_cache = !disable_cache;
+    }
+    uint32_t creation_count = 0;
+    auto     describe = [&](uint32_t index, uint32_t family, VkShaderModule fragment,
+                            const VkSpecializationInfo                *fragment_spec,
+                            const VkPipelineColorBlendStateCreateInfo *blend_state,
+                            const VkPipelineDynamicStateCreateInfo    *dynamic_state) {
         creation_count++;
         VkPipelineShaderStageCreateInfo *stage = &stages[index * 2];
         stage[0] = {};
@@ -853,6 +974,9 @@ void CreatePipelines() {
         if (!g.perf.stats.empty() && (g.perf.stats == "*" || DescribePipeline(index).find(g.perf.stats) != std::string::npos)) {
             info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
                           VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+        }
+        if (!prewarm) {
+            g_pipeline_recipes->pipelines[index] = std::make_unique<PipelineRecipe>(info);
         }
     };
     for (uint32_t family = 0; family < family_count; family++) {
@@ -920,7 +1044,7 @@ void CreatePipelines() {
             workers = std::min(workers, worker_limit);
         }
     }
-    {
+    if (prewarm) {
         // std::thread rather than std::jthread, which Android's libc++ keeps experimental.
         std::vector<std::thread> threads;
         for (uint32_t i = 0; i < workers; i++) {
@@ -1066,14 +1190,16 @@ void CreatePipelines() {
         LogShaderStats();
     }
 
-    vkDestroyShaderModule(g.device, draw2d_module, nullptr);
-    vkDestroyShaderModule(g.device, mesh_module, nullptr);
-    vkDestroyShaderModule(g.device, frag_module, nullptr);
-    vkDestroyShaderModule(g.device, frag_single_module, nullptr);
-    if (prog0_module != VK_NULL_HANDLE) {
-        vkDestroyShaderModule(g.device, prog0_module, nullptr);
+    if (prewarm) {
+        vkDestroyShaderModule(g.device, draw2d_module, nullptr);
+        vkDestroyShaderModule(g.device, mesh_module, nullptr);
+        vkDestroyShaderModule(g.device, frag_module, nullptr);
+        vkDestroyShaderModule(g.device, frag_single_module, nullptr);
+        if (prog0_module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(g.device, prog0_module, nullptr);
+        }
     }
-    if (!disable_cache && (initial.empty() || cache_unconfirmed.load(std::memory_order_relaxed) != 0)) {
+    if (prewarm && !disable_cache && (initial.empty() || cache_unconfirmed.load(std::memory_order_relaxed) != 0)) {
         SaveCache(g.config.pipeline_cache, initial);
     }
     g.pipeline_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -1086,10 +1212,40 @@ void CreatePipelines() {
                  milliseconds(start, loaded), milliseconds(loaded, cache_created),
                  milliseconds(cache_created, described), milliseconds(described, compiled), cache_unconfirmed.load(), initial.size());
     }
-    kz::Logf(kz::LogLevel::Info, "gfx", "{} pipelines ready in {:.2f} s", creation_count, g.pipeline_seconds);
+    if (!prewarm && g.config.progress) {
+        g.config.progress(creation_count, creation_count);
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx", "{} pipelines {} in {:.2f} s", creation_count,
+             prewarm ? "ready" : "described for first use", g.pipeline_seconds);
+    if (g_pipeline_recipes) {
+        g_pipeline_recipes->initial_cache = std::move(initial);
+    }
+}
+
+/**
+ * Creates a deferred regular pipeline on first use by the renderer thread.
+ */
+VkPipeline PipelineByIndex(uint32_t index) {
+    VkPipeline &pipeline = g.pipelines.at(index);
+    if (pipeline == VK_NULL_HANDLE) {
+        const auto &recipe = g_pipeline_recipes->pipelines.at(index);
+        Check(vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &recipe->info, nullptr, &pipeline),
+              "vkCreateGraphicsPipelines on demand");
+        g_pipeline_recipes->pipelines[index].reset();
+        if (!g.perf.stats.empty()) {
+            LogShaderStats();
+        }
+    }
+    return pipeline;
 }
 
 void DestroyPipelines() {
+    if (g_pipeline_recipes) {
+        if (g_pipeline_recipes->save_cache) {
+            SaveCache(g.config.pipeline_cache, g_pipeline_recipes->initial_cache);
+        }
+        g_pipeline_recipes.reset();
+    }
     for (VkPipeline pipeline : g.pipelines) {
         vkDestroyPipeline(g.device, pipeline, nullptr);
     }

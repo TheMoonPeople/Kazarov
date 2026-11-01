@@ -671,6 +671,15 @@ this family and use `-LE gpu`. CPU display-list coverage continues to run.
 
 ### Startup pipeline and cache work
 
+`KZ_PIPELINE_PREWARM=0` creates regular graphics pipelines on first draw instead of
+compiling every combination at startup. This limits software-driver memory use in
+CI while retaining every specialization and the same logical `PipelineCount()`.
+Vulkan descriptions own their backing data, and their shader modules remain alive
+until renderer shutdown. Helper pipelines still compile during initialization.
+The default prewarms every pipeline; `KZ_PIPELINE_COMPILER_THREADS` limits its
+compiler workers. The optional first-use mode runs on the render thread and saves
+its populated Vulkan pipeline cache at shutdown.
+
 Untextured colour pipelines keep fog and simple-colour specialization but share
 TEXA/AEM variants: those flags only affect texture sampling. Original index slots
 remain available internally; unused slots contain null handles and own no pipeline.
