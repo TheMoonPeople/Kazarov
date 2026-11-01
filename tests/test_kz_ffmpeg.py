@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -312,3 +313,16 @@ def test_download_failure_preserves_verified_archive(tmp_path, monkeypatch, down
     assert destination.read_bytes() == original
     assert not destination.with_name(destination.name + '.partial').exists()
     assert attempts.call_count == 5
+
+
+def test_native_macos_stamp_tracks_deployment_target(monkeypatch):
+    helper = runpy.run_path(str(KZ_FFMPEG))
+    stamp = helper['expected_stamp']
+    monkeypatch.setitem(stamp.__globals__, 'sys', SimpleNamespace(platform='darwin'))
+    monkeypatch.setenv('MACOSX_DEPLOYMENT_TARGET', '14.0')
+    baseline = stamp('digest', None)
+    monkeypatch.setenv('MACOSX_DEPLOYMENT_TARGET', '27.0')
+
+    assert baseline != stamp('digest', None)
+    assert baseline['macos_deployment_target'] == '14.0'
+    assert 'macos_deployment_target' not in stamp('digest', 'switch-arm64')

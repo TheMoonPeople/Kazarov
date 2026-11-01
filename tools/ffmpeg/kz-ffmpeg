@@ -107,7 +107,10 @@ if _leaked:
 
 
 def expected_stamp(sha, target):
-    return {'version': VERSION, 'sha256': sha, 'configure': configure_flags(target), 'license': LICENSE_LINE}
+    stamp = {'version': VERSION, 'sha256': sha, 'configure': configure_flags(target), 'license': LICENSE_LINE}
+    if target is None and sys.platform == 'darwin':
+        stamp['macos_deployment_target'] = os.environ.get('MACOSX_DEPLOYMENT_TARGET', '')
+    return stamp
 
 
 def current(out, sha, target):
