@@ -19,9 +19,9 @@ FetchContent_MakeAvailable(corrosion)
 get_filename_component(KZ_RUST_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/../Cargo.toml" ABSOLUTE)
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # The desktop setup window (eframe, rfd) does not target iOS, which extracts without it.
-    corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core NO_DEFAULT_FEATURES)
+    corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core NO_DEFAULT_FEATURES LOCKED)
 else()
-    corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core)
+    corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core LOCKED)
 endif()
 # Keep the build's seed separate from a completed extraction in the build directory.
 set(KZ_GAMEPLAY_ARCHIVE "${CMAKE_BINARY_DIR}/assets/data.zip")
