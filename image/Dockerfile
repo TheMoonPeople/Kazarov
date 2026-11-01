@@ -101,8 +101,8 @@ RUN apt-get update \
         libgtest-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# clang, lld and llvm for the PC port. Debian stops at LLVM 19, so these come
-# from apt.llvm.org and install under /usr/lib/llvm-<version>/bin.
+# clang, lld and llvm for the PC port, with compiler-rt for its AddressSanitizer build. Debian stops at
+# LLVM 19, so these come from apt.llvm.org and install under /usr/lib/llvm-<version>/bin.
 RUN wget -qO /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
     && echo "deb http://apt.llvm.org/trixie/ llvm-toolchain-trixie-${LLVM_VERSION} main" \
         > /etc/apt/sources.list.d/llvm.list \
@@ -111,6 +111,7 @@ RUN wget -qO /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-s
         clang-${LLVM_VERSION} \
         lld-${LLVM_VERSION} \
         llvm-${LLVM_VERSION} \
+        libclang-rt-${LLVM_VERSION}-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Assembler, objcopy, objdump, readelf and nm for the PS2 decompilation projects.
