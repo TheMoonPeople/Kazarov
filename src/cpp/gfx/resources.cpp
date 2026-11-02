@@ -589,11 +589,7 @@ void DestroyDoomedMesh(MeshHandle handle) {
 }
 
 bool NearSafeFogEnabled() {
-    static const bool enabled = [] {
-        const char *value = std::getenv("KZ_FOG_NEAR_SAFE");
-        return value != nullptr && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
+    return g.config.near_safe_fog;
 }
 
 bool TexaMaskEnabled() {

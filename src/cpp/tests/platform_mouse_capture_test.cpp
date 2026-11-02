@@ -152,3 +152,25 @@ TEST_F(MouseCapture, ExplicitWindowedReleaseSurvivesRefocus) {
     MouseHandleEvent(event);
     ASSERT_FALSE(MouseCaptured());
 }
+
+#ifndef __SWITCH__
+TEST(WindowLifecyclePolicy, ExplicitNativePolicyDoesNotLatchAcrossPortableWindowLifetimes) {
+    const WindowConfig ordinary;
+    EXPECT_FALSE(ordinary.manual_background_lifecycle);
+    for (const bool requested : {false, true, false}) {
+        WindowConfig config;
+        config.width = 320;
+        config.height = 240;
+        config.headless = true;
+        config.vulkan = false;
+        config.manual_background_lifecycle = requested;
+        WindowInit(config);
+        EXPECT_NE(WindowHandle(), nullptr);
+        EXPECT_TRUE(WindowPollEvents());
+        WindowShutdown();
+        EXPECT_EQ(WindowHandle(), nullptr);
+        EXPECT_FALSE(ordinary.manual_background_lifecycle);
+    }
+    EXPECT_FALSE(WindowConfig{}.manual_background_lifecycle);
+}
+#endif

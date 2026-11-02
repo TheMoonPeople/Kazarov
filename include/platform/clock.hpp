@@ -30,6 +30,10 @@
 
 using ClockTickCallback = int (*)(int);
 using ClockIdleHook = void (*)();
+/**
+ * Reanchors game-owned presentation state while the caller keeps rendering suspended.
+ */
+using ClockResumeCallback = void (*)();
 // Called over and over while ClockWaitNextTick waits, with the elapsed fraction of the current tick
 // (0 at its start, below 1) and the time the next one is due; it does one piece of work (presents
 // a display frame) and returns true while it has more to do before that time.
@@ -46,9 +50,15 @@ bool ClockUnbounded();
 // Re-anchors the clock at the current time with a count of zero.
 void ClockReset();
 
-// Re-anchors the clock at the current time without moving the count, so time the app spent in the
-// background is not run as ticks.
+/**
+ * Reanchors the clock without moving its count and notifies the game's suspended presentation state.
+ */
 void ClockReanchor();
+
+/**
+ * Installs the game-owned resume notification and returns its previous callback.
+ */
+ClockResumeCallback ClockSetResumeCallback(ClockResumeCallback callback);
 
 std::int64_t ClockTickCount();
 

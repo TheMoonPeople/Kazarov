@@ -1,10 +1,15 @@
 #include "platform/window.hpp"
 
 #include <SDL3/SDL.h>
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <format>
 #include <utility>
 #include <vector>
@@ -34,6 +39,93 @@ bool                                     g_mode_event = false;
 std::vector<void (*)(const SDL_Event &)> g_hooks;
 WindowIdentity                           g_identity;
 
+#ifdef __SWITCH__
+/** Whether passive native lifecycle diagnostics were explicitly requested. */
+bool g_lifecycle_trace = false;
+/** Whether the passive observer owns a registered native hook. */
+bool g_lifecycle_trace_hooked = false;
+/** Native hook linkage removed before SDL shuts down. */
+AppletHookCookie g_lifecycle_trace_cookie{};
+/** Current window event-pump invocation observed by native notifications. */
+std::uint64_t g_lifecycle_pump_sequence = 0;
+/** Native counter at the previous traced window event-pump entry. */
+std::uint64_t g_lifecycle_last_poll_tick = 0;
+
+/**
+ * Records native notifications without changing focus handling or presentation state.
+ */
+void TraceNativeLifecycle(AppletHookType hook_type, [[maybe_unused]] void *user) {
+    std::fprintf(stderr, "lifecycle trace native: hook_code=%u cached_focus=%u native_tick=%llu pump_sequence=%llu will_background=%d did_background=%d will_foreground=%d did_foreground=%d\n",
+                 static_cast<unsigned>(hook_type), static_cast<unsigned>(appletGetFocusState()),
+                 static_cast<unsigned long long>(armGetSystemTick()), static_cast<unsigned long long>(g_lifecycle_pump_sequence),
+                 SDL_EventEnabled(SDL_EVENT_WILL_ENTER_BACKGROUND), SDL_EventEnabled(SDL_EVENT_DID_ENTER_BACKGROUND),
+                 SDL_EventEnabled(SDL_EVENT_WILL_ENTER_FOREGROUND), SDL_EventEnabled(SDL_EVENT_DID_ENTER_FOREGROUND));
+    std::fflush(stderr);
+}
+
+/**
+ * Installs an optional observation-only native hook and reports SDL lifecycle routing.
+ */
+void StartLifecycleTrace(bool watch_registered) {
+    const char *setting = std::getenv("KZ_LIFECYCLE_TRACE");
+    g_lifecycle_trace = setting != nullptr && std::strcmp(setting, "1") == 0;
+    if (!g_lifecycle_trace) {
+        return;
+    }
+    g_lifecycle_pump_sequence = 0;
+    g_lifecycle_last_poll_tick = 0;
+    if (watch_registered) {
+        appletHook(&g_lifecycle_trace_cookie, TraceNativeLifecycle, nullptr);
+        g_lifecycle_trace_hooked = true;
+    }
+    const char *driver = SDL_GetCurrentVideoDriver();
+    std::fprintf(stderr, "lifecycle trace startup: applet_type=%u cached_focus=%u video_driver=%s watch_registered=%d native_hook_registered=%d will_background=%d did_background=%d will_foreground=%d did_foreground=%d native_tick=%llu tick_hz=%llu pump_sequence=%llu\n",
+                 static_cast<unsigned>(appletGetAppletType()), static_cast<unsigned>(appletGetFocusState()),
+                 driver != nullptr ? driver : "none", watch_registered, g_lifecycle_trace_hooked,
+                 SDL_EventEnabled(SDL_EVENT_WILL_ENTER_BACKGROUND), SDL_EventEnabled(SDL_EVENT_DID_ENTER_BACKGROUND),
+                 SDL_EventEnabled(SDL_EVENT_WILL_ENTER_FOREGROUND), SDL_EventEnabled(SDL_EVENT_DID_ENTER_FOREGROUND),
+                 static_cast<unsigned long long>(armGetSystemTick()), static_cast<unsigned long long>(armGetSystemTickFreq()),
+                 static_cast<unsigned long long>(g_lifecycle_pump_sequence));
+    std::fflush(stderr);
+}
+
+/**
+ * Records only event-pump entry gaps exceeding one hundred milliseconds.
+ */
+std::uint64_t TracePollEntry() {
+    if (!g_lifecycle_trace) {
+        return 0;
+    }
+    const auto now = armGetSystemTick();
+    ++g_lifecycle_pump_sequence;
+    if (g_lifecycle_last_poll_tick != 0 && now >= g_lifecycle_last_poll_tick &&
+        now - g_lifecycle_last_poll_tick > armGetSystemTickFreq() / 10) {
+        std::fprintf(stderr, "lifecycle trace poll gap: pump_sequence=%llu native_tick=%llu gap_ticks=%llu cached_focus=%u\n",
+                     static_cast<unsigned long long>(g_lifecycle_pump_sequence), static_cast<unsigned long long>(now),
+                     static_cast<unsigned long long>(now - g_lifecycle_last_poll_tick), static_cast<unsigned>(appletGetFocusState()));
+        std::fflush(stderr);
+    }
+    g_lifecycle_last_poll_tick = now;
+    return now;
+}
+
+/**
+ * Records only event pumps whose duration exceeds one hundred milliseconds.
+ */
+void TracePollExit(std::uint64_t begin_tick) {
+    if (!g_lifecycle_trace) {
+        return;
+    }
+    const auto now = armGetSystemTick();
+    if (now >= begin_tick && now - begin_tick > armGetSystemTickFreq() / 10) {
+        std::fprintf(stderr, "lifecycle trace poll duration: pump_sequence=%llu native_tick=%llu elapsed_ticks=%llu cached_focus=%u\n",
+                     static_cast<unsigned long long>(g_lifecycle_pump_sequence), static_cast<unsigned long long>(now),
+                     static_cast<unsigned long long>(now - begin_tick), static_cast<unsigned>(appletGetFocusState()));
+        std::fflush(stderr);
+    }
+}
+#endif
+
 void ApplyIcon() {
     if (g_identity.icon_rgba == nullptr) {
         return;
@@ -51,32 +143,71 @@ void ApplyIcon() {
     std::exit(1);
 }
 
-#ifdef SDL_PLATFORM_IOS
+#ifdef __SWITCH__
+/**
+ * Requests native focus notifications for an explicitly lifecycle-managed application window.
+ */
+void ConfigureManualBackgroundLifecycle(const WindowConfig &config, bool watch_registered) {
+    if (!config.manual_background_lifecycle) {
+        return;
+    }
+    const char *driver = SDL_GetCurrentVideoDriver();
+    const auto  applet_type = appletGetAppletType();
+    if (!watch_registered || config.headless || driver == nullptr || SDL_strcasecmp(driver, "Switch") != 0 ||
+        applet_type != AppletType_Application) {
+        SDL_SetError("manual background lifecycle unavailable: watch_registered=%d headless=%d video_driver=%s applet_type=%u",
+                     watch_registered, config.headless, driver != nullptr ? driver : "none", static_cast<unsigned>(applet_type));
+        Fatal("WindowInit lifecycle policy");
+    }
+    const auto result = appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
+    std::fprintf(stderr, "window: background lifecycle policy: manual=1 mode=%u result=0x%08x applet_type=%u\n",
+                 static_cast<unsigned>(AppletFocusHandlingMode_NoSuspend), static_cast<unsigned>(result),
+                 static_cast<unsigned>(applet_type));
+    std::fflush(stderr);
+    if (R_FAILED(result)) {
+        SDL_SetError("appletSetFocusHandlingMode(NoSuspend) failed (0x%08x)", static_cast<unsigned>(result));
+        Fatal("WindowInit lifecycle policy");
+    }
+}
+#endif
+
+#if defined(SDL_PLATFORM_IOS) || defined(__SWITCH__)
 // Whether the app is in the background, or inactive behind the lock screen or a system panel.
 bool g_background = false;
 
-// UIKit's app delegate sends these from inside an event pump on the game thread, and the watch sees them before
-// the delegate call returns: past that iOS refuses GPU work, and an app that submits it is ended. So everything
-// stops here, not when the queued event is read.
-bool SDLCALL Lifecycle(void *, SDL_Event *event) {
+/**
+ * Suspends rendering and sound before queued lifecycle handlers and reanchors them on foreground entry.
+ */
+bool SDLCALL Lifecycle([[maybe_unused]] void *user, SDL_Event *event) {
+#ifdef __SWITCH__
+    if (g_lifecycle_trace && (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND || event->type == SDL_EVENT_DID_ENTER_BACKGROUND ||
+                              event->type == SDL_EVENT_WILL_ENTER_FOREGROUND || event->type == SDL_EVENT_DID_ENTER_FOREGROUND)) {
+        std::fprintf(stderr, "lifecycle trace SDL: event_type=%u background=%d native_tick=%llu pump_sequence=%llu\n",
+                     event->type, g_background, static_cast<unsigned long long>(armGetSystemTick()),
+                     static_cast<unsigned long long>(g_lifecycle_pump_sequence));
+        std::fflush(stderr);
+    }
+#endif
     switch (event->type) {
         case SDL_EVENT_WILL_ENTER_BACKGROUND:
         case SDL_EVENT_DID_ENTER_BACKGROUND:
             if (!g_background) {
                 g_background = true;
-                kz::Log(kz::LogLevel::Info, "window", "app inactive: rendering and sound paused");
+                kz::Log(kz::LogLevel::Info, "window", "app inactive: waiting for rendering suspension");
                 gfx::RendererSuspend();
                 AudioOutputPause(true);
+                kz::Log(kz::LogLevel::Info, "window", "app inactive: rendering suspended and sound paused");
             }
             break;
         case SDL_EVENT_DID_ENTER_FOREGROUND:
             if (g_background) {
                 g_background = false;
-                kz::Log(kz::LogLevel::Info, "window", "app active again: rendering and sound resumed");
+                kz::Log(kz::LogLevel::Info, "window", "app active: reanchoring suspended presentation");
                 // The time away is not run as game ticks.
                 ClockReanchor();
                 AudioOutputPause(false);
                 gfx::RendererResume();
+                kz::Log(kz::LogLevel::Info, "window", "app active again: rendering and sound resumed");
             }
             break;
         default:
@@ -138,9 +269,14 @@ void WindowInit(const WindowConfig &config) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         Fatal("SDL_Init");
     }
-#ifdef SDL_PLATFORM_IOS
+#if defined(SDL_PLATFORM_IOS) || defined(__SWITCH__)
     g_background = false;
-    Check(SDL_AddEventWatch(Lifecycle, nullptr), "SDL_AddEventWatch");
+    const bool watch_registered = SDL_AddEventWatch(Lifecycle, nullptr);
+    Check(watch_registered, "SDL_AddEventWatch");
+#ifdef __SWITCH__
+    ConfigureManualBackgroundLifecycle(config, watch_registered);
+    StartLifecycleTrace(watch_registered);
+#endif
 #endif
     // SDL3 backs a Vulkan window on macOS with a CAMetalLayer (VK_EXT_metal_surface) by itself.
     SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
@@ -231,7 +367,14 @@ bool WindowTakeModeEvent() {
 }
 
 void WindowShutdown() {
-#ifdef SDL_PLATFORM_IOS
+#ifdef __SWITCH__
+    if (g_lifecycle_trace_hooked) {
+        appletUnhook(&g_lifecycle_trace_cookie);
+        g_lifecycle_trace_hooked = false;
+    }
+    g_lifecycle_trace = false;
+#endif
+#if defined(SDL_PLATFORM_IOS) || defined(__SWITCH__)
     SDL_RemoveEventWatch(Lifecycle, nullptr);
 #endif
     SDL_DestroyWindow(g_window);
@@ -324,19 +467,25 @@ void HandleEvent(const SDL_Event &event, bool &running) {
 } // namespace
 
 bool WindowPollEvents() {
+#ifdef __SWITCH__
+    const auto poll_begin_tick = TracePollEntry();
+#endif
     bool      running = true;
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         HandleEvent(event, running);
     }
-#ifdef SDL_PLATFORM_IOS
+#if defined(SDL_PLATFORM_IOS) || defined(__SWITCH__)
     // In the background the game waits here, with nothing rendered or mixed, until the app is active again.
-    // Waiting pumps events, so UIKit's calls keep arriving.
+    // Waiting pumps lifecycle notifications until foreground ownership returns.
     while (g_background && running) {
         if (SDL_WaitEventTimeout(&event, 250)) {
             HandleEvent(event, running);
         }
     }
+#endif
+#ifdef __SWITCH__
+    TracePollExit(poll_begin_tick);
 #endif
     return running;
 }

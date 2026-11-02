@@ -115,6 +115,9 @@ struct RendererConfig {
     bool bindless_textures = true;
     // Also precompiles the Vu_prog0 pipelines that DrawMeshProg0 needs (Dark Chronicle).
     bool prog0_meshes = false;
+    bool presented_feedback = false;  /**< Requests prior-presentation feedback for an onscreen renderer; KZ_PERF_PRESENTED_GATE=0|1 overrides it. */
+    bool split_replay_submit = false; /**< Separates onscreen replay rendering from the final transfer; KZ_PERF_SPLIT_REPLAY_SUBMIT=0|1 overrides it. */
+    bool near_safe_fog = false;       /**< Enables proven vertex-fog specialization; KZ_FOG_NEAR_SAFE=0|1 overrides it. */
     // Lowers the texture and mesh tables for tests; 0 is the build maximum, larger values are clamped to it.
     uint32_t texture_slots = 0;
     uint32_t mesh_slots = 0;

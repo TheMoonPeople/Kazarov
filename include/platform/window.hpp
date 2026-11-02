@@ -18,6 +18,7 @@ struct WindowConfig {
     // False for a renderer without a surface (gfx::RendererConfig::offscreen): SDL then loads no
     // Vulkan library and asks for no surface extension.
     bool vulkan = true;
+    bool manual_background_lifecycle = false; /**< Requests native focus notifications for application-managed suspension of an onscreen Switch window. */
 };
 
 // A window's mode: fullscreen, or a window whose inside is width by height (in the units of

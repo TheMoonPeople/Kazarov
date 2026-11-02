@@ -10,9 +10,31 @@
 
 namespace {
 
-int g_ticks;
-int g_idles;
-int g_pumps_inside;
+int          g_ticks;
+int          g_idles;
+int          g_pumps_inside;
+int          g_resume_calls; /**< Resume notifications observed by the clock lifecycle test. */
+std::int64_t g_resume_count; /**< Tick count observed when the resume notification pumps the reanchored clock. */
+
+/**
+ * Pumps the newly anchored clock without advancing suspended wall time as game ticks.
+ */
+void ResumeAndPump() {
+    ++g_resume_calls;
+    g_resume_count = ClockPump();
+}
+
+/**
+ * Restores the game-owned clock callback when a lifecycle test finishes.
+ */
+struct ResumeCallbackScope {
+    ClockResumeCallback previous = ClockSetResumeCallback(ResumeAndPump); /**< Previous callback restored after the case. */
+
+    /**
+     * Restores the original resume callback even when an assertion ends the case.
+     */
+    ~ResumeCallbackScope() { ClockSetResumeCallback(previous); }
+};
 
 int CountTick(int) {
     ++g_ticks;
@@ -64,6 +86,28 @@ TEST(PlatformClock, DefaultsToNtscRate) {
     ASSERT_TRUE(!ClockUnbounded());
     ClockSetTickRate(-1.0);
     ASSERT_TRUE(ClockTickRate() == 60.0);
+}
+
+TEST(PlatformClock, ResumeCallbackRunsAfterAnchorAndCanBeRemovedWithoutChangingTickCallback) {
+    Start(10.0, false);
+    ResumeCallbackScope callback;
+    g_resume_calls = 0;
+    g_resume_count = -1;
+    const auto tick_callback = ClockGetTickCallback();
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    ClockReanchor();
+    EXPECT_EQ(g_resume_calls, 1);
+    EXPECT_EQ(g_resume_count, 0);
+    EXPECT_EQ(ClockTickCount(), 0);
+    EXPECT_EQ(g_ticks, 0);
+    EXPECT_EQ(ClockGetTickCallback(), tick_callback);
+    EXPECT_EQ(ClockSetResumeCallback(nullptr), ResumeAndPump);
+    ClockReset();
+    ClockSetTickRate(60.0);
+    ClockReanchor();
+    EXPECT_EQ(g_resume_calls, 1);
+    ClockSetTickCallback(nullptr);
+    ClockSetIdleHook(nullptr);
 }
 
 TEST(PlatformClock, UnboundedAdvancesOneTickPerPump) {

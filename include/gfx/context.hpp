@@ -49,8 +49,10 @@ struct PresentedFeedbackObservation {
 struct PresentedFeedbackBudget {
     bool     active = false;          /**< Whether an admission episode has started. */
     bool     identity_set = false;    /**< Whether an exact predecessor identity was observed. */
-    uint64_t begin_ns = 0;            /**< First demand for this admission episode. */
+    bool     paused = false;          /**< Whether a renderer lease excludes a verified suspended interval. */
+    uint64_t begin_ns = 0;            /**< Admission start shifted only by completed verified pauses. */
     uint64_t last_ns = 0;             /**< Most recent validated monotonic clock sample. */
+    uint64_t pause_ns = 0;            /**< First leased pause boundary while the episode is suspended. */
     uint64_t expected_id = 0;         /**< Exact predecessor bound to this episode. */
     uint64_t expected_enqueue_ns = 0; /**< Stable predecessor enqueue identity. */
     uint32_t queries = 0;             /**< Queries consumed without resetting a pending episode. */
@@ -59,7 +61,7 @@ struct PresentedFeedbackBudget {
      * Admits one query within the cumulative clock and query limits.
      */
     PresentedFeedbackStatus BeginQuery(uint64_t now_ns) {
-        if (now_ns == 0 || (active && now_ns < last_ns)) {
+        if (paused || now_ns == 0 || (active && now_ns < last_ns)) {
             return PresentedFeedbackStatus::Invalid;
         }
         if (!active) {
@@ -78,7 +80,7 @@ struct PresentedFeedbackBudget {
      * Validates exact predecessor feedback and the elapsed budget after a synchronous query.
      */
     PresentedFeedbackStatus Observe(uint64_t id, uint64_t enqueue, const PresentedFeedbackObservation &observation, uint64_t now_ns) {
-        if (!active || now_ns < last_ns || !observation.valid) {
+        if (!active || paused || now_ns < last_ns || !observation.valid) {
             return PresentedFeedbackStatus::Invalid;
         }
         last_ns = now_ns;
@@ -107,6 +109,53 @@ struct PresentedFeedbackBudget {
             return PresentedFeedbackStatus::Invalid;
         }
         return PresentedFeedbackStatus::Ready;
+    }
+
+    /**
+     * Pauses an existing episode after exclusive renderer ownership prevents further queries.
+     */
+    PresentedFeedbackStatus Pause(uint64_t now_ns) {
+        if (now_ns == 0 || (active && (now_ns < last_ns || now_ns < begin_ns))) {
+            return PresentedFeedbackStatus::Invalid;
+        }
+        if (!active) {
+            return PresentedFeedbackStatus::Pending;
+        }
+        if (!paused) {
+            if (now_ns - begin_ns >= 100'000'000) {
+                return PresentedFeedbackStatus::Timeout;
+            }
+            pause_ns = now_ns;
+            paused = true;
+        }
+        last_ns = now_ns;
+        return PresentedFeedbackStatus::Pending;
+    }
+
+    /**
+     * Excludes one verified pause without renewing query limits or predecessor identity.
+     */
+    PresentedFeedbackStatus Resume(uint64_t now_ns) {
+        if (now_ns == 0 || (active && now_ns < last_ns)) {
+            return PresentedFeedbackStatus::Invalid;
+        }
+        if (!active) {
+            return PresentedFeedbackStatus::Pending;
+        }
+        if (paused) {
+            if (pause_ns > now_ns || begin_ns > pause_ns) {
+                return PresentedFeedbackStatus::Invalid;
+            }
+            const uint64_t duration_ns = now_ns - pause_ns;
+            if (begin_ns > UINT64_MAX - duration_ns) {
+                return PresentedFeedbackStatus::Invalid;
+            }
+            begin_ns += duration_ns;
+            paused = false;
+            pause_ns = 0;
+        }
+        last_ns = now_ns;
+        return PresentedFeedbackStatus::Pending;
     }
 
     /**
@@ -555,6 +604,7 @@ struct Context {
     VkFormat                      depth_format = VK_FORMAT_UNDEFINED;
     bool                          dynamic_color_write_mask = false;
     bool                          offscreen = false;
+    bool                          vsync_gate_requested = false; /**< Effective onscreen presentation gate request, including the independent legacy override. */
     bool                          triangle_fans = true;
     bool                          separate_stencil_masks = true;
     bool                          portability_subset = false;

@@ -1445,10 +1445,10 @@ TEST(GfxMeshDc2, Prog0NearSafeFogRejectsUnsafeAndNonfiniteInputs) {
 }
 
 TEST(GfxGpuMeshDc2, Prog0NearSafeFogPreservesFullRgbaAgainstUpdatedMeshReference) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
     if (!gfx::detail::NearSafeFogEnabled()) {
         GTEST_SKIP() << "Requires KZ_FOG_NEAR_SAFE=1 before process startup";
     }
-    GfxFixture                   fixture(kWidth, kHeight, 1.0f, Prog0Options());
     const std::array<uint8_t, 4> clear = {17, 29, 43, 71};
     const auto                   texture = gfx::CreateTexture({4, 4, gfx::TextureFormat::Rgba8, 1, true});
     ASSERT_NE(texture, gfx::kNullTexture);
@@ -1633,11 +1633,11 @@ TEST(GfxGpuMeshDc2, Prog0NearSafeFogPreservesFullRgbaAgainstUpdatedMeshReference
 }
 
 TEST(GfxGpuMeshDc2, Prog0NearSafeFogUsesActualInterpolatedMvp) {
+    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
     if (!gfx::detail::NearSafeFogEnabled()) {
         GTEST_SKIP() << "Requires KZ_FOG_NEAR_SAFE=1 before process startup";
     }
-    GfxFixture fixture(kWidth, kHeight, 1.0f, Prog0Options());
-    auto       vertices = ScreenVertices({0, 0, 1});
+    auto vertices = ScreenVertices({0, 0, 1});
     vertices[0].position[2] = 2;
     vertices[1].position[2] = 4;
     vertices[2].position[2] = 6;

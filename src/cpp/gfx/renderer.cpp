@@ -440,16 +440,10 @@ std::atomic<bool> g_vsync_gate_active{false};
 std::atomic<bool> g_presented_gate_active{false};
 
 /**
- * Selects the Switch-only presentation gate for an onscreen diagnostic renderer.
+ * Reports the current onscreen renderer's presentation gate request.
  */
 bool VsyncGateEnabled() {
-    static const bool requested = [] {
-        const char *setting = std::getenv("KZ_PERF_VSYNC_GATE");
-        const char *feedback = std::getenv("KZ_PERF_PRESENTED_GATE");
-        return (setting != nullptr && std::strcmp(setting, "1") == 0) ||
-               (feedback != nullptr && std::strcmp(feedback, "1") == 0);
-    }();
-    return requested && !g.offscreen;
+    return g.vsync_gate_requested;
 }
 
 /**
@@ -648,6 +642,34 @@ std::array<uint64_t, 2> WaitPresentedGate() {
 }
 
 /**
+ * Preserves pending feedback identity while excluding a renderer lease's suspended interval.
+ */
+void SuspendPresentedGateBudget(bool suspend) {
+    auto &gate = g_vsync_gate;
+    if (!gate.available || !gate.presented_feedback) {
+        return;
+    }
+    const uint64_t begin_before_ns = gate.feedback_budget.begin_ns;
+    const uint64_t pause_before_ns = gate.feedback_budget.pause_ns;
+    const bool     was_paused = gate.feedback_budget.paused;
+    const uint64_t now_ns = NativeHistoryClockNs();
+    const auto     status = suspend ? gate.feedback_budget.Pause(now_ns) : gate.feedback_budget.Resume(now_ns);
+    if (status == PresentedFeedbackStatus::Timeout) {
+        FailVsyncGate("history-lifecycle-budget", KERNELRESULT(TimedOut), true);
+    }
+    if (status == PresentedFeedbackStatus::Invalid) {
+        FailVsyncGate("history-lifecycle-clock", MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "presented lifecycle budget: stage={} active={} expected_id={} expected_enqueue_ns={} queries={} begin_before_ns={} begin_ns={} pause_ns={} paused_duration_ns={} last_ns={} last_accepted_id={} last_presented_id={}",
+             suspend ? "pause" : "resume", gate.feedback_budget.active, gate.expected_id, gate.expected_enqueue_ns,
+             gate.feedback_budget.queries, begin_before_ns, gate.feedback_budget.begin_ns,
+             suspend ? gate.feedback_budget.pause_ns : pause_before_ns,
+             !suspend && was_paused ? now_ns - pause_before_ns : 0,
+             gate.feedback_budget.last_ns, gate.last_accepted_id, gate.last_presented_id);
+}
+
+/**
  * Associates one successful queue call with exactly one newly assigned native frame.
  */
 void NotePresentedGateQueue(VkResult result, uint64_t begin_ns, uint64_t end_ns) {
@@ -712,7 +734,7 @@ void InitializeVsyncGate() {
     if (window == nullptr || !nwindowIsValid(window)) {
         FailVsyncGate("default-window", MAKERESULT(Module_Libnx, LibnxError_BadInput));
     }
-    if (const char *setting = std::getenv("KZ_PERF_PRESENTED_GATE"); setting != nullptr && std::strcmp(setting, "1") == 0) {
+    if (g.config.presented_feedback) {
         g_vsync_gate.presented_feedback = true;
         ReadPresentedGateHistory();
         g_vsync_gate.available = true;
@@ -2632,6 +2654,21 @@ namespace {
 // Held by RendererSuspend's caller while the app is in the background.
 std::optional<RenderLease> g_suspend_lease;
 
+/**
+ * Applies an explicit environment boolean to one renderer's configured policy.
+ */
+bool RendererFlag(const char *name, bool configured) {
+    if (const char *setting = std::getenv(name)) {
+        if (std::strcmp(setting, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(setting, "1") == 0) {
+            return true;
+        }
+    }
+    return configured;
+}
+
 } // namespace
 
 void RendererInit(SDL_Window *window, const RendererConfig &config) {
@@ -2652,9 +2689,11 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
     }
     g.window = window;
     g.config = config;
-    if (const char *setting = std::getenv("KZ_PERF_SPLIT_REPLAY_SUBMIT")) {
-        g.split_replay_submit = std::strcmp(setting, "1") == 0;
-    }
+    g.config.presented_feedback = !config.offscreen && RendererFlag("KZ_PERF_PRESENTED_GATE", config.presented_feedback);
+    g.config.split_replay_submit = !config.offscreen && RendererFlag("KZ_PERF_SPLIT_REPLAY_SUBMIT", config.split_replay_submit);
+    g.config.near_safe_fog = RendererFlag("KZ_FOG_NEAR_SAFE", config.near_safe_fog);
+    g.vsync_gate_requested = !config.offscreen && (g.config.presented_feedback || RendererFlag("KZ_PERF_VSYNC_GATE", false));
+    g.split_replay_submit = g.config.split_replay_submit;
     if (const char *setting = std::getenv("KZ_MAIN_HEIGHT_LIMIT")) {
         const std::string_view text(setting);
         uint32_t               value = 0;
@@ -2723,9 +2762,9 @@ void RendererShutdown() {
         Error("RendererShutdown inside a canonical retirement callback");
         return;
     }
-    g_suspend_lease.reset();
     // No idle hook call may start once shutdown begins.
     SetRenderIdleHook(nullptr, nullptr);
+    g_suspend_lease.reset();
     if (g.device == VK_NULL_HANDLE) {
         return;
     }
@@ -2800,6 +2839,9 @@ void RendererSuspend() {
     }
     // The lease waits out queued commands and the idle hook's frame, then keeps both from starting.
     g_suspend_lease.emplace();
+#ifdef __SWITCH__
+    SuspendPresentedGateBudget(true);
+#endif
     vkDeviceWaitIdle(g.device);
 }
 
@@ -2809,6 +2851,9 @@ void RendererResume() {
     }
     // The layer's drawables may have changed size or been released while the app was away.
     g_resize_pending.store(true);
+#ifdef __SWITCH__
+    SuspendPresentedGateBudget(false);
+#endif
     g_suspend_lease.reset();
 }
 

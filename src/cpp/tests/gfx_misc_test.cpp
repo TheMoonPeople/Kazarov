@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <semaphore>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -40,6 +42,69 @@ uint32_t Crc(const uint8_t *data, size_t size) {
     }
     return ~crc;
 }
+
+/**
+ * Isolates renderer policy overrides across successive renderer lifetimes.
+ */
+struct RendererPolicySettings {
+    std::array<EnvSnapshot, 6> settings = {
+        SaveEnv("KZ_PERF_PRESENTED_GATE"), SaveEnv("KZ_PERF_VSYNC_GATE"),
+        SaveEnv("KZ_PERF_SPLIT_REPLAY_SUBMIT"), SaveEnv("KZ_FOG_NEAR_SAFE"),
+        SaveEnv("KZ_PROG0_FOG_NEAR_SAFE"), SaveEnv("KZ_RENDER_THREAD")}; /**< Original policy overrides restored after the test. */
+
+    /**
+     * Starts the fixture without inherited policy overrides.
+     */
+    RendererPolicySettings() { Clear(); }
+
+    /**
+     * Restores each original process setting after the final renderer shuts down.
+     */
+    ~RendererPolicySettings() {
+        for (const auto &setting : settings) {
+            RestoreEnv(setting);
+        }
+    }
+
+    /**
+     * Removes explicit overrides before the next renderer instance is initialized.
+     */
+    void Clear() const {
+        for (const auto &setting : settings) {
+            EXPECT_EQ(UnsetEnv(setting.name.c_str()), 0);
+        }
+    }
+};
+
+/**
+ * Initializes the real renderer with independently selected per-instance policies.
+ */
+struct RendererPolicyFixture {
+    /**
+     * Creates a small renderer using the requested policy defaults and surface mode.
+     */
+    explicit RendererPolicyFixture(gfx::RendererConfig config) {
+        EXPECT_EQ(SetEnv("VK_LAYER_VALIDATE_SYNC", "1", 0), 0);
+        WindowConfig window{64, 48, true};
+        window.vulkan = !config.offscreen;
+        WindowInit(window);
+        config.app_name = "Kazarov policy tests";
+        config.logical_width = 64;
+        config.logical_height = 48;
+        config.validation = true;
+        config.pipeline_cache = std::filesystem::temp_directory_path() / "dc_gfx_test" / "pipeline_cache_prog0.bin";
+        gfx::RendererInit(WindowHandle(), config);
+    }
+
+    /**
+     * Shuts down the renderer and rejects graphics validation failures.
+     */
+    ~RendererPolicyFixture() {
+        gfx::RendererShutdown();
+        WindowShutdown();
+        EXPECT_EQ(gfx::ValidationMessageCount(), 0u);
+    }
+};
 
 /**
  * Configures small headless canonical-image transaction fixtures.
@@ -256,6 +321,151 @@ SplitReplaySample SampleSplitReplay(bool enabled, bool batch) {
 #endif
 
 } // namespace
+
+#ifdef _WIN32
+TEST(GfxGpuMisc, RendererPolicyDefaultsAndEnvironmentAreResolvedPerInstance) {
+    RendererPolicySettings settings;
+    const auto             check = [](bool feedback, bool split, bool fog, bool gate) {
+        EXPECT_EQ(gfx::detail::g.config.presented_feedback, feedback);
+        EXPECT_EQ(gfx::detail::g.config.split_replay_submit, split);
+        EXPECT_EQ(gfx::detail::g.config.near_safe_fog, fog);
+        EXPECT_EQ(gfx::detail::g.split_replay_submit, split);
+        EXPECT_EQ(gfx::detail::NearSafeFogEnabled(), fog);
+        EXPECT_EQ(gfx::detail::g.vsync_gate_requested, gate);
+    };
+    gfx::RendererConfig config;
+    EXPECT_FALSE(config.presented_feedback);
+    EXPECT_FALSE(config.split_replay_submit);
+    EXPECT_FALSE(config.near_safe_fog);
+    {
+        RendererPolicyFixture fixture(config);
+        check(false, false, false, false);
+    }
+    config.presented_feedback = config.split_replay_submit = config.near_safe_fog = true;
+    {
+        RendererPolicyFixture fixture(config);
+        check(true, true, true, true);
+        EXPECT_EQ(SetEnv("KZ_PERF_PRESENTED_GATE", "0", 1), 0);
+        EXPECT_EQ(SetEnv("KZ_PERF_SPLIT_REPLAY_SUBMIT", "0", 1), 0);
+        EXPECT_EQ(SetEnv("KZ_FOG_NEAR_SAFE", "0", 1), 0);
+        check(true, true, true, true);
+    }
+    {
+        RendererPolicyFixture fixture(config);
+        check(false, false, false, false);
+    }
+    EXPECT_EQ(SetEnv("KZ_PERF_VSYNC_GATE", "1", 1), 0);
+    {
+        RendererPolicyFixture fixture(config);
+        check(false, false, false, true);
+    }
+    settings.Clear();
+    config.presented_feedback = config.split_replay_submit = config.near_safe_fog = false;
+    EXPECT_EQ(SetEnv("KZ_PERF_PRESENTED_GATE", "1", 1), 0);
+    EXPECT_EQ(SetEnv("KZ_PERF_SPLIT_REPLAY_SUBMIT", "1", 1), 0);
+    EXPECT_EQ(SetEnv("KZ_FOG_NEAR_SAFE", "1", 1), 0);
+    {
+        RendererPolicyFixture fixture(config);
+        check(true, true, true, true);
+    }
+    settings.Clear();
+    {
+        RendererPolicyFixture fixture(config);
+        check(false, false, false, false);
+    }
+}
+#endif
+
+TEST(GfxGpuMisc, RendererPoliciesExcludeOffscreenPresentationAndInheritProg0Fog) {
+    RendererPolicySettings settings;
+    gfx::RendererConfig    config;
+    config.offscreen = true;
+    config.prog0_meshes = true;
+    config.presented_feedback = config.split_replay_submit = config.near_safe_fog = true;
+    EXPECT_EQ(SetEnv("KZ_PERF_PRESENTED_GATE", "1", 1), 0);
+    EXPECT_EQ(SetEnv("KZ_PERF_VSYNC_GATE", "1", 1), 0);
+    EXPECT_EQ(SetEnv("KZ_PERF_SPLIT_REPLAY_SUBMIT", "1", 1), 0);
+    EXPECT_EQ(SetEnv("KZ_PROG0_FOG_NEAR_SAFE", "0", 1), 0);
+    {
+        RendererPolicyFixture fixture(config);
+        EXPECT_FALSE(gfx::detail::g.config.presented_feedback);
+        EXPECT_FALSE(gfx::detail::g.vsync_gate_requested);
+        EXPECT_FALSE(gfx::detail::g.config.split_replay_submit);
+        EXPECT_FALSE(gfx::detail::g.split_replay_submit);
+        EXPECT_TRUE(gfx::detail::NearSafeFogEnabled());
+        EXPECT_NE(gfx::detail::g.near_safe_fog_pipelines[0], VK_NULL_HANDLE);
+        EXPECT_EQ(gfx::detail::g.prog0_near_safe_fog_pipelines[0], VK_NULL_HANDLE);
+    }
+    EXPECT_EQ(UnsetEnv("KZ_PROG0_FOG_NEAR_SAFE"), 0);
+    {
+        RendererPolicyFixture fixture(config);
+        EXPECT_TRUE(gfx::detail::NearSafeFogEnabled());
+        EXPECT_NE(gfx::detail::g.prog0_near_safe_fog_pipelines[0], VK_NULL_HANDLE);
+    }
+    EXPECT_EQ(SetEnv("KZ_FOG_NEAR_SAFE", "0", 1), 0);
+    {
+        RendererPolicyFixture fixture(config);
+        EXPECT_FALSE(gfx::detail::NearSafeFogEnabled());
+        EXPECT_EQ(gfx::detail::g.near_safe_fog_pipelines[0], VK_NULL_HANDLE);
+        EXPECT_EQ(gfx::detail::g.prog0_near_safe_fog_pipelines[0], VK_NULL_HANDLE);
+    }
+}
+
+TEST(GfxGpuMisc, AsyncSuspendResumeDuplicatesAndSuspendedShutdownAllowFreshRendering) {
+    RendererPolicySettings settings;
+    ASSERT_EQ(SetEnv("KZ_RENDER_THREAD", "async", 1), 0);
+    GfxOptions options;
+    options.offscreen = true;
+    options.render_thread = gfx::RenderThreadMode::Async;
+    options.logical_width = 64;
+    options.logical_height = 48;
+    const auto draw = [](std::array<uint8_t, 4> color) {
+        gfx::Draw2D(gfx::Primitive::Quads, Quad(8, 6, 48, 36, color), {}, {});
+    };
+
+    /**
+     * Records actual idle-hook entries before the suspend lease parks the worker.
+     */
+    struct IdleProbe {
+        std::atomic<uint32_t> calls{0};   /**< Counts entries into the harmless idle hook. */
+        std::binary_semaphore started{0}; /**< Confirms that the worker actually invoked the installed hook. */
+    } probe;
+
+    uint32_t parked_calls = 0;
+    {
+        GfxFixture fixture(64, 48, 1.0f, options);
+        ASSERT_EQ(gfx::ActiveRenderThreadMode(), gfx::RenderThreadMode::Async);
+        fixture.Frame({11, 19, 23, 255}, [&] { draw({179, 31, 47, 255}); });
+        EXPECT_EQ(fixture.Pixel(32, 24), (std::array<uint8_t, 4>{179, 31, 47, 255}));
+        gfx::SetRenderIdleHook(+[](void *user) -> std::chrono::steady_clock::duration {
+            auto &idle = *static_cast<IdleProbe *>(user);
+            if (idle.calls.fetch_add(1) == 0) {
+                idle.started.release();
+            }
+            return std::chrono::hours(1); }, &probe);
+        ASSERT_TRUE(probe.started.try_acquire_for(std::chrono::seconds(5)));
+        gfx::RendererSuspend();
+        gfx::RendererSuspend();
+        EXPECT_TRUE(gfx::detail::DeviceThreadAllowed());
+        gfx::RendererResume();
+        gfx::RendererResume();
+        EXPECT_FALSE(gfx::detail::DeviceThreadAllowed());
+        fixture.Frame({29, 37, 43, 255}, [&] { draw({53, 181, 71, 255}); });
+        EXPECT_EQ(fixture.Pixel(32, 24), (std::array<uint8_t, 4>{53, 181, 71, 255}));
+        gfx::RendererSuspend();
+        EXPECT_TRUE(gfx::detail::DeviceThreadAllowed());
+        parked_calls = probe.calls.load();
+    }
+    EXPECT_EQ(probe.calls.load(), parked_calls);
+    {
+        GfxFixture fixture(64, 48, 1.0f, options);
+        ASSERT_EQ(gfx::ActiveRenderThreadMode(), gfx::RenderThreadMode::Async);
+        EXPECT_FALSE(gfx::detail::DeviceThreadAllowed());
+        fixture.Frame({59, 61, 67, 255}, [&] { draw({83, 97, 211, 255}); });
+        EXPECT_EQ(fixture.Pixel(32, 24), (std::array<uint8_t, 4>{83, 97, 211, 255}));
+    }
+    EXPECT_EQ(probe.calls.load(), parked_calls);
+}
 
 TEST(GfxMisc, PipelineCache) {
     // Its own file: the other cases share theirs, and save over it while they run.
@@ -1486,7 +1696,7 @@ TEST(GfxMisc, MeshBoundsFollowTheFlagAndAreInvalidatedByUpdates) {
     };
     std::vector<gfx::Vertex3D> vertices = {vertex(-1, 2, 3), vertex(4, -5, 6), vertex(0, 0, -7)};
     const uint32_t             indices[] = {0, 1, 2};
-    // The flag is read once per process; the root test runs this under KZ_FOG_NEAR_SAFE=1 as well.
+    // Bounds follow this renderer instance's effective fog policy.
     const bool enabled = gfx::detail::NearSafeFogEnabled();
     auto       known = [](gfx::MeshHandle handle) { return gfx::detail::LookupMesh(handle)->bounds_known; };
 
@@ -1970,4 +2180,122 @@ TEST(GfxPresentedFeedback, AdoptsBootstrapIdentityWithoutRestartingBudget) {
     budget.Reset();
     EXPECT_EQ(budget.BeginQuery(2000), PresentedFeedbackStatus::Pending);
     EXPECT_EQ(budget.Observe(1, 1500, {.latest_id = 1, .predecessor_found = true, .enqueue_ns = 1500, .presented = true, .presentation_ns = 1900}, 2100), PresentedFeedbackStatus::Ready);
+}
+
+TEST(GfxPresentedFeedback, SuspendExcludesOnlyPausedTimeFromTheRemainingActiveBudget) {
+    using namespace gfx::detail;
+    PresentedFeedbackBudget            budget;
+    const PresentedFeedbackObservation pending{.latest_id = 7, .predecessor_found = true, .enqueue_ns = 100};
+    ASSERT_EQ(budget.BeginQuery(1000), PresentedFeedbackStatus::Pending);
+    ASSERT_EQ(budget.Observe(7, 100, pending, 2000), PresentedFeedbackStatus::Pending);
+    ASSERT_EQ(budget.Pause(30'001'000), PresentedFeedbackStatus::Pending);
+    ASSERT_EQ(budget.Resume(1'030'001'000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.begin_ns, 1'000'001'000u);
+    EXPECT_EQ(budget.queries, 1u);
+    EXPECT_EQ(budget.expected_id, 7u);
+    EXPECT_EQ(budget.expected_enqueue_ns, 100u);
+    ASSERT_EQ(budget.BeginQuery(1'100'000'999), PresentedFeedbackStatus::Pending);
+    auto ready = pending;
+    ready.presented = true;
+    ready.presentation_ns = 1'099'000'000;
+    EXPECT_EQ(budget.Observe(7, 100, ready, 1'100'001'000), PresentedFeedbackStatus::Timeout);
+}
+
+TEST(GfxPresentedFeedback, SuspendPreservesTheCumulativeQueryLimit) {
+    using namespace gfx::detail;
+    PresentedFeedbackBudget            budget;
+    const PresentedFeedbackObservation pending{.latest_id = 7, .predecessor_found = true, .enqueue_ns = 100};
+    for (uint64_t query = 0; query < 128; ++query) {
+        ASSERT_EQ(budget.BeginQuery(1000 + query * 2), PresentedFeedbackStatus::Pending);
+        ASSERT_EQ(budget.Observe(7, 100, pending, 1001 + query * 2), PresentedFeedbackStatus::Pending);
+    }
+    ASSERT_EQ(budget.Pause(2000), PresentedFeedbackStatus::Pending);
+    ASSERT_EQ(budget.Resume(1'000'002'000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.queries, 128u);
+    EXPECT_EQ(budget.BeginQuery(1'000'002'001), PresentedFeedbackStatus::Timeout);
+}
+
+TEST(GfxPresentedFeedback, DuplicateLifecycleNotificationsCannotRenewTheActiveDeadline) {
+    using namespace gfx::detail;
+    PresentedFeedbackBudget budget;
+    ASSERT_EQ(budget.BeginQuery(1000), PresentedFeedbackStatus::Pending);
+    ASSERT_EQ(budget.Pause(30'001'000), PresentedFeedbackStatus::Pending);
+    ASSERT_EQ(budget.Pause(40'001'000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.pause_ns, 30'001'000u);
+    ASSERT_EQ(budget.Resume(1'030'001'000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.begin_ns, 1'000'001'000u);
+    ASSERT_EQ(budget.Resume(1'040'001'000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.begin_ns, 1'000'001'000u);
+    EXPECT_EQ(budget.BeginQuery(1'100'001'000), PresentedFeedbackStatus::Timeout);
+}
+
+TEST(GfxPresentedFeedback, LifecycleRejectsBackwardsClocksAndInvalidPausedIntervals) {
+    using namespace gfx::detail;
+    PresentedFeedbackBudget budget;
+    ASSERT_EQ(budget.BeginQuery(1000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.Pause(0), PresentedFeedbackStatus::Invalid);
+    EXPECT_EQ(budget.Pause(999), PresentedFeedbackStatus::Invalid);
+    ASSERT_EQ(budget.Pause(2000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.Pause(1999), PresentedFeedbackStatus::Invalid);
+    EXPECT_EQ(budget.BeginQuery(3000), PresentedFeedbackStatus::Invalid);
+    EXPECT_EQ(budget.Observe(0, 0, {}, 3000), PresentedFeedbackStatus::Invalid);
+    EXPECT_EQ(budget.Resume(0), PresentedFeedbackStatus::Invalid);
+    EXPECT_EQ(budget.Resume(1999), PresentedFeedbackStatus::Invalid);
+    ASSERT_TRUE(budget.paused);
+    ASSERT_EQ(budget.Resume(4000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.Resume(3999), PresentedFeedbackStatus::Invalid);
+    EXPECT_EQ(budget.begin_ns, 3000u);
+
+    budget.Reset();
+    ASSERT_EQ(budget.BeginQuery(UINT64_MAX - 1000), PresentedFeedbackStatus::Pending);
+    ASSERT_EQ(budget.Pause(UINT64_MAX - 900), PresentedFeedbackStatus::Pending);
+    ASSERT_EQ(budget.Resume(UINT64_MAX - 100), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.begin_ns, UINT64_MAX - 200);
+    EXPECT_EQ(budget.BeginQuery(UINT64_MAX - 99), PresentedFeedbackStatus::Pending);
+
+    budget = {.active = true, .paused = true, .begin_ns = UINT64_MAX - 2, .last_ns = 8, .pause_ns = 4};
+    EXPECT_EQ(budget.Resume(10), PresentedFeedbackStatus::Invalid);
+    EXPECT_EQ(budget.begin_ns, UINT64_MAX - 2);
+    EXPECT_TRUE(budget.paused);
+
+    budget.Reset();
+    ASSERT_EQ(budget.BeginQuery(1000), PresentedFeedbackStatus::Pending);
+    EXPECT_EQ(budget.Pause(100'001'000), PresentedFeedbackStatus::Timeout);
+    EXPECT_FALSE(budget.paused);
+}
+
+TEST(GfxPresentedFeedback, ResumeRequiresTheRetainedExactPredecessorAndPositivePresentation) {
+    using namespace gfx::detail;
+    const auto check = [](uint64_t id, uint64_t enqueue, PresentedFeedbackObservation observation) {
+        PresentedFeedbackBudget budget;
+        EXPECT_EQ(budget.BeginQuery(1000), PresentedFeedbackStatus::Pending);
+        EXPECT_EQ(budget.Observe(7, 100, {.latest_id = 7, .predecessor_found = true, .enqueue_ns = 100}, 1100), PresentedFeedbackStatus::Pending);
+        EXPECT_EQ(budget.Pause(2000), PresentedFeedbackStatus::Pending);
+        EXPECT_EQ(budget.Resume(1'000'002'000), PresentedFeedbackStatus::Pending);
+        EXPECT_EQ(budget.BeginQuery(1'000'002'100), PresentedFeedbackStatus::Pending);
+        return budget.Observe(id, enqueue, observation, 1'000'003'000);
+    };
+    PresentedFeedbackObservation observation{.latest_id = 7, .predecessor_found = true, .enqueue_ns = 100};
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Pending);
+    observation.presented = true;
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Pending);
+    observation.presentation_ns = 1'000'002'500;
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Ready);
+    observation.predecessor_found = false;
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Invalid);
+    observation.predecessor_found = true;
+    observation.enqueue_ns = 101;
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Invalid);
+    observation.enqueue_ns = 100;
+    observation.latest_id = 8;
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Invalid);
+    observation.latest_id = 6;
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Invalid);
+    observation.latest_id = 7;
+    EXPECT_EQ(check(8, 100, observation), PresentedFeedbackStatus::Invalid);
+    EXPECT_EQ(check(0, 0, {}), PresentedFeedbackStatus::Invalid);
+    observation.presentation_ns = 99;
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Invalid);
+    observation.presentation_ns = 1'000'003'001;
+    EXPECT_EQ(check(7, 100, observation), PresentedFeedbackStatus::Invalid);
 }
