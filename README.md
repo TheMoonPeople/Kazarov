@@ -354,6 +354,16 @@ to that list. The Vulkan loader download
 is pinned and hash-checked when `KZ_VULKAN_RUNTIME_DIR` is not supplied. These
 rules copy program dependencies only; they never include retail game assets.
 
+**Gameplay seed.** A game's tracked gameplay documents (`port/gameplay/` beside the submodule, or
+`KAZAROV_GAMEPLAY_ROOT`) are checked when `kazarov_core` builds and sealed into a seed `data.zip`
+with each document's digest. Each document is a JSON object with a `kind` and a `schema_version`
+of 1 or more; Dark Cloud 2's `.cfg.json` and `.map.json` configurations are version 2, and its
+`character_clips.json` animation plan is checked when present. A game without the folder gets an
+empty seed. The seed installs to `KZ_GAMEPLAY_INSTALL_DIR` (the binary directory by default; the
+reader also looks in an `assets/` folder there). Dark Cloud 2's extraction publishes the documents
+into its archive; `gameplay_publish(data_root)` writes them into a data folder as loose files
+instead, for a game that reads its data from a folder.
+
 ## Models and actions
 
 `src/rust/models.rs` converts the game's models, skeletons and motions into glTF with

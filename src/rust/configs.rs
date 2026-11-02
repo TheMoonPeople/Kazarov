@@ -91,9 +91,62 @@ pub fn gameplay_documents(root: Option<&Path>) -> CoreResult<Vec<(&'static str, 
     )))
 }
 
+/// Writes the build's gameplay documents into a data folder as loose files at their archive paths
+/// (`gameplay/...`), each checked against its digest, for a game that reads its data from a folder
+/// rather than the extractor's archive. JSON files under `gameplay/` the build no longer has are
+/// removed. Returns how many documents were written.
+pub fn publish_gameplay_tree(data_root: &Path) -> CoreResult<usize> {
+    let documents = gameplay_documents(None)?;
+    for (name, bytes) in &documents {
+        let path = data_root.join(name);
+        fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| fail(format!("bad gameplay path: {name}")))?,
+        )?;
+        let temp = path.with_extension("json.part");
+        fs::write(&temp, bytes)?;
+        fs::rename(&temp, &path)?;
+    }
+    let mut stale = Vec::new();
+    collect_json(&data_root.join("gameplay"), &mut stale)?;
+    for path in stale {
+        let name = path
+            .strip_prefix(data_root)
+            .map_err(|_| fail("gameplay file outside the data folder"))?
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if gameplay_digest(&name).is_none() {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(documents.len())
+}
+
+fn collect_json(directory: &Path, files: &mut Vec<PathBuf>) -> CoreResult<()> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_json(&path, files)?;
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Dark Cloud 2's character animation slicing plan, which a game's gameplay documents may hold.
+const CHARACTER_CLIPS: &str = "gameplay/character_clips.json";
+
 /// Digest of only the source-derived animation slicing plan used by asset extraction.
 pub fn asset_plan_fingerprint() -> String {
-    gameplay_digest("gameplay/character_clips.json").map_or_else(String::new, |digest| hex(digest))
+    gameplay_digest(CHARACTER_CLIPS).map_or_else(String::new, |digest| hex(digest))
 }
 
 /// True when a relative gameplay path belongs to the tracked source tree.
@@ -1447,11 +1500,8 @@ pub fn initialize_character_plans(documents: &[(&str, Vec<u8>)]) -> CoreResult<(
     if CHARACTER_PLANS.get().is_some() {
         return Ok(());
     }
-    let Some((name, bytes)) = documents
-        .iter()
-        .find(|(name, _)| *name == "gameplay/character_clips.json")
-    else {
-        if gameplay_manifest().is_empty() {
+    let Some((name, bytes)) = documents.iter().find(|(name, _)| *name == CHARACTER_CLIPS) else {
+        if gameplay_digest(CHARACTER_CLIPS).is_none() {
             let _ = CHARACTER_PLANS.set(BTreeMap::new());
             return Ok(());
         }
@@ -1477,7 +1527,12 @@ pub(crate) fn profile_actions_for(
     character_alias: &str,
 ) -> CoreResult<Option<&'static CharacterPlan>> {
     if CHARACTER_PLANS.get().is_none() {
-        initialize_character_plans(&gameplay_documents(None)?)?;
+        // A game that tracks no plan needs no seed to say so.
+        if gameplay_digest(CHARACTER_CLIPS).is_none() {
+            let _ = CHARACTER_PLANS.set(BTreeMap::new());
+        } else {
+            initialize_character_plans(&gameplay_documents(None)?)?;
+        }
     }
     let plans = CHARACTER_PLANS
         .get()
@@ -2110,13 +2165,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn published_gameplay_tree_holds_the_build_documents_and_drops_stale_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp.path().join("gameplay/gone/old.json");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"{}").unwrap();
+        let notes = temp.path().join("gameplay/notes.txt");
+        fs::write(&notes, b"kept").unwrap();
+        let written = publish_gameplay_tree(temp.path()).unwrap();
+        assert_eq!(written, gameplay_manifest().len());
+        for (name, digest) in gameplay_manifest() {
+            let bytes = fs::read(temp.path().join(name)).unwrap();
+            assert_eq!(Sha256::digest(&bytes).as_slice(), digest);
+        }
+        assert!(!stale.exists());
+        assert!(notes.exists());
+    }
+
+    #[test]
     fn archived_gameplay_preserves_source_decimal() {
         let documents = gameplay_documents(None).unwrap();
         let Some((_, document)) = documents
             .iter()
             .find(|(name, _)| *name == "gameplay/chara/e3_donnie.character.json")
         else {
-            assert_eq!(documents.len(), 0);
+            // Another game's seed, or none.
             return;
         };
         let text = std::str::from_utf8(document).unwrap();
