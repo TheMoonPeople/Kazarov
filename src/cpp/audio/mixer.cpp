@@ -558,8 +558,8 @@ void Mixer::StartLayer(const Bank &bank, const Layer &layer, int note, int veloc
     voice.bend_low = split.bend_low;
     voice.bend_high = split.bend_high;
     if (TraceEnabled()) {
-        Trace("  program %d note %d -> sample %d (vag %d, %d Hz, base %d%s): %+.2f st, gain %.3f, core %d",
-              prototype.program, note, static_cast<int>(&sample - bank.Header().samples.data()),
+        Trace("  port %d program %d note %d -> sample %d (vag %d, %d Hz, base %d%s): %+.2f st, gain %.3f, core %d",
+              prototype.port, prototype.program, note, static_cast<int>(&sample - bank.Header().samples.data()),
               sample.vag, layer.rate, sample.base_note, layer.vag->loops ? ", loops" : "", voice.base_pitch,
               voice.base_gain, voice.core);
     }

@@ -782,6 +782,32 @@ TEST(GfxGpuMeshDc2, LetterboxClipsMeshesAndClearsToTheFrame) {
     gfx::SetFrameLayout(gfx::FrameLayout{gfx::AspectMode::Fill, 1.0f});
 }
 
+TEST(GfxGpuDisplayList, HostOverlayRemainsVisibleInLetterboxBars) {
+    GfxFixture fixture(1360, 768, 1.0f);
+    gfx::SetFrameLayout({gfx::AspectMode::Letterbox, 1.0f});
+    gfx::BeginRecording();
+    const uint8_t clear[4] = {0, 0, 0, 255};
+    gfx::Clear(true, clear, true, 0);
+    auto game = gfx::EndRecording();
+    ASSERT_NE(game, nullptr);
+    ASSERT_TRUE(gfx::RenderList(*game, 1, {.canonical = true}));
+    const auto overlay = OverlayRecord("60 FPS");
+    ASSERT_NE(overlay, nullptr);
+    ASSERT_TRUE(gfx::RenderList(*game, 1, {.present = true, .overlay = overlay.get()}));
+    ASSERT_TRUE(gfx::ReadbackFrame(fixture.pixels, fixture.width, fixture.height));
+    bool visible = false;
+    // The 4:3 frame starts at x=168; the entire counter fits inside the left bar.
+    for (uint32_t y = 0; y < 64; ++y) {
+        for (uint32_t x = 0; x < 168; ++x) {
+            const auto pixel = fixture.Pixel(x, y);
+            visible = visible || pixel[0] > 128 || pixel[1] > 128 || pixel[2] > 128;
+        }
+    }
+    EXPECT_TRUE(visible);
+    EXPECT_TRUE(fixture.PixelNear(4, 384, 0, 0, 0));
+    gfx::SetFrameLayout({gfx::AspectMode::Fill, 1.0f});
+}
+
 TEST(GfxGpuMeshDc2, FillKeepsClearsAcrossTheWindow) {
     constexpr int kFillWidth = 128;
     constexpr int kFillHeight = 72;
