@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "experiment": "default-off fragment SM50 FSetP and predicate-AND fusion",
+  "status": "Host regression validated; driver artifact compatibility and native mechanism remain unvalidated.",
+  "local_base_revision": "a416fc212b246310a32b47ca6e73a3b7392f1862",
+  "local_base_qualification": "Local patched revision, not asserted to be a fetchable upstream commit. Affected base-file digests below are authoritative; surrounding build changes are not part of this patch.",
+  "base_files": [
+    {
+      "path": "src/nouveau/compiler/nak/api.rs",
+      "sha256": "a84d1646297a901d5145b15e5543fb2feeb434e0445a1e528936db3e3fc3a17d"
+    },
+    {
+      "path": "src/nouveau/compiler/nak/lib.rs",
+      "sha256": "e61d70134562c424678d79534ef5780d011f4cba5f0a1ae6ccf9ae7f2c8c3492"
+    },
+    {
+      "path": "src/nouveau/compiler/nak/sm50.rs",
+      "sha256": "fe6e8b205dd4dad1d5f9db1d0787ebabace38a3946636cc4e024d77d0b4978af"
+    }
+  ],
+  "patched_files": [
+    {
+      "path": "src/nouveau/compiler/nak/api.rs",
+      "sha256": "0a6a4f6bba9790bf98995e259eba4f5b922c159e4b4677abbdd84eda46d4e125"
+    },
+    {
+      "path": "src/nouveau/compiler/nak/lib.rs",
+      "sha256": "c2a5af6044dd8b09f1d680ccd7104e50691e3a80b6745ec2a5b67d1b2f01b375"
+    },
+    {
+      "path": "src/nouveau/compiler/nak/opt_fsetp_and.rs",
+      "sha256": "06738fa09a50cb1a79388c60d4664e0f08ac40ec66748a6473dcd118cb623ca9"
+    },
+    {
+      "path": "src/nouveau/compiler/nak/sm50.rs",
+      "sha256": "d5ac58e3ba2b74622f6939aece5254314fcef88df843970dea4284a274e88bf2"
+    }
+  ],
+  "patch_sha256": "3eecc8422955c69980142ccfce7e9cf6ac351b1172909d9b3df1fbf37d779e40",
+  "option": {
+    "environment": "NAK_FSETP_AND_FUSION",
+    "enabled_value": "1",
+    "default": false,
+    "compiler_flag_bit": 7,
+    "stages": [
+      "fragment"
+    ],
+    "encoder_family": "50 <= SM < 70",
+    "motion_sources": [
+      "scalar GPR SSA",
+      "Imm32",
+      "Zero"
+    ],
+    "rejected_motion_sources": [
+      "physical registers",
+      "constant buffers",
+      "other non-SSA sources"
+    ]
+  },
+  "cache_identity": "Existing nak_debug_flags compiler flags participate in pipelineCacheUUID, shaderBinaryUUID, and disk-cache driver flags; the option is initialized before compiler creation.",
+  "apply_command": "patch -p1 < mesa-nak-fsetp-and.patch",
+  "tests": {
+    "framework": "Existing Mesa NAK Rust tests",
+    "configure": "meson setup build-nak --buildtype=release -Doptimization=2 -Dvulkan-drivers=nouveau -Dgallium-drivers=[] -Dplatforms=[] -Dbuild-tests=true -Db_sanitize=none -Dglx=disabled -Degl=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dgallium-rusticl=false -Dmesa-clc=system -Dprecomp-compiler=system",
+    "run": "meson test -C build-nak --suite nouveau --no-rebuild nak",
+    "hardware_tests": "Existing hw_tests:: and nvdisasm_tests:: exclusions remain unchanged.",
+    "host_qualification": "The qualified local source required host-only declaration-order and DRM-header inclusion fixes outside this compiler patch. Existing hardware test modules remained compiled and their existing runtime exclusions remained unchanged.",
+    "completed_results": {
+      "focused_default_environment": {
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 62
+      },
+      "focused_option_one_same_binary": {
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 62
+      },
+      "existing_nonhardware_suite": {
+        "passed_subtests": 18,
+        "failed": 0
+      }
+    },
+    "native_validation": "Not performed by these host tests; no performance or artifact-staging claim."
+  },
+  "source_line_endings": "Canonical LF; patched-file digests describe exact GNU patch output on LF base files.",
+  "source_repository": "https://github.com/danfromtico/mesa-switch.git",
+  "base_revision": "0ff52079ca9e9e837ed27eb95a8d239f439a1864",
+  "source_revision_qualification": "Configured origin and pin; remote availability is not asserted. Component Git trees were compared locally against the qualified local revision.",
+  "identical_base_component_trees": {
+    "src/nouveau/compiler": "bc35f3be1b719287502590400956570efae2085b",
+    "src/nouveau/compiler/nak": "6b8e5c7d33e696a1388902f6bd5785b6c9b0acf7",
+    "src/compiler/rust": "e6a09422f2e05a4ed18c836f211f869315f83f5d",
+    "src/nouveau/headers": "8c3ca5a1358e8ebbedb2ec4e125fe852def7ac7a"
+  },
+  "base_scope": "The listed components and affected file digests match the configured base revision; no whole-tree identity is claimed for the local test source."
+}

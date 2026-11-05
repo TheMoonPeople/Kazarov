@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 
+#include "gfx/alpha_trace.hpp"
 #include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
 
@@ -62,6 +63,7 @@ void WriteTextureDescriptor(uint32_t slot, VkImageView view) {
 void ClearImage(VkCommandBuffer cmd, Image &image, const VkClearColorValue &color) {
     Transition(cmd, image, TransferDst());
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, image.mips, 0, 1};
+    AttachmentAlphaImageClear(image, color, image.mips);
     vkCmdClearColorImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
     ToRest(cmd, image);
 }
@@ -288,10 +290,18 @@ Image CreateImage(uint32_t width, uint32_t height, uint32_t mips, VkFormat forma
     view.format = format;
     view.subresourceRange = {image.aspect, 0, mips, 0, 1};
     Check(vkCreateImageView(g.device, &view, nullptr, &image.view), "vkCreateImageView");
+    image.alpha_trace_allocation = AttachmentAlphaAllocation();
     return image;
 }
 
 void DestroyImage(Image &image) {
+    if (image.image != VK_NULL_HANDLE && AttachmentAlphaTraceRecording()) {
+        AlphaTraceEvent event;
+        event.kind = AlphaTraceKind::Destroy;
+        event.image = std::bit_cast<uint64_t>(image.image);
+        event.allocation = image.alpha_trace_allocation;
+        AttachmentAlphaObserve(std::move(event));
+    }
     AssertDeviceThread(__func__);
     if (image.view != VK_NULL_HANDLE) {
         vkDestroyImageView(g.device, image.view, nullptr);
@@ -491,6 +501,8 @@ void RecreateRenderTargets() {
             region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.dstOffsets[0] = to[0];
             region.dstOffsets[1] = to[1];
+            texture.alpha_trace_aliases = 0;
+            AttachmentAlphaTransfer(old_image, from, texture.image, to, true);
             vkCmdBlitImage(cmd, old_image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
             ToRest(cmd, texture.image);
@@ -579,6 +591,7 @@ void DestroyDoomedMesh(MeshHandle handle) {
     Buffer buffer = mesh.buffer;
     mesh.live = false;
     mesh.bounds_known = false;
+    mesh.bounded_uv_inputs = false;
     mesh.skin_bounds_known = false;
     mesh.doomed = nullptr;
     mesh.buffer = {};
@@ -690,25 +703,44 @@ bool MeshFogIsNearSafe(const Mesh &mesh, const MeshConstants &constants) {
     return true;
 }
 
-bool Prog0FogIsNearSafe(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0) {
-    if (!mesh.bounds_known || !mesh.bounds_normal_inputs ||
-        (prog0.flags & kProg0Skinned) != 0 || prog0.fog[3] == 0.0f) {
+namespace {
+/**
+ * Evaluates the unchanged numerical proof with optional first-rejection observations.
+ */
+template <bool diagnose>
+bool EvaluateProg0Fog(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0, Prog0FogProof *proof) {
+    const auto reject = [&](Prog0FogReason reason) {
+        if constexpr (diagnose) {
+            proof->reason = reason;
+        }
         return false;
+    };
+    if (!mesh.bounds_known) {
+        return reject(Prog0FogReason::UnknownBounds);
+    }
+    if (!mesh.bounds_normal_inputs) {
+        return reject(Prog0FogReason::NonnormalPositions);
+    }
+    if ((prog0.flags & kProg0Skinned) != 0) {
+        return reject(Prog0FogReason::SkinnedFlag);
+    }
+    if (prog0.fog[3] == 0.0f) {
+        return reject(Prog0FogReason::ZeroFogScale);
     }
     for (std::size_t axis = 0; axis < 3; ++axis) {
         if (!NormalOrZeroFloat(mesh.bounds_min[axis]) || !NormalOrZeroFloat(mesh.bounds_max[axis]) ||
             mesh.bounds_min[axis] > mesh.bounds_max[axis]) {
-            return false;
+            return reject(Prog0FogReason::InvalidBounds);
         }
     }
     for (float value : constants.mvp) {
         if (!NormalOrZeroFloat(value)) {
-            return false;
+            return reject(Prog0FogReason::NonnormalMvp);
         }
     }
     for (float value : prog0.fog) {
         if (!NormalOrZeroFloat(value)) {
-            return false;
+            return reject(Prog0FogReason::NonnormalFog);
         }
     }
     const float          *matrix = constants.mvp;
@@ -722,8 +754,13 @@ bool Prog0FogIsNearSafe(const Mesh &mesh, const MeshConstants &constants, const 
         }
     }
     const double limit = static_cast<double>(FLT_MAX) / 64.0;
+    if constexpr (diagnose) {
+        proof->clip_computed = true;
+        proof->magnitude = magnitude;
+        proof->limit = limit;
+    }
     if (std::ranges::any_of(magnitude, [limit](double value) { return !(value < limit); })) {
-        return false;
+        return reject(Prog0FogReason::ClipOverflow);
     }
     double w_min = matrix[15], w_max = w_min, w_magnitude = std::abs(w_min);
     double difference_min = static_cast<double>(matrix[15]) - matrix[14];
@@ -737,8 +774,18 @@ bool Prog0FogIsNearSafe(const Mesh &mesh, const MeshConstants &constants, const 
     const double ftz_guard = 64.0 * FLT_MIN;
     const double w_guard = 64.0 * FLT_EPSILON * std::max(1.0, magnitude[3]) + ftz_guard;
     const double difference_guard = 64.0 * FLT_EPSILON * std::max(1.0, magnitude[3] + magnitude[2]) + ftz_guard;
-    if (!(w_min > w_guard) || !(difference_min > difference_guard)) {
-        return false;
+    if constexpr (diagnose) {
+        proof->margins_computed = true;
+        proof->w_min = w_min;
+        proof->w_guard = w_guard;
+        proof->difference_min = difference_min;
+        proof->difference_guard = difference_guard;
+    }
+    if (!(w_min > w_guard)) {
+        return reject(Prog0FogReason::WMargin);
+    }
+    if (!(difference_min > difference_guard)) {
+        return reject(Prog0FogReason::NearMargin);
     }
     const double w_bottom = w_min - w_guard;
     const double w_top = w_magnitude + w_guard;
@@ -746,8 +793,150 @@ bool Prog0FogIsNearSafe(const Mesh &mesh, const MeshConstants &constants, const 
     const double scale = std::abs(static_cast<double>(prog0.fog[3]));
     const double fog_top = std::max({0.0, static_cast<double>(prog0.fog[1]), static_cast<double>(prog0.fog[2])});
     // Prog0 emits floor(clamp(offset + scale/W)) * W and offset*W + scale, unlike the plain-mesh slots.
-    return fog_top < limit && fog_top * w_top < limit && offset * w_top + scale < limit &&
-           offset + scale / w_bottom < limit;
+    if constexpr (diagnose) {
+        proof->fog_computed = true;
+        proof->w_top = w_top;
+        proof->w_bottom = w_bottom;
+        proof->offset = offset;
+        proof->scale = scale;
+        proof->fog_top = fog_top;
+    }
+    const bool safe = fog_top < limit && fog_top * w_top < limit && offset * w_top + scale < limit &&
+                      offset + scale / w_bottom < limit;
+    if constexpr (diagnose) {
+        proof->reason = safe ? Prog0FogReason::Safe : Prog0FogReason::FogOverflow;
+    }
+    return safe;
+}
+} // namespace
+
+bool Prog0FogIsNearSafe(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0) {
+    return EvaluateProg0Fog<false>(mesh, constants, prog0, nullptr);
+}
+
+Prog0FogProof ExplainProg0Fog(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0) {
+    Prog0FogProof proof;
+    EvaluateProg0Fog<true>(mesh, constants, prog0, &proof);
+    return proof;
+}
+
+bool Prog0FogHasExactMode1(const Mesh &mesh, const Prog0Constants &prog0) {
+    return mesh.bounds_known && mesh.bounds_normal_inputs && (prog0.flags & kProg0Skinned) == 0 &&
+           NormalOrZeroFloat(prog0.fog[0]) && std::isnormal(prog0.fog[3]) &&
+           prog0.fog[1] == 255.0f && std::bit_cast<uint32_t>(prog0.fog[2]) == 0;
+}
+
+bool Prog0HasZeroSourceAlpha(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0) {
+    constexpr double input_limit = 0x1p20;
+    const bool       user_clip = prog0.flags == (kProg0Unlit | kProg0Clip | kProg0Scissor);
+    if (!mesh.bounded_uv_inputs || (prog0.flags != kProg0Unlit && !user_clip) ||
+        (constants.flags & ~kMeshFog) != 0 || !Prog0FogIsNearSafe(mesh, constants, prog0) ||
+        prog0.fog[1] != 255.0f || std::bit_cast<uint32_t>(prog0.fog[2]) != 0) {
+        return false;
+    }
+    for (std::size_t channel = 0; channel < 4; ++channel) {
+        const float object = prog0.object_color[channel];
+        const float diffuse = prog0.diffuse[channel];
+        if (!NormalOrZeroFloat(object) || !NormalOrZeroFloat(diffuse) ||
+            std::abs(static_cast<double>(object)) > input_limit || std::abs(static_cast<double>(diffuse)) > input_limit ||
+            !std::isfinite(static_cast<double>(object) * diffuse)) {
+            return false;
+        }
+    }
+    // The double product is exact for two binary32 inputs; the margin keeps either rounded
+    // multiplication or underflow below the vertex shader's first positive integer alpha.
+    if (prog0.object_color[3] < 0.0f || prog0.diffuse[3] < 0.0f ||
+        static_cast<double>(prog0.object_color[3]) * prog0.diffuse[3] > 1.0 - 0x1p-20) {
+        return false;
+    }
+    for (std::size_t argument : {std::size_t{0}, std::size_t{3}}) {
+        if (!NormalOrZeroFloat(prog0.fog[argument]) || std::abs(static_cast<double>(prog0.fog[argument])) > input_limit) {
+            return false;
+        }
+    }
+    std::array<double, 4> low{}, high{}, error{};
+    for (std::size_t row = 0; row < low.size(); ++row) {
+        low[row] = high[row] = constants.mvp[12 + row];
+        double magnitude = std::abs(low[row]);
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            AddTerm(constants.mvp[axis * 4 + row], mesh.bounds_min[axis], mesh.bounds_max[axis],
+                    low[row], high[row], magnitude);
+        }
+        error[row] = 64.0 * FLT_EPSILON * std::max(1.0, magnitude) + 64.0 * FLT_MIN;
+        if (!(magnitude + error[row] <= input_limit)) {
+            return false;
+        }
+    }
+    const double w_low = low[3] - error[3];
+    const double w_high = high[3] + error[3];
+    if (!(low[2] - error[2] >= 1.0) || !(w_low >= 1.0) || !(w_high <= 256.0 * w_low)) {
+        return false;
+    }
+    // The independent near-safe proof makes every marker zero and every emitted weight W.
+    // Positive-W convex clipping/interpolation keeps its denominator above w_low/2; the
+    // weighted numerator stays below 2^29, so the quotient stays finite below 2^30 without
+    // assuming correlated rounding. Bounded UVs sample finite UNORM values; bounded fog
+    // numerators and positive reciprocal W also keep the original fresh/mix path finite.
+    return !user_clip || Prog0CanGuardZeroSourceAlpha(mesh, constants, prog0);
+}
+
+bool Prog0CanGuardZeroSourceAlpha(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0) {
+    constexpr double input_limit = 0x1p20;
+    const bool       user_clip = prog0.flags == (kProg0Unlit | kProg0Clip | kProg0Scissor);
+    if (!mesh.bounds_known || !mesh.bounds_normal_inputs || !mesh.bounded_uv_inputs ||
+        (prog0.flags != kProg0Unlit && !user_clip) || (constants.flags & ~kMeshFog) != 0 ||
+        prog0.fog[1] != 255.0f || std::bit_cast<uint32_t>(prog0.fog[2]) != 0 || !std::isnormal(prog0.fog[3])) {
+        return false;
+    }
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (!NormalOrZeroFloat(mesh.bounds_min[axis]) || !NormalOrZeroFloat(mesh.bounds_max[axis]) ||
+            mesh.bounds_min[axis] > mesh.bounds_max[axis]) {
+            return false;
+        }
+    }
+    for (std::size_t channel = 0; channel < 4; ++channel) {
+        const float object = prog0.object_color[channel];
+        const float diffuse = prog0.diffuse[channel];
+        if (!NormalOrZeroFloat(object) || !NormalOrZeroFloat(diffuse) ||
+            std::abs(static_cast<double>(object)) > input_limit || std::abs(static_cast<double>(diffuse)) > input_limit ||
+            !std::isfinite(static_cast<double>(object) * diffuse)) {
+            return false;
+        }
+    }
+    if (prog0.object_color[3] < 0.0f || prog0.diffuse[3] < 0.0f ||
+        static_cast<double>(prog0.object_color[3]) * prog0.diffuse[3] > 1.0 - 0x1p-20) {
+        return false;
+    }
+    for (std::size_t argument : {std::size_t{0}, std::size_t{3}}) {
+        if (!NormalOrZeroFloat(prog0.fog[argument]) || std::abs(static_cast<double>(prog0.fog[argument])) > input_limit) {
+            return false;
+        }
+    }
+    for (bool clip_planes : {false, true}) {
+        if (clip_planes && !user_clip) {
+            break;
+        }
+        const float *matrix = clip_planes ? prog0.clip_or_view : constants.mvp;
+        for (std::size_t element = 0; element < 16; ++element) {
+            if (!NormalOrZeroFloat(matrix[element])) {
+                return false;
+            }
+        }
+        for (std::size_t row = 0; row < 4; ++row) {
+            double low = matrix[12 + row], high = low, magnitude = std::abs(low);
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                AddTerm(matrix[axis * 4 + row], mesh.bounds_min[axis], mesh.bounds_max[axis], low, high, magnitude);
+            }
+            const double error = 64.0 * FLT_EPSILON * std::max(1.0, magnitude) + 64.0 * FLT_MIN;
+            if (!(magnitude + error <= input_limit) || (!clip_planes && row == 2 && !(low - error >= 1.0))) {
+                return false;
+            }
+        }
+    }
+    // Original vertex numerators and six user clip distances stay finite. Crossing weights
+    // need no assumed lower bound: the fragment sibling checks its actual interpolated
+    // denominator and operands, then retains the full original shader whenever unsafe.
+    return true;
 }
 
 void SetMeshSkinBounds(Mesh &mesh, std::span<const Vertex3D> vertices, std::span<const uint32_t> indices) {
@@ -895,6 +1084,7 @@ TextureHandle CreateTexture(const TextureDesc &desc) {
             return;
         }
         Texture &texture = g.textures[slot];
+        texture.alpha_trace_aliases = 0;
         texture.live = true;
         texture.generation = NextGeneration(texture.generation);
         texture.desc = desc;
@@ -951,6 +1141,7 @@ TextureHandle CreateRenderTarget(uint32_t logical_width, uint32_t logical_height
             return;
         }
         Texture &texture = g.textures[slot];
+        texture.alpha_trace_aliases = 0;
         texture.live = true;
         texture.generation = NextGeneration(texture.generation);
         texture.desc = TextureDesc{logical_width, logical_height, TextureFormat::Rgba8, 1, has_alpha};
@@ -1061,6 +1252,23 @@ bool UpdateTextureImpl(TextureHandle handle, uint32_t mip, uint32_t x, uint32_t 
     }
 
     RunOnRenderThread([&] {
+        if (AttachmentAlphaIdentityReady()) {
+            texture->alpha_trace_aliases = 0;
+            texture->alpha_trace_aliases = texture->render_target ? 0 : AttachmentAlphaMatchTexture(texture->desc, mip, x, y, w, h, pixels, row_length);
+        }
+        if (AttachmentAlphaTraceRecording()) {
+            AlphaTraceEvent event;
+            event.kind = AlphaTraceKind::Update;
+            event.image = std::bit_cast<uint64_t>(image.image);
+            event.allocation = image.alpha_trace_allocation;
+            event.target = handle;
+            event.mip = mip;
+            event.width = image.width;
+            event.height = image.height;
+            event.rect = {static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(w), static_cast<int32_t>(h)};
+            event.texture_aliases = texture->alpha_trace_aliases;
+            AttachmentAlphaObserve(std::move(event));
+        }
         TransientSpan     staging = AllocateStaging(static_cast<VkDeviceSize>(row) * h);
         static const bool track_alpha = [] {
             const char *setting = std::getenv("KZ_ALPHA_OPAQUE");
@@ -1233,13 +1441,18 @@ MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32
         mesh.last_draw_use = 0;
         mesh.bounds_known = false;
         mesh.bounds_normal_inputs = false;
+        mesh.bounded_uv_inputs = false;
         if (!vertices.empty() && std::all_of(indices.begin(), indices.end(),
                                              [count = vertices.size()](uint32_t index) { return index < count; })) {
             std::array<float, 3> lo = {INFINITY, INFINITY, INFINITY};
             std::array<float, 3> hi = {-INFINITY, -INFINITY, -INFINITY};
             bool                 finite = true;
             bool                 normal_inputs = true;
+            bool                 bounded_uv_inputs = true;
             for (const Vertex3D &vertex : vertices) {
+                for (float uv : vertex.uv) {
+                    bounded_uv_inputs = bounded_uv_inputs && NormalOrZeroFloat(uv) && std::abs(uv) <= 4096.0f;
+                }
                 for (int axis = 0; axis < 3; axis++) {
                     const float p = vertex.position[axis];
                     finite = finite && std::isfinite(p);
@@ -1253,6 +1466,7 @@ MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32
                 mesh.bounds_max = hi;
                 mesh.bounds_known = true;
                 mesh.bounds_normal_inputs = normal_inputs;
+                mesh.bounded_uv_inputs = bounded_uv_inputs;
             }
         }
         SetMeshSkinBounds(mesh, vertices, indices);
@@ -1262,6 +1476,9 @@ MeshHandle CreateMesh(std::span<const Vertex3D> vertices, std::span<const uint32
                                    false);
         UploadToBuffer(mesh, 0, vertices.data(), vertex_bytes);
         UploadToBuffer(mesh, vertex_bytes, indices.data(), index_bytes);
+        mesh.alpha_trace_aliases = 0;
+        mesh.alpha_trace_allocation = AttachmentAlphaAllocation();
+        mesh.alpha_trace_aliases = AttachmentAlphaMatchMesh(vertices, indices);
         handle = MakeHandle(mesh.generation, slot);
     });
     return handle;
@@ -1282,8 +1499,19 @@ bool UpdateMeshVertices(MeshHandle handle, uint32_t first, std::span<const Verte
         return true;
     }
     RunOnRenderThread([&] {
+        mesh->alpha_trace_aliases = 0;
+        if (AttachmentAlphaTraceRecording()) {
+            AlphaTraceEvent event;
+            event.kind = AlphaTraceKind::Update;
+            event.mesh = handle;
+            event.mesh_allocation = mesh->alpha_trace_allocation;
+            event.first = first;
+            event.count = static_cast<uint32_t>(vertices.size());
+            AttachmentAlphaObserve(std::move(event));
+        }
         mesh->bounds_known = false;
         mesh->bounds_normal_inputs = false;
+        mesh->bounded_uv_inputs = false;
         mesh->skin_bounds_known = false;
         UploadToBuffer(*mesh, first * sizeof(Vertex3D), vertices.data(), vertices.size_bytes());
     });

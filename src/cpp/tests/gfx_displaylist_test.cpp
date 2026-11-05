@@ -183,7 +183,8 @@ TEST(GfxGpuDisplayList, CandidateBucketsPreserveOrderedReferenceMatches) {
         clear.color = clear.depth = true;
         list->entries.emplace_back(clear);
         list->main_cleared = true;
-        for (uint32_t index = 0; index < 96; ++index) {
+        const uint32_t record_count = scenario < 12 ? 96 : 1024;
+        for (uint32_t index = 0; index < record_count; ++index) {
             if (generation && (index + static_cast<uint32_t>(scenario)) % 17 == 0) {
                 continue;
             }
@@ -206,6 +207,9 @@ TEST(GfxGpuDisplayList, CandidateBucketsPreserveOrderedReferenceMatches) {
             std::memcpy(mesh.constants.mvp, identity.data(), sizeof mesh.constants.mvp);
             gfx::detail::MeshRecord record;
             record.key = index % 11 ? 1 + index % 3 : 0;
+            if (scenario >= 12 && record.key != 0) {
+                record.key = index % 4 ? 65536 + index : 4096 + index % 7;
+            }
             record.has_transform = index % 23 != 0;
             record.entry = static_cast<uint32_t>(list->entries.size());
             record.occurrence = index % 5;
@@ -235,7 +239,19 @@ TEST(GfxGpuDisplayList, CandidateBucketsPreserveOrderedReferenceMatches) {
         }
         return list;
     };
-    for (int scenario = 0; scenario < 12; ++scenario) {
+
+    /**
+     * Retains independent cache values after temporary matching arenas have been released.
+     */
+    struct RetainedMatches {
+        gfx::DisplayListRef  before; /**< Earlier owned list used by the cache lookup. */
+        gfx::DisplayListRef  after;  /**< Later owned list containing persistent match indices. */
+        std::vector<int32_t> match;  /**< Independent copy of the ordered reference result. */
+        std::vector<bool>    blend;  /**< Independent copy of the cached vertex-blending decisions. */
+    };
+
+    std::vector<RetainedMatches> retained;
+    for (int scenario = 0; scenario < 16; ++scenario) {
         SCOPED_TRACE(scenario);
         auto before = make(scenario, 0);
         auto after = make(scenario, 1);
@@ -245,9 +261,23 @@ TEST(GfxGpuDisplayList, CandidateBucketsPreserveOrderedReferenceMatches) {
             const auto expected = ReferenceMeshMatches(*after, *before, instanced);
             ASSERT_TRUE(gfx::RenderList(*after, .5f, {.previous = before.get()}));
             EXPECT_EQ(after->cache.match, expected);
+            retained.push_back({before, after, expected, after->cache.blend});
+            ASSERT_TRUE(gfx::RenderList(*after, .75f, {.previous = before.get()}));
+            EXPECT_EQ(after->cache.match, expected);
+            EXPECT_EQ(after->cache.blend, retained.back().blend);
             before = std::move(after);
             after = make(scenario, generation + 1);
         }
+    }
+    // Later generations and cuts have reused temporary allocation storage; cached indices
+    // still belong to their lists and must remain valid without another matching pass.
+    for (const auto &pair : retained) {
+        EXPECT_EQ(pair.after->cache.previous_serial, pair.before->serial);
+        EXPECT_EQ(pair.after->cache.match, pair.match);
+        EXPECT_EQ(pair.after->cache.blend, pair.blend);
+        ASSERT_TRUE(gfx::RenderList(*pair.after, .25f, {.previous = pair.before.get()}));
+        EXPECT_EQ(pair.after->cache.match, pair.match);
+        EXPECT_EQ(pair.after->cache.blend, pair.blend);
     }
     for (auto mesh : meshes) {
         gfx::DestroyMesh(mesh);

@@ -16,9 +16,20 @@ param(
     [ValidateSet('normal', 'auto')] [string]$Performance = 'normal',
     [ValidateRange(1, 3600)] [int]$Seconds = 60,
     [string]$CompletePattern = '',
+    [string]$CapturePattern = '',
+    [string]$MovieCapturePattern = '',
+    [string]$FailurePattern = '',
+    [string]$TargetManagerRecordPattern = '',
+    [ValidateRange(1, 10)] [int]$TargetManagerRecordSeconds = 10,
+    [switch]$TargetManagerScreenshot,
+    # Leaves screenshots and recording to a separate capture client.
+    [switch]$ExternalCapture,
     [switch]$StageOnly
 )
 $ErrorActionPreference = 'Stop'
+if ($ExternalCapture -and ($CapturePattern -or $MovieCapturePattern)) {
+    throw '-ExternalCapture cannot be combined with automatic capture patterns'
+}
 $Mode = $Mode.ToLowerInvariant()
 $Performance = $Performance.ToLowerInvariant()
 $applicationFile = $Application -replace '[^A-Za-z0-9_-]', '_'
@@ -42,6 +53,13 @@ $manifest = [ordered]@{
     arguments = $Arguments
     seconds = $Seconds
     stage_only = [bool]$StageOnly
+    capture_pattern = $CapturePattern
+    movie_capture_pattern = $MovieCapturePattern
+    failure_pattern = $FailurePattern
+    target_manager_record_pattern = $TargetManagerRecordPattern
+    target_manager_record_seconds = $TargetManagerRecordSeconds
+    target_manager_screenshot = [bool]$TargetManagerScreenshot
+    external_capture = [bool]$ExternalCapture
     result = 'staged'
     files = @()
 }
@@ -115,10 +133,33 @@ function Invoke-TargetCleanup([string]$Step, [string[]]$CommandArguments) {
         }
     } catch { Write-Warning "Target cleanup $Step failed: $_" }
 }
+function Quote-ProcessArgument([string]$Value) {
+    return '"' + [regex]::Replace($Value, '(\\*)("|$)', {
+        param($match)
+        $slashes = $match.Groups[1].Value
+        if ($match.Groups[2].Value -eq '"') { return $slashes + $slashes + '\"' }
+        return $slashes + $slashes
+    }) + '"'
+}
+function Start-TargetManagerRecording([string]$StartLog) {
+    $mediaScript = Join-Path $PSScriptRoot 'devkit-media.ps1'
+    $powershell = (Get-Process -Id $PID).Path
+    $mediaArguments = @('-NoProfile', '-File', (Quote-ProcessArgument $mediaScript),
+        '-SdkRoot', (Quote-ProcessArgument $SdkRoot), '-Target', (Quote-ProcessArgument $Target),
+        '-Action', 'Record', '-Seconds', $TargetManagerRecordSeconds,
+        '-OutputDirectory', (Quote-ProcessArgument $runRoot), '-FileName', 'scene',
+        '-StartLogPath', (Quote-ProcessArgument $StartLog), '-StartPattern', (Quote-ProcessArgument $TargetManagerRecordPattern))
+    return Start-Process -FilePath $powershell -ArgumentList $mediaArguments -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $runRoot 'target-manager-recording.jsonl') `
+        -RedirectStandardError (Join-Path $runRoot 'target-manager-recording.err')
+}
 $targetLock = $null
 $locked = $false
 $listener = $null
 $launcher = $null
+$capture = $null
+$movieCapture = $null
+$targetManagerRecording = $null
 try {
     # Shared with Chronicle's existing SDK validation operations.
     $targetLock = [IO.File]::Open((Join-Path $env:TEMP 'chronicle-edev.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
@@ -133,6 +174,17 @@ try {
     $listener = Start-Process -FilePath $control -ArgumentList @('read-log', '--target', $Target, '--print-host-time', '-v') `
         -RedirectStandardOutput $log -RedirectStandardError (Join-Path $runRoot 'read-log.err') -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 2
+    if ($TargetManagerRecordPattern) {
+        $targetManagerRecording = Start-TargetManagerRecording $log
+        $recordingReadyDeadline = (Get-Date).AddSeconds(30)
+        $recordingOutput = Join-Path $runRoot 'target-manager-recording.jsonl'
+        while (!(Select-String -LiteralPath $recordingOutput -Pattern '"kind":"recording_waiting"' -Quiet)) {
+            if ($targetManagerRecording.HasExited -or (Get-Date) -ge $recordingReadyDeadline) {
+                throw "Target Manager recording client did not become ready; see $recordingOutput"
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    }
     $launcher = Start-Process -FilePath (Join-Path $tools 'RunOnTarget.exe') `
         -ArgumentList @(('"' + $package + '"'), '--target', $Target, '--print-host-time', '--no-wait') `
         -RedirectStandardOutput (Join-Path $runRoot 'launch.log') -RedirectStandardError (Join-Path $runRoot 'launch.err') -PassThru -WindowStyle Hidden
@@ -141,6 +193,21 @@ try {
     $deadline = (Get-Date).AddSeconds($Seconds)
     $manifest.result = 'timed_out'
     while ((Get-Date) -lt $deadline) {
+        if ($FailurePattern -and (Select-String -LiteralPath $log -Pattern $FailurePattern -Quiet)) {
+            throw "Application failure pattern was observed; see $log"
+        }
+        if ($MovieCapturePattern -and $null -eq $movieCapture -and (Select-String -LiteralPath $log -Pattern $MovieCapturePattern -Quiet)) {
+            $movieCapture = Start-Process -FilePath $control `
+                -ArgumentList @('devmenu', '--target', $Target, '--', 'debug', 'perform-capture-button-long-pressing') `
+                -RedirectStandardOutput (Join-Path $runRoot 'movie-capture.out') -RedirectStandardError (Join-Path $runRoot 'movie-capture.err') `
+                -PassThru -WindowStyle Hidden
+        }
+        if ($CapturePattern -and $null -eq $capture -and (Select-String -LiteralPath $log -Pattern $CapturePattern -Quiet)) {
+            $capture = Start-Process -FilePath $control `
+                -ArgumentList @('take-screenshot', '--target', $Target, '--full-path', ('"' + (Join-Path $runRoot 'scene.png') + '"')) `
+                -RedirectStandardOutput (Join-Path $runRoot 'scene.out') -RedirectStandardError (Join-Path $runRoot 'scene.err') `
+                -PassThru -WindowStyle Hidden
+        }
         if ($CompletePattern -and (Select-String -LiteralPath $log -Pattern $CompletePattern -Quiet)) {
             $manifest.result = 'completed'
             break
@@ -151,15 +218,58 @@ try {
     if ($CompletePattern -and !(Select-String -LiteralPath $log -Pattern $CompletePattern -Quiet)) {
         throw "Completion pattern was not observed; see $runRoot"
     }
-    $screenshot = Start-Process -FilePath $control `
-        -ArgumentList @('take-screenshot', '--target', $Target, '--full-path', ('"' + (Join-Path $runRoot 'final.png') + '"')) `
-        -RedirectStandardOutput (Join-Path $runRoot 'screenshot.out') -RedirectStandardError (Join-Path $runRoot 'screenshot.err') `
-        -PassThru -WindowStyle Hidden
-    if (!$screenshot.WaitForExit(15000)) {
-        Stop-Process -Id $screenshot.Id -Force -ErrorAction SilentlyContinue
-        $manifest.screenshot_result = 'timed_out'
+    if ($null -ne $targetManagerRecording) {
+        if (!$targetManagerRecording.WaitForExit(40000)) {
+            Stop-Process -Id $targetManagerRecording.Id -Force -ErrorAction SilentlyContinue
+            $manifest.target_manager_recording_result = 'timed_out'
+        } else {
+            $manifest.target_manager_recording_result = $targetManagerRecording.ExitCode
+        }
+    } elseif ($TargetManagerRecordPattern) {
+        $manifest.target_manager_recording_result = 'pattern_not_observed'
+    }
+    if ($TargetManagerScreenshot) {
+        try {
+            & (Join-Path $PSScriptRoot 'devkit-media.ps1') -SdkRoot $SdkRoot -Target $Target -Action Screenshot `
+                -OutputDirectory $runRoot -FileName 'scene-still' *> (Join-Path $runRoot 'target-manager-screenshot.jsonl')
+            $manifest.target_manager_screenshot_result = 'completed'
+        } catch {
+            $manifest.target_manager_screenshot_result = $_.Exception.Message
+        }
+    }
+    if ($null -ne $movieCapture) {
+        if (!$movieCapture.WaitForExit(15000)) {
+            Stop-Process -Id $movieCapture.Id -Force -ErrorAction SilentlyContinue
+            $manifest.movie_capture_result = 'timed_out'
+        } else {
+            $manifest.movie_capture_result = $movieCapture.ExitCode
+        }
+    } elseif ($MovieCapturePattern) {
+        $manifest.movie_capture_result = 'pattern_not_observed'
+    }
+    if ($null -ne $capture) {
+        if (!$capture.WaitForExit(15000)) {
+            Stop-Process -Id $capture.Id -Force -ErrorAction SilentlyContinue
+            $manifest.scene_capture_result = 'timed_out'
+        } else {
+            $manifest.scene_capture_result = $capture.ExitCode
+        }
+    } elseif ($CapturePattern) {
+        $manifest.scene_capture_result = 'pattern_not_observed'
+    }
+    if ($ExternalCapture) {
+        $manifest.screenshot_result = 'external'
     } else {
-        $manifest.screenshot_result = $screenshot.ExitCode
+        $screenshot = Start-Process -FilePath $control `
+            -ArgumentList @('take-screenshot', '--target', $Target, '--full-path', ('"' + (Join-Path $runRoot 'final.png') + '"')) `
+            -RedirectStandardOutput (Join-Path $runRoot 'screenshot.out') -RedirectStandardError (Join-Path $runRoot 'screenshot.err') `
+            -PassThru -WindowStyle Hidden
+        if (!$screenshot.WaitForExit(15000)) {
+            Stop-Process -Id $screenshot.Id -Force -ErrorAction SilentlyContinue
+            $manifest.screenshot_result = 'timed_out'
+        } else {
+            $manifest.screenshot_result = $screenshot.ExitCode
+        }
     }
 } catch {
     $manifest.result = 'failed'
@@ -174,7 +284,7 @@ try {
         Invoke-TargetCleanup 'performance-auto' @('devmenu', '--target', $Target, '--', 'debug', 'set-performance-mode-policy', 'auto')
         $targetLock.Dispose()
     }
-    foreach ($process in @($launcher, $listener)) {
+    foreach ($process in @($launcher, $listener, $capture, $movieCapture, $targetManagerRecording)) {
         if ($null -ne $process -and !$process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
     }
 }

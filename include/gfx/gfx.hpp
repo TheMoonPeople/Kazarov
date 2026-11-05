@@ -278,6 +278,18 @@ uint64_t PresentationHistoryClockNs();
 /**
  * Starts bounded native presentation-history collection at a measurement boundary.
  */
+/**
+ * Arms a bounded CPU attachment-alpha observation epoch at a measurement boundary.
+ */
+void BeginAttachmentAlphaTrace(uint64_t boundary_ns);
+/**
+ * Closes an observation epoch without adding device waits.
+ */
+void EndAttachmentAlphaTrace(uint64_t boundary_ns);
+/**
+ * Logs retained complete executions after their observation window.
+ */
+void LogAttachmentAlphaTrace();
 void BeginPresentationHistory(uint64_t boundary_ns);
 
 /**

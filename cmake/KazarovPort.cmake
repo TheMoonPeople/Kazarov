@@ -127,6 +127,18 @@ function(kz_port_host_library target)
         endif()
     endforeach()
 
+    set(unlit_header "${generated_dir}/shaders/mesh_prog0_unlit.vert.spv.hpp")
+    list(APPEND shader_headers ${unlit_header})
+    if(NOT shaders_defined)
+        add_custom_command(OUTPUT ${unlit_header}
+            COMMAND ${GLSLANG_VALIDATOR} -V --target-env ${shader_env} --quiet
+                -DKZ_PROG0_UNLIT_VERTEX=1 --vn mesh_prog0_unlit_vert
+                --depfile ${unlit_header}.d -o ${unlit_header} ${KZ_PORT_ROOT}/gfx/shaders/mesh_prog0.vert
+            DEPENDS ${KZ_PORT_ROOT}/gfx/shaders/mesh_prog0.vert
+            DEPFILE ${unlit_header}.d
+            COMMENT "Compiling unlit Prog0 vertex shader to SPIR-V")
+    endif()
+
     file(GLOB host_sources CONFIGURE_DEPENDS
         ${KZ_PORT_ROOT}/gfx/*.cpp ${KZ_PORT_ROOT}/audio/*.cpp ${KZ_PORT_ROOT}/platform/*.cpp)
     option(KZ_PORT_BUILD_TIM2 "Build the legacy TIM2 decoder into the host library" ON)

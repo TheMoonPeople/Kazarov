@@ -1,5 +1,7 @@
 #include <SDL3/SDL.h>
+#include <switch.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -8,11 +10,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-
-extern "C" {
-std::uint32_t romfsMountSelf(const char *name);
-std::uint32_t romfsUnmount(const char *name);
-}
 
 #include "platform/window.hpp"
 #include "switch_main.hpp"
@@ -23,6 +20,65 @@ namespace {
 int output_width = 0;
 /** Last configured operation-mode output height. */
 int output_height = 0;
+
+/**
+ * Describes ownership of an explicitly requested host-directory filesystem.
+ */
+enum class HostDirectoryMount {
+    Unrequested,
+    Mounted,
+    Failed
+};
+
+/**
+ * Binds an explicit host directory without changing the save path or existing mounts.
+ */
+HostDirectoryMount MountHostDirectory() {
+    const char *setting = std::getenv("KZ_SWITCH_HOST_DIRECTORY");
+    if (setting == nullptr) {
+        return HostDirectoryMount::Unrequested;
+    }
+    const std::string_view directory{setting};
+    const bool             drive = directory.size() > 3 &&
+                                   ((directory[0] >= 'A' && directory[0] <= 'Z') || (directory[0] >= 'a' && directory[0] <= 'z')) &&
+                                   directory[1] == ':' && (directory[2] == '/' || directory[2] == '\\');
+    const bool             child = drive && directory.substr(3).find_first_not_of("/\\") != std::string_view::npos;
+    bool                   traversal = false;
+    if (drive) {
+        auto remaining = directory.substr(3);
+        while (!remaining.empty()) {
+            const auto separator = remaining.find_first_of("/\\");
+            const auto component = remaining.substr(0, separator);
+            traversal |= component == "." || component == "..";
+            if (separator == std::string_view::npos) {
+                break;
+            }
+            remaining.remove_prefix(separator + 1);
+        }
+    }
+    if (!child || traversal || directory.size() >= FS_MAX_PATH) {
+        std::fprintf(stderr, "switch: host directory requires an explicit absolute Windows directory below a drive root\n");
+        std::fflush(stderr);
+        return HostDirectoryMount::Failed;
+    }
+    if (fsdevGetDeviceFileSystem("host") != nullptr) {
+        std::fprintf(stderr, "switch: host directory mount rejected; host is already mounted\n");
+        std::fflush(stderr);
+        return HostDirectoryMount::Failed;
+    }
+    FsFileSystem filesystem{};
+    const auto   result = fsOpenHostFileSystem(&filesystem, setting);
+    std::fprintf(stderr, "switch: host directory open result=0x%08x path=%s\n", static_cast<unsigned int>(result), setting);
+    std::fflush(stderr);
+    if (R_FAILED(result)) {
+        return HostDirectoryMount::Failed;
+    }
+    // fsdev consumes the filesystem on both registration success and failure.
+    const int device = fsdevMountDevice("host", filesystem);
+    std::fprintf(stderr, "switch: host directory mount device=%d errno=%d\n", device, device < 0 ? errno : 0);
+    std::fflush(stderr);
+    return device < 0 ? HostDirectoryMount::Failed : HostDirectoryMount::Mounted;
+}
 
 /**
  * Selects the internal resolution independently from the operation mode's presentation size.
@@ -90,7 +146,17 @@ int SwitchMain(int argc, const char **argv, SwitchRunFunction run) {
         args.push_back(input[index]);
     }
     args.push_back(nullptr);
+    const auto host_directory = MountHostDirectory();
+    if (host_directory == HostDirectoryMount::Failed) {
+        if (romfs_result == 0) {
+            static_cast<void>(romfsUnmount("romfs"));
+        }
+        return 2;
+    }
     const int result = run(static_cast<int>(args.size()) - 1, args.data());
+    if (host_directory == HostDirectoryMount::Mounted) {
+        static_cast<void>(fsdevUnmountDevice("host"));
+    }
     if (romfs_result == 0) {
         static_cast<void>(romfsUnmount("romfs"));
     }

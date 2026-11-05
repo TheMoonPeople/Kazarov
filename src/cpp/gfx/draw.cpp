@@ -9,6 +9,7 @@
 #include <map>
 #include <optional>
 
+#include "gfx/alpha_trace.hpp"
 #include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
 #include "gfx/profile.hpp"
@@ -529,7 +530,9 @@ void PushTextures(VkCommandBuffer cmd, VkPipelineLayout layout, const PushConsta
 bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureBinding &binding,
              const DrawState &state, PushConstants &push, bool ui = false, UiSide side = {},
              std::span<const Vertex2D> vertices = {}, const MeshConstants *mesh_constants = nullptr,
-             const Mesh *static_mesh = nullptr, uint32_t index_count = 0, const Prog0Constants *prog0 = nullptr) {
+             const Mesh *static_mesh = nullptr, uint32_t index_count = 0, const Prog0Constants *prog0 = nullptr,
+             MeshHandle observed_mesh = kNullMesh, uint32_t first_index = 0,
+             FragmentInvocationObservation *fragment_observation = nullptr, uint32_t *final_scope = nullptr) {
     if (!g.in_frame) {
         return false;
     }
@@ -642,6 +645,24 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
                                                          : NoColorPipelineIndex(family, mode);
     uint32_t     scope_pipeline = pipeline;
     VkPipeline   selected_pipeline = PipelineByIndex(pipeline);
+    if (pipeline == g.prog0_zero_source_alpha_base && g.prog0_zero_source_alpha_pipeline != VK_NULL_HANDLE &&
+        writes_color && family == kFamilyMeshProg0 && mode == kTextureRgba && blend.slot == 12 &&
+        alpha == kAlphaVariantNone && features == kColorFeatureCount + 1 && target.has_alpha &&
+        state.prog0_face == 0 && sampled_texture != nullptr && !sampled_texture->render_target &&
+        sampled_texture->desc.format == TextureFormat::Rgba8 && sampled_texture->desc.has_alpha &&
+        sampled_texture->image.format == VK_FORMAT_R8G8B8A8_UNORM && sampled_texture->image.mips == 1 &&
+        sampled_texture->image.image != VK_NULL_HANDLE && sampled_texture->image.view != VK_NULL_HANDLE &&
+        g.anisotropy_level == 0 &&
+        binding.palette == kNullTexture && !binding.ignore_alpha &&
+        (binding.filter == Filter::Nearest || binding.filter == Filter::Linear) &&
+        (binding.wrap_u == Wrap::Clamp || binding.wrap_u == Wrap::Repeat) &&
+        (binding.wrap_v == Wrap::Clamp || binding.wrap_v == Wrap::Repeat) &&
+        static_mesh != nullptr && mesh_constants != nullptr && prog0 != nullptr &&
+        Prog0HasZeroSourceAlpha(*static_mesh, *mesh_constants, *prog0)) {
+        selected_pipeline = g.prog0_zero_source_alpha_pipeline;
+        scope_pipeline = kProg0ZeroSourceAlphaScope;
+        ++g.prog0_zero_source_alpha_selected;
+    }
     if (g.near_safe_fog_pipelines[0] != VK_NULL_HANDLE && family == kFamilyMesh &&
         static_mesh != nullptr && mesh_constants != nullptr) {
         for (uint32_t variant = 0; variant < g.near_safe_fog_pipelines.size(); variant++) {
@@ -656,7 +677,7 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     const bool prog0_fog_candidate = writes_color && family >= kFamilyMeshProg0 && mode == kTextureRgba &&
                                      features == kColorFeatureCount + 1 &&
                                      ((blend.slot == 0 && alpha == kAlphaVariantGEqual) ||
-                                      (blend.slot == 4 && alpha == kAlphaVariantNone));
+                                      ((blend.slot == 4 || blend.slot == 12) && alpha == kAlphaVariantNone));
     if (prog0_fog_candidate && g.prog0_near_safe_fog_pipelines[0] != VK_NULL_HANDLE) {
         ++g.prog0_fog_candidates;
         if (family == kFamilyMeshProg0Skinned) {
@@ -668,16 +689,57 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
             ++g.prog0_fog_unsafe;
         } else {
             for (std::size_t variant = 0; variant < g.prog0_near_safe_fog_pipelines.size(); ++variant) {
-                if (pipeline == g.prog0_near_safe_fog_bases[variant] &&
+                if (scope_pipeline == pipeline && pipeline == g.prog0_near_safe_fog_bases[variant] &&
                     g.prog0_near_safe_fog_pipelines[variant] != VK_NULL_HANDLE) {
                     selected_pipeline = g.prog0_near_safe_fog_pipelines[variant];
-                    scope_pipeline = variant == 0 ? kProg0NearSafeFogAlphaScope : kProg0NearSafeFogBlendScope;
+                    scope_pipeline = variant == 0 ? kProg0NearSafeFogAlphaScope : variant == 1 ? kProg0NearSafeFogBlendScope
+                                                                                               : kProg0NearSafeFogAdditiveScope;
                     ++g.prog0_fog_selected;
                     ++g.counters.near_safe_prog0_fog;
                     break;
                 }
             }
         }
+    }
+    const bool mode1_fog_candidate = writes_color && family == kFamilyMeshProg0 && mode == kTextureRgba &&
+                                     blend.slot == 12 && alpha == kAlphaVariantNone && features == kColorFeatureCount + 1;
+    if (mode1_fog_candidate && scope_pipeline == pipeline && pipeline == g.prog0_mode1_fog_base &&
+        g.prog0_mode1_fog_pipeline != VK_NULL_HANDLE && static_mesh != nullptr && mesh_constants != nullptr &&
+        prog0 != nullptr && Prog0FogHasExactMode1(*static_mesh, *prog0)) {
+        selected_pipeline = g.prog0_mode1_fog_pipeline;
+        scope_pipeline = kProg0Mode1FogScope;
+        ++g.counters.mode1_prog0_fog;
+        ++g.prog0_mode1_fog_selected;
+    }
+    if ((scope_pipeline == kProg0NearSafeFogAdditiveScope || scope_pipeline == kProg0Mode1FogScope) &&
+        (state.fog_color[0] | state.fog_color[1] | state.fog_color[2]) == 0) {
+        if (scope_pipeline == kProg0NearSafeFogAdditiveScope && g.prog0_near_safe_black_fog_pipeline != VK_NULL_HANDLE) {
+            selected_pipeline = g.prog0_near_safe_black_fog_pipeline;
+            scope_pipeline = kProg0NearSafeFogAdditiveBlackScope;
+        } else if (scope_pipeline == kProg0Mode1FogScope && g.prog0_mode1_black_fog_pipeline != VK_NULL_HANDLE) {
+            selected_pipeline = g.prog0_mode1_black_fog_pipeline;
+            scope_pipeline = kProg0Mode1FogBlackScope;
+        }
+        if (scope_pipeline == kProg0NearSafeFogAdditiveBlackScope || scope_pipeline == kProg0Mode1FogBlackScope) {
+            ++g.counters.black_prog0_fog;
+            ++g.prog0_black_fog_selected;
+        }
+    }
+    if (scope_pipeline == kProg0Mode1FogBlackScope && g.prog0_guarded_zero_alpha_pipeline != VK_NULL_HANDLE &&
+        family == kFamilyMeshProg0 && state.prog0_face == 0 && target.has_alpha &&
+        sampled_texture != nullptr && !sampled_texture->render_target &&
+        sampled_texture->desc.format == TextureFormat::Rgba8 && sampled_texture->desc.has_alpha &&
+        sampled_texture->image.format == VK_FORMAT_R8G8B8A8_UNORM && sampled_texture->image.mips == 1 &&
+        sampled_texture->image.image != VK_NULL_HANDLE && sampled_texture->image.view != VK_NULL_HANDLE &&
+        g.anisotropy_level == 0 && binding.palette == kNullTexture && !binding.ignore_alpha &&
+        (binding.filter == Filter::Nearest || binding.filter == Filter::Linear) &&
+        (binding.wrap_u == Wrap::Clamp || binding.wrap_u == Wrap::Repeat) &&
+        (binding.wrap_v == Wrap::Clamp || binding.wrap_v == Wrap::Repeat) &&
+        static_mesh != nullptr && mesh_constants != nullptr && prog0 != nullptr &&
+        Prog0CanGuardZeroSourceAlpha(*static_mesh, *mesh_constants, *prog0)) {
+        selected_pipeline = g.prog0_guarded_zero_alpha_pipeline;
+        scope_pipeline = kProg0GuardedZeroSourceAlphaScope;
+        ++g.prog0_guarded_zero_alpha_selected;
     }
     const auto unorm_rgba = [](VkFormat format) {
         return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM;
@@ -693,6 +755,93 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     if (tls.plane_draw != nullptr) {
         selected_pipeline = g.depth_planes_pipeline;
         scope_pipeline = kDepthPlanesScope;
+    }
+    if (g.prog0_shared_rgb && (scope_pipeline == kProg0NearSafeFogAdditiveBlackScope || scope_pipeline == kProg0Mode1FogBlackScope || scope_pipeline == kProg0GuardedZeroSourceAlphaScope) &&
+        family == kFamilyMeshProg0 && mesh_constants != nullptr && prog0 != nullptr &&
+        state.prog0_face == 0 && (prog0->flags == kProg0Unlit || prog0->flags == (kProg0Unlit | kProg0Clip | kProg0Scissor))) {
+        bool equal_material = true;
+        for (size_t component = 0; component < 3; ++component) {
+            equal_material &= std::bit_cast<uint32_t>(prog0->object_color[component]) == std::bit_cast<uint32_t>(128.0f) &&
+                              std::bit_cast<uint32_t>(prog0->diffuse[component]) == std::bit_cast<uint32_t>(1.0f);
+        }
+        const size_t variant = scope_pipeline == kProg0NearSafeFogAdditiveBlackScope ? 0 : scope_pipeline == kProg0Mode1FogBlackScope ? 1
+                                                                                                                                      : 2;
+        if (equal_material && g.prog0_shared_rgb_pipelines[variant] != VK_NULL_HANDLE) {
+            selected_pipeline = g.prog0_shared_rgb_pipelines[variant];
+            constexpr std::array scopes = {kProg0NearSafeFogSharedRgbScope, kProg0Mode1FogSharedRgbScope, kProg0GuardedZeroSharedRgbScope};
+            scope_pipeline = scopes[variant];
+            ++g.prog0_shared_rgb_selected[variant];
+        }
+    }
+    uint32_t issued_color_mask = state.color_write_mask;
+    if (g.prog0_rgb_cost_mode != Prog0RgbCostMode::Disabled &&
+        (scope_pipeline == kProg0NearSafeFogSharedRgbScope || scope_pipeline == kProg0Mode1FogSharedRgbScope)) {
+        ++g.prog0_rgb_cost_candidates;
+        if (AttachmentAlphaIdentityReady() && family == kFamilyMeshProg0 && state.prog0_face == 0 &&
+            prog0 != nullptr && (prog0->flags == kProg0Unlit || prog0->flags == (kProg0Unlit | kProg0Clip | kProg0Scissor)) &&
+            state.color_write_mask == kWriteRgba && !alpha_test && mode == kTextureRgba && !texa &&
+            static_mesh != nullptr && first_index == 0 && index_count == static_mesh->index_count &&
+            sampled_texture != nullptr && !sampled_texture->render_target && sampled_texture->desc.has_alpha &&
+            sampled_texture->desc.format == TextureFormat::Rgba8 && sampled_texture->image.format == VK_FORMAT_R8G8B8A8_UNORM &&
+            sampled_texture->image.mips == 1 && sampled_texture->image.image != VK_NULL_HANDLE && sampled_texture->image.view != VK_NULL_HANDLE &&
+            binding.palette == kNullTexture && !binding.ignore_alpha &&
+            AttachmentAlphaRelationships(static_mesh->alpha_trace_aliases, sampled_texture->alpha_trace_aliases) != 0) {
+            const size_t family_index = scope_pipeline == kProg0NearSafeFogSharedRgbScope ? 0 : 1;
+            const size_t variant = g.prog0_rgb_cost_mode == Prog0RgbCostMode::AlphaShader ? family_index + 2 : family_index;
+            if (g.prog0_rgb_cost_mode == Prog0RgbCostMode::Control || g.prog0_rgb_cost_pipelines[variant] != VK_NULL_HANDLE) {
+                ++g.prog0_rgb_cost_selected[family_index];
+                if (g.prog0_rgb_cost_mode != Prog0RgbCostMode::Control) {
+                    selected_pipeline = g.prog0_rgb_cost_pipelines[variant];
+                    constexpr std::array scopes = {kProg0NearSafeRgbMaskScope, kProg0Mode1RgbMaskScope, kProg0NearSafeAlphaOnlyScope, kProg0Mode1AlphaOnlyScope};
+                    scope_pipeline = scopes[variant];
+                    issued_color_mask = kWriteAlpha;
+                }
+            }
+        }
+    }
+    if (g.prog0_unlit_vertex &&
+        (scope_pipeline == kProg0NearSafeFogSharedRgbScope || scope_pipeline == kProg0Mode1FogSharedRgbScope || scope_pipeline == kProg0GuardedZeroSharedRgbScope) &&
+        family == kFamilyMeshProg0 && state.prog0_face == 0 && prog0 != nullptr &&
+        (prog0->flags == kProg0Unlit || prog0->flags == (kProg0Unlit | kProg0Clip | kProg0Scissor))) {
+        const size_t variant = scope_pipeline == kProg0NearSafeFogSharedRgbScope ? 0 : scope_pipeline == kProg0Mode1FogSharedRgbScope ? 1 : 2;
+        if (g.prog0_unlit_vertex_pipelines[variant] != VK_NULL_HANDLE) {
+            selected_pipeline = g.prog0_unlit_vertex_pipelines[variant];
+            constexpr std::array scopes = {kProg0NearSafeUnlitVertexScope, kProg0Mode1UnlitVertexScope, kProg0GuardedUnlitVertexScope};
+            scope_pipeline = scopes[variant];
+            ++g.prog0_unlit_vertex_selected[variant];
+        }
+    }
+    if (g.prog0_fog_rejections && mode1_fog_candidate) {
+        Prog0FogObservation observation;
+        observation.mesh = observed_mesh;
+        observation.first_index = first_index;
+        observation.index_count = index_count;
+        observation.texture = binding.texture;
+        observation.target = g.target;
+        observation.mesh_present = static_mesh != nullptr;
+        observation.constants_present = mesh_constants != nullptr && prog0 != nullptr;
+        observation.near_safe_selected = scope_pipeline == kProg0NearSafeUnlitVertexScope || scope_pipeline == kProg0NearSafeFogAdditiveScope || scope_pipeline == kProg0NearSafeFogAdditiveBlackScope || scope_pipeline == kProg0NearSafeFogSharedRgbScope || scope_pipeline == kProg0NearSafeRgbMaskScope || scope_pipeline == kProg0NearSafeAlphaOnlyScope;
+        observation.mode1_selected = scope_pipeline == kProg0Mode1UnlitVertexScope || scope_pipeline == kProg0GuardedUnlitVertexScope || scope_pipeline == kProg0Mode1FogScope || scope_pipeline == kProg0Mode1FogBlackScope || scope_pipeline == kProg0GuardedZeroSourceAlphaScope || scope_pipeline == kProg0Mode1FogSharedRgbScope || scope_pipeline == kProg0GuardedZeroSharedRgbScope || scope_pipeline == kProg0Mode1RgbMaskScope || scope_pipeline == kProg0Mode1AlphaOnlyScope;
+        observation.actual_scope = scope_pipeline;
+        if (static_mesh != nullptr) {
+            observation.generation = static_mesh->generation;
+            observation.vertex_count = static_mesh->vertex_count;
+            observation.bounds_known = static_mesh->bounds_known;
+            observation.bounds_normal_inputs = static_mesh->bounds_normal_inputs;
+            observation.bounds_min = static_mesh->bounds_min;
+            observation.bounds_max = static_mesh->bounds_max;
+        }
+        if (observation.constants_present) {
+            observation.flags = prog0->flags;
+            std::copy_n(mesh_constants->mvp, observation.mvp.size(), observation.mvp.begin());
+            std::copy_n(prog0->fog, observation.fog.size(), observation.fog.begin());
+            if (static_mesh != nullptr) {
+                observation.proof = ExplainProg0Fog(*static_mesh, *mesh_constants, *prog0);
+            }
+        } else {
+            observation.proof.reason = Prog0FogReason::MissingParameters;
+        }
+        ObserveProg0Fog(std::move(observation));
     }
     if (MeshAlphaDiagnosticEnabled() && mesh_alpha_diagnostic.sampling && family >= kFamilyMesh &&
         tls.replaying && !tls.quiet && !tls.in_idle_hook) {
@@ -893,9 +1042,9 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
         SetStencilFace(cmd, 1, state.stencil_back, masks);
     }
     if (g.dynamic_color_write_mask && (writes_color || alpha_test) &&
-        g.bound.color_write_mask != state.color_write_mask) {
-        g.bound.color_write_mask = state.color_write_mask;
-        VkColorComponentFlags mask = state.color_write_mask & kWriteRgba;
+        g.bound.color_write_mask != issued_color_mask) {
+        g.bound.color_write_mask = issued_color_mask;
+        VkColorComponentFlags mask = issued_color_mask & kWriteRgba;
         g.cmd_set_color_write_mask(cmd, 0, 1, &mask);
     }
     if (g.bound.topology != static_cast<int>(topology)) {
@@ -922,6 +1071,70 @@ bool Prepare(PipelineFamily family, VkPrimitiveTopology topology, const TextureB
     if (!SameRect(g.bound.scissor, scissor)) {
         g.bound.scissor = scissor;
         vkCmdSetScissor(cmd, 0, 1, &scissor);
+    }
+    if (fragment_observation != nullptr) {
+        fragment_observation->scope = scope_pipeline;
+        fragment_observation->target = g.target;
+        fragment_observation->width = target.color->width;
+        fragment_observation->height = target.color->height;
+        fragment_observation->color_image = std::bit_cast<uint64_t>(target.color->image);
+        fragment_observation->color_format = static_cast<uint32_t>(target.color->format);
+        if (target.depth != nullptr) {
+            fragment_observation->depth_image = std::bit_cast<uint64_t>(target.depth->image);
+            fragment_observation->depth_format = static_cast<uint32_t>(target.depth->format);
+        }
+        fragment_observation->viewport = {0, 0, static_cast<float>(target.color->width), static_cast<float>(target.color->height), 0, 1};
+    }
+    if (AttachmentAlphaTraceRecording()) {
+        AlphaTraceEvent event;
+        event.kind = AlphaTraceKind::Draw;
+        event.target = g.target;
+        event.image = std::bit_cast<uint64_t>(target.color->image);
+        event.allocation = target.color->alpha_trace_allocation;
+        event.width = target.color->width;
+        event.height = target.color->height;
+        event.target_has_alpha = target.has_alpha;
+        if (target.depth != nullptr) {
+            event.depth_image = std::bit_cast<uint64_t>(target.depth->image);
+            event.depth_allocation = target.depth->alpha_trace_allocation;
+        }
+        event.viewport = {0, 0, static_cast<float>(target.color->width), static_cast<float>(target.color->height), 0, 1};
+        event.scope = scope_pipeline;
+        event.base_pipeline = pipeline;
+        event.mesh = observed_mesh;
+        event.first = first_index;
+        event.count = index_count;
+        event.flags = static_cast<uint32_t>(family) | (static_cast<uint32_t>(mode) << 8) | (texa ? 1u << 16 : 0);
+        event.state = state;
+        event.binding = binding;
+        event.push = push;
+        if (binding.texture != kNullTexture) {
+            if (const auto *source = ColorImageOf(binding.texture)) {
+                event.source = std::bit_cast<uint64_t>(source->image);
+                event.source_allocation = source->alpha_trace_allocation;
+            }
+        }
+        if (const auto *palette = LookupTexture(binding.palette); palette != nullptr) {
+            event.palette = std::bit_cast<uint64_t>(palette->image.image);
+            event.palette_allocation = palette->image.alpha_trace_allocation;
+        }
+        if (static_mesh != nullptr) {
+            event.mesh_allocation = static_mesh->alpha_trace_allocation;
+            if (first_index == 0 && index_count == static_mesh->index_count && sampled_texture != nullptr &&
+                !sampled_texture->render_target && binding.palette == kNullTexture) {
+                event.geometry_aliases = AttachmentAlphaRelationships(static_mesh->alpha_trace_aliases, sampled_texture->alpha_trace_aliases);
+                event.texture_aliases = sampled_texture->alpha_trace_aliases;
+            }
+        }
+        PrepareAttachmentAlphaDraw(std::move(event));
+    }
+    if (AttachmentAlphaIdentityReady()) {
+        if (auto *destination = LookupTexture(g.target); destination != nullptr) {
+            destination->alpha_trace_aliases = 0;
+        }
+    }
+    if (final_scope != nullptr) {
+        *final_scope = scope_pipeline;
     }
     return true;
 }
@@ -1410,11 +1623,19 @@ void Transfer(VkCommandBuffer cmd, Image &src, const VkOffset3D src_offsets[2], 
         return;
     }
 
+    if (AttachmentAlphaIdentityReady()) {
+        for (auto &texture : g.textures) {
+            if (texture.live && texture.image.image == dst.image) {
+                texture.alpha_trace_aliases = 0;
+            }
+        }
+    }
     Transition(cmd, src, TransferSrc());
     Transition(cmd, dst, TransferDst());
     bool same_size = width(src_offsets) == width(dst_offsets) && height(src_offsets) == height(dst_offsets) &&
                      src_offsets[1].x > src_offsets[0].x && src_offsets[1].y > src_offsets[0].y &&
                      dst_offsets[1].x > dst_offsets[0].x && dst_offsets[1].y > dst_offsets[0].y;
+    AttachmentAlphaTransfer(src, src_offsets, dst, dst_offsets, !same_size);
     if (same_size) {
         VkImageCopy region = {};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1916,10 +2137,12 @@ void DrawPrepared(Primitive primitive, std::span<const Vertex2D> vertices, const
             index += 3;
         }
         vkCmdBindIndexBuffer(cmd, indices.buffer, indices.offset, VK_INDEX_TYPE_UINT32);
+        EmitAttachmentAlphaDraw(triangles * 3, vertices, topology);
         vkCmdDrawIndexed(cmd, triangles * 3, 1, 0, 0, 0);
         return;
     }
     if (primitive != Primitive::Quads) {
+        EmitAttachmentAlphaDraw(static_cast<uint32_t>(vertices.size()), vertices, topology);
         vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
         return;
     }
@@ -1940,6 +2163,7 @@ void DrawPrepared(Primitive primitive, std::span<const Vertex2D> vertices, const
         index += 6;
     }
     vkCmdBindIndexBuffer(cmd, indices.buffer, indices.offset, VK_INDEX_TYPE_UINT32);
+    EmitAttachmentAlphaDraw(quads * 6, vertices, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true);
     vkCmdDrawIndexed(cmd, quads * 6, 1, 0, 0, 0);
 }
 
@@ -2255,8 +2479,14 @@ void DrawIndexedMesh(MeshHandle handle, uint32_t first_index, uint32_t index_cou
         if (MeasureMeshPhaseCall()) {
             phases.emplace(family == kFamilyMesh ? MeshPhaseClass::RetainedPlain : MeshPhaseClass::RetainedProg0);
         }
+        std::optional<FragmentInvocationObservation> fragment_observation;
+        if (g.fragment_invocations_enabled) {
+            fragment_observation.emplace();
+        }
+        uint32_t guarded_scope = UINT32_MAX;
         if (!Prepare(family, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, binding, state, push,
-                     false, {}, {}, &constants, mesh, index_count, prog0)) {
+                     false, {}, {}, &constants, mesh, index_count, prog0, handle, first_index,
+                     fragment_observation ? &*fragment_observation : nullptr, g.guarded_samples_enabled ? &guarded_scope : nullptr)) {
             return;
         }
         if (phases) {
@@ -2276,7 +2506,59 @@ void DrawIndexedMesh(MeshHandle handle, uint32_t first_index, uint32_t index_cou
                              VK_INDEX_TYPE_UINT32);
         RecordMeshApiEvent(MeshApiEvent::IndexBind);
         g.counters.mesh_draws++;
+        uint32_t fragment_query = UINT32_MAX;
+        if (g.fragment_invocations_enabled) {
+            fragment_observation->mesh = handle;
+            fragment_observation->generation = mesh->generation;
+            fragment_observation->vertex_count = mesh->vertex_count;
+            fragment_observation->bounds_known = mesh->bounds_known;
+            fragment_observation->bounds_normal_inputs = mesh->bounds_normal_inputs;
+            fragment_observation->bounds_min = mesh->bounds_min;
+            fragment_observation->bounds_max = mesh->bounds_max;
+            std::copy(std::begin(constants.mvp), std::end(constants.mvp), fragment_observation->mvp.begin());
+            fragment_observation->first_index = first_index;
+            fragment_observation->index_count = index_count;
+            fragment_observation->texture = binding.texture;
+            if (FragmentInvocationScopeIndex(fragment_observation->scope) >= 0 &&
+                CurrentFrame().fragment_pairs.NeedsSnapshot(*fragment_observation)) {
+                auto snapshot = std::make_shared<FragmentDrawSnapshot>();
+                snapshot->origin = tls.fragment_origin;
+                snapshot->mesh_valid = g.bound_constants.mesh_valid;
+                snapshot->prog0_valid = g.bound_constants.prog0_valid;
+                if (snapshot->mesh_valid) {
+                    snapshot->mesh = g.bound_constants.mesh;
+                }
+                if (snapshot->prog0_valid) {
+                    snapshot->prog0 = g.bound_constants.prog0;
+                }
+                snapshot->binding = binding;
+                snapshot->state = state;
+                snapshot->bound = g.bound;
+                snapshot->push = push;
+                snapshot->push.mesh_index = g.bound_constants.mesh_index;
+                snapshot->push.prog0_index = prog0 != nullptr ? g.bound_constants.prog0_index : 0;
+                snapshot->push.palette_index = family == kFamilyMeshProg0Skinned ? g.bound_constants.palette_index : 0;
+                snapshot->dynamic_color_mask = g.dynamic_color_write_mask;
+                snapshot->resolved_color_mask = g.dynamic_color_write_mask ? static_cast<uint32_t>(g.bound.color_write_mask) : state.color_write_mask != 0 ? kWriteRgba
+                                                                                                                                                           : 0;
+                snapshot->color_image = fragment_observation->color_image;
+                snapshot->depth_image = fragment_observation->depth_image;
+                snapshot->color_format = fragment_observation->color_format;
+                snapshot->depth_format = fragment_observation->depth_format;
+                snapshot->viewport = fragment_observation->viewport;
+                fragment_observation->snapshot = std::move(snapshot);
+            }
+            fragment_query = BeginFragmentInvocation(cmd, *fragment_observation);
+        }
+        EmitAttachmentAlphaDraw(index_count);
+        const uint32_t guarded_token = g.guarded_samples_enabled ? BeginGuardedZeroSamples(guarded_scope, handle, first_index, index_count, binding, state) : UINT32_MAX;
         vkCmdDrawIndexed(cmd, index_count, 1, first_index, 0, 0);
+        if (guarded_token != UINT32_MAX) {
+            EndGuardedZeroSamples(guarded_token, index_count, first_index);
+        }
+        if (fragment_query != UINT32_MAX) {
+            vkCmdEndQuery(cmd, g.fragment_invocation_pool, fragment_query);
+        }
         RecordMeshApiEvent(MeshApiEvent::DrawIndexed);
     };
     DispatchMeshWork(work);
@@ -2352,6 +2634,7 @@ void DrawImmediateMesh(std::span<const Vertex3D> vertices, std::span<const uint3
         vkCmdBindIndexBuffer(cmd, index_data.buffer, index_data.offset, VK_INDEX_TYPE_UINT32);
         RecordMeshApiEvent(MeshApiEvent::IndexBind);
         g.counters.mesh_draws++;
+        EmitAttachmentAlphaDraw(static_cast<uint32_t>(indices.size()));
         vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
         RecordMeshApiEvent(MeshApiEvent::DrawIndexed);
     };
@@ -2418,6 +2701,27 @@ void Clear(bool clear_color, const uint8_t color[4], bool clear_depth, float dep
             attachments[count].clearValue.depthStencil = {std::clamp(depth, 0.0f, 1.0f), 0};
             count++;
         }
+        if (AttachmentAlphaTraceRecording()) {
+            AlphaTraceEvent event;
+            event.kind = AlphaTraceKind::Clear;
+            event.target = g.target;
+            event.image = std::bit_cast<uint64_t>(target.color->image);
+            event.allocation = target.color->alpha_trace_allocation;
+            event.width = target.color->width;
+            event.height = target.color->height;
+            event.mask = clear_color ? kWriteRgba : 0;
+            if (clear_color) {
+                for (size_t i = 0; i < 4; ++i) {
+                    event.clear_rgba[i] = std::bit_cast<uint32_t>(attachments[0].clearValue.color.float32[i]);
+                }
+            }
+            event.rect = {clear.rect.offset.x, clear.rect.offset.y, static_cast<int32_t>(clear.rect.extent.width), static_cast<int32_t>(clear.rect.extent.height)};
+            event.flags = clear_color && clear.rect.offset.x == 0 && clear.rect.offset.y == 0 &&
+                                  clear.rect.extent.width == target.color->width && clear.rect.extent.height == target.color->height
+                              ? 1u
+                              : 0u;
+            AttachmentAlphaObserve(std::move(event));
+        }
         vkCmdClearAttachments(DrawCommands(), count, attachments, 1, &clear);
     });
 }
@@ -2447,6 +2751,18 @@ void ClearStencil(uint8_t value, const LogicalRect *rect) {
         VkClearAttachment attachment = {};
         attachment.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
         attachment.clearValue.depthStencil = {0.0f, value};
+        if (AttachmentAlphaTraceRecording()) {
+            AlphaTraceEvent event;
+            event.kind = AlphaTraceKind::Clear;
+            event.target = g.target;
+            event.image = std::bit_cast<uint64_t>(target.color->image);
+            event.allocation = target.color->alpha_trace_allocation;
+            event.width = target.color->width;
+            event.height = target.color->height;
+            event.flags = 16;
+            event.rect = {clear.rect.offset.x, clear.rect.offset.y, static_cast<int32_t>(clear.rect.extent.width), static_cast<int32_t>(clear.rect.extent.height)};
+            AttachmentAlphaObserve(std::move(event));
+        }
         vkCmdClearAttachments(DrawCommands(), 1, &attachment, 1, &clear);
     });
 }

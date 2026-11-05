@@ -181,6 +181,23 @@ else is internal. No game header is reachable from here: `platform/`, `gfx/` and
   (times the vertex colour). `kMeshShadow` is flat `diffuse`. `specular` is carried, unused.
 - **TEXA**: a texture with `has_alpha = false` (24-bit TIM2, a 24-bit render target) gets
   `alpha = (texa_aem && rgb == 0) ? 0 : texa_ta0` per texel, before filtering.
+  Ordinary RGBA8 uploads track fully initialized mip levels whose RGB texels are all nonblack.
+  When every accessible mip has that property, AEM selects the constant-TA0 specialization,
+  avoiding the three RGB gathers used for linear AEM filtering. Partial black uploads invalidate
+  the affected mip; copies and blits invalidate the destination metadata. Render targets retain
+  the general path. Texture alpha and readback data remain unchanged. `KZ_TEXA_NONBLACK=0`
+  disables this selection for comparisons.
+  On Switch, ordinary RGB24 uploads also maintain an owned R8 companion image containing the
+  exact per-texel nonblack predicate. A complete companion mip chain replaces the three RGB
+  gathers with one mask gather through the original sampler and the same footprint and bilinear
+  arithmetic. The gather remains at the base level, matching the general alpha path even when
+  RGB sampling uses lower mips. The RGBA draw's unused palette binding carries the companion;
+  indexed draws and depth-plane tables retain their existing binding. Partial uploads update
+  the companion, while GPU copies invalidate its proof until complete uploads restore it.
+  Destruction and draw-use tracking follow the owning texture. The companion's logical data is
+  one byte per source texel at each mip; original RGBA pixels and readbacks are preserved.
+  `KZ_TEXA_MASK=0` disables companion creation on Switch; desktop defaults remain unchanged,
+  and `KZ_TEXA_MASK=1` enables the path for host validation.
 - **Palettes**: an `Index8` texture is looked up in its palette before filtering, so a linear
   filter blends four palette entries (base level only). Palettes are 256x1 RGBA8 textures;
   swapping one between two draws of a frame is ordered as written.
@@ -459,8 +476,9 @@ renders one.
   enlarged composite writes depth. This is separate from keyed 2D interpolation.
   Outline callers provide full-visible-extent presentation vertices and scratch clears
   so models remain complete under interpolated rotation, skinning and display-only
-  camera motion. Shifted, filtered copies can sample beyond their scissors, so scratch
-  clears retain the full caller rectangle instead of a copy scissor. Each copy retains
+  camera motion. Proven immutable bounds can restrict a shared-depth or frame-target region;
+  unknown or updated geometry retains the full extent. Shifted, filtered copies can sample
+  beyond their scissors, so bounded scratch clears include a source-texel gutter. Each copy retains
   its texture-to-screen offset. Canonical clear/copy
   rectangles stay unchanged; transparent texels in depth-writing replacements never
   write depth. Callers that copy recorded display lists must preserve
@@ -471,6 +489,14 @@ renders one.
   `GfxGpuDisplayList.PresentationCompositeKeepsMovingMeshAndClearsReusedTarget`
   and `PresentationCompositeDoesNotWriteTransparentDepth` cover replacement
   composites, scratch clears and transparent depth rejection.
+  Eligible source-over bodies preserve full-area destination alpha with an alpha-only reset.
+  After the first reset, display replay can restrict later resets to the preceding body's
+  conservative destination footprint. The proof covers only the exact reset extent and scissor,
+  with unchanged source/destination mappings; ordinary scratch writes and RGB-only alpha readers
+  preserve it, while unknown alpha writers and unsupported bodies retire it. Independent ordinary
+  images retain their original UI/extension path. `KZ_PRESENTATION_ALPHA_FOOTPRINT=0` restores full
+  resets for executable comparisons. `ConsecutivePresentationBodiesPreserveRgbaAndAlphaReaders`
+  checks complete RGBA and intermediate destination-alpha observations across these transitions.
 - **Interpolation.** A mesh draw may carry a `MeshTransform` (projection, view, middle, model,
   local: `mvp` is their product) and is tagged with the current `InterpKey` (`SetInterpKey`). A
   display render at `alpha` < 1 with `options.previous` matches each tagged draw with the previous

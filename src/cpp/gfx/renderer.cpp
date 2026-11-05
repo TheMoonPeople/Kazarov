@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -20,6 +21,8 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+#include "gfx/alpha_trace.hpp"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -86,6 +89,61 @@ namespace gfx {
 namespace detail {
 
 Context g;
+
+void Prog0FogObservations::Clear() {
+    counts.fill(0);
+    dropped_draws = 0;
+    records.clear();
+}
+
+void Prog0FogObservations::Retain(const Prog0FogObservation &observation) {
+    const auto same = [&](const Prog0FogObservation &record) {
+        return record.mesh == observation.mesh && record.generation == observation.generation &&
+               record.first_index == observation.first_index && record.index_count == observation.index_count &&
+               record.texture == observation.texture && record.target == observation.target &&
+               record.proof.reason == observation.proof.reason && record.near_safe_selected == observation.near_safe_selected && record.mode1_selected == observation.mode1_selected && record.actual_scope == observation.actual_scope;
+    };
+    const auto found = std::ranges::find_if(records, same);
+    if (found != records.end()) {
+        const uint64_t draws = found->draws + observation.draws;
+        const uint64_t first = std::min(found->first_frame, observation.first_frame);
+        const uint64_t last = std::max(found->last_frame, observation.last_frame);
+        const auto     margin = [](const Prog0FogObservation &record) {
+            return record.proof.reason == Prog0FogReason::WMargin ? record.proof.w_min - record.proof.w_guard
+                                                                  : record.proof.difference_min - record.proof.difference_guard;
+        };
+        if (!observation.proof.margins_computed || margin(observation) <= margin(*found)) {
+            *found = observation;
+        }
+        found->draws = draws;
+        found->first_frame = first;
+        found->last_frame = last;
+        return;
+    }
+    if (records.size() >= capacity) {
+        dropped_draws += observation.draws;
+        return;
+    }
+    if (records.capacity() < capacity) {
+        records.reserve(capacity);
+    }
+    records.push_back(observation);
+}
+
+void Prog0FogObservations::Add(const Prog0FogObservation &observation) {
+    counts[static_cast<size_t>(observation.proof.reason)] += observation.draws;
+    Retain(observation);
+}
+
+void Prog0FogObservations::Merge(const Prog0FogObservations &observations) {
+    for (size_t i = 0; i < counts.size(); ++i) {
+        counts[i] += observations.counts[i];
+    }
+    dropped_draws += observations.dropped_draws;
+    for (const auto &record : observations.records) {
+        Retain(record);
+    }
+}
 
 namespace {
 
@@ -867,27 +925,43 @@ struct FrameRoleRecord {
  * Retains recording metadata until its slot's normal timestamp harvest.
  */
 struct FrameRoleSlot {
-    FrameRole          role = FrameRole::Direct; /**< Current recording entry path. */
-    uint64_t           cpu_begin_ns = 0;         /**< CPU frame start, including display preparation. */
-    uint64_t           acquire_begin_ns = 0;     /**< Swapchain acquire call start. */
-    uint64_t           acquire_end_ns = 0;       /**< Swapchain acquire completion. */
-    double             preparation_ms = 0.0;     /**< Display preparation preceding this recording. */
-    FrameRoleReference record;                   /**< Measurement record for this slot's submission. */
+    FrameRole            role = FrameRole::Direct; /**< Current recording entry path. */
+    uint64_t             cpu_begin_ns = 0;         /**< CPU frame start, including display preparation. */
+    uint64_t             acquire_begin_ns = 0;     /**< Swapchain acquire call start. */
+    uint64_t             acquire_end_ns = 0;       /**< Swapchain acquire completion. */
+    double               preparation_ms = 0.0;     /**< Display preparation preceding this recording. */
+    FrameRoleReference   record;                   /**< Measurement record for this slot's submission. */
+    Prog0FogObservations fog;                      /**< Render-owned exact-target observations for this logical frame. */
 };
 
 /**
  * Buffers detailed timings between explicit performance measurement boundaries.
  */
 struct FrameRoleHistory {
-    uint64_t                     epoch = 0;             /**< Measurement generation. */
-    uint64_t                     renderer_instance = 0; /**< Device lifetime sharing the GPU timestamp clock. */
-    uint64_t                     begin_ns = 0;          /**< CPU measurement boundary on the diagnostic clock. */
-    uint64_t                     end_ns = 0;            /**< CPU measurement completion on the diagnostic clock. */
-    uint64_t                     sequence = 0;          /**< Last submission sequence, including overflow. */
-    uint64_t                     overflow = 0;          /**< Records omitted by the bounded buffer. */
-    uint64_t                     conflicts = 0;         /**< Submissions rejected after a device lifetime change. */
-    bool                         logged = true;         /**< Capture has no pending output. */
-    std::vector<FrameRoleRecord> records;               /**< Retained submissions in queue submission order. */
+    uint64_t                                                                                                            guarded_begin_ns = 0;                  /**< Probe start in the measurement and presentation clock domain. */
+    uint64_t                                                                                                            guarded_end_ns = 0;                    /**< Probe end in that same domain. */
+    bool                                                                                                                fragment_enabled = false;              /**< This measurement requested fragment counter observations. */
+    std::array<std::array<FragmentInvocationSamples, static_cast<size_t>(FrameRole::Count)>, 16>                        fragment_buckets;                      /**< Bounded submission-second result aggregates. */
+    std::array<std::array<FragmentDrawPairSamples, static_cast<size_t>(FrameRole::Count)>, 16>                          fragment_pair_buckets;                 /**< Bounded same-submission geometry pairs. */
+    uint64_t                                                                                                            fragment_pair_group_dropped_draws = 0; /**< Eligible draws beyond per-slot geometry capacity. */
+    std::array<std::array<uint64_t, 2>, static_cast<size_t>(FrameRole::Count)>                                          fragment_expected = {};                /**< Eligible submitted draws by role and selected scope. */
+    uint64_t                                                                                                            fragment_history_overflow = 0;         /**< Target draws omitted with an overflowing role record. */
+    uint64_t                                                                                                            fragment_bucket_overflow = 0;          /**< Results beyond the bounded submission-time horizon. */
+    uint64_t                                                                                                            fragment_stale_draws = 0;              /**< Old-epoch results deliberately excluded from this capture. */
+    uint64_t                                                                                                            epoch = 0;                             /**< Measurement generation. */
+    uint64_t                                                                                                            renderer_instance = 0;                 /**< Device lifetime sharing the GPU timestamp clock. */
+    uint64_t                                                                                                            begin_ns = 0;                          /**< CPU measurement boundary on the diagnostic clock. */
+    uint64_t                                                                                                            end_ns = 0;                            /**< CPU measurement completion on the diagnostic clock. */
+    uint64_t                                                                                                            sequence = 0;                          /**< Last submission sequence, including overflow. */
+    uint64_t                                                                                                            overflow = 0;                          /**< Records omitted by the bounded buffer. */
+    uint64_t                                                                                                            conflicts = 0;                         /**< Submissions rejected after a device lifetime change. */
+    bool                                                                                                                logged = true;                         /**< Capture has no pending output. */
+    std::vector<FrameRoleRecord>                                                                                        records;                               /**< Retained submissions in queue submission order. */
+    bool                                                                                                                fog_enabled = false;                   /**< This measurement requested CPU-only fog observations. */
+    std::array<std::array<uint64_t, static_cast<size_t>(Prog0FogReason::Count)>, static_cast<size_t>(FrameRole::Count)> fog_counts = {};                       /**< Exact accepted target draws by role and reason. */
+    std::array<std::array<Prog0FogObservations, static_cast<size_t>(FrameRole::Count)>, 16>                             fog_buckets;                           /**< Bounded one-second submission buckets. */
+    uint64_t                                                                                                            fog_bucket_overflow_draws = 0;         /**< Counted draws beyond the representative time horizon. */
+    uint64_t                                                                                                            fog_role_overflow_draws = 0;           /**< Draws omitted because their role record overflowed. */
 };
 
 /** Maximum submissions retained for one performance measurement. */
@@ -958,31 +1032,505 @@ void UpdateFrameRoleRecord(const FrameRoleReference &reference, Update update) {
 }
 
 /**
- * Opens a bounded timing capture at the explicit performance boundary.
+ * Bounds precise query storage for one in-flight slot.
  */
-void BeginFrameRoleHistory() {
-    if (!FramePhasesEnabled()) {
+constexpr uint32_t kGuardedQueries = 128;
+
+/**
+ * Keeps one original/classifier pair independent of retired resources.
+ */
+struct GuardedSamplePair {
+    uint64_t   frame = 0;              /**< Original renderer frame sequence. */
+    uint64_t   list = 0;               /**< Actual retained list serial. */
+    uint64_t   previous_list = 0;      /**< Previous retained list serial. */
+    uint64_t   publication = 0;        /**< Accepted logical submission sequence. */
+    uint64_t   first_submit = 0;       /**< First physical queue submission containing this pair. */
+    uint64_t   last_submit = 0;        /**< Final physical queue submission containing this pair. */
+    uint64_t   image = 0;              /**< Resolved color image identity. */
+    uint64_t   image_allocation = 0;   /**< Resolved color allocation identity. */
+    uint64_t   mesh_allocation = 0;    /**< Matched mesh allocation identity. */
+    uint64_t   texture_allocation = 0; /**< Matched sampled allocation identity. */
+    uint64_t   depth_image = 0;        /**< Resolved depth image identity. */
+    uint64_t   depth_allocation = 0;   /**< Resolved depth allocation identity. */
+    uint64_t   interpolation_bits = 0; /**< Bit-exact actual interpolation factor. */
+    uint32_t   viewport_width = 0;     /**< Actual viewport width. */
+    uint32_t   viewport_height = 0;    /**< Actual viewport height. */
+    uint32_t   mesh = 0;               /**< Matched mesh handle. */
+    uint32_t   generation = 0;         /**< Matched mesh generation. */
+    uint32_t   texture = 0;            /**< Matched texture handle. */
+    uint32_t   geometry_aliases = 0;   /**< Fully verified geometry aliases. */
+    uint32_t   texture_aliases = 0;    /**< Fully verified texture aliases. */
+    uint32_t   relationship = 0;       /**< Verified catalog relationship bits. */
+    uint32_t   first = 0;              /**< Actual first index. */
+    uint32_t   count = 0;              /**< Actual index count. */
+    uint32_t   query = 0;              /**< First query index in the pair. */
+    uint32_t   slot = 0;               /**< Owning in-flight slot. */
+    DrawState  state;                  /**< Actual requested draw state. */
+    BoundState bound;                  /**< Actual resolved dynamic state. */
+    uint64_t   total = 0;              /**< Original post-test covered samples. */
+    uint64_t   fast = 0;               /**< Guard-fast post-test covered samples. */
+    bool       total_ready = false;    /**< Original query result is available. */
+    bool       fast_ready = false;     /**< Classifier query result is available. */
+    bool       failed = false;         /**< Either query or pair validation failed. */
+};
+
+/**
+ * Owns one bounded logical execution selected before its first instrumented draw.
+ */
+struct GuardedSampleExecution {
+    bool                           attempted = false; /**< An eligible draw reserved this execution. */
+    bool                           closed = false;    /**< The logical execution has ended. */
+    bool                           cancelled = false; /**< Boundary or evidence loss invalidated this execution. */
+    bool                           overflow = false;  /**< Eligible draws exceeded the pair budget. */
+    uint64_t                       begin = 0;         /**< Logical execution entry time. */
+    uint64_t                       end = 0;           /**< Logical execution exit time. */
+    uint64_t                       matched = 0;       /**< Identity-compatible draws observed. */
+    uint64_t                       eligible = 0;      /**< Matched draws satisfying final state gates. */
+    uint64_t                       excluded = 0;      /**< Matched draws rejected by final state gates. */
+    uint64_t                       sidecars = 0;      /**< Classifier draws actually emitted. */
+    uint32_t                       role = 0;          /**< Canonical or replay role index. */
+    std::vector<GuardedSamplePair> pairs;             /**< Owned original and classifier observations. */
+};
+
+/**
+ * Owns only opt-in CPU observations and four complete execution attempts.
+ */
+struct GuardedSamplesOwner {
+    uint64_t                              epoch = 0;                 /**< Measurement generation owning these observations. */
+    uint64_t                              publication_begin = 0;     /**< Published measurement start. */
+    uint64_t                              publication_end = 0;       /**< Published measurement end. */
+    uint64_t                              current_begin = 0;         /**< Current logical execution entry time. */
+    uint64_t                              current_epoch = 0;         /**< Current logical execution generation. */
+    uint64_t                              submit_sequence = 0;       /**< Physical submission sequence. */
+    uint64_t                              stale = 0;                 /**< Retired observations rejected by generation. */
+    uint64_t                              errors = 0;                /**< Query or sample-order validation errors. */
+    uint64_t                              unavailable = 0;           /**< Pairs finalized without both results. */
+    uint64_t                              cancelled = 0;             /**< Boundary or evidence loss invalidated this execution. */
+    uint64_t                              matched = 0;               /**< Identity-compatible draws observed. */
+    uint64_t                              eligible = 0;              /**< Matched draws satisfying final state gates. */
+    uint64_t                              excluded = 0;              /**< Matched draws rejected by final state gates. */
+    uint64_t                              list = 0;                  /**< Actual retained list serial. */
+    uint64_t                              previous_list = 0;         /**< Previous retained list serial. */
+    uint64_t                              interpolation_bits = 0;    /**< Bit-exact actual interpolation factor. */
+    bool                                  logical_open = false;      /**< A logical execution is currently open. */
+    bool                                  failed_pool = false;       /**< Dedicated query creation failed. */
+    bool                                  destroying = false;        /**< Renderer teardown is finalizing observations. */
+    uint64_t                              logged_epoch = UINT64_MAX; /**< Last generation already reported. */
+    uint32_t                              current_role = 0;          /**< Current canonical or replay role index. */
+    int32_t                               current = -1;              /**< Reserved execution index or no reservation. */
+    std::array<uint32_t, 2>               attempts{};                /**< Consumed execution attempts by role. */
+    std::array<GuardedSampleExecution, 4> executions;                /**< Four bounded complete-execution attempts. */
+};
+
+/**
+ * Owns observations only after precise probe prerequisites have succeeded.
+ */
+std::unique_ptr<GuardedSamplesOwner> g_guarded_samples;
+
+/**
+ * Samples the measurement and presentation clock domain used by the public marker.
+ */
+uint64_t GuardedClockNs() {
+    return FrameRoleClockNs();
+}
+
+/**
+ * Closes a logical execution before retirement callbacks can re-enter rendering.
+ */
+void EndGuardedExecution(bool cancelled = false) {
+    if (!g_guarded_samples || !g_guarded_samples->logical_open) {
+        return;
+    }
+    const uint64_t  end = GuardedClockNs();
+    auto           &owner = *g_guarded_samples;
+    std::lock_guard lock(g_frame_role_mutex);
+    if (owner.current >= 0) {
+        auto &execution = owner.executions[owner.current];
+        execution.end = end;
+        execution.closed = true;
+        execution.cancelled |= cancelled || !AttachmentAlphaIdentityReady() || owner.current_epoch != g_frame_role_history.epoch ||
+                               (g_frame_role_history.guarded_end_ns != 0 && end >= g_frame_role_history.guarded_end_ns);
+        owner.cancelled += execution.cancelled;
+    }
+    owner.logical_open = false;
+    owner.current = -1;
+}
+
+/**
+ * Opens execution ownership without consuming a slot during warmup or an endpoint.
+ */
+void BeginGuardedExecution(bool canonical, bool endpoint) {
+    if (!g.guarded_samples_enabled) {
+        return;
+    }
+    const uint64_t begin = GuardedClockNs();
+    if (!g_guarded_samples) {
+        g_guarded_samples = std::make_unique<GuardedSamplesOwner>();
+    }
+    EndGuardedExecution(true);
+    auto           &owner = *g_guarded_samples;
+    std::lock_guard lock(g_frame_role_mutex);
+    const auto     &history = g_frame_role_history;
+    if (endpoint || history.renderer_instance != g.renderer_instance || history.guarded_begin_ns == 0 ||
+        begin < history.guarded_begin_ns || history.guarded_end_ns != 0 || history.logged) {
+        return;
+    }
+    if (owner.epoch != history.epoch) {
+        const auto submissions = owner.submit_sequence;
+        const auto stale = owner.stale;
+        owner = {};
+        owner.submit_sequence = submissions;
+        owner.stale = stale;
+        owner.epoch = history.epoch;
+    }
+    owner.publication_begin = history.guarded_begin_ns;
+    owner.current_epoch = history.epoch;
+    owner.current_begin = begin;
+    owner.current_role = canonical ? 0 : 1;
+    owner.current = -1;
+    owner.logical_open = true;
+    owner.list = owner.previous_list = owner.interpolation_bits = 0;
+}
+
+/**
+ * Creates and resets queries only at a logical command opening outside rendering.
+ */
+void OpenGuardedQueries(VkCommandBuffer cmd) {
+    if (!g.guarded_samples_enabled) {
+        return;
+    }
+    if (!g_guarded_samples) {
+        g_guarded_samples = std::make_unique<GuardedSamplesOwner>();
+    }
+    auto &frame = CurrentFrame();
+    if (!frame.guarded_merged) {
+        for (const auto &reference : frame.guarded_samples) {
+            if (reference.epoch == g_guarded_samples->epoch) {
+                g_guarded_samples->executions[reference.execution].cancelled = true;
+                ++g_guarded_samples->unavailable;
+            } else {
+                ++g_guarded_samples->stale;
+            }
+        }
+        frame.guarded_merged = true;
+    }
+    if (g.guarded_sample_pool == VK_NULL_HANDLE) {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_OCCLUSION;
+        info.queryCount = kGuardedQueries * kFramesInFlight;
+        if (vkCreateQueryPool(g.device, &info, nullptr, &g.guarded_sample_pool) != VK_SUCCESS) {
+            g.guarded_sample_pool = VK_NULL_HANDLE;
+            g.guarded_samples_enabled = false;
+            g_guarded_samples->failed_pool = true;
+            return;
+        }
+        vkCmdResetQueryPool(cmd, g.guarded_sample_pool, 0, info.queryCount);
+    } else if (frame.guarded_reset != 0) {
+        vkCmdResetQueryPool(cmd, g.guarded_sample_pool, g.frame_slot * kGuardedQueries, frame.guarded_reset);
+    }
+    frame.guarded_samples.clear();
+    frame.guarded_values.clear();
+    frame.guarded_reset = 0;
+    frame.guarded_merged = false;
+}
+
+/**
+ * Harvests complete pairs after an existing fence or final nonblocking status check.
+ */
+void HarvestGuardedSamples(Frame &frame, bool fence_ready, bool final = false) {
+    if (!g_guarded_samples || frame.guarded_merged || frame.guarded_samples.empty()) {
+        return;
+    }
+    if (!fence_ready && !final) {
+        return;
+    }
+    auto &owner = *g_guarded_samples;
+    if (!fence_ready) {
+        owner.unavailable += frame.guarded_samples.size();
+        frame.guarded_merged = true;
+        return;
+    }
+    frame.guarded_values.resize(frame.guarded_samples.size() * 2);
+    const uint32_t first = frame.guarded_samples.front().query;
+    const VkResult result = vkGetQueryPoolResults(g.device, g.guarded_sample_pool, first,
+                                                  static_cast<uint32_t>(frame.guarded_values.size()), frame.guarded_values.size() * sizeof(frame.guarded_values[0]),
+                                                  frame.guarded_values.data(), sizeof(frame.guarded_values[0]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    bool           ready = result == VK_SUCCESS || result == VK_NOT_READY;
+    for (const auto &value : frame.guarded_values) {
+        ready &= value[1] != 0;
+    }
+    if (!ready && !final && result == VK_NOT_READY) {
+        return;
+    }
+    frame.guarded_merged = true;
+    for (size_t i = 0; i < frame.guarded_samples.size(); ++i) {
+        const auto &reference = frame.guarded_samples[i];
+        if (reference.epoch != owner.epoch || reference.epoch != g_frame_role_history.epoch) {
+            ++owner.stale;
+            continue;
+        }
+        auto &pair = owner.executions[reference.execution].pairs[reference.pair];
+        pair.failed = result != VK_SUCCESS && result != VK_NOT_READY;
+        pair.total_ready = !pair.failed && frame.guarded_values[i * 2][1] != 0;
+        pair.fast_ready = !pair.failed && frame.guarded_values[i * 2 + 1][1] != 0;
+        if (pair.total_ready) {
+            pair.total = frame.guarded_values[i * 2][0];
+        }
+        if (pair.fast_ready) {
+            pair.fast = frame.guarded_values[i * 2 + 1][0];
+        }
+        pair.failed |= pair.total_ready && pair.fast_ready && pair.fast > pair.total;
+        owner.errors += pair.failed;
+        owner.unavailable += !pair.total_ready || !pair.fast_ready;
+    }
+}
+
+/**
+ * Attaches publication and physical submit identities without changing queue ordering.
+ */
+void SubmitGuardedSamples(Frame &frame, uint64_t first, uint64_t last) {
+    if (!g_guarded_samples) {
+        return;
+    }
+    std::lock_guard lock(g_frame_role_mutex);
+    auto           &owner = *g_guarded_samples;
+    const auto      publication = FrameRoleState(frame).record;
+    for (const auto &reference : frame.guarded_samples) {
+        if (reference.epoch != owner.epoch) {
+            continue;
+        }
+        auto &pair = owner.executions[reference.execution].pairs[reference.pair];
+        if (pair.first_submit == 0) {
+            pair.first_submit = first;
+        }
+        pair.last_submit = last;
+        if (publication.epoch == reference.epoch && publication.epoch == g_frame_role_history.epoch &&
+            publication.index < g_frame_role_history.records.size() &&
+            g_frame_role_history.records[publication.index].sequence == publication.sequence) {
+            pair.publication = publication.sequence;
+        }
+    }
+}
+
+/**
+ * Emits bounded post-test covered-sample results without adding fence waits.
+ */
+void LogGuardedSamples() {
+    if (!g.guarded_samples_requested) {
         return;
     }
     std::lock_guard lock(g_frame_role_mutex);
     auto           &history = g_frame_role_history;
+    const bool      current_owner = g_guarded_samples && g_guarded_samples->epoch == history.epoch;
+    if (g_guarded_samples && g_guarded_samples->logged_epoch == history.epoch) {
+        return;
+    }
+    if (g_guarded_samples) {
+        for (auto &frame : g.frames) {
+            HarvestGuardedSamples(frame, !frame.pending || vkGetFenceStatus(g.device, frame.fence) == VK_SUCCESS, history.guarded_end_ns != 0);
+        }
+    }
+    const auto identity = InspectAttachmentAlphaTrace();
+    kz::Logf(kz::LogLevel::Info, "gfx", "guarded samples begin: schema=1 instance={} epoch={} begin_ns={} end_ns={} supported={} enabled={} pool={} identity_ready={} identity_overflow={} execution_cap=4 pairs_per_execution=64 precise=true population=post_test_covered_samples diagnostic_only=true queries_and_sidecar_overhead=true extra_application_gpu_waits=0", g.renderer_instance, history.epoch, history.guarded_begin_ns, history.guarded_end_ns, g.guarded_samples_supported, g.guarded_samples_enabled, g.guarded_sample_pool != VK_NULL_HANDLE, AttachmentAlphaIdentityReady(), identity.identity_overflow);
+    for (size_t index = 0; index < 4; ++index) {
+        const bool exists = g_guarded_samples && g_guarded_samples->epoch == history.epoch && g_guarded_samples->executions[index].attempted;
+        if (!exists) {
+            kz::Logf(kz::LogLevel::Info, "gfx", "guarded samples execution: index={} role={} missing=true", index, index / 2);
+            continue;
+        }
+        const auto &execution = g_guarded_samples->executions[index];
+        const bool  cancelled = execution.cancelled || (execution.closed && (execution.begin < history.guarded_begin_ns || (history.guarded_end_ns != 0 && execution.end >= history.guarded_end_ns)));
+        bool        complete = execution.closed && !cancelled && !execution.overflow && !execution.pairs.empty() &&
+                               execution.sidecars == execution.pairs.size() && history.guarded_end_ns != 0 &&
+                               execution.begin >= history.guarded_begin_ns && execution.end < history.guarded_end_ns;
+        uint64_t    total = 0, fast = 0;
+        for (size_t i = 0; i < execution.pairs.size(); ++i) {
+            const auto &pair = execution.pairs[i];
+            const bool  valid = pair.total_ready && pair.fast_ready && !pair.failed && pair.publication != 0;
+            complete &= valid;
+            if (valid) {
+                total += pair.total;
+                fast += pair.fast;
+            }
+            kz::Logf(kz::LogLevel::Info, "gfx", "guarded samples pair: execution={} pair={} frame={} publication={} submit_first={} submit_last={} slot={} total_query={} fast_query={} list={} previous_list={} scope={} mesh={} generation={} mesh_allocation={} texture={} texture_allocation={} geometry_aliases={} texture_aliases={} relationship={} first={} count={} image={} image_allocation={} depth_test={} depth_write={} stencil_test={} color_mask={} scissor={},{},{},{} total_ready={} fast_ready={} error={} total={} fast={}", index, i, pair.frame, pair.publication, pair.first_submit, pair.last_submit, pair.slot, pair.query, pair.query + 1, pair.list, pair.previous_list, kProg0GuardedZeroSharedRgbScope, pair.mesh, pair.generation, pair.mesh_allocation, pair.texture, pair.texture_allocation, pair.geometry_aliases, pair.texture_aliases, pair.relationship, pair.first, pair.count, pair.image, pair.image_allocation, pair.bound.depth_test, pair.bound.depth_write, pair.bound.stencil_test, pair.bound.color_write_mask, pair.bound.scissor.offset.x, pair.bound.scissor.offset.y, pair.bound.scissor.extent.width, pair.bound.scissor.extent.height, pair.total_ready, pair.fast_ready, pair.failed, pair.total, pair.fast);
+            kz::Logf(kz::LogLevel::Info, "gfx", "guarded samples state: execution={} pair={} interpolation_bits={} depth_image={} depth_allocation={} viewport=0,0,{},{},0,1 requested_mask={} depth_op={} cull={} topology={} requested_depth={} requested_write={} requested_stencil={} alpha_test={} alpha_func={} alpha_ref={} blend={} blend_terms={},{},{},{},{}", index, i, pair.interpolation_bits, pair.depth_image, pair.depth_allocation, pair.viewport_width, pair.viewport_height, pair.state.color_write_mask, pair.bound.depth_op, pair.bound.cull, pair.bound.topology, static_cast<unsigned>(pair.state.depth_test), pair.state.depth_write, pair.state.stencil_test, pair.state.alpha_test, static_cast<unsigned>(pair.state.alpha_func), pair.state.alpha_ref, pair.state.blend, pair.state.alpha.a, pair.state.alpha.b, pair.state.alpha.c, pair.state.alpha.d, pair.state.alpha.fix);
+        }
+        const std::string ratio = complete && total != 0 ? std::format("{:.9f}", static_cast<double>(fast) / total) : "undefined";
+        kz::Logf(kz::LogLevel::Info, "gfx", "guarded samples execution: index={} role={} missing=false begin_ns={} end_ns={} closed={} cancelled={} overflow={} matched={} eligible={} state_excluded={} queried={} sidecars={} complete={} total={} fast={} fallback={} fast_ratio={}", index, execution.role, execution.begin, execution.end, execution.closed, cancelled, execution.overflow, execution.matched, execution.eligible, execution.excluded, execution.pairs.size(), execution.sidecars, complete, total, fast, complete ? total - fast : 0, ratio);
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx", "guarded samples end: epoch={} errors={} unavailable={} stale_lifetime={} pool_failure={} no_performance_claim=true", history.epoch, current_owner ? g_guarded_samples->errors : 0, current_owner ? g_guarded_samples->unavailable : 0, g_guarded_samples ? g_guarded_samples->stale : 0, g_guarded_samples && g_guarded_samples->failed_pool);
+    if (g_guarded_samples) {
+        kz::Logf(kz::LogLevel::Info, "gfx", "guarded samples summary: epoch={} matched={} eligible={} state_excluded={} destruction={} unfinished_epoch={}", history.epoch, current_owner ? g_guarded_samples->matched : 0, current_owner ? g_guarded_samples->eligible : 0, current_owner ? g_guarded_samples->excluded : 0, g_guarded_samples->destroying, history.guarded_end_ns == 0);
+        g_guarded_samples->logged_epoch = history.epoch;
+    }
+}
+
+/**
+ * Retrieves completed counters and consumes each slot once while the history mutex is held.
+ */
+void HarvestFragmentInvocationsLocked(Frame &frame, FrameRoleHistory &history, bool fence_ready) {
+    if (frame.fragment_merged || frame.fragment_draws.empty()) {
+        return;
+    }
+    frame.fragment_merged = true;
+    const auto &reference = FrameRoleState(frame).record;
+    if (!history.fragment_enabled || history.logged || reference.sequence == 0) {
+        return;
+    }
+    if (reference.epoch != history.epoch || history.renderer_instance != g.renderer_instance ||
+        reference.index >= history.records.size() || history.records[reference.index].sequence != reference.sequence) {
+        history.fragment_stale_draws += frame.fragment_draws.size();
+        return;
+    }
+    const auto    &record = history.records[reference.index];
+    const uint64_t bucket = (record.submit_begin_ns - history.begin_ns) / 1'000'000'000;
+    if (bucket >= history.fragment_buckets.size()) {
+        history.fragment_bucket_overflow += frame.fragment_draws.size();
+        return;
+    }
+    auto      &samples = history.fragment_buckets[bucket][static_cast<size_t>(record.role)];
+    VkResult   result = VK_NOT_READY;
+    const bool readback = fence_ready && g.fragment_invocation_pool != VK_NULL_HANDLE;
+    if (readback) {
+        frame.fragment_values.assign(frame.fragment_draws.size(), {});
+        const uint32_t slot = static_cast<uint32_t>(&frame - g.frames.data());
+        result = vkGetQueryPoolResults(g.device, g.fragment_invocation_pool, slot * kFragmentInvocationQueries,
+                                       static_cast<uint32_t>(frame.fragment_draws.size()),
+                                       frame.fragment_values.size() * sizeof(frame.fragment_values[0]), frame.fragment_values.data(),
+                                       sizeof(frame.fragment_values[0]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    }
+    for (size_t i = 0; i < frame.fragment_draws.size(); ++i) {
+        auto observation = frame.fragment_draws[i];
+        if (result != VK_SUCCESS && result != VK_NOT_READY) {
+            observation.errors = 1;
+            observation.unavailable = 1;
+        } else if (readback && frame.fragment_values[i][1] != 0) {
+            observation.available = 1;
+            observation.invocations = observation.peak_invocations = frame.fragment_values[i][0];
+        } else {
+            observation.unavailable = 1;
+        }
+        samples.Add(observation);
+        frame.fragment_draws[i] = observation;
+    }
+    history.fragment_pair_group_dropped_draws += frame.fragment_pairs.dropped_draws;
+    auto &pairs = history.fragment_pair_buckets[bucket][static_cast<size_t>(record.role)];
+    for (const auto &group : frame.fragment_pairs.records) {
+        auto pair = group;
+        pair.complete = pair.queried_occurrences == pair.occurrences;
+        for (size_t member = 0; member < std::min<uint64_t>(pair.occurrences, 2); ++member) {
+            if (pair.queries[member] < frame.fragment_draws.size()) {
+                pair.members[member] = frame.fragment_draws[pair.queries[member]];
+            } else {
+                pair.members[member].submission = record.sequence;
+                pair.members[member].submit_ns = record.submit_begin_ns;
+                pair.members[member].unavailable = 1;
+            }
+            pair.complete = pair.complete && pair.members[member].snapshot != nullptr && pair.members[member].available != 0 && pair.members[member].errors == 0;
+        }
+        for (const auto &draw : frame.fragment_draws) {
+            const auto &first = pair.members[0];
+            if (draw.mesh == first.mesh && draw.generation == first.generation && draw.first_index == first.first_index && draw.index_count == first.index_count) {
+                pair.complete = pair.complete && draw.available != 0 && draw.errors == 0;
+            }
+        }
+        pairs.Add(pair, pair.queried_occurrences);
+    }
+}
+
+/**
+ * Resets bounded slot queries only at a logical frame opening outside rendering.
+ */
+void OpenFragmentInvocationQueries(VkCommandBuffer cmd) {
+    if (!g.fragment_invocations_enabled) {
+        return;
+    }
+    Frame &frame = CurrentFrame();
+    if (g.fragment_invocation_pool == VK_NULL_HANDLE) {
+        VkQueryPoolCreateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+        info.queryCount = kFramesInFlight * kFragmentInvocationQueries;
+        info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+        const VkResult result = vkCreateQueryPool(g.device, &info, nullptr, &g.fragment_invocation_pool);
+        if (result != VK_SUCCESS) {
+            g.fragment_invocation_pool = VK_NULL_HANDLE;
+            g.fragment_invocations_failed = true;
+            g.fragment_invocations_enabled = false;
+            kz::Logf(kz::LogLevel::Info, "gfx", "fragment invocation diagnostic unavailable: pool_result={}", static_cast<int>(result));
+            return;
+        }
+        // Every query is reset before any slot can use the newly created pool.
+        vkCmdResetQueryPool(cmd, g.fragment_invocation_pool, 0, info.queryCount);
+    } else if (frame.fragment_reset != 0) {
+        vkCmdResetQueryPool(cmd, g.fragment_invocation_pool, g.frame_slot * kFragmentInvocationQueries, frame.fragment_reset);
+    }
+    frame.fragment_reset = 0;
+    frame.fragment_draws.clear();
+    frame.fragment_pairs.Clear();
+    frame.fragment_skipped.fill(0);
+    frame.fragment_merged = false;
+}
+
+/**
+ * Opens a bounded timing capture at the explicit performance boundary.
+ */
+void BeginFrameRoleHistory(uint64_t boundary_ns) {
+    if (!FramePhasesEnabled()) {
+        return;
+    }
+    const uint64_t  guarded_boundary = g.guarded_samples_requested ? (boundary_ns != 0 ? boundary_ns : GuardedClockNs()) : 0;
+    std::lock_guard lock(g_frame_role_mutex);
+    auto           &history = g_frame_role_history;
     ++history.epoch;
+    history.guarded_begin_ns = guarded_boundary;
+    history.guarded_end_ns = 0;
     history.renderer_instance = g.renderer_instance;
     history.begin_ns = FrameRoleClockNs();
     history.end_ns = history.sequence = history.overflow = history.conflicts = 0;
     history.records.clear();
     history.records.reserve(kFrameRoleRecordLimit);
+    history.fragment_enabled = g.fragment_invocations_requested;
+    if (history.fragment_enabled) {
+        history.fragment_expected = {};
+        history.fragment_pair_group_dropped_draws = 0;
+        for (auto &bucket : history.fragment_pair_buckets) {
+            for (auto &role : bucket) {
+                role.Clear();
+            }
+        }
+        history.fragment_history_overflow = history.fragment_bucket_overflow = history.fragment_stale_draws = 0;
+        for (auto &bucket : history.fragment_buckets) {
+            for (auto &role : bucket) {
+                role.Clear();
+            }
+        }
+    }
+    history.fog_enabled = g.prog0_fog_rejections;
+    for (auto &counts : history.fog_counts) {
+        counts.fill(0);
+    }
+    for (auto &bucket : history.fog_buckets) {
+        for (auto &role : bucket) {
+            role.Clear();
+        }
+    }
+    history.fog_bucket_overflow_draws = history.fog_role_overflow_draws = 0;
     history.logged = false;
 }
 
 /**
  * Closes the submission window while allowing normal in-flight timestamp harvests.
  */
-void EndFrameRoleHistory() {
+void EndFrameRoleHistory(uint64_t boundary_ns) {
     if (!FramePhasesEnabled()) {
         return;
     }
+    const uint64_t  guarded_boundary = g.guarded_samples_requested ? (boundary_ns != 0 ? boundary_ns : GuardedClockNs()) : 0;
     std::lock_guard lock(g_frame_role_mutex);
+    if (g.guarded_samples_requested) {
+        g_frame_role_history.guarded_end_ns = guarded_boundary;
+    }
     if (!g_frame_role_history.logged) {
         g_frame_role_history.end_ns = FrameRoleClockNs();
     }
@@ -996,7 +1544,10 @@ void OpenFrameRole(FrameRole role) {
         return;
     }
     FrameRoleSlot &slot = FrameRoleState(CurrentFrame());
+    auto           fog = std::move(slot.fog);
+    fog.Clear();
     slot = {};
+    slot.fog = std::move(fog);
     slot.role = role;
     slot.cpu_begin_ns = g_role_frame_opened_ns;
     slot.acquire_begin_ns = g_role_acquire_begin_ns;
@@ -1022,7 +1573,46 @@ void SubmitFrameRole(Frame &frame, uint64_t begin_ns, uint64_t end_ns) {
     slot.record = {.epoch = history.epoch, .sequence = ++history.sequence, .index = history.records.size()};
     if (history.records.size() == kFrameRoleRecordLimit) {
         ++history.overflow;
+        if (history.fragment_enabled) {
+            history.fragment_history_overflow += frame.fragment_draws.size() + frame.fragment_skipped[0] + frame.fragment_skipped[1];
+        }
+        if (history.fog_enabled) {
+            history.fog_role_overflow_draws += std::accumulate(slot.fog.counts.begin(), slot.fog.counts.end(), uint64_t{0});
+        }
         return;
+    }
+    if (history.fragment_enabled) {
+        const size_t role = static_cast<size_t>(slot.role);
+        for (auto &observation : frame.fragment_draws) {
+            observation.submission = slot.record.sequence;
+            observation.submit_ns = begin_ns;
+            ++history.fragment_expected[role][static_cast<size_t>(FragmentInvocationScopeIndex(observation.scope))];
+        }
+        const uint64_t bucket = (begin_ns - history.begin_ns) / 1'000'000'000;
+        for (size_t scope = 0; scope < 2; ++scope) {
+            history.fragment_expected[role][scope] += frame.fragment_skipped[scope];
+        }
+        if (bucket < history.fragment_buckets.size()) {
+            history.fragment_buckets[bucket][role].Skip(frame.fragment_skipped);
+        } else {
+            history.fragment_bucket_overflow += frame.fragment_skipped[0] + frame.fragment_skipped[1];
+        }
+    }
+    if (history.fog_enabled) {
+        for (auto &record : slot.fog.records) {
+            record.representative_submission = slot.record.sequence;
+            record.representative_submit_ns = begin_ns;
+        }
+        const size_t role = static_cast<size_t>(slot.role);
+        for (size_t i = 0; i < slot.fog.counts.size(); ++i) {
+            history.fog_counts[role][i] += slot.fog.counts[i];
+        }
+        const uint64_t bucket = (begin_ns - history.begin_ns) / 1'000'000'000;
+        if (bucket < history.fog_buckets.size()) {
+            history.fog_buckets[bucket][role].Merge(slot.fog);
+        } else {
+            history.fog_bucket_overflow_draws += std::accumulate(slot.fog.counts.begin(), slot.fog.counts.end(), uint64_t{0});
+        }
     }
     history.records.push_back({
         .role = slot.role,
@@ -1153,6 +1743,372 @@ std::string Format([[maybe_unused]] bool fatal, const char *format, std::va_list
 }
 
 } // namespace
+
+int FragmentInvocationScopeIndex(uint32_t scope) {
+    if (scope == kProg0NearSafeFogAdditiveBlackScope) {
+        return 0;
+    }
+    return scope == kProg0Mode1FogBlackScope ? 1 : -1;
+}
+
+void FragmentInvocationSamples::Clear() {
+    draws = invocations = available = unavailable = errors = skipped = {};
+    truncated_draws = 0;
+    records.clear();
+}
+
+void FragmentInvocationSamples::Skip(const std::array<uint64_t, 2> &counts) {
+    for (size_t i = 0; i < counts.size(); ++i) {
+        draws[i] += counts[i];
+        skipped[i] += counts[i];
+    }
+}
+
+void FragmentInvocationSamples::Add(const FragmentInvocationObservation &observation) {
+    const int index = FragmentInvocationScopeIndex(observation.scope);
+    if (index < 0) {
+        return;
+    }
+    const size_t column = static_cast<size_t>(index);
+    draws[column] += observation.draws;
+    invocations[column] += observation.invocations;
+    available[column] += observation.available;
+    unavailable[column] += observation.unavailable;
+    errors[column] += observation.errors;
+    auto found = std::find_if(records.begin(), records.end(), [&](const auto &record) {
+        return record.mesh == observation.mesh && record.generation == observation.generation &&
+               record.first_index == observation.first_index && record.index_count == observation.index_count &&
+               record.texture == observation.texture && record.target == observation.target &&
+               record.width == observation.width && record.height == observation.height && record.scope == observation.scope;
+    });
+    if (found != records.end()) {
+        const auto previous = *found;
+        if (observation.peak_invocations > found->peak_invocations || (found->available == 0 && observation.available != 0)) {
+            *found = observation;
+        }
+        found->draws = previous.draws + observation.draws;
+        found->available = previous.available + observation.available;
+        found->unavailable = previous.unavailable + observation.unavailable;
+        found->errors = previous.errors + observation.errors;
+        found->invocations = previous.invocations + observation.invocations;
+    } else if (records.size() < capacity) {
+        records.push_back(observation);
+    } else {
+        truncated_draws += observation.draws;
+    }
+}
+
+namespace {
+/**
+ * Matches geometry independently of the material, target, scope and owner evidence.
+ */
+bool SameFragmentGeometry(const FragmentInvocationObservation &left, const FragmentInvocationObservation &right) {
+    return left.mesh == right.mesh && left.generation == right.generation &&
+           left.first_index == right.first_index && left.index_count == right.index_count;
+}
+
+/**
+ * Scores only the first two members of one intact submitted pair.
+ */
+uint64_t FragmentPairScore(const FragmentDrawPair &pair) {
+    uint64_t score = 0;
+    for (size_t i = 0; i < std::min<uint64_t>(pair.occurrences, 2); ++i) {
+        score += pair.members[i].invocations;
+    }
+    return score;
+}
+} // namespace
+
+void FragmentDrawPairSlot::Clear() {
+    records.clear();
+    dropped_draws = 0;
+}
+
+bool FragmentDrawPairSlot::NeedsSnapshot(const FragmentInvocationObservation &observation) const {
+    const auto found = std::find_if(records.begin(), records.end(), [&](const auto &record) {
+        return SameFragmentGeometry(record.members[0], observation);
+    });
+    return found != records.end() ? found->occurrences < 2 : records.size() < capacity;
+}
+
+void FragmentDrawPairSlot::Add(const FragmentInvocationObservation &observation, uint32_t query) {
+    auto found = std::find_if(records.begin(), records.end(), [&](const auto &record) {
+        return SameFragmentGeometry(record.members[0], observation);
+    });
+    if (found == records.end()) {
+        if (records.size() >= capacity) {
+            ++dropped_draws;
+            return;
+        }
+        records.emplace_back();
+        found = std::prev(records.end());
+    }
+    if (found->occurrences < 2) {
+        const size_t member = static_cast<size_t>(found->occurrences);
+        found->members[member] = observation;
+        found->queries[member] = query;
+    }
+    ++found->occurrences;
+    found->queried_occurrences += query != UINT32_MAX ? 1 : 0;
+}
+
+void FragmentDrawPairSamples::Clear() {
+    records.clear();
+    dropped_groups = dropped_occurrences = 0;
+}
+
+void FragmentDrawPairSamples::Add(const FragmentDrawPair &pair, uint64_t queried) {
+    auto found = std::find_if(records.begin(), records.end(), [&](const auto &record) {
+        return SameFragmentGeometry(record.representative.members[0], pair.members[0]);
+    });
+    if (found == records.end()) {
+        if (records.size() >= capacity) {
+            ++dropped_groups;
+            dropped_occurrences += pair.occurrences;
+            return;
+        }
+        records.emplace_back();
+        found = std::prev(records.end());
+        found->representative = pair;
+    } else if ((pair.occurrences >= 2 && found->representative.occurrences < 2) ||
+               ((pair.occurrences >= 2) == (found->representative.occurrences >= 2) &&
+                ((pair.complete && !found->representative.complete) ||
+                 (pair.complete == found->representative.complete && FragmentPairScore(pair) > FragmentPairScore(found->representative))))) {
+        found->representative = pair;
+    }
+    found->submissions_with_one += pair.occurrences == 1 ? 1 : 0;
+    found->submissions_with_two += pair.occurrences == 2 ? 1 : 0;
+    found->submissions_with_more += pair.occurrences > 2 ? 1 : 0;
+    found->max_occurrences = std::max(found->max_occurrences, pair.occurrences);
+    found->occurrences += pair.occurrences;
+    found->queried_occurrences += queried;
+    found->incomplete_submissions += pair.complete ? 0 : 1;
+}
+
+uint32_t BeginGuardedZeroSamples(uint32_t scope, MeshHandle handle, uint32_t first, uint32_t count,
+                                 const TextureBinding &binding, const DrawState &state) {
+    if (!g.guarded_samples_enabled || g.guarded_sample_pool == VK_NULL_HANDLE || !g_guarded_samples ||
+        !g_guarded_samples->logical_open || scope != kProg0GuardedZeroSharedRgbScope) {
+        return UINT32_MAX;
+    }
+    auto &owner = *g_guarded_samples;
+    if (!AttachmentAlphaIdentityReady()) {
+        if (owner.current >= 0) {
+            owner.executions[owner.current].cancelled = true;
+        }
+        return UINT32_MAX;
+    }
+    {
+        std::lock_guard lock(g_frame_role_mutex);
+        if (owner.current_epoch != g_frame_role_history.epoch || g_frame_role_history.logged ||
+            g_frame_role_history.guarded_end_ns != 0 || owner.current_begin < g_frame_role_history.guarded_begin_ns) {
+            return UINT32_MAX;
+        }
+    }
+    const auto *mesh = LookupMesh(handle);
+    const auto *texture = LookupTexture(binding.texture);
+    if (mesh == nullptr || texture == nullptr || texture->render_target ||
+        first != 0 || count != mesh->index_count || binding.palette != kNullTexture || binding.ignore_alpha) {
+        return UINT32_MAX;
+    }
+    const uint32_t relationship = AttachmentAlphaRelationships(mesh->alpha_trace_aliases, texture->alpha_trace_aliases);
+    if (relationship == 0) {
+        return UINT32_MAX;
+    }
+    const uint32_t role = owner.current_role;
+    ++owner.matched;
+    const bool state_eligible = !state.depth_write && !state.stencil_test && g.bound.depth_write == 0 &&
+                                g.bound.stencil_test == 0 && g.guarded_classifier_pipeline != VK_NULL_HANDLE && g.bound.pipeline == g.prog0_shared_rgb_pipelines[2];
+    if (!state_eligible) {
+        ++owner.excluded;
+        if (owner.current >= 0) {
+            ++owner.executions[owner.current].matched;
+            ++owner.executions[owner.current].excluded;
+        }
+        return UINT32_MAX;
+    }
+    ++owner.eligible;
+    if (owner.current < 0) {
+        const auto attempt = owner.attempts[role];
+        if (attempt >= 2 || (attempt == 1 && owner.current_begin < owner.executions[role * 2].begin + 500'000'000)) {
+            return UINT32_MAX;
+        }
+        const uint32_t index = role * 2 + attempt;
+        owner.current = static_cast<int32_t>(index);
+        ++owner.attempts[role];
+        auto &execution = owner.executions[index];
+        execution.attempted = true;
+        execution.begin = owner.current_begin;
+        execution.role = role;
+        execution.pairs.reserve(64);
+    }
+    auto &execution = owner.executions[owner.current];
+    ++execution.matched;
+    ++execution.eligible;
+    auto &frame = CurrentFrame();
+    if (execution.pairs.size() >= 64 || frame.guarded_samples.size() >= kGuardedQueries / 2) {
+        execution.overflow = true;
+        return UINT32_MAX;
+    }
+    GuardedSamplePair pair;
+    pair.frame = g.frame_serial;
+    pair.list = tls.fragment_origin.present ? tls.fragment_origin.list_serial : owner.list;
+    pair.previous_list = owner.previous_list;
+    pair.mesh = handle;
+    pair.generation = mesh->generation;
+    pair.mesh_allocation = mesh->alpha_trace_allocation;
+    pair.texture = binding.texture;
+    pair.texture_allocation = texture->image.alpha_trace_allocation;
+    pair.geometry_aliases = mesh->alpha_trace_aliases;
+    pair.texture_aliases = texture->alpha_trace_aliases;
+    pair.relationship = relationship;
+    pair.first = first;
+    pair.count = count;
+    pair.state = state;
+    pair.bound = g.bound;
+    if (!g.dynamic_color_write_mask) {
+        pair.bound.color_write_mask = state.color_write_mask != 0 ? kWriteRgba : 0;
+    }
+    pair.interpolation_bits = owner.interpolation_bits;
+    if (const auto *image = ColorImageOf(g.target)) {
+        pair.image = std::bit_cast<uint64_t>(image->image);
+        pair.image_allocation = image->alpha_trace_allocation;
+        pair.viewport_width = image->width;
+        pair.viewport_height = image->height;
+    }
+    const Image *depth = &MainDepth();
+    if (const auto *target = LookupTexture(g.target); target != nullptr && !target->shares_main_depth) {
+        depth = &target->depth;
+    }
+    pair.depth_image = std::bit_cast<uint64_t>(depth->image);
+    pair.depth_allocation = depth->alpha_trace_allocation;
+    pair.slot = g.frame_slot;
+    pair.query = g.frame_slot * kGuardedQueries + static_cast<uint32_t>(frame.guarded_samples.size()) * 2;
+    const uint32_t ordinal = static_cast<uint32_t>(execution.pairs.size());
+    execution.pairs.push_back(pair);
+    const uint32_t token = static_cast<uint32_t>(frame.guarded_samples.size());
+    frame.guarded_samples.push_back({owner.epoch, static_cast<uint32_t>(owner.current), ordinal, pair.query});
+    frame.guarded_reset = static_cast<uint32_t>(frame.guarded_samples.size()) * 2;
+    vkCmdBeginQuery(DrawCommands(), g.guarded_sample_pool, pair.query, VK_QUERY_CONTROL_PRECISE_BIT);
+    return token;
+}
+
+void EndGuardedZeroSamples(uint32_t token, uint32_t index_count, uint32_t first_index) {
+    // The GPU lease must close even if the other thread just closed the epoch.
+    auto           &frame = CurrentFrame();
+    const auto      reference = frame.guarded_samples[token];
+    VkCommandBuffer cmd = DrawCommands();
+    vkCmdEndQuery(cmd, g.guarded_sample_pool, reference.query);
+    const auto original_pipeline = g.bound.pipeline;
+    const auto original_mask = g.bound.color_write_mask;
+    g.bound.pipeline = g.guarded_classifier_pipeline;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.bound.pipeline);
+    if (g.dynamic_color_write_mask) {
+        VkColorComponentFlags mask = 0;
+        g.cmd_set_color_write_mask(cmd, 0, 1, &mask);
+        g.bound.color_write_mask = 0;
+    }
+    vkCmdBeginQuery(cmd, g.guarded_sample_pool, reference.query + 1, VK_QUERY_CONTROL_PRECISE_BIT);
+    vkCmdDrawIndexed(cmd, index_count, 1, first_index, 0, 0);
+    vkCmdEndQuery(cmd, g.guarded_sample_pool, reference.query + 1);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original_pipeline);
+    g.bound.pipeline = original_pipeline;
+    if (g.dynamic_color_write_mask) {
+        VkColorComponentFlags mask = static_cast<uint32_t>(original_mask) & kWriteRgba;
+        g.cmd_set_color_write_mask(cmd, 0, 1, &mask);
+        g.bound.color_write_mask = original_mask;
+    }
+    if (g_guarded_samples && reference.epoch == g_guarded_samples->epoch) {
+        ++g_guarded_samples->executions[reference.execution].sidecars;
+    }
+}
+
+void GuardedSampleOrigin(uint64_t list, uint64_t previous, double alpha) {
+    if (!g_guarded_samples || !g_guarded_samples->logical_open) {
+        return;
+    }
+    g_guarded_samples->list = list;
+    g_guarded_samples->previous_list = previous;
+    g_guarded_samples->interpolation_bits = std::bit_cast<uint64_t>(alpha);
+}
+
+GuardedSampleStats InspectGuardedZeroSamples() {
+    GuardedSampleStats result;
+    RunOnRenderThread([&] {
+        result.enabled = g.guarded_samples_enabled;
+        result.supported = g.guarded_samples_supported;
+        result.owner = g_guarded_samples != nullptr;
+        result.pool = g.guarded_sample_pool != VK_NULL_HANDLE;
+        std::lock_guard lock(g_frame_role_mutex);
+        result.epoch = g_frame_role_history.epoch;
+        if (!g_guarded_samples) {
+            return;
+        }
+        for (auto &frame : g.frames) {
+            HarvestGuardedSamples(frame, !frame.pending || vkGetFenceStatus(g.device, frame.fence) == VK_SUCCESS);
+        }
+        const auto &owner = *g_guarded_samples;
+        if (owner.epoch != g_frame_role_history.epoch) {
+            return;
+        }
+        result.errors = owner.errors;
+        result.unavailable = owner.unavailable;
+        for (size_t i = 0; i < 4; ++i) {
+            const auto &execution = owner.executions[i];
+            auto       &summary = result.executions[i];
+            summary.attempted = execution.attempted;
+            summary.overflow = execution.overflow;
+            summary.cancelled = execution.cancelled || (execution.closed &&
+                                                        (execution.begin < g_frame_role_history.guarded_begin_ns ||
+                                                         (g_frame_role_history.guarded_end_ns != 0 && execution.end >= g_frame_role_history.guarded_end_ns)));
+            summary.begin = execution.begin;
+            summary.pairs = execution.pairs.size();
+            summary.sidecars = execution.sidecars;
+            summary.complete = execution.attempted && execution.closed && !summary.cancelled && !execution.overflow &&
+                               !execution.pairs.empty() && execution.sidecars == execution.pairs.size() && g_frame_role_history.guarded_end_ns != 0 &&
+                               execution.begin >= g_frame_role_history.guarded_begin_ns && execution.end < g_frame_role_history.guarded_end_ns;
+            for (const auto &pair : execution.pairs) {
+                const bool ready = pair.total_ready && pair.fast_ready && !pair.failed && pair.publication != 0;
+                summary.complete &= ready;
+                if (ready) {
+                    summary.total += pair.total;
+                    summary.fast += pair.fast;
+                }
+            }
+        }
+    });
+    return result;
+}
+
+uint32_t BeginFragmentInvocation(VkCommandBuffer cmd, FragmentInvocationObservation observation) {
+    const int scope = FragmentInvocationScopeIndex(observation.scope);
+    if (!g.fragment_invocations_enabled || g.fragment_invocation_pool == VK_NULL_HANDLE || scope < 0) {
+        return UINT32_MAX;
+    }
+    Frame &frame = CurrentFrame();
+    observation.frame = g.frame_serial;
+    observation.list_serial = tls.fragment_origin.present ? tls.fragment_origin.list_serial : g.list_serial;
+    if (frame.fragment_draws.size() >= kFragmentInvocationQueries) {
+        frame.fragment_pairs.Add(observation, UINT32_MAX);
+        ++frame.fragment_skipped[static_cast<size_t>(scope)];
+        return UINT32_MAX;
+    }
+    frame.fragment_pairs.Add(observation, static_cast<uint32_t>(frame.fragment_draws.size()));
+    const uint32_t query = g.frame_slot * kFragmentInvocationQueries + static_cast<uint32_t>(frame.fragment_draws.size());
+    frame.fragment_draws.push_back(observation);
+    frame.fragment_reset = static_cast<uint32_t>(frame.fragment_draws.size());
+    vkCmdBeginQuery(cmd, g.fragment_invocation_pool, query, 0);
+    return query;
+}
+
+void ObserveProg0Fog(Prog0FogObservation observation) {
+    if (!g.prog0_fog_rejections || !FramePhasesEnabled()) {
+        return;
+    }
+    observation.first_frame = observation.last_frame = observation.representative_frame = g.frame_serial;
+    observation.list_serial = g.list_serial;
+    FrameRoleState(CurrentFrame()).fog.Add(observation);
+}
 
 void Fatal(const char *format, ...) {
     std::va_list args;
@@ -1515,6 +2471,20 @@ void CreateDevice() {
     vkGetPhysicalDeviceFeatures(g.physical_device, &supported);
     g.sampler_anisotropy = supported.samplerAnisotropy == VK_TRUE;
     features.features.samplerAnisotropy = supported.samplerAnisotropy;
+    g.guarded_samples_supported = supported.occlusionQueryPrecise == VK_TRUE;
+    g.guarded_samples_enabled = g.guarded_samples_requested && g.guarded_samples_supported && FramePhasesEnabled() &&
+                                AttachmentAlphaIdentityReady() && !g.fragment_invocations_requested && !GpuScopes(1) &&
+                                (g.perf.stats.empty() || g.perf.stats == "guard-arms");
+    features.features.occlusionQueryPrecise = g.guarded_samples_enabled ? VK_TRUE : VK_FALSE;
+    if (g.guarded_samples_requested) {
+        kz::Logf(kz::LogLevel::Info, "gfx", "guarded samples: requested=true supported={} enabled={} frame_phases={} precise=true diagnostic_only=true", g.guarded_samples_supported, g.guarded_samples_enabled, FramePhasesEnabled());
+    }
+    g.fragment_invocations_supported = supported.pipelineStatisticsQuery == VK_TRUE;
+    g.fragment_invocations_enabled = g.fragment_invocations_requested && FramePhasesEnabled() && g.fragment_invocations_supported;
+    features.features.pipelineStatisticsQuery = g.fragment_invocations_enabled ? VK_TRUE : VK_FALSE;
+    if (g.fragment_invocations_requested) {
+        kz::Logf(kz::LogLevel::Info, "gfx", "fragment invocation diagnostic: requested=true enabled={} supported={} frame_phases={} queries_per_slot={} diagnostic_only=true query_commands_may_synchronize=true extra_application_waits=0", g.fragment_invocations_enabled, g.fragment_invocations_supported, FramePhasesEnabled(), kFragmentInvocationQueries);
+    }
     // The depth-planes pass needs the depth bounds test; it is optional and only the pass uses it.
     features.features.depthBounds = supported.depthBounds;
     g.depth_bounds = supported.depthBounds == VK_TRUE;
@@ -1939,8 +2909,375 @@ void HarvestTimestamps(Frame &frame) {
 }
 
 /**
+ * Encodes floating-point input bits without rounding, including nonfinite rejected values.
+ */
+template <typename Float, size_t count>
+std::string FogFloatBits(const std::array<Float, count> &values) {
+    std::string result;
+    for (Float value : values) {
+        if (!result.empty()) {
+            result += '/';
+        }
+        if constexpr (sizeof(Float) == sizeof(uint32_t)) {
+            result += std::format("{:08x}", std::bit_cast<uint32_t>(value));
+        } else {
+            result += std::format("{:016x}", std::bit_cast<uint64_t>(value));
+        }
+    }
+    return result;
+}
+
+/**
+ * Emits bounded CPU-only fog observations after the existing submission window has ended.
+ */
+void LogProg0FogRejections(const FrameRoleHistory &history) {
+    if (!history.fog_enabled) {
+        return;
+    }
+    static constexpr std::array reasons = {"safe", "unknown-bounds", "nonnormal-positions", "skinned-flag",
+                                           "zero-fog-scale", "invalid-bounds", "nonnormal-mvp", "nonnormal-fog", "clip-overflow", "w-margin",
+                                           "near-margin", "fog-overflow", "missing-parameters"};
+    static constexpr std::array roles = {"canonical-render", "display-replay", "canonical-endpoint", "direct"};
+    static_assert(reasons.size() == static_cast<size_t>(Prog0FogReason::Count));
+    static_assert(roles.size() == static_cast<size_t>(FrameRole::Count));
+    uint64_t dropped = history.fog_bucket_overflow_draws;
+    for (const auto &bucket : history.fog_buckets) {
+        for (const auto &role : bucket) {
+            dropped += role.dropped_draws;
+        }
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx", "perf prog0 fog rejections begin: schema=2 instance={} begin_ns={} end_ns={} membership=submit_start buckets={} capacity_per_role_bucket=64 float_encoding=ieee754_hex mvp_order=column_major clip_f64_order=x/y/z/w/limit margins_f64_order=w_min/w_guard/w_minus_z_min/w_minus_z_guard fog_limits_f64_order=w_top/w_bottom/offset/scale/fog_top unrepresented_draws={} bucket_overflow_draws={} role_overflow_draws={} extra_gpu_queries=0 extra_gpu_waits=0", history.renderer_instance, history.begin_ns, history.end_ns, history.fog_buckets.size(), dropped, history.fog_bucket_overflow_draws, history.fog_role_overflow_draws);
+    for (size_t role = 0; role < roles.size(); ++role) {
+        for (size_t reason = 0; reason < reasons.size(); ++reason) {
+            kz::Logf(kz::LogLevel::Info, "gfx", "perf prog0 fog rejection count: role={} reason={} draws={}", roles[role], reasons[reason], history.fog_counts[role][reason]);
+        }
+    }
+    for (size_t bucket = 0; bucket < history.fog_buckets.size(); ++bucket) {
+        for (size_t role = 0; role < roles.size(); ++role) {
+            const auto    &observations = history.fog_buckets[bucket][role];
+            const uint64_t draws = std::accumulate(observations.counts.begin(), observations.counts.end(), uint64_t{0});
+            if (draws != 0 || observations.dropped_draws != 0) {
+                kz::Logf(kz::LogLevel::Info, "gfx", "perf prog0 fog rejection bucket: bucket={} role={} draws={} unrepresented_draws={} representatives={}", bucket, roles[role], draws, observations.dropped_draws, observations.records.size());
+                for (size_t reason = 0; reason < reasons.size(); ++reason) {
+                    if (observations.counts[reason] != 0) {
+                        kz::Logf(kz::LogLevel::Info, "gfx", "perf prog0 fog rejection bucket count: bucket={} role={} reason={} draws={}", bucket, roles[role], reasons[reason], observations.counts[reason]);
+                    }
+                }
+            }
+            for (const auto &record : observations.records) {
+                const auto       &proof = record.proof;
+                const std::string clip = proof.clip_computed ? FogFloatBits(proof.magnitude) + '/' + FogFloatBits(std::array{proof.limit}) : "unavailable";
+                const std::string margins = proof.margins_computed ? FogFloatBits(std::array{proof.w_min, proof.w_guard, proof.difference_min, proof.difference_guard}) : "unavailable";
+                const std::string fog_limits = proof.fog_computed ? FogFloatBits(std::array{proof.w_top, proof.w_bottom, proof.offset, proof.scale, proof.fog_top}) : "unavailable";
+                kz::Logf(kz::LogLevel::Info, "gfx", "perf prog0 fog rejection representative: bucket={} role={} reason={} mesh={:#x} generation={} first_index={} index_count={} vertices={} texture={:#x} target={:#x} near_safe_selected={} mode1_selected={} actual_scope={:#x} draws={} first_frame={} last_frame={} representative_frame={} representative_submission={} representative_submit_ns={} list={} flags={:#x} mesh_present={} constants_present={} known={} normal={} bounds_min_bits={} bounds_max_bits={} mvp_bits={} fog_bits={} clip_f64_bits={} margins_f64_bits={} fog_limits_f64_bits={}", bucket, roles[role], reasons[static_cast<size_t>(proof.reason)], record.mesh, record.generation, record.first_index, record.index_count, record.vertex_count, record.texture, record.target, record.near_safe_selected, record.mode1_selected, record.actual_scope, record.draws, record.first_frame, record.last_frame, record.representative_frame, record.representative_submission, record.representative_submit_ns, record.list_serial, record.flags, record.mesh_present, record.constants_present, record.bounds_known, record.bounds_normal_inputs, record.mesh_present ? FogFloatBits(record.bounds_min) : "unavailable", record.mesh_present ? FogFloatBits(record.bounds_max) : "unavailable", record.constants_present ? FogFloatBits(record.mvp) : "unavailable", record.constants_present ? FogFloatBits(record.fog) : "unavailable", clip, margins, fog_limits);
+            }
+        }
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx", "perf prog0 fog rejections end: complete_counts={} representative_scope=bounded_mesh_range_reason_role_per_second", history.fog_role_overflow_draws == 0 && history.conflicts == 0 && history.renderer_instance == g.renderer_instance);
+}
+
+/**
  * Prints bounded role timings after measurement without waiting for unharvested GPU work.
  */
+/**
+ * Appends explicitly named floating-point components without reading object padding.
+ */
+template <typename Value>
+void FragmentFloatComponents(std::string &text, const Value &value) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<Value>, float>) {
+        if (!text.empty()) {
+            text += '/';
+        }
+        text += std::format("{:08x}", std::bit_cast<uint32_t>(value));
+    } else {
+        for (const auto &component : value) {
+            FragmentFloatComponents(text, component);
+        }
+    }
+}
+
+/**
+ * Serializes fixed named fields as JSON integers and IEEE floating-point strings.
+ */
+class FragmentFieldWriter {
+public:
+    /**
+     * Adds a named integer, enumeration or boolean without conversion through float.
+     */
+    template <typename Value>
+    void Add(std::string_view name, Value value) {
+        Prefix(name);
+        if constexpr (std::is_enum_v<Value>) {
+            text += std::format("{}", static_cast<int64_t>(value));
+        } else {
+            text += std::format("{}", value);
+        }
+    }
+
+    /**
+     * Adds only explicit floating-point components as exact bit strings.
+     */
+    template <typename Value>
+    void Floats(std::string_view name, const Value &value) {
+        std::string bits;
+        FragmentFloatComponents(bits, value);
+        Prefix(name);
+        text += '"' + bits + '"';
+    }
+
+    /**
+     * Finishes the independently parseable named field set.
+     */
+    std::string Finish() { return text + '}'; }
+
+private:
+    std::string text = "{"; /**< JSON fields accumulated without resource dereferences. */
+
+    /**
+     * Separates and names a fixed schema field.
+     */
+    void Prefix(std::string_view name) {
+        if (text.size() > 1) {
+            text += ',';
+        }
+        text += std::format("\"{}\":", name);
+    }
+};
+
+/**
+ * Serializes one bounded member's named inputs without padding hashes or borrowed memory.
+ */
+std::string FragmentSnapshotFields(const FragmentDrawSnapshot &snapshot, std::string_view section) {
+    FragmentFieldWriter out;
+    if (section == "origin") {
+        const auto &origin = snapshot.origin;
+        out.Add("present", origin.present);
+        out.Add("list_serial", origin.list_serial);
+        out.Add("record", origin.record);
+        out.Add("entry", origin.entry);
+        out.Add("key", origin.key);
+        out.Add("occurrence", origin.occurrence);
+        out.Add("camera", origin.camera);
+        out.Add("has_transform", origin.has_transform);
+        out.Add("owner_known", origin.present && origin.key != 0);
+    } else if (section == "mesh") {
+        out.Add("valid", snapshot.mesh_valid);
+        if (snapshot.mesh_valid) {
+            out.Floats("mvp", snapshot.mesh.mvp);
+            out.Floats("normal_matrix", snapshot.mesh.normal_matrix);
+            out.Floats("light_direction", snapshot.mesh.light_direction);
+            out.Floats("light_color", snapshot.mesh.light_color);
+            out.Floats("ambient", snapshot.mesh.ambient);
+            out.Floats("diffuse", snapshot.mesh.diffuse);
+            out.Floats("ambient_material", snapshot.mesh.ambient_material);
+            out.Floats("specular", snapshot.mesh.specular);
+            out.Floats("fog", snapshot.mesh.fog);
+            out.Floats("clip_plane", snapshot.mesh.clip_plane);
+            out.Floats("world_uv", snapshot.mesh.world_uv);
+            out.Add("flags", snapshot.mesh.flags);
+            out.Add("light_count", snapshot.mesh.light_count);
+        }
+    } else if (section == "prog0") {
+        out.Add("valid", snapshot.prog0_valid);
+        if (snapshot.prog0_valid) {
+            out.Floats("model_world", snapshot.prog0.model_world);
+            out.Floats("light_direction", snapshot.prog0.light_direction);
+            out.Floats("light_color", snapshot.prog0.light_color);
+            out.Floats("ambient", snapshot.prog0.ambient);
+            out.Floats("object_color", snapshot.prog0.object_color);
+            out.Floats("eye", snapshot.prog0.eye);
+            out.Floats("clip_or_view", snapshot.prog0.clip_or_view);
+            out.Floats("diffuse", snapshot.prog0.diffuse);
+            out.Floats("specular", snapshot.prog0.specular);
+            out.Floats("point_light", snapshot.prog0.point_light);
+            out.Floats("point_color", snapshot.prog0.point_color);
+            out.Floats("fog", snapshot.prog0.fog);
+            out.Add("flags", snapshot.prog0.flags);
+            out.Add("specular_power", snapshot.prog0.specular_power);
+        }
+    } else if (section == "binding") {
+        out.Add("texture", snapshot.binding.texture);
+        out.Add("palette", snapshot.binding.palette);
+        out.Add("filter", snapshot.binding.filter);
+        out.Add("wrap_u", snapshot.binding.wrap_u);
+        out.Add("wrap_v", snapshot.binding.wrap_v);
+        out.Add("ignore_alpha", snapshot.binding.ignore_alpha);
+    } else if (section == "state") {
+        const auto &state = snapshot.state;
+        out.Add("blend", state.blend);
+        out.Add("depth_test", state.depth_test);
+        out.Add("depth_write", state.depth_write);
+        out.Add("alpha_test", state.alpha_test);
+        out.Add("alpha_func", state.alpha_func);
+        out.Add("alpha_ref", state.alpha_ref);
+        out.Add("cull", state.cull);
+        out.Add("fog", state.fog);
+        out.Add("texa_aem", state.texa_aem);
+        out.Add("texa_ta0", state.texa_ta0);
+        out.Add("scissor", state.scissor);
+        out.Add("extend_scissor", state.extend_scissor);
+        out.Add("stencil_test", state.stencil_test);
+        out.Add("color_write_mask", state.color_write_mask);
+        out.Add("screen_space", state.screen_space);
+        out.Add("prog0_face", state.prog0_face);
+        out.Add("alpha_a", state.alpha.a);
+        out.Add("alpha_b", state.alpha.b);
+        out.Add("alpha_c", state.alpha.c);
+        out.Add("alpha_d", state.alpha.d);
+        out.Add("alpha_fix", state.alpha.fix);
+        out.Add("fog_color_0", state.fog_color[0]);
+        out.Add("fog_color_1", state.fog_color[1]);
+        out.Add("fog_color_2", state.fog_color[2]);
+        out.Floats("scissor_x", state.scissor_rect.x);
+        out.Floats("scissor_y", state.scissor_rect.y);
+        out.Floats("scissor_w", state.scissor_rect.w);
+        out.Floats("scissor_h", state.scissor_rect.h);
+        out.Add("stencil_front_compare", state.stencil_front.compare);
+        out.Add("stencil_front_fail", state.stencil_front.fail);
+        out.Add("stencil_front_pass", state.stencil_front.pass);
+        out.Add("stencil_front_depth_fail", state.stencil_front.depth_fail);
+        out.Add("stencil_front_reference", state.stencil_front.reference);
+        out.Add("stencil_front_compare_mask", state.stencil_front.compare_mask);
+        out.Add("stencil_front_write_mask", state.stencil_front.write_mask);
+        out.Add("stencil_back_compare", state.stencil_back.compare);
+        out.Add("stencil_back_fail", state.stencil_back.fail);
+        out.Add("stencil_back_pass", state.stencil_back.pass);
+        out.Add("stencil_back_depth_fail", state.stencil_back.depth_fail);
+        out.Add("stencil_back_reference", state.stencil_back.reference);
+        out.Add("stencil_back_compare_mask", state.stencil_back.compare_mask);
+        out.Add("stencil_back_write_mask", state.stencil_back.write_mask);
+    } else if (section == "resolved") {
+        out.Add("cull", snapshot.bound.cull);
+        out.Add("topology", snapshot.bound.topology);
+        out.Add("depth_test", snapshot.bound.depth_test);
+        out.Add("depth_write", snapshot.bound.depth_write);
+        out.Add("depth_op", snapshot.bound.depth_op);
+        out.Add("stencil_test", snapshot.bound.stencil_test);
+        out.Add("stencil_ops_0", snapshot.bound.stencil_ops[0]);
+        out.Add("stencil_ops_1", snapshot.bound.stencil_ops[1]);
+        out.Add("stencil_reference_0", snapshot.bound.stencil_reference[0]);
+        out.Add("stencil_reference_1", snapshot.bound.stencil_reference[1]);
+        out.Add("stencil_compare_mask_0", snapshot.bound.stencil_compare_mask[0]);
+        out.Add("stencil_compare_mask_1", snapshot.bound.stencil_compare_mask[1]);
+        out.Add("stencil_write_mask_0", snapshot.bound.stencil_write_mask[0]);
+        out.Add("stencil_write_mask_1", snapshot.bound.stencil_write_mask[1]);
+        out.Add("scissor_x", snapshot.bound.scissor.offset.x);
+        out.Add("scissor_y", snapshot.bound.scissor.offset.y);
+        out.Add("scissor_width", snapshot.bound.scissor.extent.width);
+        out.Add("scissor_height", snapshot.bound.scissor.extent.height);
+        out.Add("dynamic_color_mask", snapshot.dynamic_color_mask);
+        out.Add("color_mask", snapshot.resolved_color_mask);
+        out.Floats("blend_constant_alpha", snapshot.bound.blend_constant_alpha);
+        out.Floats("viewport", snapshot.viewport);
+        out.Add("color_image", snapshot.color_image);
+        out.Add("depth_image", snapshot.depth_image);
+        out.Add("color_format", snapshot.color_format);
+        out.Add("depth_format", snapshot.depth_format);
+    } else if (section == "push") {
+        out.Floats("xform", snapshot.push.xform);
+        out.Floats("uv_xform", snapshot.push.uv_xform);
+        out.Add("texture_slot", snapshot.push.texture_slot);
+        out.Add("palette_slot", snapshot.push.palette_slot);
+        out.Add("sampler_slot", snapshot.push.sampler_slot);
+        out.Add("flags", snapshot.push.flags);
+        out.Add("alpha", snapshot.push.alpha);
+        out.Add("fog_color", snapshot.push.fog_color);
+        out.Add("face", snapshot.push.face);
+        out.Add("mesh_index", snapshot.push.mesh_index);
+        out.Add("prog0_index", snapshot.push.prog0_index);
+        out.Add("palette_index", snapshot.push.palette_index);
+    }
+    return out.Finish();
+}
+
+/**
+ * Prints atomic same-submission pairs independently of the exact counter totals.
+ */
+void LogFragmentDrawPairs(const FrameRoleHistory &history, bool counts_complete) {
+    constexpr std::array names = {"canonical-render", "display-replay", "canonical-endpoint", "direct"};
+    uint64_t             dropped_groups = 0;
+    uint64_t             dropped_occurrences = history.fragment_pair_group_dropped_draws;
+    uint64_t             incomplete = 0;
+    for (size_t bucket = 0; bucket < history.fragment_pair_buckets.size(); ++bucket) {
+        for (size_t role = 0; role < names.size(); ++role) {
+            const auto &samples = history.fragment_pair_buckets[bucket][role];
+            dropped_groups += samples.dropped_groups;
+            dropped_occurrences += samples.dropped_occurrences;
+            for (const auto &record : samples.records) {
+                incomplete += record.incomplete_submissions;
+                const auto &pair = record.representative;
+                const auto &first = pair.members[0];
+                kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment pair count: second={} role={} mesh={} generation={} range={}/{} submissions_one={} submissions_two={} submissions_more={} occurrences={} queried_occurrences={} max_occurrences={} incomplete_submissions={} representative_submission={} representative_submit_ns={} representative_occurrences={} representative_complete={}", bucket, names[role], first.mesh, first.generation, first.first_index, first.index_count, record.submissions_with_one, record.submissions_with_two, record.submissions_with_more, record.occurrences, record.queried_occurrences, record.max_occurrences, record.incomplete_submissions, first.submission, first.submit_ns, pair.occurrences, pair.complete);
+                for (size_t member = 0; member < std::min<uint64_t>(pair.occurrences, 2); ++member) {
+                    const auto &draw = pair.members[member];
+                    kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment pair member: second={} role={} mesh={} generation={} range={}/{} member={} query_ordinal={} queried={} scope={} texture={} target={} extent={}/{} frame={} submission={} submit_ns={} list_serial={} available={} unavailable={} errors={} invocations={} snapshot_present={}", bucket, names[role], draw.mesh, draw.generation, draw.first_index, draw.index_count, member, pair.queries[member], pair.queries[member] != UINT32_MAX, draw.scope, draw.texture, draw.target, draw.width, draw.height, draw.frame, draw.submission, draw.submit_ns, draw.list_serial, draw.available, draw.unavailable, draw.errors, draw.invocations, draw.snapshot != nullptr);
+                    if (draw.snapshot) {
+                        for (const char *section : {"origin", "mesh", "prog0", "binding", "state", "resolved", "push"}) {
+                            kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment pair fields: second={} role={} mesh={} generation={} range={}/{} member={} submission={} section={} fields={}", bucket, names[role], draw.mesh, draw.generation, draw.first_index, draw.index_count, member, draw.submission, section, FragmentSnapshotFields(*draw.snapshot, section));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment pairs end: slot_group_dropped_draws={} bucket_dropped_groups={} dropped_occurrences={} incomplete_submissions={} complete_pairs={} occurrence_membership=all_eligible_target_draws pair_members=first_two_ordered key_zero=unknown padding_serialized=false", history.fragment_pair_group_dropped_draws, dropped_groups, dropped_occurrences, incomplete, counts_complete && dropped_occurrences == 0 && incomplete == 0);
+}
+
+/**
+ * Prints bounded fragment counts without interpreting them as pixel visibility or timing shares.
+ */
+void LogFragmentInvocations(const FrameRoleHistory &history) {
+    if (!history.fragment_enabled) {
+        return;
+    }
+    bool                                                                       complete = g.fragment_invocations_enabled && !g.fragment_invocations_failed &&
+                                                                                          history.conflicts == 0 && history.overflow == 0 && history.fragment_history_overflow == 0 &&
+                                                                                          history.fragment_bucket_overflow == 0 && history.renderer_instance == g.renderer_instance;
+    std::array<std::array<uint64_t, 2>, static_cast<size_t>(FrameRole::Count)> observed = {};
+    uint64_t                                                                   truncated = 0;
+    auto                                                                       totals = observed;
+    auto                                                                       available_totals = observed;
+    auto                                                                       unavailable_totals = observed;
+    auto                                                                       error_totals = observed;
+    auto                                                                       skipped_totals = observed;
+    for (const auto &bucket : history.fragment_buckets) {
+        for (size_t role = 0; role < bucket.size(); ++role) {
+            const auto &samples = bucket[role];
+            truncated += samples.truncated_draws;
+            for (size_t scope = 0; scope < 2; ++scope) {
+                observed[role][scope] += samples.draws[scope];
+                totals[role][scope] += samples.invocations[scope];
+                available_totals[role][scope] += samples.available[scope];
+                unavailable_totals[role][scope] += samples.unavailable[scope];
+                error_totals[role][scope] += samples.errors[scope];
+                skipped_totals[role][scope] += samples.skipped[scope];
+                complete = complete && samples.unavailable[scope] == 0 && samples.errors[scope] == 0 && samples.skipped[scope] == 0;
+            }
+        }
+    }
+    complete = complete && observed == history.fragment_expected;
+    kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment invocations begin: schema=2 instance={} epoch={} begin_ns={} end_ns={} membership=submit_start scope_columns=near-safe-black/mode1-black queries_per_slot={} supported={} enabled={} pool_failure={} diagnostic_only=true query_commands_may_synchronize=true extra_application_waits=0 float_encoding=ieee754_hex mvp_order=column_major", history.renderer_instance, history.epoch, history.begin_ns, history.end_ns, kFragmentInvocationQueries, g.fragment_invocations_supported, g.fragment_invocations_enabled, g.fragment_invocations_failed);
+    constexpr std::array names = {"canonical-render", "display-replay", "canonical-endpoint", "direct"};
+    for (size_t bucket = 0; bucket < history.fragment_buckets.size(); ++bucket) {
+        for (size_t role = 0; role < names.size(); ++role) {
+            const auto &samples = history.fragment_buckets[bucket][role];
+            for (size_t scope = 0; scope < 2; ++scope) {
+                if (samples.draws[scope] != 0) {
+                    kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment invocation bucket: second={} role={} scope={} draws={} available={} unavailable={} errors={} skipped={} invocations={} truncated_draws={}", bucket, names[role], scope == 0 ? kProg0NearSafeFogAdditiveBlackScope : kProg0Mode1FogBlackScope, samples.draws[scope], samples.available[scope], samples.unavailable[scope], samples.errors[scope], samples.skipped[scope], samples.invocations[scope], samples.truncated_draws);
+                }
+            }
+            for (const auto &record : samples.records) {
+                kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment invocation representative: second={} role={} scope={} mesh={} generation={} range={}/{} texture={} target={} extent={}/{} draws={} available={} unavailable={} errors={} invocations={} peak_invocations={} representative_frame={} representative_submission={} representative_submit_ns={} list_serial={} vertices={} bounds_known={} bounds_normal={} bounds_min_f32={} bounds_max_f32={} mvp_f32={}", bucket, names[role], record.scope, record.mesh, record.generation, record.first_index, record.index_count, record.texture, record.target, record.width, record.height, record.draws, record.available, record.unavailable, record.errors, record.invocations, record.peak_invocations, record.frame, record.submission, record.submit_ns, record.list_serial, record.vertex_count, record.bounds_known, record.bounds_normal_inputs, FogFloatBits(record.bounds_min), FogFloatBits(record.bounds_max), FogFloatBits(record.mvp));
+            }
+        }
+    }
+    for (size_t role = 0; role < names.size(); ++role) {
+        kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment invocation totals: role={} expected={}/{} observed={}/{} invocations={}/{} available={}/{} unavailable={}/{} errors={}/{} skipped={}/{}", names[role], history.fragment_expected[role][0], history.fragment_expected[role][1], observed[role][0], observed[role][1], totals[role][0], totals[role][1], available_totals[role][0], available_totals[role][1], unavailable_totals[role][0], unavailable_totals[role][1], error_totals[role][0], error_totals[role][1], skipped_totals[role][0], skipped_totals[role][1]);
+    }
+    LogFragmentDrawPairs(history, complete);
+    kz::Logf(kz::LogLevel::Info, "gfx", "perf fragment invocations end: complete_counts={} complete_representatives={} truncated_draws={} history_overflow_draws={} bucket_overflow_draws={} stale_excluded_draws={} extra_application_waits=0", complete, truncated == 0, truncated, history.fragment_history_overflow, history.fragment_bucket_overflow, history.fragment_stale_draws);
+}
+
 void LogFrameRoleHistory() {
     if (!FramePhasesEnabled()) {
         return;
@@ -1984,6 +3321,13 @@ void LogFrameRoleHistory() {
                 record.gpu_valid = true;
             } else {
                 ++tail_unavailable;
+            }
+        }
+    }
+    if (history.fragment_enabled && DeviceThreadAllowed() && history.renderer_instance == g.renderer_instance) {
+        for (auto &frame : g.frames) {
+            if (frame.pending && !frame.fragment_merged) {
+                HarvestFragmentInvocationsLocked(frame, history, vkGetFenceStatus(g.device, frame.fence) == VK_SUCCESS);
             }
         }
     }
@@ -2058,6 +3402,8 @@ void LogFrameRoleHistory() {
              history.records.size(), history.overflow, unresolved,
              history.conflicts + static_cast<uint64_t>(history.renderer_instance != g.renderer_instance),
              tail_reads, tail_unavailable, tail_access, split_lifetime[0], split_lifetime[1], split_lifetime[2]);
+    LogProg0FogRejections(history);
+    LogFragmentInvocations(history);
 }
 
 constexpr uint32_t kGpuScopeQueries = 2048;
@@ -2145,6 +3491,14 @@ void WaitFrame(Frame &frame, FramePhaseSample *phases = nullptr) {
         frame.pending = false;
         if (phases != nullptr) {
             phase_start = TimingClock::now();
+        }
+        if (g.fragment_invocations_requested) {
+            std::lock_guard lock(g_frame_role_mutex);
+            HarvestFragmentInvocationsLocked(frame, g_frame_role_history, true);
+        }
+        if (g.guarded_samples_requested) {
+            std::lock_guard lock(g_frame_role_mutex);
+            HarvestGuardedSamples(frame, true);
         }
         HarvestDepthQueries(frame);
         if (phases != nullptr) {
@@ -2368,6 +3722,7 @@ void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal, VkCommandBuffe
     submit.pSignalSemaphoreInfos = &signal_info;
     Check(vkResetFences(g.device, 1, &frame.fence), "vkResetFences");
     const uint64_t            submit_start = FramePhasesEnabled() && with_draw ? FrameRoleClockNs() : 0;
+    const uint64_t            guarded_first_submit = g_guarded_samples ? g_guarded_samples->submit_sequence + 1 : 0;
     VkCommandBufferSubmitInfo final_info{};
     if (final_cmd != VK_NULL_HANDLE) {
         // Separate calls prevent Mesa from merging the acquire wait ahead of replay rendering.
@@ -2375,6 +3730,9 @@ void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal, VkCommandBuffe
         replay.waitSemaphoreInfoCount = 0;
         replay.signalSemaphoreInfoCount = 0;
         Check(vkQueueSubmit2(g.queue, 1, &replay, VK_NULL_HANDLE), "vkQueueSubmit2 replay");
+        if (g_guarded_samples) {
+            ++g_guarded_samples->submit_sequence;
+        }
         ++g.split_replay_first_submits;
         final_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, final_cmd, 0};
         submit.commandBufferInfoCount = 1;
@@ -2382,6 +3740,9 @@ void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal, VkCommandBuffe
     }
     // Partial submission cannot fall back or release resources before the final fence.
     Check(vkQueueSubmit2(g.queue, 1, &submit, frame.fence), "vkQueueSubmit2");
+    if (g_guarded_samples) {
+        ++g_guarded_samples->submit_sequence;
+    }
     if (final_cmd != VK_NULL_HANDLE) {
         ++g.split_replay_final_submits;
     }
@@ -2389,6 +3750,9 @@ void Submit(bool with_draw, VkSemaphore wait, VkSemaphore signal, VkCommandBuffe
         SubmitFrameRole(frame, submit_start, FrameRoleClockNs());
     } else if (FramePhasesEnabled() && !with_draw) {
         FrameRoleState(frame).record = {};
+    }
+    if (with_draw && g_guarded_samples) {
+        SubmitGuardedSamples(frame, guarded_first_submit, g_guarded_samples->submit_sequence);
     }
     frame.pending = true;
     frame.presents = signal != VK_NULL_HANDLE;
@@ -2585,6 +3949,7 @@ void CreateMainTargets() {
         };
         for (Image *image : {&g.main_color[0], &g.main_color[1], &g.display_color}) {
             Transition(cmd, *image, TransferDst());
+            AttachmentAlphaImageClear(*image, black, 1);
             vkCmdClearColorImage(cmd, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
             ToRest(cmd, *image);
         }
@@ -2692,6 +4057,15 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
     g.config.presented_feedback = !config.offscreen && RendererFlag("KZ_PERF_PRESENTED_GATE", config.presented_feedback);
     g.config.split_replay_submit = !config.offscreen && RendererFlag("KZ_PERF_SPLIT_REPLAY_SUBMIT", config.split_replay_submit);
     g.config.near_safe_fog = RendererFlag("KZ_FOG_NEAR_SAFE", config.near_safe_fog);
+    g.prog0_shared_rgb = RendererFlag("KZ_PROG0_SHARED_RGB", false);
+    g.prog0_unlit_vertex = RendererFlag("KZ_PROG0_UNLIT_VERTEX", false);
+    InitializeAttachmentAlphaTrace();
+    g.fragment_invocations_requested = RendererFlag("KZ_PERF_FRAGMENT_INVOCATIONS", false);
+    const bool fog_rejections_requested = RendererFlag("KZ_PERF_PROG0_FOG_REJECTIONS", false);
+    g.prog0_fog_rejections = fog_rejections_requested && FramePhasesEnabled();
+    if (fog_rejections_requested) {
+        kz::Logf(kz::LogLevel::Info, "gfx", "prog0 fog rejection diagnostic: requested=true enabled={} frame_phases={} required_frame_phases=1 extra_gpu_queries=0", g.prog0_fog_rejections, FramePhasesEnabled());
+    }
     g.vsync_gate_requested = !config.offscreen && (g.config.presented_feedback || RendererFlag("KZ_PERF_VSYNC_GATE", false));
     g.split_replay_submit = g.config.split_replay_submit;
     if (const char *setting = std::getenv("KZ_MAIN_HEIGHT_LIMIT")) {
@@ -2769,11 +4143,39 @@ void RendererShutdown() {
         return;
     }
     StopRenderThread();
+    {
+        std::lock_guard lock(g_frame_role_mutex);
+        for (auto &slot : g_frame_role_slots) {
+            slot.fog = {};
+        }
+        g_frame_role_history.fog_buckets = {};
+        g_frame_role_history.fog_counts = {};
+        g_frame_role_history.fog_enabled = false;
+        g_frame_role_history.fragment_buckets = {};
+        g_frame_role_history.fragment_pair_buckets = {};
+        g_frame_role_history.fragment_enabled = false;
+    }
 #ifdef __SWITCH__
     CloseVsyncGate();
 #endif
     EndRecording();
     vkDeviceWaitIdle(g.device);
+    if (g_guarded_samples && g_guarded_samples->logged_epoch != g_frame_role_history.epoch) {
+        EndGuardedExecution(true);
+        g_guarded_samples->destroying = true;
+        {
+            std::lock_guard lock(g_frame_role_mutex);
+            if (g_frame_role_history.guarded_end_ns == 0) {
+                for (auto &execution : g_guarded_samples->executions) {
+                    if (execution.attempted) {
+                        execution.cancelled = true;
+                    }
+                }
+            }
+        }
+        LogGuardedSamples();
+    }
+
 #ifdef KZ_PORT_TRACY
     // Zones write into their command buffers when they close, so they close before the pools go.
     g.rendering_zone.reset();
@@ -2798,6 +4200,15 @@ void RendererShutdown() {
     if (g.timestamp_pool != VK_NULL_HANDLE) {
         vkDestroyQueryPool(g.device, g.timestamp_pool, nullptr);
         g.timestamp_pool = VK_NULL_HANDLE;
+    }
+    if (g.guarded_sample_pool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(g.device, g.guarded_sample_pool, nullptr);
+        g.guarded_sample_pool = VK_NULL_HANDLE;
+    }
+    g_guarded_samples.reset();
+    if (g.fragment_invocation_pool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(g.device, g.fragment_invocation_pool, nullptr);
+        g.fragment_invocation_pool = VK_NULL_HANDLE;
     }
     if (g.scope_pool != VK_NULL_HANDLE) {
         vkDestroyQueryPool(g.device, g.scope_pool, nullptr);
@@ -2882,6 +4293,8 @@ namespace {
 bool OpenFrame(FrameRole role = FrameRole::Direct) {
     AssertDeviceThread(__func__);
     BeginCommands(CurrentFrame().draw_cmd);
+    OpenGuardedQueries(CurrentFrame().draw_cmd);
+    OpenFragmentInvocationQueries(CurrentFrame().draw_cmd);
     OpenTimestamps(CurrentFrame().draw_cmd);
     OpenFrameRole(role);
 #ifdef KZ_PORT_TRACY
@@ -2970,6 +4383,23 @@ bool AcquireImage(bool targets) {
 void CopyOrBlitWhole(VkCommandBuffer cmd, VkImage source, VkFormat source_format, VkExtent2D source_extent,
                      VkImage destination, VkFormat destination_format, VkExtent2D destination_extent,
                      const VkImageBlit &region) {
+    if (AttachmentAlphaTraceRecording()) {
+        AlphaTraceEvent event;
+        event.kind = AlphaTraceKind::Blit;
+        event.image = std::bit_cast<uint64_t>(destination);
+        event.allocation = AttachmentAlphaImageAllocation(destination);
+        event.source = std::bit_cast<uint64_t>(source);
+        event.source_allocation = AttachmentAlphaImageAllocation(source);
+        event.width = destination_extent.width;
+        event.height = destination_extent.height;
+        event.mip = region.dstSubresource.mipLevel;
+        event.source_mip = region.srcSubresource.mipLevel;
+        event.rect = {region.dstOffsets[0].x, region.dstOffsets[0].y, region.dstOffsets[1].x, region.dstOffsets[1].y,
+                      region.srcOffsets[0].x, region.srcOffsets[0].y, region.srcOffsets[1].x, region.srcOffsets[1].y};
+        event.flags = event.allocation == 0 || event.source_allocation == 0 ? 2u : 0u;
+        event.kind = source_format == destination_format && source_extent.width == destination_extent.width && source_extent.height == destination_extent.height ? AlphaTraceKind::Copy : AlphaTraceKind::Blit;
+        AttachmentAlphaObserve(std::move(event));
+    }
     if (source_format == destination_format && source_extent.width == destination_extent.width &&
         source_extent.height == destination_extent.height) {
         VkImageCopy copy = {};
@@ -3026,6 +4456,15 @@ uint64_t WritePresentMarker(VkCommandBuffer cmd, VkImage swapchain) {
     region.bufferOffset = staging.offset;
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {marker_width, marker_height, 1};
+    if (AttachmentAlphaTraceRecording()) {
+        AlphaTraceEvent event;
+        event.kind = AlphaTraceKind::Update;
+        event.image = std::bit_cast<uint64_t>(swapchain);
+        event.flags = 2;
+        event.mip = region.imageSubresource.mipLevel;
+        event.rect = {region.imageOffset.x, region.imageOffset.y, static_cast<int32_t>(region.imageExtent.width), static_cast<int32_t>(region.imageExtent.height)};
+        AttachmentAlphaObserve(std::move(event));
+    }
     vkCmdCopyBufferToImage(cmd, staging.buffer, swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     return sequence;
 }
@@ -3200,19 +4639,32 @@ bool PrepareCanonicalTargets() {
 bool CanonicalEndpointScopeActive() { return g_endpoint_role; }
 
 bool OpenListFrame(bool canonical, bool present, bool base, double preparation_ms, bool canonical_prepared) {
+    BeginGuardedExecution(canonical, g_endpoint_role);
+    BeginAttachmentAlphaExecution(canonical, g_endpoint_role);
     KZ_PROFILE_ZONE("Kazarov open frame");
     if (canonical) {
         if (g.canonical_commit_pending || (canonical_prepared ? g_resize_pending.load() : !PrepareCanonicalTargets())) {
+            EndGuardedExecution(true);
+            EndAttachmentAlphaExecution();
             return false;
         }
-        return OpenFrame(FrameRole::CanonicalRender);
+        const bool opened = OpenFrame(FrameRole::CanonicalRender);
+        if (!opened) {
+            EndGuardedExecution(true);
+            EndAttachmentAlphaExecution();
+        }
+        return opened;
     }
     if (g.canonical_commit_pending && !g_endpoint_role) {
+        EndGuardedExecution(true);
+        EndAttachmentAlphaExecution();
         return false;
     }
     const auto     display_started = Timing() ? TimingClock::now() : TimingClock::time_point{};
     const uint64_t display_started_ns = FramePhasesEnabled() ? FrameRoleClockNs() : 0;
     if (present && !g.offscreen && !AcquireImage(false)) {
+        EndGuardedExecution(true);
+        EndAttachmentAlphaExecution();
         return false;
     }
     OpenFrame(g_endpoint_role ? FrameRole::CanonicalEndpoint : FrameRole::DisplayReplay);
@@ -3300,6 +4752,8 @@ void CloseListFrame(bool canonical, bool present, const CanonicalCommitTransacti
             RecordDepthQueries(cmd);
         }
         SubmitWithoutPresent(cmd, CurrentMainColor());
+        EndGuardedExecution();
+        EndAttachmentAlphaExecution();
         if (transaction != nullptr) {
             g.canonical_commit_pending = true;
             g.deferred_prior_image = transaction->prior;
@@ -3321,6 +4775,8 @@ void CloseListFrame(bool canonical, bool present, const CanonicalCommitTransacti
     } else {
         SubmitWithoutPresent(cmd, g.display_color);
     }
+    EndGuardedExecution();
+    EndAttachmentAlphaExecution();
     tls.display_pass = false;
     g.target = kMainTarget;
     if (present) {
@@ -3540,7 +4996,7 @@ uint64_t PresentationHistoryClockNs() {
 }
 
 void BeginPresentationHistory(uint64_t boundary_ns) {
-    BeginFrameRoleHistory();
+    BeginFrameRoleHistory(boundary_ns);
 #ifdef __SWITCH__
     if (!NativeHistoryEnabled() || boundary_ns == 0) {
         return;
@@ -3559,7 +5015,7 @@ void BeginPresentationHistory(uint64_t boundary_ns) {
 }
 
 void EndPresentationHistory(uint64_t boundary_ns) {
-    EndFrameRoleHistory();
+    EndFrameRoleHistory(boundary_ns);
 #ifdef __SWITCH__
     if (!NativeHistoryEnabled()) {
         return;
@@ -3611,10 +5067,17 @@ void LogPresentationHistory() {
                      static_cast<unsigned long long>(history.query_total_ns), static_cast<unsigned long long>(history.query_max_ns));
     }();
     LogVsyncGate("summary");
-    std::fprintf(stderr, "perf prog0 fog: candidates=%llu selected=%llu unknown=%llu skinned=%llu unsafe=%llu\n",
+    std::fprintf(stderr, "perf prog0 unlit vertex: enabled=%d near_safe_selected=%llu mode1_selected=%llu guarded_selected=%llu\n", g.prog0_unlit_vertex,
+                 static_cast<unsigned long long>(g.prog0_unlit_vertex_selected[0]), static_cast<unsigned long long>(g.prog0_unlit_vertex_selected[1]),
+                 static_cast<unsigned long long>(g.prog0_unlit_vertex_selected[2]));
+    std::fprintf(stderr, "perf prog0 shared rgb: enabled=%d near_safe_selected=%llu mode1_selected=%llu guarded_selected=%llu\n", g.prog0_shared_rgb,
+                 static_cast<unsigned long long>(g.prog0_shared_rgb_selected[0]), static_cast<unsigned long long>(g.prog0_shared_rgb_selected[1]),
+                 static_cast<unsigned long long>(g.prog0_shared_rgb_selected[2]));
+    std::fprintf(stderr, "perf prog0 fog: candidates=%llu selected=%llu unknown=%llu skinned=%llu unsafe=%llu mode1_selected=%llu black_selected=%llu zero_source_alpha_selected=%llu guarded_zero_alpha_selected=%llu\n",
                  static_cast<unsigned long long>(g.prog0_fog_candidates), static_cast<unsigned long long>(g.prog0_fog_selected),
                  static_cast<unsigned long long>(g.prog0_fog_unknown), static_cast<unsigned long long>(g.prog0_fog_skinned),
-                 static_cast<unsigned long long>(g.prog0_fog_unsafe));
+                 static_cast<unsigned long long>(g.prog0_fog_unsafe), static_cast<unsigned long long>(g.prog0_mode1_fog_selected), static_cast<unsigned long long>(g.prog0_black_fog_selected),
+                 static_cast<unsigned long long>(g.prog0_zero_source_alpha_selected), static_cast<unsigned long long>(g.prog0_guarded_zero_alpha_selected));
 #endif
     RunOnRenderThread([] {
         if (g.split_replay_submit) {
@@ -3624,7 +5087,22 @@ void LogPresentationHistory() {
                          static_cast<unsigned long long>(g.split_replay_timed));
         }
     });
+    RunOnRenderThread([] {
+        if (g.prog0_rgb_cost_mode != Prog0RgbCostMode::Disabled) {
+            const auto identity = InspectAttachmentAlphaTrace();
+            std::fprintf(stderr, "perf prog0 rgb cost: mode=%u identity_ready=%d candidates=%llu near_selected=%llu mode1_selected=%llu mesh_matches=%llu texture_matches=%llu identity_overflow=%llu geometry_seen=%u textures_seen=%u relationships_seen=%llu diagnostic_only=1 rgb_suppression_requested=%d extra_gpu_queries=0 extra_gpu_waits=0\n",
+                         static_cast<unsigned>(g.prog0_rgb_cost_mode), AttachmentAlphaIdentityReady(),
+                         static_cast<unsigned long long>(g.prog0_rgb_cost_candidates), static_cast<unsigned long long>(g.prog0_rgb_cost_selected[0]),
+                         static_cast<unsigned long long>(g.prog0_rgb_cost_selected[1]), static_cast<unsigned long long>(identity.mesh_verifications),
+                         static_cast<unsigned long long>(identity.texture_verifications), static_cast<unsigned long long>(identity.identity_overflow),
+                         identity.geometry_seen, identity.textures_seen, static_cast<unsigned long long>(identity.relationships_seen),
+                         g.prog0_rgb_cost_mode != Prog0RgbCostMode::Control);
+        }
+    });
     LogFrameRoleHistory();
+    if (g.guarded_samples_requested) {
+        RunOnRenderThread(LogGuardedSamples);
+    }
 }
 
 FrameTimings TakeFrameTimings() {

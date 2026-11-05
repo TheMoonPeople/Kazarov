@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 
+#include "gfx/alpha_trace.hpp"
 #include "gfx/context.hpp"
 #include "gfx/displaylist.hpp"
 
@@ -34,6 +35,13 @@ void HostBarrier(VkCommandBuffer cmd) {
 }
 
 bool ReadImage(Image &image, uint32_t texel_size, std::vector<uint8_t> &pixels) {
+    if (AttachmentAlphaTraceRecording()) {
+        AlphaTraceEvent event;
+        event.kind = AlphaTraceKind::Readback;
+        event.source = std::bit_cast<uint64_t>(image.image);
+        event.source_allocation = image.alpha_trace_allocation;
+        AttachmentAlphaObserve(std::move(event));
+    }
     VkDeviceSize size = static_cast<VkDeviceSize>(image.width) * image.height * texel_size;
     Buffer       buffer = CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
     RunOneShot([&](VkCommandBuffer cmd) {

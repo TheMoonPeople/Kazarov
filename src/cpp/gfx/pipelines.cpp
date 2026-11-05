@@ -24,11 +24,18 @@
 #include "shaders/depth_planes.frag.spv.hpp"
 #include "shaders/draw.frag.spv.hpp"
 #include "shaders/draw2d.vert.spv.hpp"
+#include "shaders/draw_alpha_only_single.frag.spv.hpp"
 #include "shaders/draw_bound.frag.spv.hpp"
+#include "shaders/draw_bound_alpha_only_single.frag.spv.hpp"
+#include "shaders/draw_bound_guard_classifier_single.frag.spv.hpp"
+#include "shaders/draw_bound_shared_rgb_single.frag.spv.hpp"
 #include "shaders/draw_bound_single.frag.spv.hpp"
+#include "shaders/draw_guard_classifier_single.frag.spv.hpp"
+#include "shaders/draw_shared_rgb_single.frag.spv.hpp"
 #include "shaders/draw_single.frag.spv.hpp"
 #include "shaders/mesh.vert.spv.hpp"
 #include "shaders/mesh_prog0.vert.spv.hpp"
+#include "shaders/mesh_prog0_unlit.vert.spv.hpp"
 
 namespace gfx {
 
@@ -373,7 +380,7 @@ struct PipelineRecipe {
  */
 struct PipelineRecipes {
     std::vector<std::unique_ptr<PipelineRecipe>> pipelines;          /**< Descriptions awaiting first use by each pipeline index. */
-    std::array<VkShaderModule, 5>                modules{};          /**< Shader modules referenced by deferred descriptions. */
+    std::array<VkShaderModule, 9>                modules{};          /**< Shader modules referenced by deferred descriptions. */
     bool                                         save_cache = false; /**< Whether shutdown persists compiled pipeline cache data. */
     std::vector<uint8_t>                         initial_cache;      /**< Cache bytes loaded before deferred pipeline creation. */
 
@@ -477,6 +484,34 @@ void CreatePushedTextureLayout() {
     layout.pBindings = bindings;
     Check(vkCreateDescriptorSetLayout(g.device, &layout, nullptr, &g.texture_set_layout),
           "vkCreateDescriptorSetLayout");
+}
+
+/**
+ * Selects shader statistics by description or the paired shared-input group.
+ */
+bool ShaderStatsSelected(std::string_view name) {
+    if (g.perf.stats.empty()) {
+        return false;
+    }
+    if (g.perf.stats == "guard-arms") {
+        return name == "prog0-guarded-zero-source-alpha-shared-rgb" || name == "prog0-guarded-zero-sample-classifier";
+    }
+    if (g.perf.stats == "rgb-cost") {
+        return name == "prog0-fog-near-safe-additive-black-shared-rgb" || name == "prog0-fog-mode1-fresh-black-shared-rgb" ||
+               name == "prog0-fog-near-safe-additive-black-rgb-mask" || name == "prog0-fog-mode1-fresh-black-rgb-mask" ||
+               name == "prog0-fog-near-safe-additive-black-alpha-only" || name == "prog0-fog-mode1-fresh-black-alpha-only";
+    }
+    if (g.perf.stats == "unlit-vertex") {
+        return name == "prog0-fog-near-safe-additive-black-shared-rgb" || name == "prog0-fog-mode1-fresh-black-shared-rgb" ||
+               name == "prog0-guarded-zero-source-alpha-shared-rgb" || name == "prog0-fog-near-safe-additive-black-shared-rgb-unlit-vertex" ||
+               name == "prog0-fog-mode1-fresh-black-shared-rgb-unlit-vertex" || name == "prog0-guarded-zero-source-alpha-shared-rgb-unlit-vertex";
+    }
+    if (g.perf.stats == "shared-rgb") {
+        return name == "prog0-fog-near-safe-additive-black" || name == "prog0-fog-mode1-fresh-black" ||
+               name == "prog0-guarded-zero-source-alpha" || name == "prog0-fog-near-safe-additive-black-shared-rgb" ||
+               name == "prog0-fog-mode1-fresh-black-shared-rgb" || name == "prog0-guarded-zero-source-alpha-shared-rgb";
+    }
+    return g.perf.stats == "*" || name.find(g.perf.stats) != std::string_view::npos;
 }
 
 } // namespace
@@ -615,13 +650,30 @@ void LogShaderStats() {
     if (properties == nullptr || statistics == nullptr || representations == nullptr) {
         return;
     }
-    const bool                                           all = g.perf.stats == "*";
-    const std::array<std::pair<uint32_t, VkPipeline>, 6> extras = {
+    const bool                                            all = g.perf.stats == "*";
+    const std::array<std::pair<uint32_t, VkPipeline>, 23> extras = {
         {
          {kNearSafeFogScope, g.near_safe_fog_pipelines[0]},
          {kNearSafeFogAlphaScope, g.near_safe_fog_pipelines[1]},
          {kProg0NearSafeFogAlphaScope, g.prog0_near_safe_fog_pipelines[0]},
          {kProg0NearSafeFogBlendScope, g.prog0_near_safe_fog_pipelines[1]},
+         {kProg0NearSafeFogAdditiveScope, g.prog0_near_safe_fog_pipelines[2]},
+         {kProg0Mode1FogScope, g.prog0_mode1_fog_pipeline},
+         {kProg0NearSafeFogAdditiveBlackScope, g.prog0_near_safe_black_fog_pipeline},
+         {kProg0Mode1FogBlackScope, g.prog0_mode1_black_fog_pipeline},
+         {kProg0ZeroSourceAlphaScope, g.prog0_zero_source_alpha_pipeline},
+         {kProg0GuardedZeroSourceAlphaScope, g.prog0_guarded_zero_alpha_pipeline},
+         {kProg0NearSafeFogSharedRgbScope, g.prog0_shared_rgb_pipelines[0]},
+         {kProg0Mode1FogSharedRgbScope, g.prog0_shared_rgb_pipelines[1]},
+         {kProg0GuardedZeroSharedRgbScope, g.prog0_shared_rgb_pipelines[2]},
+         {kProg0NearSafeUnlitVertexScope, g.prog0_unlit_vertex_pipelines[0]},
+         {kProg0Mode1UnlitVertexScope, g.prog0_unlit_vertex_pipelines[1]},
+         {kProg0GuardedUnlitVertexScope, g.prog0_unlit_vertex_pipelines[2]},
+         {kProg0GuardClassifierScope, g.guarded_classifier_pipeline},
+         {kProg0NearSafeRgbMaskScope, g.prog0_rgb_cost_pipelines[0]},
+         {kProg0Mode1RgbMaskScope, g.prog0_rgb_cost_pipelines[1]},
+         {kProg0NearSafeAlphaOnlyScope, g.prog0_rgb_cost_pipelines[2]},
+         {kProg0Mode1AlphaOnlyScope, g.prog0_rgb_cost_pipelines[3]},
          {kDepthPlanesScope, g.depth_planes_pipeline},
          {kZeroAlphaNoopScope, g.zero_alpha_noop_pipeline},
          }
@@ -634,7 +686,7 @@ void LogShaderStats() {
             continue;
         }
         const std::string name = DescribePipeline(entry.first);
-        if (!all && name.find(g.perf.stats) == std::string::npos) {
+        if (!ShaderStatsSelected(name)) {
             continue;
         }
         VkPipelineInfoKHR pipeline = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, handle};
@@ -727,6 +779,10 @@ void CreatePipelines() {
     VkShaderModule frag_single_module = g.bindless
                                             ? CreateShader(draw_single_frag, sizeof(draw_single_frag))
                                             : CreateShader(draw_bound_single_frag, sizeof(draw_bound_single_frag));
+    VkShaderModule classifier_module = VK_NULL_HANDLE;
+    VkShaderModule alpha_only_module = VK_NULL_HANDLE;
+    VkShaderModule unlit_vertex_module = VK_NULL_HANDLE;
+    VkShaderModule shared_rgb_module = VK_NULL_HANDLE;
     VkShaderModule prog0_module =
         g.config.prog0_meshes ? CreateShader(mesh_prog0_vert, sizeof(mesh_prog0_vert)) : VK_NULL_HANDLE;
 
@@ -876,9 +932,13 @@ void CreatePipelines() {
         VkBool32 plain_mesh_fog;
         VkBool32 near_safe_mesh_fog;
         VkBool32 near_safe_reciprocal;
+        VkBool32 prog0_mode1_fog;
+        VkBool32 black_fog_input;    /**< Replaces known zero packed fog RGB with an exact constant input. */
+        VkBool32 zero_source_alpha;  /**< Emits an exact zero source while retaining rasterization and attachment writes. */
+        VkBool32 guarded_zero_alpha; /**< Tests actual varyings and retains complete explicit-LOD black mode1 shading otherwise. */
     };
 
-    VkSpecializationMapEntry spec_entries[9] = {
+    VkSpecializationMapEntry spec_entries[13] = {
         {0,  offsetof(Specialization, mode),                 sizeof(int32_t) },
         {1,  offsetof(Specialization, alpha_test),           sizeof(VkBool32)},
         {2,  offsetof(Specialization, features),             sizeof(int32_t) },
@@ -888,6 +948,10 @@ void CreatePipelines() {
         {6,  offsetof(Specialization, plain_mesh_fog),       sizeof(VkBool32)},
         {10, offsetof(Specialization, near_safe_mesh_fog),   sizeof(VkBool32)},
         {11, offsetof(Specialization, near_safe_reciprocal), sizeof(VkBool32)},
+        {12, offsetof(Specialization, prog0_mode1_fog),      sizeof(VkBool32)},
+        {13, offsetof(Specialization, black_fog_input),      sizeof(VkBool32)},
+        {14, offsetof(Specialization, zero_source_alpha),    sizeof(VkBool32)},
+        {15, offsetof(Specialization, guarded_zero_alpha),   sizeof(VkBool32)},
     };
     Specialization       spec_data[kFamilyCount][kTextureModeCount][kAlphaVariantCount][kFragmentFeatureCount + 1];
     VkSpecializationInfo spec_info[kFamilyCount][kTextureModeCount][kAlphaVariantCount][kFragmentFeatureCount + 1];
@@ -907,9 +971,13 @@ void CreatePipelines() {
                         -1,
                         family == kFamilyMesh ? VK_TRUE : VK_FALSE,
                         VK_FALSE,
+                        VK_FALSE,
+                        VK_FALSE,
+                        VK_FALSE,
+                        VK_FALSE,
                         VK_FALSE};
                     spec_info[family][mode][test][features] = {
-                        9, spec_entries, sizeof(Specialization), &spec_data[family][mode][test][features]};
+                        13, spec_entries, sizeof(Specialization), &spec_data[family][mode][test][features]};
                 }
             }
         }
@@ -980,7 +1048,7 @@ void CreatePipelines() {
         info.pColorBlendState = blend_state;
         info.pDynamicState = dynamic_state;
         info.layout = PipelineLayoutOf(static_cast<PipelineFamily>(family));
-        if (!g.perf.stats.empty() && (g.perf.stats == "*" || DescribePipeline(index).find(g.perf.stats) != std::string::npos)) {
+        if (ShaderStatsSelected(DescribePipeline(index))) {
             info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
                           VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
         }
@@ -1093,17 +1161,44 @@ void CreatePipelines() {
     }
     Check(failure, "vkCreateGraphicsPipelines");
     const auto compiled = trace_init ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (g.config.prog0_meshes && g.blend_slot_count > 12 &&
+        g_equations[12].src == VK_BLEND_FACTOR_SRC_ALPHA && g_equations[12].dst == VK_BLEND_FACTOR_ONE &&
+        g_equations[12].op == VK_BLEND_OP_ADD) {
+        const uint32_t base = PipelineIndex(kFamilyMeshProg0, 12, kTextureRgba, kAlphaVariantNone, kColorFeatureCount + 1);
+        g.prog0_zero_source_alpha_base = base;
+        Specialization data = spec_data[kFamilyMeshProg0][kTextureRgba][kAlphaVariantNone][kColorFeatureCount + 1];
+        data.zero_source_alpha = VK_TRUE;
+        VkSpecializationInfo fragment_info = spec_info[kFamilyMeshProg0][kTextureRgba][kAlphaVariantNone][kColorFeatureCount + 1];
+        fragment_info.pData = &data;
+        VkPipelineShaderStageCreateInfo zero_stages[] = {stages[base * 2], stages[base * 2 + 1]};
+        zero_stages[1].pSpecializationInfo = &fragment_info;
+        VkGraphicsPipelineCreateInfo info = infos[base];
+        info.pStages = zero_stages;
+        if (ShaderStatsSelected(DescribePipeline(kProg0ZeroSourceAlphaScope))) {
+            info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+            if (g.perf.stats != "*") {
+                info.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+            }
+        }
+        Check(create_pipeline(info, g.prog0_zero_source_alpha_pipeline), "vkCreateGraphicsPipelines zero source alpha");
+    }
+
     if (NearSafeFogEnabled() && g.blend_slot_count > 4) {
         const char *prog0_override = std::getenv("KZ_PROG0_FOG_NEAR_SAFE");
         const bool  prog0_enabled = g.config.prog0_meshes && (prog0_override == nullptr || std::strcmp(prog0_override, "0") != 0);
-        for (uint32_t variant = 0; variant < 4; variant++) {
+        for (uint32_t variant = 0; variant < 5; variant++) {
             const bool prog0 = variant >= 2;
             if (prog0 && !prog0_enabled) {
                 continue;
             }
-            const uint32_t       local_variant = prog0 ? variant - 2 : variant;
+            const uint32_t local_variant = prog0 ? variant - 2 : variant;
+            if (prog0 && local_variant == 2 && g.blend_slot_count <= 12) {
+                continue;
+            }
             const PipelineFamily family = prog0 ? kFamilyMeshProg0 : kFamilyMesh;
-            const uint32_t       blend = prog0 && local_variant == 0 ? 0 : 4;
+            const uint32_t       blend = prog0 ? (local_variant == 0 ? 0 : local_variant == 1 ? 4
+                                                                                              : 12)
+                                               : 4;
             const AlphaVariant   alpha = prog0 ? (local_variant == 0 ? kAlphaVariantGEqual : kAlphaVariantNone)
                                                : (local_variant == 0 ? kAlphaVariantNone : kAlphaVariantGEqual);
             const uint32_t       features = kColorFeatureCount + 1;
@@ -1123,7 +1218,7 @@ void CreatePipelines() {
             const auto create_near_pipeline = [&](uint32_t scope, VkPipeline &pipeline) {
                 VkGraphicsPipelineCreateInfo create = info;
                 const std::string            name = DescribePipeline(scope);
-                if (!g.perf.stats.empty() && (g.perf.stats == "*" || name.find(g.perf.stats) != std::string::npos)) {
+                if (ShaderStatsSelected(name)) {
                     create.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
                     if (g.perf.stats != "*") {
                         create.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
@@ -1132,10 +1227,95 @@ void CreatePipelines() {
                 Check(create_pipeline(create, pipeline),
                       "vkCreateGraphicsPipelines near-safe fog");
             };
-            const uint32_t scope = prog0 ? (local_variant == 0 ? kProg0NearSafeFogAlphaScope : kProg0NearSafeFogBlendScope)
+            const uint32_t scope = prog0 ? (local_variant == 0 ? kProg0NearSafeFogAlphaScope : local_variant == 1 ? kProg0NearSafeFogBlendScope
+                                                                                                                  : kProg0NearSafeFogAdditiveScope)
                                          : (local_variant == 0 ? kNearSafeFogScope : kNearSafeFogAlphaScope);
             auto          &pipeline = prog0 ? g.prog0_near_safe_fog_pipelines[local_variant] : g.near_safe_fog_pipelines[local_variant];
             create_near_pipeline(scope, pipeline);
+            if (prog0 && local_variant == 2) {
+                const auto create_shared_pipeline = [&](uint32_t shared_scope, size_t shared_index) {
+                    if (!g.prog0_shared_rgb) {
+                        return;
+                    }
+                    if (shared_rgb_module == VK_NULL_HANDLE) {
+                        shared_rgb_module = g.bindless ? CreateShader(draw_shared_rgb_single_frag, sizeof(draw_shared_rgb_single_frag))
+                                                       : CreateShader(draw_bound_shared_rgb_single_frag, sizeof(draw_bound_shared_rgb_single_frag));
+                        if (g_pipeline_recipes) {
+                            g_pipeline_recipes->modules[5] = shared_rgb_module;
+                        }
+                    }
+                    const auto ordinary_module = near_stages[1].module;
+                    near_stages[1].module = shared_rgb_module;
+                    create_near_pipeline(shared_scope, g.prog0_shared_rgb_pipelines[shared_index]);
+                    if (g.prog0_unlit_vertex) {
+                        if (unlit_vertex_module == VK_NULL_HANDLE) {
+                            unlit_vertex_module = CreateShader(mesh_prog0_unlit_vert, sizeof(mesh_prog0_unlit_vert));
+                            if (g_pipeline_recipes) {
+                                g_pipeline_recipes->modules[8] = unlit_vertex_module;
+                            }
+                        }
+                        const auto original_vertex = near_stages[0].module;
+                        near_stages[0].module = unlit_vertex_module;
+                        constexpr std::array scopes = {kProg0NearSafeUnlitVertexScope, kProg0Mode1UnlitVertexScope, kProg0GuardedUnlitVertexScope};
+                        create_near_pipeline(scopes[shared_index], g.prog0_unlit_vertex_pipelines[shared_index]);
+                        near_stages[0].module = original_vertex;
+                    }
+                    if (g.guarded_samples_enabled && shared_index == 2) {
+                        classifier_module = g.bindless ? CreateShader(draw_guard_classifier_single_frag, sizeof(draw_guard_classifier_single_frag))
+                                                       : CreateShader(draw_bound_guard_classifier_single_frag, sizeof(draw_bound_guard_classifier_single_frag));
+                        if (g_pipeline_recipes) {
+                            g_pipeline_recipes->modules[7] = classifier_module;
+                        }
+                        const auto *original_blend = info.pColorBlendState;
+                        auto        classifier_blend = *original_blend;
+                        auto        attachment = original_blend->pAttachments[0];
+                        attachment.colorWriteMask = 0;
+                        classifier_blend.pAttachments = &attachment;
+                        info.pColorBlendState = &classifier_blend;
+                        near_stages[1].module = classifier_module;
+                        create_near_pipeline(kProg0GuardClassifierScope, g.guarded_classifier_pipeline);
+                        info.pColorBlendState = original_blend;
+                        near_stages[1].module = shared_rgb_module;
+                    }
+                    if (g.prog0_rgb_cost_mode != Prog0RgbCostMode::Disabled && shared_index < 2) {
+                        const auto *original_blend = info.pColorBlendState;
+                        auto        diagnostic_blend = *original_blend;
+                        auto        attachment = original_blend->pAttachments[0];
+                        attachment.colorWriteMask = VK_COLOR_COMPONENT_A_BIT;
+                        diagnostic_blend.pAttachments = &attachment;
+                        info.pColorBlendState = &diagnostic_blend;
+                        const uint32_t mask_scope = shared_index == 0 ? kProg0NearSafeRgbMaskScope : kProg0Mode1RgbMaskScope;
+                        create_near_pipeline(mask_scope, g.prog0_rgb_cost_pipelines[shared_index]);
+                        if (alpha_only_module == VK_NULL_HANDLE) {
+                            alpha_only_module = g.bindless ? CreateShader(draw_alpha_only_single_frag, sizeof(draw_alpha_only_single_frag))
+                                                           : CreateShader(draw_bound_alpha_only_single_frag, sizeof(draw_bound_alpha_only_single_frag));
+                            if (g_pipeline_recipes) {
+                                g_pipeline_recipes->modules[6] = alpha_only_module;
+                            }
+                        }
+                        near_stages[1].module = alpha_only_module;
+                        const uint32_t alpha_scope = shared_index == 0 ? kProg0NearSafeAlphaOnlyScope : kProg0Mode1AlphaOnlyScope;
+                        create_near_pipeline(alpha_scope, g.prog0_rgb_cost_pipelines[shared_index + 2]);
+                        info.pColorBlendState = original_blend;
+                    }
+                    near_stages[1].module = ordinary_module;
+                };
+                data.black_fog_input = VK_TRUE;
+                create_near_pipeline(kProg0NearSafeFogAdditiveBlackScope, g.prog0_near_safe_black_fog_pipeline);
+                create_shared_pipeline(kProg0NearSafeFogSharedRgbScope, 0);
+                data.black_fog_input = VK_FALSE;
+                data.near_safe_mesh_fog = VK_FALSE;
+                data.near_safe_reciprocal = VK_FALSE;
+                data.prog0_mode1_fog = VK_TRUE;
+                g.prog0_mode1_fog_base = base;
+                create_near_pipeline(kProg0Mode1FogScope, g.prog0_mode1_fog_pipeline);
+                data.black_fog_input = VK_TRUE;
+                create_near_pipeline(kProg0Mode1FogBlackScope, g.prog0_mode1_black_fog_pipeline);
+                create_shared_pipeline(kProg0Mode1FogSharedRgbScope, 1);
+                data.guarded_zero_alpha = VK_TRUE;
+                create_near_pipeline(kProg0GuardedZeroSourceAlphaScope, g.prog0_guarded_zero_alpha_pipeline);
+                create_shared_pipeline(kProg0GuardedZeroSharedRgbScope, 2);
+            }
         }
     }
     if (g.dynamic_color_write_mask) {
@@ -1152,7 +1332,7 @@ void CreatePipelines() {
         VkGraphicsPipelineCreateInfo info = infos[base];
         info.pStages = zero_stages;
         const std::string name = DescribePipeline(kZeroAlphaNoopScope);
-        if (!g.perf.stats.empty() && (g.perf.stats == "*" || name.find(g.perf.stats) != std::string::npos)) {
+        if (ShaderStatsSelected(name)) {
             info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
             if (g.perf.stats != "*") {
                 info.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
@@ -1184,7 +1364,7 @@ void CreatePipelines() {
         planes_dynamic.pDynamicStates = planes_states.data();
         VkGraphicsPipelineCreateInfo planes = {};
         planes.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        if (!g.perf.stats.empty() && (g.perf.stats == "*" || std::string("depth-planes").find(g.perf.stats) != std::string::npos)) {
+        if (ShaderStatsSelected("depth-planes")) {
             planes.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
                            VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
         }
@@ -1217,6 +1397,18 @@ void CreatePipelines() {
         vkDestroyShaderModule(g.device, mesh_module, nullptr);
         vkDestroyShaderModule(g.device, frag_module, nullptr);
         vkDestroyShaderModule(g.device, frag_single_module, nullptr);
+        if (classifier_module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(g.device, classifier_module, nullptr);
+        }
+        if (alpha_only_module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(g.device, alpha_only_module, nullptr);
+        }
+        if (shared_rgb_module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(g.device, shared_rgb_module, nullptr);
+        }
+        if (unlit_vertex_module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(g.device, unlit_vertex_module, nullptr);
+        }
         if (prog0_module != VK_NULL_HANDLE) {
             vkDestroyShaderModule(g.device, prog0_module, nullptr);
         }
@@ -1287,6 +1479,41 @@ void DestroyPipelines() {
         }
     }
     g.prog0_near_safe_fog_bases.fill(UINT32_MAX);
+    if (g.prog0_mode1_fog_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(g.device, g.prog0_mode1_fog_pipeline, nullptr);
+        g.prog0_mode1_fog_pipeline = VK_NULL_HANDLE;
+    }
+    g.prog0_mode1_fog_base = UINT32_MAX;
+    for (VkPipeline *pipeline : {&g.prog0_near_safe_black_fog_pipeline, &g.prog0_mode1_black_fog_pipeline,
+                                 &g.prog0_zero_source_alpha_pipeline, &g.prog0_guarded_zero_alpha_pipeline}) {
+        if (*pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(g.device, *pipeline, nullptr);
+            *pipeline = VK_NULL_HANDLE;
+        }
+    }
+    if (g.guarded_classifier_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(g.device, g.guarded_classifier_pipeline, nullptr);
+        g.guarded_classifier_pipeline = VK_NULL_HANDLE;
+    }
+    for (auto &pipeline : g.prog0_rgb_cost_pipelines) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(g.device, pipeline, nullptr);
+        }
+        pipeline = VK_NULL_HANDLE;
+    }
+    for (auto &pipeline : g.prog0_unlit_vertex_pipelines) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(g.device, pipeline, nullptr);
+        }
+        pipeline = VK_NULL_HANDLE;
+    }
+    for (auto &pipeline : g.prog0_shared_rgb_pipelines) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(g.device, pipeline, nullptr);
+        }
+        pipeline = VK_NULL_HANDLE;
+    }
+    g.prog0_zero_source_alpha_base = UINT32_MAX;
     if (g.zero_alpha_noop_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(g.device, g.zero_alpha_noop_pipeline, nullptr);
         g.zero_alpha_noop_pipeline = VK_NULL_HANDLE;
@@ -1305,6 +1532,12 @@ void DestroyPipelines() {
 std::string DescribePipeline(uint32_t index) {
     static constexpr const char *kFamilies[] = {"2d", "lines", "mesh", "prog0", "skinned"};
     static constexpr const char *kModes[] = {"flat", "rgba", "clut"};
+    if (index == kProg0ZeroSourceAlphaScope) {
+        return "prog0-zero-source-alpha";
+    }
+    if (index == kProg0GuardedZeroSourceAlphaScope) {
+        return "prog0-guarded-zero-source-alpha";
+    }
     if (index == kDepthPlanesScope) {
         return "depth-planes";
     }
@@ -1314,8 +1547,51 @@ std::string DescribePipeline(uint32_t index) {
     if (index == kNearSafeFogScope || index == kNearSafeFogAlphaScope) {
         return index == kNearSafeFogScope ? "mesh-fog-near-safe" : "mesh-fog-near-safe-atest>=";
     }
-    if (index == kProg0NearSafeFogAlphaScope || index == kProg0NearSafeFogBlendScope) {
-        return index == kProg0NearSafeFogAlphaScope ? "prog0-fog-near-safe-atest>=" : "prog0-fog-near-safe-blend";
+    if (index == kProg0NearSafeFogAlphaScope || index == kProg0NearSafeFogBlendScope || index == kProg0NearSafeFogAdditiveScope) {
+        return index == kProg0NearSafeFogAlphaScope ? "prog0-fog-near-safe-atest>=" : index == kProg0NearSafeFogBlendScope ? "prog0-fog-near-safe-blend"
+                                                                                                                           : "prog0-fog-near-safe-additive";
+    }
+    if (index == kProg0NearSafeFogAdditiveBlackScope) {
+        return "prog0-fog-near-safe-additive-black";
+    }
+    if (index == kProg0Mode1FogBlackScope) {
+        return "prog0-fog-mode1-fresh-black";
+    }
+    if (index == kProg0NearSafeUnlitVertexScope) {
+        return "prog0-fog-near-safe-additive-black-shared-rgb-unlit-vertex";
+    }
+    if (index == kProg0Mode1UnlitVertexScope) {
+        return "prog0-fog-mode1-fresh-black-shared-rgb-unlit-vertex";
+    }
+    if (index == kProg0GuardedUnlitVertexScope) {
+        return "prog0-guarded-zero-source-alpha-shared-rgb-unlit-vertex";
+    }
+    if (index == kProg0NearSafeFogSharedRgbScope) {
+        return "prog0-fog-near-safe-additive-black-shared-rgb";
+    }
+    if (index == kProg0Mode1FogSharedRgbScope) {
+        return "prog0-fog-mode1-fresh-black-shared-rgb";
+    }
+    if (index == kProg0GuardedZeroSharedRgbScope) {
+        return "prog0-guarded-zero-source-alpha-shared-rgb";
+    }
+    if (index == kProg0NearSafeRgbMaskScope) {
+        return "prog0-fog-near-safe-additive-black-rgb-mask";
+    }
+    if (index == kProg0Mode1RgbMaskScope) {
+        return "prog0-fog-mode1-fresh-black-rgb-mask";
+    }
+    if (index == kProg0NearSafeAlphaOnlyScope) {
+        return "prog0-fog-near-safe-additive-black-alpha-only";
+    }
+    if (index == kProg0Mode1AlphaOnlyScope) {
+        return "prog0-fog-mode1-fresh-black-alpha-only";
+    }
+    if (index == kProg0GuardClassifierScope) {
+        return "prog0-guarded-zero-sample-classifier";
+    }
+    if (index == kProg0Mode1FogScope) {
+        return "prog0-fog-mode1-fresh";
     }
     const uint32_t families = FamilyCount();
     const uint32_t colour =

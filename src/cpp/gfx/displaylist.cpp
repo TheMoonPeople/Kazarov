@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "gfx/alpha_trace.hpp"
 #include "gfx/context.hpp"
 #include "gfx/profile.hpp"
 #include "kazarov/log.hpp"
@@ -558,18 +559,23 @@ uint64_t g_cut_generation = 0;
 constexpr float kInstanceStep = 25.0f;
 
 struct KeyDraws {
-    std::vector<int32_t> records;
-    bool                 instanced = false;
+    /**
+     * Keeps one key's ordered indices in the surrounding matching arena.
+     */
+    explicit KeyDraws(std::pmr::memory_resource &resource) : records(&resource) {}
+
+    std::pmr::vector<int32_t> records;
+    bool                      instanced = false;
 };
 
-std::unordered_map<InterpKey, KeyDraws> DrawsByKey(const DisplayList &list) {
-    std::unordered_map<InterpKey, KeyDraws> keys;
+std::pmr::unordered_map<InterpKey, KeyDraws> DrawsByKey(const DisplayList &list, std::pmr::memory_resource &resource) {
+    std::pmr::unordered_map<InterpKey, KeyDraws> keys{&resource};
     for (size_t i = 0; i < list.records.size(); i++) {
         const MeshRecord &record = list.records[i];
         if (record.key == 0 || !record.has_transform) {
             continue;
         }
-        KeyDraws &draws = keys[record.key];
+        KeyDraws &draws = keys.try_emplace(record.key, resource).first->second;
         draws.instanced = draws.instanced ||
                           (!draws.records.empty() && list.records[draws.records.front()].model != record.model);
         draws.records.push_back(static_cast<int32_t>(i));
@@ -797,13 +803,13 @@ void BuildMatches(const DisplayList &list, const DisplayList &previous) {
         }
     }
 
-    std::unordered_map<InterpKey, KeyDraws> before = DrawsByKey(previous);
-    std::unordered_map<InterpKey, KeyDraws> now = DrawsByKey(list);
-    const auto                              earlier_surfaces = MatchSurfaces(previous);
-    const auto                              surfaces = MatchSurfaces(list);
-    // Candidate nodes and their lists expire together; keep their small allocations in one arena.
     std::pmr::monotonic_buffer_resource match_storage;
-    MatchCandidates                     candidates{&match_storage};
+    const auto                          before = DrawsByKey(previous, match_storage);
+    const auto                          now = DrawsByKey(list, match_storage);
+    const auto                          earlier_surfaces = MatchSurfaces(previous);
+    const auto                          surfaces = MatchSurfaces(list);
+    // Candidate nodes and their lists expire together; keep their small allocations in one arena.
+    MatchCandidates candidates{&match_storage};
     candidates.reserve(previous.records.size());
     for (size_t index = 0; index < previous.records.size(); ++index) {
         if (earlier_surfaces[index].key != 0) {
@@ -1833,6 +1839,27 @@ const Prog0Palette *ReplayPalette(const MeshEntry &entry, const DisplayList &lis
 
 void ReplayMesh(const MeshEntry &e, const DisplayList &list, bool canonical, const Overrides *overrides,
                 const DrawState &state) {
+    /**
+     * Restores an enclosing draw origin after this retained entry finishes replay.
+     */
+    struct OriginRestore {
+        FragmentReplayOrigin previous; /**< Enclosing render-owner origin. */
+
+        /**
+         * Restores the prior direct or nested replay state.
+         */
+        ~OriginRestore() { tls.fragment_origin = previous; }
+    };
+
+    std::optional<OriginRestore> origin;
+    if (g.fragment_invocations_enabled || g.guarded_samples_enabled) {
+        origin.emplace(tls.fragment_origin);
+        tls.fragment_origin = {};
+        if (e.record < list.records.size()) {
+            const auto &record = list.records[e.record];
+            tls.fragment_origin = {.present = true, .list_serial = list.serial, .record = e.record, .entry = record.entry, .key = record.key, .occurrence = record.occurrence, .camera = record.camera, .has_transform = record.has_transform};
+        }
+    }
     const MeshConstants *constants = &e.constants;
     if (overrides != nullptr && overrides->index[e.record] >= 0) {
         constants = &overrides->constants[overrides->index[e.record]];
@@ -2525,6 +2552,7 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
     }
     for (size_t index = 0; index < list.entries.size(); index++) {
         const Entry &entry = list.entries[index];
+        AttachmentAlphaEntry(static_cast<uint32_t>(index));
         if (!occlusion.occluders.empty() && index == occlusion.start) {
             DrawOccluderDepth(occlusion, list, canonical, overrides);
         }
@@ -2537,6 +2565,9 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                 }
                 if constexpr (std::is_same_v<T, Draw2DEntry>) {
                     if (canonical && e.presentation_only) {
+                        if (e.region_alpha_reset) {
+                            AttachmentAlphaTargetNote(AlphaTraceKind::ResetOmitted);
+                        }
                         return;
                     }
                     const PresentationCoverage *coverage = !canonical && e.presentation_region >= 0 &&
@@ -2597,8 +2628,10 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         if (reuse) {
                             if (!previous_dirty) {
                                 ++alpha_footprint.empty_resets;
+                                AttachmentAlphaTargetNote(AlphaTraceKind::ResetOmitted);
                                 return;
                             }
+                            AttachmentAlphaTargetNote(AlphaTraceKind::ResetRestricted);
                             ++alpha_footprint.prior_resets;
                             alpha_footprint.reset_pixels += static_cast<double>((*previous_dirty)[2] - (*previous_dirty)[0]) * ((*previous_dirty)[3] - (*previous_dirty)[1]) * pixel_scale;
                             for (size_t i = 0; i < bounded_vertices.size(); ++i) {
@@ -2666,6 +2699,7 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                         }
                     }
                     SetRenderTarget(target);
+                    AttachmentAlphaTargetNote(AlphaTraceKind::Target);
                 } else if (canonical) {
                     if constexpr (std::is_same_v<T, CopyEntry>) {
                         if (e.kind == CopyEntry::Copy) {
@@ -3324,6 +3358,7 @@ bool ReplayCanonicalList(const DisplayList &list, const CanonicalCommitTransacti
     const auto opened = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
         const MeshAlphaDiagnosticReplay diagnostic;
+        AttachmentAlphaOrigin(list.serial, 0, 1.0);
         Replay(list, true, nullptr);
     }
     const auto replayed = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3413,10 +3448,12 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
         if (tint) {
             TraceInterpolation(list, options.previous, interpolate ? &overrides : nullptr, alpha);
         }
+        AttachmentAlphaOrigin(list.serial, interpolate ? options.previous->serial : 0, interpolate ? std::max(alpha, 0.0f) : 1.0);
         Replay(list, false, interpolate ? &overrides : nullptr, options.host, tint, options.suppressed_2d_key);
         if (options.overlay != nullptr && options.overlay->instance == g.renderer_instance) {
             KZ_PROFILE_ZONE("Kazarov overlay");
             SetRenderTarget(kMainTarget);
+            AttachmentAlphaOrigin(options.overlay->serial, 0, 1.0);
             Replay(*options.overlay, false, nullptr, true, tint);
         }
         CloseListFrame(false, options.present);

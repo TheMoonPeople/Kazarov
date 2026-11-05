@@ -145,8 +145,13 @@ void blend(inout vec3 position, inout vec3 normal) {
 }
 
 void main() {
+#ifdef KZ_PROG0_UNLIT_VERTEX
+    uint F = 0x20u | (p0.flags & 0x3u);
+    uint T = 0u;
+#else
     uint F = p0.flags;
     uint T = pc.face;
+#endif
 
     vec3 position = a_position;
     vec3 normal = a_normal;

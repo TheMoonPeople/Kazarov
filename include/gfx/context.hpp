@@ -218,6 +218,7 @@ struct ImageState {
 };
 
 struct Image {
+    uint64_t           alpha_trace_allocation = 0; /**< Optional diagnostic allocation identity. */
     VkImage            image = VK_NULL_HANDLE;
     VkImageView        view = VK_NULL_HANDLE;
     Allocation         memory;
@@ -246,6 +247,7 @@ ImageState TransferDst();
 // ---- Resources -------------------------------------------------------------------------------
 
 struct Texture {
+    uint32_t    alpha_trace_aliases = 0; /**< Fully verified private diagnostic upload aliases. */
     bool        live = false;
     uint16_t    generation = 0;
     TextureDesc desc;
@@ -268,6 +270,8 @@ struct Texture {
 };
 
 struct Mesh {
+    uint64_t             alpha_trace_allocation = 0; /**< Optional diagnostic allocation identity. */
+    uint32_t             alpha_trace_aliases = 0;    /**< Fully verified private diagnostic upload aliases. */
     bool                 live = false;
     uint16_t             generation = 0;
     Buffer               buffer; // vertices, then indices
@@ -278,6 +282,7 @@ struct Mesh {
     std::array<float, 3> bounds_max = {};
     bool                 bounds_known = false;         /**< Static upload bounds; vertex updates invalidate them. */
     bool                 bounds_normal_inputs = false; /**< Every immutable uploaded position component is zero or normal. */
+    bool                 bounded_uv_inputs = false;    /**< Immutable UVs are normal or zero and bounded by 4096. */
     std::array<float, 3> skin_bounds_min = {};         /**< Bounds of the position slots in the packed skin stream. */
     std::array<float, 3> skin_bounds_max = {};         /**< Upper bounds of the packed skin positions. */
     double               skin_weight_sum_min = 0.0;    /**< Conservative least sum of the four nonnegative shader weights. */
@@ -301,6 +306,131 @@ bool TexaMaskEnabled();
  * Prove positive clip W and zero near/eye fog markers over static mesh bounds.
  */
 bool MeshFogIsNearSafe(const Mesh &mesh, const MeshConstants &constants);
+
+/**
+ * Identifies the first unchanged rigid Prog0 fog proof condition that rejects a draw.
+ */
+enum class Prog0FogReason : uint8_t {
+    Safe,
+    UnknownBounds,
+    NonnormalPositions,
+    SkinnedFlag,
+    ZeroFogScale,
+    InvalidBounds,
+    NonnormalMvp,
+    NonnormalFog,
+    ClipOverflow,
+    WMargin,
+    NearMargin,
+    FogOverflow,
+    MissingParameters,
+    Count
+};
+
+/**
+ * Retains only proof intermediates that were actually evaluated for a rigid draw.
+ */
+struct Prog0FogProof {
+    Prog0FogReason        reason = Prog0FogReason::UnknownBounds; /**< First rejection or successful proof. */
+    bool                  clip_computed = false;                  /**< Clip magnitudes and their limit were evaluated. */
+    bool                  margins_computed = false;               /**< Clip W and W-Z bounds and guards were evaluated. */
+    bool                  fog_computed = false;                   /**< Final fog arithmetic bounds were evaluated. */
+    std::array<double, 4> magnitude = {};                         /**< Absolute clip-coordinate bounds. */
+    double                limit = 0;                              /**< Finite arithmetic upper bound. */
+    double                w_min = 0;                              /**< Least conservative clip W. */
+    double                w_guard = 0;                            /**< Floating-point error allowance for W. */
+    double                difference_min = 0;                     /**< Least conservative W-Z. */
+    double                difference_guard = 0;                   /**< Floating-point error allowance for W-Z. */
+    double                w_top = 0;                              /**< Largest guarded W magnitude. */
+    double                w_bottom = 0;                           /**< Smallest guarded positive W. */
+    double                offset = 0;                             /**< Absolute fog offset. */
+    double                scale = 0;                              /**< Absolute reciprocal-W fog scale. */
+    double                fog_top = 0;                            /**< Largest nonnegative fog clamp value. */
+};
+
+/**
+ * Owns a reconstructible exact-target draw observation independently of mesh lifetime.
+ */
+struct Prog0FogObservation {
+    Prog0FogProof         proof;                         /**< Unchanged proof result and evaluated intermediates. */
+    MeshHandle            mesh = kNullMesh;              /**< Complete retained mesh handle. */
+    uint16_t              generation = 0;                /**< Uploaded mesh allocation generation. */
+    uint32_t              first_index = 0;               /**< First submitted index. */
+    uint32_t              index_count = 0;               /**< Submitted index count. */
+    uint32_t              vertex_count = 0;              /**< Immutable allocation vertex count. */
+    uint32_t              flags = 0;                     /**< Actual uploaded Prog0 flags. */
+    TextureHandle         texture = kNullTexture;        /**< Sampled texture identity. */
+    uint32_t              target = 0;                    /**< Actual render target identity. */
+    bool                  mesh_present = false;          /**< Immutable mesh metadata was available. */
+    bool                  constants_present = false;     /**< Actual uploaded constants were available. */
+    bool                  bounds_known = false;          /**< Immutable bounds remain valid. */
+    bool                  bounds_normal_inputs = false;  /**< Uploaded positions satisfy the normal-or-zero precondition. */
+    bool                  near_safe_selected = false;    /**< Actual draw selected the existing near-safe specialization. */
+    bool                  mode1_selected = false;        /**< Actual draw selected exact mode1 fog evaluation. */
+    uint32_t              actual_scope = UINT32_MAX;     /**< Actual selected pipeline diagnostic identity. */
+    std::array<float, 3>  bounds_min = {};               /**< Immutable lower object-space bounds. */
+    std::array<float, 3>  bounds_max = {};               /**< Immutable upper object-space bounds. */
+    std::array<float, 16> mvp = {};                      /**< Actual uploaded or interpolated column-major matrix. */
+    std::array<float, 4>  fog = {};                      /**< Actual uploaded fog arguments. */
+    uint64_t              first_frame = 0;               /**< First renderer raw frame serial represented. */
+    uint64_t              last_frame = 0;                /**< Last renderer raw frame serial represented. */
+    uint64_t              list_serial = 0;               /**< Display-list serial of the retained representative. */
+    uint64_t              representative_frame = 0;      /**< Raw renderer frame owning the retained matrix snapshot. */
+    uint64_t              representative_submission = 0; /**< Correlatable accepted role-record sequence. */
+    uint64_t              representative_submit_ns = 0;  /**< Submission start owning the retained matrix snapshot. */
+    uint64_t              draws = 1;                     /**< Exact observations represented by this key. */
+};
+
+/**
+ * Counts every target draw while retaining a bounded set of independently owned representatives.
+ */
+struct Prog0FogObservations {
+    size_t                                                           capacity = 64;     /**< Maximum distinct mesh/range/reason representatives. */
+    std::array<uint64_t, static_cast<size_t>(Prog0FogReason::Count)> counts = {};       /**< Exact target draws by result. */
+    uint64_t                                                         dropped_draws = 0; /**< Draw observations without a retained representative. */
+    std::vector<Prog0FogObservation>                                 records;           /**< Bounded representatives, preserving allocated capacity. */
+    /**
+     * Resets counts and representatives without releasing the render-owned allocation.
+     */
+    void Clear();
+    /**
+     * Counts one observation and retains its latest or least-safe representative.
+     */
+    void Add(const Prog0FogObservation &observation);
+    /**
+     * Merges exact counts and bounded representatives from one submitted logical frame.
+     */
+    void Merge(const Prog0FogObservations &observations);
+    /**
+     * Retains a representative without changing the separately accumulated reason counts.
+     */
+    void Retain(const Prog0FogObservation &observation);
+};
+
+/**
+ * Reports the same rigid fog proof result together with its first rejection and available bounds.
+ */
+Prog0FogProof ExplainProg0Fog(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0);
+
+/**
+ * Selects immutable rigid inputs whose vertex shader emits the exact255/positive-zero mode1 layout.
+ */
+bool Prog0FogHasExactMode1(const Mesh &mesh, const Prog0Constants &prog0);
+
+/**
+ * Proves finite rigid Prog0 shading with an exactly zero quantized source alpha.
+ */
+bool Prog0HasZeroSourceAlpha(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0);
+
+/**
+ * Bounds rigid zero-alpha inputs for an independently guarded fragment fallback.
+ */
+bool Prog0CanGuardZeroSourceAlpha(const Mesh &mesh, const MeshConstants &constants, const Prog0Constants &prog0);
+
+/**
+ * Buffers an exact-target observation on the render owner for submission-window aggregation.
+ */
+void ObserveProg0Fog(Prog0FogObservation observation);
 
 /**
  * Proves finite rigid Prog0 fog interpolation with positive W and zero near-crossing markers.
@@ -363,6 +493,171 @@ struct GpuScopeMark {
     uint32_t     barriers; // pipeline barriers recorded in the segment
 };
 
+/**
+ * Identifies one retained display-list draw without retaining its recording.
+ */
+struct FragmentReplayOrigin {
+    bool     present = false;       /**< A valid replay record supplied this origin. */
+    uint64_t list_serial = 0;       /**< Actual replayed list identity. */
+    uint32_t record = 0;            /**< Mesh record index within that list. */
+    uint32_t entry = 0;             /**< Entry index retained by the mesh record. */
+    uint64_t key = 0;               /**< Opaque frame-object token; zero means unknown. */
+    uint32_t occurrence = 0;        /**< Recorded occurrence of this interpolation key. */
+    uint32_t camera = 0;            /**< Recorded camera identity. */
+    bool     has_transform = false; /**< The record owns decomposition for interpolation. */
+};
+
+/**
+ * Retains complete named state only for the first two draws of a geometry group.
+ */
+struct FragmentDrawSnapshot;
+
+/**
+ * Owns retained-draw identity and fragment counter results independently of resources.
+ */
+struct FragmentInvocationObservation {
+    std::shared_ptr<FragmentDrawSnapshot> snapshot;                     /**< Independent complete state for a bounded paired member. */
+    MeshHandle                            mesh = kNullMesh;             /**< Submitted retained mesh identity. */
+    uint16_t                              generation = 0;               /**< Allocation generation at recording. */
+    uint32_t                              first_index = 0;              /**< First submitted index. */
+    uint32_t                              index_count = 0;              /**< Number of submitted indices. */
+    uint32_t                              vertex_count = 0;             /**< Immutable allocation vertex count. */
+    bool                                  bounds_known = false;         /**< Immutable bounds remain valid for this allocation. */
+    bool                                  bounds_normal_inputs = false; /**< Immutable positions are normal or zero. */
+    std::array<float, 3>                  bounds_min = {};              /**< Copied object-space lower bounds. */
+    std::array<float, 3>                  bounds_max = {};              /**< Copied object-space upper bounds. */
+    std::array<float, 16>                 mvp = {};                     /**< Actual uploaded or interpolated draw matrix. */
+    TextureHandle                         texture = kNullTexture;       /**< Sampled texture identity. */
+    uint32_t                              target = 0;                   /**< Actual color attachment identity. */
+    uint32_t                              width = 0;                    /**< Actual attachment raster width. */
+    uint32_t                              height = 0;                   /**< Actual attachment raster height. */
+    uint32_t                              scope = UINT32_MAX;           /**< Actual selected pipeline scope. */
+    uint64_t                              color_image = 0;              /**< Actual prepared color image identity. */
+    uint64_t                              depth_image = 0;              /**< Actual prepared depth image identity. */
+    uint32_t                              color_format = 0;             /**< Prepared color attachment format. */
+    uint32_t                              depth_format = 0;             /**< Prepared depth attachment format. */
+    std::array<float, 6>                  viewport = {};                /**< Prepared actual raster viewport. */
+    uint64_t                              frame = 0;                    /**< Raw renderer frame of the representative. */
+    uint64_t                              list_serial = 0;              /**< Display list owning the representative. */
+    uint64_t                              submission = 0;               /**< Accepted measurement submission sequence. */
+    uint64_t                              submit_ns = 0;                /**< Existing CPU submission start. */
+    uint64_t                              draws = 1;                    /**< Draws represented by this identity. */
+    uint64_t                              available = 0;                /**< Draws with available counters. */
+    uint64_t                              unavailable = 0;              /**< Draws without available counters. */
+    uint64_t                              errors = 0;                   /**< Draws affected by query API errors. */
+    uint64_t                              invocations = 0;              /**< Sum of directly reported fragment invocations. */
+    uint64_t                              peak_invocations = 0;         /**< Largest individual available draw result. */
+};
+
+/**
+ * Retains ordered members from one logical submission without mixing their states.
+ */
+struct FragmentDrawPair {
+    uint64_t                                     occurrences = 0;                    /**< All eligible draws, including unqueried overflow occurrences. */
+    uint64_t                                     queried_occurrences = 0;            /**< Eligible occurrences with an allocated query. */
+    std::array<FragmentInvocationObservation, 2> members;                            /**< First two ordered actual draw snapshots. */
+    std::array<uint32_t, 2>                      queries = {UINT32_MAX, UINT32_MAX}; /**< Own slot-local query ordinals or explicit absence. */
+    bool                                         complete = true;                    /**< Both required members have complete available query evidence. */
+};
+
+/**
+ * Bounds per-slot geometry groups while counting every eligible occurrence.
+ */
+struct FragmentDrawPairSlot {
+    size_t                        capacity = 16;     /**< Maximum geometry groups in this logical frame. */
+    uint64_t                      dropped_draws = 0; /**< Eligible occurrences whose geometry group could not be retained. */
+    std::vector<FragmentDrawPair> records;           /**< Render-owned ordered groups. */
+    /**
+     * Clears this logical frame while retaining allocated capacity.
+     */
+    void Clear();
+    /**
+     * Checks whether the next eligible occurrence needs a full snapshot.
+     */
+    bool NeedsSnapshot(const FragmentInvocationObservation &observation) const;
+    /**
+     * Counts an occurrence and retains its first two ordered members.
+     */
+    void Add(const FragmentInvocationObservation &observation, uint32_t query);
+};
+
+/**
+ * Aggregates frequency while preserving an atomic same-submission representative pair.
+ */
+struct FragmentDrawPairRecord {
+    FragmentDrawPair representative;             /**< Both members from one retained submission. */
+    uint64_t         submissions_with_one = 0;   /**< Accepted submissions with one eligible occurrence. */
+    uint64_t         submissions_with_two = 0;   /**< Accepted submissions with exactly two eligible occurrences. */
+    uint64_t         submissions_with_more = 0;  /**< Accepted submissions with three or more eligible occurrences. */
+    uint64_t         max_occurrences = 0;        /**< Largest complete observed occurrence count. */
+    uint64_t         occurrences = 0;            /**< All eligible occurrences represented by this geometry. */
+    uint64_t         queried_occurrences = 0;    /**< Occurrences with allocated counter queries. */
+    uint64_t         incomplete_submissions = 0; /**< Submissions with missing paired state or counter evidence. */
+};
+
+/**
+ * Owns bounded geometry-pair evidence for one role and submission-second bucket.
+ */
+struct FragmentDrawPairSamples {
+    size_t                              capacity = 16;           /**< Maximum distinct geometry groups retained. */
+    uint64_t                            dropped_groups = 0;      /**< Submitted geometry groups beyond representative capacity. */
+    uint64_t                            dropped_occurrences = 0; /**< Eligible occurrences without retained geometry-pair evidence. */
+    std::vector<FragmentDrawPairRecord> records;                 /**< Atomic pairs and independent frequency totals. */
+    /**
+     * Clears frequency and representatives without releasing storage.
+     */
+    void Clear();
+    /**
+     * Merges one submitted geometry group without separating its two members.
+     */
+    void Add(const FragmentDrawPair &pair, uint64_t queried);
+};
+
+/**
+ * Counts every diagnostic result while retaining bounded per-mesh representatives.
+ */
+struct FragmentInvocationSamples {
+    size_t                                     capacity = 64;       /**< Maximum independently owned representatives. */
+    std::array<uint64_t, 2>                    draws = {};          /**< Eligible draws by near-safe and mode1 black scope. */
+    std::array<uint64_t, 2>                    invocations = {};    /**< Direct available invocation totals by scope. */
+    std::array<uint64_t, 2>                    available = {};      /**< Available query results by scope. */
+    std::array<uint64_t, 2>                    unavailable = {};    /**< Unavailable query results by scope. */
+    std::array<uint64_t, 2>                    errors = {};         /**< Query API errors by scope. */
+    std::array<uint64_t, 2>                    skipped = {};        /**< Draws not instrumented after query capacity exhaustion. */
+    uint64_t                                   truncated_draws = 0; /**< Results omitted only from bounded representatives. */
+    std::vector<FragmentInvocationObservation> records;             /**< Bounded resource-independent representatives. */
+    /**
+     * Resets aggregate values without releasing retained allocation capacity.
+     */
+    void Clear();
+    /**
+     * Adds a result while preserving exact totals when representatives are full.
+     */
+    void Add(const FragmentInvocationObservation &observation);
+    /**
+     * Counts target draws that exceeded the bounded query capacity.
+     */
+    void Skip(const std::array<uint64_t, 2> &counts);
+};
+
+/**
+ * Maps only the two explicitly instrumented pipeline scopes to counter columns.
+ */
+int FragmentInvocationScopeIndex(uint32_t scope);
+
+/** Maximum fragment invocation probes recorded in one logical frame slot. */
+inline constexpr uint32_t kFragmentInvocationQueries = 512;
+
+/**
+ * Associates a pair of precise queries with its immutable logical execution.
+ */
+struct GuardedSampleReference {
+    uint64_t epoch = 0;     /**< Measurement generation. */
+    uint32_t execution = 0; /**< Bounded execution index. */
+    uint32_t pair = 0;      /**< Ordered pair within that execution. */
+    uint32_t query = 0;     /**< Total query followed immediately by its classifier query. */
+};
+
 struct Frame {
     VkCommandPool               pool = VK_NULL_HANDLE;
     VkCommandBuffer             upload_cmd = VK_NULL_HANDLE;
@@ -392,9 +687,19 @@ struct Frame {
         Display
     } timestamps = Timestamps::None;
     // KZ_GPU_SCOPES: what each segment of the slot's scope queries covered; segment i ends at query i + 1.
-    std::vector<GpuScopeMark> scope_marks;
-    uint32_t                  scope_reset = 0; // scope queries the slot's next frame resets
-    uint32_t                  scope_passes = 0;
+    std::vector<GpuScopeMark>                  scope_marks;
+    uint32_t                                   scope_reset = 0; // scope queries the slot's next frame resets
+    uint32_t                                   scope_passes = 0;
+    std::vector<FragmentInvocationObservation> fragment_draws;         /**< Render-owned probes until the final slot fence. */
+    std::vector<std::array<uint64_t, 2>>       fragment_values;        /**< Reusable value/availability readback storage. */
+    std::array<uint64_t, 2>                    fragment_skipped = {};  /**< Target draws beyond this slot's query budget. */
+    uint32_t                                   fragment_reset = 0;     /**< Previously used query range reset at the next logical opening. */
+    FragmentDrawPairSlot                       fragment_pairs;         /**< Bounded same-submission ordered draw groups. */
+    std::vector<GuardedSampleReference>        guarded_samples;        /**< Render-owned query references through the slot fence. */
+    std::vector<std::array<uint64_t, 2>>       guarded_values;         /**< Bounded value and availability readback. */
+    uint32_t                                   guarded_reset = 0;      /**< Previously recorded query range. */
+    bool                                       guarded_merged = true;  /**< Query pairs have been consumed once. */
+    bool                                       fragment_merged = true; /**< Results have already been consumed or deliberately discarded. */
 };
 
 struct Swapchain {
@@ -489,6 +794,28 @@ struct PushConstants {
     uint32_t palette_index; // record of a skinned draw's Prog0Palette, skinned draws only
 };
 
+/**
+ * Copies named actual draw inputs independently of command buffers and resources.
+ */
+struct FragmentDrawSnapshot {
+    FragmentReplayOrigin origin;                     /**< Scoped retained-list origin, or explicit direct draw. */
+    bool                 mesh_valid = false;         /**< The bound mesh block is available. */
+    bool                 prog0_valid = false;        /**< The bound Prog0 block is available. */
+    MeshConstants        mesh = {};                  /**< Actual cached uploaded mesh constants. */
+    Prog0Constants       prog0 = {};                 /**< Actual cached uploaded Prog0 constants. */
+    TextureBinding       binding;                    /**< Input texture, palette, filtering and wrapping. */
+    DrawState            state;                      /**< Complete requested draw state. */
+    BoundState           bound;                      /**< Resolved dynamic state copied by value. */
+    PushConstants        push = {};                  /**< Packed push state with actual three bound record indices. */
+    bool                 dynamic_color_mask = false; /**< Device honors the dynamic color mask. */
+    uint32_t             resolved_color_mask = 0;    /**< Actual channel mask, including static fallback. */
+    uint64_t             color_image = 0;            /**< Opaque actual color image identity. */
+    uint64_t             depth_image = 0;            /**< Opaque actual depth image identity, or absent. */
+    uint32_t             color_format = 0;           /**< Actual color attachment format. */
+    uint32_t             depth_format = 0;           /**< Actual depth attachment format, or undefined. */
+    std::array<float, 6> viewport = {};              /**< Actual x/y/width/height/minDepth/maxDepth viewport. */
+};
+
 enum PushFlags : uint32_t {
     kPushFog = 1u << 0,
     kPushTexa = 1u << 1,
@@ -536,6 +863,56 @@ inline constexpr uint32_t kDepthPlanesScope = UINT32_MAX - 5;
 inline constexpr uint32_t kZeroAlphaNoopScope = UINT32_MAX - 6;
 inline constexpr uint32_t kProg0NearSafeFogAlphaScope = UINT32_MAX - 7;
 inline constexpr uint32_t kProg0NearSafeFogBlendScope = UINT32_MAX - 8;
+/** Identifies the exact source-alpha additive rigid Prog0 fog specialization. */
+inline constexpr uint32_t kProg0NearSafeFogAdditiveScope = UINT32_MAX - 9;
+/** Identifies rigid Prog0 exact mode1 fog evaluation. */
+inline constexpr uint32_t kProg0Mode1FogScope = UINT32_MAX - 10;
+/** Identifies exact black input on the additive near-safe fog pipeline. */
+inline constexpr uint32_t kProg0NearSafeFogAdditiveBlackScope = UINT32_MAX - 11;
+/** Identifies exact black input on the additive mode1 fog pipeline. */
+inline constexpr uint32_t kProg0Mode1FogBlackScope = UINT32_MAX - 12;
+
+/**
+ * Identifies constant zero source output with unchanged rigid Prog0 rasterization.
+ */
+inline constexpr uint32_t kProg0ZeroSourceAlphaScope = UINT32_MAX - 13;
+
+/**
+ * Identifies actual-varying guarded zero output on the existing black mode1 pipeline.
+ */
+inline constexpr uint32_t kProg0GuardedZeroSourceAlphaScope = UINT32_MAX - 14;
+/** Selects shared smooth RGB for the additive near-safe black sibling. */
+inline constexpr uint32_t kProg0NearSafeFogSharedRgbScope = UINT32_MAX - 15;
+/** Selects shared smooth RGB for the mode1 black sibling. */
+inline constexpr uint32_t kProg0Mode1FogSharedRgbScope = UINT32_MAX - 16;
+/** Selects shared smooth RGB for the guarded zero-output sibling. */
+inline constexpr uint32_t kProg0GuardedZeroSharedRgbScope = UINT32_MAX - 17;
+/** Identifies alpha-write-only near-safe work with the original fragment shader. */
+inline constexpr uint32_t kProg0NearSafeRgbMaskScope = UINT32_MAX - 18;
+/** Identifies alpha-write-only mode1 work with the original fragment shader. */
+inline constexpr uint32_t kProg0Mode1RgbMaskScope = UINT32_MAX - 19;
+/** Identifies sampled-alpha-only near-safe work. */
+inline constexpr uint32_t kProg0NearSafeAlphaOnlyScope = UINT32_MAX - 20;
+/** Identifies sampled-alpha-only mode1 work. */
+inline constexpr uint32_t kProg0Mode1AlphaOnlyScope = UINT32_MAX - 21;
+/** Identifies the guarded predicate's no-write classifier sidecar. */
+inline constexpr uint32_t kProg0GuardClassifierScope = UINT32_MAX - 22;
+/** Shared-input near-safe fog with rigid unlit vertex evaluation. */
+inline constexpr uint32_t kProg0NearSafeUnlitVertexScope = UINT32_MAX - 23;
+/** Shared-input mode1 fog with rigid unlit vertex evaluation. */
+inline constexpr uint32_t kProg0Mode1UnlitVertexScope = UINT32_MAX - 24;
+/** Shared-input guarded zero with rigid unlit vertex evaluation. */
+inline constexpr uint32_t kProg0GuardedUnlitVertexScope = UINT32_MAX - 25;
+
+/**
+ * Selects an identity-bound diagnostic which deliberately suppresses matched RGB.
+ */
+enum class Prog0RgbCostMode : uint8_t {
+    Disabled,
+    Control,
+    WriteMask,
+    AlphaShader
+};
 
 /**
  * One coverage draw of a depth-planes pass.
@@ -572,6 +949,54 @@ enum AlphaVariant : uint32_t {
     kAlphaVariantCount,
 };
 
+/**
+ * Begins the total query for an eligible already-prepared retained draw.
+ */
+uint32_t BeginGuardedZeroSamples(uint32_t scope, MeshHandle mesh, uint32_t first, uint32_t count,
+                                 const TextureBinding &binding, const DrawState &state);
+/**
+ * Counts the exact guard arm with an adjacent no-write repeat and restores bindings.
+ */
+void EndGuardedZeroSamples(uint32_t token, uint32_t index_count, uint32_t first_index);
+/**
+ * Carries actual retained replay provenance without observing any commands.
+ */
+void GuardedSampleOrigin(uint64_t list, uint64_t previous, double alpha);
+
+/**
+ * Summarizes a bounded execution without treating unavailable values as zero samples.
+ */
+struct GuardedSampleResult {
+    bool     attempted = false; /**< An eligible execution consumed this slot. */
+    bool     complete = false;  /**< Every pair is available and the execution is closed. */
+    bool     overflow = false;  /**< A draw exceeded the complete-execution budget. */
+    bool     cancelled = false; /**< A boundary or failed opening cancelled the execution. */
+    uint64_t begin = 0;         /**< Actual execution entry time. */
+    uint64_t total = 0;         /**< Valid total covered samples. */
+    uint64_t fast = 0;          /**< Valid fast-arm covered samples. */
+    uint64_t sidecars = 0;      /**< Adjacent classifier draws actually emitted. */
+    size_t   pairs = 0;         /**< Original/classifier query pairs. */
+};
+
+/**
+ * Copies precise-query readiness and four bounded execution summaries.
+ */
+struct GuardedSampleStats {
+    bool                               enabled = false;   /**< Supported instrumentation is active. */
+    bool                               supported = false; /**< Precise occlusion is supported by the device. */
+    bool                               owner = false;     /**< Opt-in CPU observation ownership exists. */
+    bool                               pool = false;      /**< Dedicated GPU query ownership exists. */
+    uint64_t                           epoch = 0;         /**< Current measurement generation. */
+    uint64_t                           errors = 0;        /**< Invalid queries or fast-greater-than-total results. */
+    uint64_t                           unavailable = 0;   /**< Explicitly finalized unavailable pairs. */
+    std::array<GuardedSampleResult, 4> executions{};      /**< Two attempts per canonical/replay role. */
+};
+
+/**
+ * Copies current probe state using only nonblocking query retrieval.
+ */
+GuardedSampleStats InspectGuardedZeroSamples();
+
 // Per-frame renderer work counts, plotted to the profiler when a frame closes.
 struct FrameCounters {
     uint32_t barriers = 0;
@@ -580,26 +1005,34 @@ struct FrameCounters {
     uint32_t draws_2d = 0;
     uint32_t bounded_presentation_regions = 0; /**< Scratch regions replayed with a proven smaller display rectangle. */
     uint32_t near_safe_prog0_fog = 0;          /**< Rigid Prog0 draws using proven vertex-fog reconstruction. */
+    uint32_t mode1_prog0_fog = 0;              /**< Rigid additive draws using exact mode1 fog evaluation. */
+    uint32_t black_prog0_fog = 0;              /**< Draws specializing the exact black fog RGB input. */
     uint32_t grab_copies = 0;
     uint32_t grab_precopies = 0;
     uint32_t descriptor_binds = 0;
     uint64_t transient_bytes = 0;
 };
 
+/**
+ * Owns optional bounded attachment-alpha diagnostic data.
+ */
+struct AttachmentAlphaTrace;
+
 struct Context {
-    SDL_Window                      *window = nullptr;
-    RendererConfig                   config;
-    uint32_t                         texture_slot_limit = kMaxTextures;
-    uint32_t                         mesh_slot_limit = kMaxMeshes;
-    VkInstance                       instance = VK_NULL_HANDLE;
-    VkDebugUtilsMessengerEXT         messenger = VK_NULL_HANDLE;
-    VkSurfaceKHR                     surface = VK_NULL_HANDLE;
-    VkPhysicalDevice                 physical_device = VK_NULL_HANDLE;
-    VkPhysicalDeviceProperties       properties = {};
-    VkPhysicalDeviceMemoryProperties memory_properties = {};
-    VkDevice                         device = VK_NULL_HANDLE;
-    uint32_t                         queue_family = 0;
-    VkQueue                          queue = VK_NULL_HANDLE;
+    std::shared_ptr<AttachmentAlphaTrace> alpha_trace; /**< Allocated only for the explicit diagnostic. */
+    SDL_Window                           *window = nullptr;
+    RendererConfig                        config;
+    uint32_t                              texture_slot_limit = kMaxTextures;
+    uint32_t                              mesh_slot_limit = kMaxMeshes;
+    VkInstance                            instance = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT              messenger = VK_NULL_HANDLE;
+    VkSurfaceKHR                          surface = VK_NULL_HANDLE;
+    VkPhysicalDevice                      physical_device = VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties            properties = {};
+    VkPhysicalDeviceMemoryProperties      memory_properties = {};
+    VkDevice                              device = VK_NULL_HANDLE;
+    uint32_t                              queue_family = 0;
+    VkQueue                               queue = VK_NULL_HANDLE;
     // D32_SFLOAT_S8_UINT, or D24_UNORM_S8_UINT where the former cannot be an attachment.
     VkFormat                      depth_format = VK_FORMAT_UNDEFINED;
     bool                          dynamic_color_write_mask = false;
@@ -650,15 +1083,37 @@ struct Context {
     PlaneTable                    plane_table;
     std::array<VkPipeline, 2>     near_safe_fog_pipelines = {};
     std::array<uint32_t, 2>       near_safe_fog_bases = {UINT32_MAX, UINT32_MAX};
-    std::array<VkPipeline, 2>     prog0_near_safe_fog_pipelines = {};                   /**< Exact fog variants for alpha-tested and blended rigid Prog0. */
-    std::array<uint32_t, 2>       prog0_near_safe_fog_bases = {UINT32_MAX, UINT32_MAX}; /**< Generic pipelines replaced by those variants. */
-    uint64_t                      prog0_fog_candidates = 0;                             /**< Draws matching the targeted fog and blend states. */
-    uint64_t                      prog0_fog_selected = 0;                               /**< Draws proven safe and submitted through an exact fog variant. */
-    uint64_t                      prog0_fog_unknown = 0;                                /**< Targeted draws without immutable position bounds. */
-    uint64_t                      prog0_fog_skinned = 0;                                /**< Targeted draws retaining the generic skin fog path. */
-    uint64_t                      prog0_fog_unsafe = 0;                                 /**< Targeted rigid draws without a complete numerical proof. */
-    VkPipeline                    zero_alpha_noop_pipeline = VK_NULL_HANDLE;            /**< Exact-zero discard for RGB-only source-over sprites. */
-    uint32_t                      zero_alpha_noop_base = UINT32_MAX;                    /**< Ordinary pipeline whose draw states permit exact-zero discard. */
+    std::array<VkPipeline, 3>     prog0_near_safe_fog_pipelines = {};                               /**< Exact fog variants for alpha-tested, source-over and additive rigid Prog0. */
+    std::array<uint32_t, 3>       prog0_near_safe_fog_bases = {UINT32_MAX, UINT32_MAX, UINT32_MAX}; /**< Generic pipelines replaced by those variants. */
+    VkPipeline                    prog0_mode1_fog_pipeline = VK_NULL_HANDLE;                        /**< Eager exact mode1 additive fog pipeline. */
+    uint32_t                      prog0_mode1_fog_base = UINT32_MAX;                                /**< Unchanged generic pipeline cloned by the mode1 variant. */
+    uint64_t                      prog0_mode1_fog_selected = 0;                                     /**< Lifetime draws selecting exact mode1 fog evaluation. */
+    VkPipeline                    prog0_near_safe_black_fog_pipeline = VK_NULL_HANDLE;              /**< Eager near-safe additive pipeline with exact black fog RGB. */
+    VkPipeline                    prog0_mode1_black_fog_pipeline = VK_NULL_HANDLE;                  /**< Eager mode1 additive pipeline with exact black fog RGB. */
+    uint64_t                      prog0_black_fog_selected = 0;                                     /**< Lifetime selections of exact black fog RGB siblings. */
+    VkPipeline                    prog0_zero_source_alpha_pipeline = VK_NULL_HANDLE;                /**< Eager constant-output sibling preserving additive alpha and depth writes. */
+    uint32_t                      prog0_zero_source_alpha_base = UINT32_MAX;                        /**< Exact generic base for the constant-output sibling. */
+    uint64_t                      prog0_zero_source_alpha_selected = 0;                             /**< Lifetime draws preserving coverage with a zero source value. */
+    VkPipeline                    prog0_guarded_zero_alpha_pipeline = VK_NULL_HANDLE;               /**< Eager black mode1 sibling with a bounded-varying zero-output arm. */
+    uint64_t                      prog0_guarded_zero_alpha_selected = 0;                            /**< Lifetime selections retaining the complete fallback shader. */
+    Prog0RgbCostMode              prog0_rgb_cost_mode = Prog0RgbCostMode::Disabled;                 /**< Explicit diagnostic mode. */
+    std::array<VkPipeline, 4>     prog0_rgb_cost_pipelines{};                                       /**< Mask and alpha-only siblings by fog family. */
+    std::array<uint64_t, 2>       prog0_rgb_cost_selected{};                                        /**< Identity-matched selections by fog family. */
+    uint64_t                      prog0_rgb_cost_candidates = 0;                                    /**< Ordinary shared-family qualification attempts. */
+    bool                          prog0_unlit_vertex = false; /**< Enables exact rigid unlit vertex evaluation. */
+    std::array<VkPipeline, 3> prog0_unlit_vertex_pipelines{}; /**< Shared near-safe, mode1 and guarded vertex siblings. */
+    std::array<uint64_t, 3> prog0_unlit_vertex_selected{}; /**< Lifetime selections by fragment family. */
+    bool                          prog0_shared_rgb = false;                                         /**< Enables equal-material smooth RGB input sharing. */
+    std::array<VkPipeline, 3>     prog0_shared_rgb_pipelines{};                                     /**< Near-safe, mode1 and guarded shared-input siblings. */
+    std::array<uint64_t, 3>       prog0_shared_rgb_selected{};                                      /**< Lifetime selections by shared-input family. */
+    bool                          prog0_fog_rejections = false;                                     /**< Enables bounded CPU-only rigid additive fog observations. */
+    uint64_t                      prog0_fog_candidates = 0;                                         /**< Draws matching the targeted fog and blend states. */
+    uint64_t                      prog0_fog_selected = 0;                                           /**< Draws proven safe and submitted through an exact fog variant. */
+    uint64_t                      prog0_fog_unknown = 0;                                            /**< Targeted draws without immutable position bounds. */
+    uint64_t                      prog0_fog_skinned = 0;                                            /**< Targeted draws retaining the generic skin fog path. */
+    uint64_t                      prog0_fog_unsafe = 0;                                             /**< Targeted rigid draws without a complete numerical proof. */
+    VkPipeline                    zero_alpha_noop_pipeline = VK_NULL_HANDLE;                        /**< Exact-zero discard for RGB-only source-over sprites. */
+    uint32_t                      zero_alpha_noop_base = UINT32_MAX;                                /**< Ordinary pipeline whose draw states permit exact-zero discard. */
     uint32_t                      blend_slot_count = 0;
     std::array<BlendMapping, 162> blend_map = {};
     double                        pipeline_seconds = 0.0;
@@ -708,6 +1163,16 @@ struct Context {
 
     FrameCounters counters;
     // FrameTimings GPU timestamps, two per frame slot; null until timing is first enabled or where unsupported.
+    bool        guarded_samples_requested = false;            /**< Explicit precise guarded-arm sample probe. */
+    bool        guarded_samples_supported = false;            /**< Physical precise occlusion support. */
+    bool        guarded_samples_enabled = false;              /**< Supported probe with valid prerequisites. */
+    VkQueryPool guarded_sample_pool = VK_NULL_HANDLE;         /**< Bounded dedicated occlusion query pool. */
+    VkPipeline  guarded_classifier_pipeline = VK_NULL_HANDLE; /**< Exact no-write guard classifier. */
+    bool        fragment_invocations_requested = false;       /**< Per-instance explicit fragment diagnostic request. */
+    bool        fragment_invocations_enabled = false;         /**< Supported query instrumentation with frame history enabled. */
+    bool        fragment_invocations_supported = false;       /**< Physical device supports pipeline statistics queries. */
+    bool        fragment_invocations_failed = false;          /**< Query pool creation failed for this lifetime. */
+    VkQueryPool fragment_invocation_pool = VK_NULL_HANDLE;    /**< Opt-in bounded pipeline statistics pool. */
     VkQueryPool timestamp_pool = VK_NULL_HANDLE;
     bool        timestamps_checked = false;
     uint64_t    timestamp_mask = 0;
@@ -751,7 +1216,8 @@ struct ThreadFlags {
     bool     in_async_job = false;
     uint32_t interpolation_tint = 0;
     // Set around the 2D draws of one depth-planes coverage: they select its pipeline and bounds.
-    const PlaneDraw *plane_draw = nullptr;
+    const PlaneDraw     *plane_draw = nullptr;
+    FragmentReplayOrigin fragment_origin; /**< Render-owner replay origin restored across nested and direct calls. */
 };
 
 extern thread_local ThreadFlags tls;
@@ -894,6 +1360,11 @@ const DisplayList *RecordingList();
 // draw.cpp
 void EndRendering();
 // Ends a KZ_GPU_SCOPES segment with a timestamp while scopes are recorded at level or finer.
+/**
+ * Begins a bounded counter query immediately before one retained mesh draw.
+ */
+uint32_t BeginFragmentInvocation(VkCommandBuffer cmd, FragmentInvocationObservation observation);
+
 void MarkGpuScope(VkCommandBuffer cmd, GpuScopeKind kind, uint32_t target, uint32_t pipeline = UINT32_MAX);
 
 inline bool GpuScopes(uint32_t level) { return g.scopes_open && g.gpu_scopes >= level; }
