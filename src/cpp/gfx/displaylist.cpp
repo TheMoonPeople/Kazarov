@@ -1,18 +1,27 @@
 #include "gfx/displaylist.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory_resource>
+#include <mutex>
 #include <optional>
+#include <stop_token>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
 #include "gfx/alpha_trace.hpp"
 #include "gfx/context.hpp"
@@ -1837,6 +1846,122 @@ const Prog0Palette *ReplayPalette(const MeshEntry &entry, const DisplayList &lis
     return palette;
 }
 
+/**
+ * Interpolates the next display frame on another core while the canonical render uses this one.
+ *
+ * Interpolation only reads both lists and fills its own overrides, so it can overlap the canonical replay of the
+ * same list. A render that wants anything else waits for the job first, since matching shares state between lists.
+ */
+class InterpolationWorker {
+public:
+    /**
+     * Starts interpolating a pair when the worker is enabled and idle.
+     */
+    void Prepare(DisplayListRef list, DisplayListRef previous, float alpha) {
+        if (!Enabled() || !list || !previous || list->instance != g.renderer_instance ||
+            previous->instance != g.renderer_instance || list->cut || !(alpha < 1.0f)) {
+            return;
+        }
+        std::unique_lock lock(mutex);
+        idle.wait(lock, [this] { return !running; });
+        job_list = std::move(list);
+        job_previous = std::move(previous);
+        job_alpha = alpha;
+        running = true;
+        ready = false;
+        if (!thread.joinable()) {
+            thread = std::jthread([this](const std::stop_token &stop) { Run(stop); });
+        }
+        wake.notify_all();
+    }
+
+    /**
+     * Hands over the finished overrides of exactly this pair, waiting for them if they are running.
+     */
+    bool Take(const DisplayList &list, const DisplayList &previous, float alpha, Overrides &out) {
+        std::unique_lock lock(mutex);
+        idle.wait(lock, [this] { return !running; });
+        const bool matches = ready && job_list.get() == &list && job_previous.get() == &previous && job_alpha == alpha;
+        if (matches) {
+            std::swap(out, result);
+        }
+        ready = false;
+        job_list.reset();
+        job_previous.reset();
+        return matches;
+    }
+
+private:
+    static bool Enabled() {
+        static const bool enabled = [] {
+            const char *setting = std::getenv("KZ_INTERPOLATION_WORKER");
+#ifdef __SWITCH__
+            return setting == nullptr || std::strcmp(setting, "0") != 0;
+#else
+            return setting != nullptr && std::strcmp(setting, "1") == 0;
+#endif
+        }();
+        return enabled;
+    }
+
+    void Run(const std::stop_token &stop) {
+#ifdef __SWITCH__
+        // Core 0 holds neither the game nor the render thread; audio sharing it runs first.
+        svcSetThreadCoreMask(threadGetCurHandle(), 0, 1 << 0);
+        s32 priority = 0;
+        if (R_SUCCEEDED(svcGetThreadPriority(&priority, threadGetCurHandle()))) {
+            svcSetThreadPriority(threadGetCurHandle(), priority + 1);
+        }
+#endif
+        std::unique_lock lock(mutex);
+        while (!stop.stop_requested()) {
+            wake.wait(lock, stop, [this] { return running; });
+            if (!running) {
+                continue;
+            }
+            const DisplayListRef list = job_list;
+            const DisplayListRef previous = job_previous;
+            const float          alpha = job_alpha;
+            lock.unlock();
+            result.Clear();
+            Interpolated(*list, *previous, std::max(alpha, 0.0f), result);
+            lock.lock();
+            running = false;
+            ready = true;
+            idle.notify_all();
+        }
+    }
+
+    std::mutex                  mutex;            /**< Guards the job's state. */
+    std::condition_variable_any wake;             /**< Tells the worker a job arrived. */
+    std::condition_variable     idle;             /**< Tells waiters the job finished. */
+    DisplayListRef              job_list;         /**< Newer list of the pair. */
+    DisplayListRef              job_previous;     /**< Older list of the pair. */
+    float                       job_alpha = 1.0f; /**< Position between the lists. */
+    bool                        running = false;  /**< Whether the worker holds a job. */
+    bool                        ready = false;    /**< Whether result holds the job's overrides. */
+    Overrides                   result;           /**< Overrides of the finished job. */
+    std::jthread                thread;           /**< Runs the jobs; last member, stopping first. */
+};
+
+InterpolationWorker g_interpolation_worker;
+
+/**
+ * Accepts a big alpha-tested mesh, whose own layers would otherwise all shade before depth rejects them.
+ */
+bool AlphaPrepassDraw(const MeshEntry &e, const DrawState &state) {
+    static const uint32_t min_indices = [] {
+        const char *setting = std::getenv("KZ_ALPHA_PREPASS_INDICES");
+#ifdef __SWITCH__
+        return setting != nullptr ? static_cast<uint32_t>(std::atoi(setting)) : 500u;
+#else
+        return setting != nullptr ? static_cast<uint32_t>(std::atoi(setting)) : 0u;
+#endif
+    }();
+    return min_indices != 0 && e.index_count >= min_indices && state.alpha_test && state.alpha_func == AlphaFunc::GEqual &&
+           state.alpha_ref != 0 && state.depth_write && !state.stencil_test && state.color_write_mask == kWriteRgba;
+}
+
 void ReplayMesh(const MeshEntry &e, const DisplayList &list, bool canonical, const Overrides *overrides,
                 const DrawState &state) {
     /**
@@ -1869,6 +1994,18 @@ void ReplayMesh(const MeshEntry &e, const DisplayList &list, bool canonical, con
     TextureBinding        binding = GrabbedBinding(e.binding, canonical);
     if (e.mesh != kNullMesh) {
         if (prog0 != nullptr) {
+            if (AlphaPrepassDraw(e, state)) {
+                // Alpha-tested fragments shade before depth rejects them; this leaves only the nearest to shade.
+                DrawState depth_state = state;
+                depth_state.color_write_mask = 0;
+                depth_state.blend = false;
+                depth_state.fog = false;
+                DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, depth_state, nullptr, palette);
+                DrawState color_state = state;
+                color_state.depth_write = false;
+                DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, color_state, nullptr, palette);
+                return;
+            }
             DrawMeshProg0(e.mesh, e.first_index, e.index_count, *constants, *prog0, binding, state, nullptr, palette);
         } else {
             DrawMesh(e.mesh, e.first_index, e.index_count, *constants, binding, state);
@@ -1889,7 +2026,11 @@ void ReplayMesh(const MeshEntry &e, const DisplayList &list, bool canonical, con
 bool OcclusionPrepassEnabled() {
     static const bool enabled = [] {
         const char *value = std::getenv("KZ_OCCLUSION_PREPASS");
+#ifdef __SWITCH__
+        return value == nullptr || std::strcmp(value, "0") != 0;
+#else
         return value != nullptr && std::strcmp(value, "1") == 0;
+#endif
     }();
     return enabled;
 }
@@ -2041,6 +2182,8 @@ void DrawOccluderDepth(const OcclusionPlan &plan, const DisplayList &list, bool 
  * Shares one proven source rectangle between a presentation group's clear and every composite.
  */
 struct PresentationCoverage {
+    std::vector<LogicalRect> parts;               /**< Padded screen rectangles of the meshes the region drew. */
+    bool                     parts_valid = false; /**< Whether parts covers everything the region drew. */
     LogicalRect rect = {};
     LogicalRect clear_rect = {};
     bool        bounded = false;
@@ -2145,7 +2288,8 @@ bool RegionCompositeEligible(const Draw2DEntry &draw, const PresentationRegion &
     }
     const DrawState &state = draw.presentation_state;
     if (draw.primitive != Primitive::Quads || draw.presentation_vertices.size() != 4 ||
-        state.depth_test != DepthTest::Always || state.depth_write || state.stencil_test ||
+        (state.depth_test != DepthTest::Always && (state.depth_test != DepthTest::GEqual || draw.region_alpha_reset)) ||
+        state.depth_write || state.stencil_test ||
         state.cull != CullMode::None ||
         (state.alpha_test && state.alpha_func != AlphaFunc::Always && !(state.alpha_func == AlphaFunc::GEqual && state.alpha_ref == 0))) {
         return false;
@@ -2181,7 +2325,7 @@ bool RegionCompositeEligible(const Draw2DEntry &draw, const PresentationRegion &
 /**
  * Resolves immutable geometry with the matrices and bone palettes used by this display replay.
  */
-std::vector<PresentationCoverage> ResolvePresentationCoverage(const DisplayList &list, const Overrides *overrides) {
+std::vector<PresentationCoverage> ResolvePresentationCoverage(const DisplayList &list, const Overrides *overrides, bool large_only = false) {
     const size_t count = list.presentation_regions.size();
     if (count == 0) {
         return {};
@@ -2209,6 +2353,28 @@ std::vector<PresentationCoverage> ResolvePresentationCoverage(const DisplayList 
                    std::isfinite(region.extent.x) && std::isfinite(region.extent.y) &&
                    std::isfinite(region.extent.w) && std::isfinite(region.extent.h) &&
                    region.extent.w > 0.0f && region.extent.h > 0.0f;
+    }
+    if (large_only) {
+        // Bounding a region's meshes costs more than tiling a small object's copies could save.
+        std::vector<bool> large(count, false);
+        bool              any = false;
+        constexpr float   kLargeShare = 0.1f;
+        const float       large_area = kLargeShare * static_cast<float>(g.config.logical_width) * static_cast<float>(g.config.logical_height);
+        for (const Entry &entry : list.entries) {
+            const auto *draw = std::get_if<Draw2DEntry>(&entry);
+            if (draw != nullptr && draw->presentation_region >= 0 && static_cast<size_t>(draw->presentation_region) < count &&
+                draw->vertices.size() == 4 &&
+                (draw->vertices[2].x - draw->vertices[0].x) * (draw->vertices[2].y - draw->vertices[0].y) >= large_area) {
+                large[static_cast<size_t>(draw->presentation_region)] = true;
+                any = true;
+            }
+        }
+        if (!any) {
+            return coverage;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            valid[i] = valid[i] && large[i];
+        }
     }
     std::unordered_set<MeshHandle> updated;
     for (const Entry &entry : list.entries) {
@@ -2279,6 +2445,7 @@ std::vector<PresentationCoverage> ResolvePresentationCoverage(const DisplayList 
             invalidate(index, CoverageFailure::Projection);
             continue;
         }
+        coverage[index].parts.push_back(*bounds);
         if (!seen[index]) {
             coverage[index].rect = *bounds;
             seen[index] = true;
@@ -2306,6 +2473,10 @@ std::vector<PresentationCoverage> ResolvePresentationCoverage(const DisplayList 
         const float gutter_y = 1.0f / region.mapping.scale_y;
         const float padding_x = std::max(region.padding, gutter_x);
         const float padding_y = std::max(region.padding, gutter_y);
+        for (LogicalRect &part : coverage[i].parts) {
+            part = {part.x - padding_x, part.y - padding_y, part.w + 2.0f * padding_x, part.h + 2.0f * padding_y};
+        }
+        coverage[i].parts_valid = true;
         const float left = std::clamp(std::floor(bounds.x - padding_x), region.extent.x, region.extent.x + region.extent.w);
         const float top = std::clamp(std::floor(bounds.y - padding_y), region.extent.y, region.extent.y + region.extent.h);
         const float right = std::clamp(std::ceil(bounds.x + bounds.w + padding_x), region.extent.x, region.extent.x + region.extent.w);
@@ -2325,6 +2496,75 @@ std::vector<PresentationCoverage> ResolvePresentationCoverage(const DisplayList 
                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
     }
     return coverage;
+}
+
+bool OutlineTilesEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_OUTLINE_TILES");
+#ifdef __SWITCH__
+        return setting == nullptr || std::strcmp(setting, "0") != 0;
+#else
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+#endif
+    }();
+    return enabled;
+}
+
+/**
+ * Cuts an offset copy of a region's image down to the grid cells its meshes touch.
+ *
+ * Everywhere else the image is empty, so a copy there would shade and blend nothing.
+ */
+void TileRegionCopy(std::span<const Vertex2D> quad, const std::vector<LogicalRect> &parts, std::vector<Vertex2D> &out) {
+    constexpr float kCell = 16.0f;
+    out.clear();
+    const float left = quad[0].u;
+    const float top = quad[0].v;
+    const float dx = quad[0].x - quad[0].u;
+    const float dy = quad[0].y - quad[0].v;
+    const auto  columns = static_cast<int>(std::ceil((quad[2].u - left) / kCell));
+    const auto  rows = static_cast<int>(std::ceil((quad[2].v - top) / kCell));
+    if (columns <= 0 || rows <= 0 || columns > 512 || rows > 512) {
+        return;
+    }
+    static thread_local std::vector<uint8_t> cells;
+    cells.assign(static_cast<size_t>(columns) * rows, 0);
+    for (const LogicalRect &part : parts) {
+        const int x0 = std::max(0, static_cast<int>(std::floor((part.x - left) / kCell)));
+        const int y0 = std::max(0, static_cast<int>(std::floor((part.y - top) / kCell)));
+        const int x1 = std::min(columns - 1, static_cast<int>(std::floor((part.x + part.w - left) / kCell)));
+        const int y1 = std::min(rows - 1, static_cast<int>(std::floor((part.y + part.h - top) / kCell)));
+        for (int y = y0; y <= y1; ++y) {
+            std::fill_n(cells.begin() + y * columns + std::max(x0, 0), std::max(x1 - x0 + 1, 0), uint8_t{1});
+        }
+    }
+    const float right = quad[2].u;
+    const float bottom = quad[2].v;
+    Vertex2D    vertex = quad[0];
+    for (int y = 0; y < rows; ++y) {
+        for (int x = 0; x < columns; ++x) {
+            if (cells[static_cast<size_t>(y) * columns + x] == 0) {
+                continue;
+            }
+            const int start = x;
+            while (x + 1 < columns && cells[static_cast<size_t>(y) * columns + x + 1] != 0) {
+                ++x;
+            }
+            const float u0 = left + static_cast<float>(start) * kCell;
+            const float u1 = std::min(right, left + static_cast<float>(x + 1) * kCell);
+            const float v0 = top + static_cast<float>(y) * kCell;
+            const float v1 = std::min(bottom, top + static_cast<float>(y + 1) * kCell);
+            for (const auto &[u, v] : std::array<std::pair<float, float>, 4>{
+                     {{u0, v0}, {u1, v0}, {u1, v1}, {u0, v1}}
+            }) {
+                vertex.u = u;
+                vertex.v = v;
+                vertex.x = u + dx;
+                vertex.y = v + dy;
+                out.push_back(vertex);
+            }
+        }
+    }
 }
 
 /**
@@ -2525,6 +2765,429 @@ void RecordAlphaFootprint(const AlphaFootprint &footprint) {
     started = now;
 }
 
+bool AdditiveLayerEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_ADDITIVE_LAYER");
+#ifdef __SWITCH__
+        return setting == nullptr || std::strcmp(setting, "0") != 0;
+#else
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+#endif
+    }();
+    return enabled;
+}
+
+// Screens of bounding-box coverage below which the copy and composite cost more than the smaller raster saves.
+constexpr float kAdditiveLayerMinScreens = 1.0f;
+// Screens below which a kind of draw stays at full resolution, not repaying its composite.
+constexpr float kAdditiveLayerSmallScreens = 0.25f;
+// The layer's size against the main target's, per axis. Its blasts are soft, so little of the detail shows.
+constexpr float kAdditiveLayerDivisor = 3.0f;
+// Draws an additive run may pull ahead of itself, such as the solid body of an explosion between its flashes.
+constexpr size_t kAdditiveLayerMaxPulled = 4;
+
+/**
+ * One stretch of the replay order whose additive draws go to the low-resolution layer.
+ */
+struct AdditiveRun {
+    size_t begin = 0;           /**< Step of the first additive draw. */
+    size_t end = 0;             /**< Step of the last additive draw. */
+    bool   subtract = false;    /**< Whether the layer takes light away instead of adding it. */
+    bool   reuse_depth = false; /**< Whether the layer's depth already holds this group's copy. */
+};
+
+/**
+ * The replay order of a list and its additive runs; an empty order is the list's own.
+ */
+struct AdditiveLayerPlan {
+    std::vector<uint32_t>    order;
+    std::vector<AdditiveRun> runs;
+};
+
+bool ReadsMain(TextureHandle texture) {
+    return texture == kMainTarget || texture == kPreviousFrame;
+}
+
+/**
+ * Accepts a draw that adds its source to the target, or takes it away, independent of what else was drawn.
+ */
+bool AdditiveLayerDraw(const MeshEntry &e, bool subtract) {
+    const DrawState &state = e.state;
+    return e.presentation_region < 0 && state.blend && state.alpha.a == (subtract ? 2 : 0) && state.alpha.b == (subtract ? 0 : 2) &&
+           state.alpha.c == 0 && state.alpha.d == 1 && !state.depth_write && !state.stencil_test && !state.scissor &&
+           !state.screen_space && !ReadsMain(e.binding.texture);
+}
+
+/**
+ * Estimates the share of the frame a mesh's bounding box covers.
+ */
+float MeshScreenCoverage(const MeshEntry &e, const Overrides *overrides) {
+    const Mesh *mesh = e.mesh != kNullMesh ? LookupMesh(e.mesh) : nullptr;
+    if (e.mesh != kNullMesh && (mesh == nullptr || !mesh->bounds_known)) {
+        return 0.0f;
+    }
+    std::array<float, 3> bounds_min = {INFINITY, INFINITY, INFINITY};
+    std::array<float, 3> bounds_max = {-INFINITY, -INFINITY, -INFINITY};
+    if (mesh != nullptr) {
+        bounds_min = mesh->bounds_min;
+        bounds_max = mesh->bounds_max;
+    } else {
+        if (e.vertices.empty()) {
+            return 0.0f;
+        }
+        for (const Vertex3D &vertex : e.vertices) {
+            for (size_t axis = 0; axis < bounds_min.size(); ++axis) {
+                bounds_min[axis] = std::min(bounds_min[axis], vertex.position[axis]);
+                bounds_max[axis] = std::max(bounds_max[axis], vertex.position[axis]);
+            }
+        }
+    }
+    const MeshConstants &constants = overrides != nullptr && overrides->index[e.record] >= 0
+                                         ? overrides->constants[overrides->index[e.record]]
+                                         : e.constants;
+    const float         *m = constants.mvp;
+    float                low[2] = {1.0f, 1.0f};
+    float                high[2] = {-1.0f, -1.0f};
+    for (int corner = 0; corner < 8; ++corner) {
+        const float x = (corner & 1) != 0 ? bounds_max[0] : bounds_min[0];
+        const float y = (corner & 2) != 0 ? bounds_max[1] : bounds_min[1];
+        const float z = (corner & 4) != 0 ? bounds_max[2] : bounds_min[2];
+        const float w = m[3] * x + m[7] * y + m[11] * z + m[15];
+        // A box crossing the camera plane can fill the frame.
+        if (w <= 0.001f) {
+            return 1.0f;
+        }
+        const float clip_x = (m[0] * x + m[4] * y + m[8] * z + m[12]) / w;
+        const float clip_y = (m[1] * x + m[5] * y + m[9] * z + m[13]) / w;
+        low[0] = std::min(low[0], clip_x);
+        low[1] = std::min(low[1], clip_y);
+        high[0] = std::max(high[0], clip_x);
+        high[1] = std::max(high[1], clip_y);
+    }
+    const float width = std::clamp(high[0], -1.0f, 1.0f) - std::clamp(low[0], -1.0f, 1.0f);
+    const float height = std::clamp(high[1], -1.0f, 1.0f) - std::clamp(low[1], -1.0f, 1.0f);
+    return width * height / 4.0f;
+}
+
+/**
+ * Reports whether a 2D draw replaces the alpha of the whole main target.
+ */
+bool ReplacesMainAlpha(const Draw2DEntry &e) {
+    if (e.state.blend || e.presentation_only || (e.state.color_write_mask & kWriteAlpha) == 0 || e.vertices.empty() ||
+        e.primitive == Primitive::Lines || e.primitive == Primitive::LineStrip) {
+        return false;
+    }
+    float left = e.vertices[0].x;
+    float top = e.vertices[0].y;
+    float right = left;
+    float bottom = top;
+    for (const Vertex2D &vertex : e.vertices) {
+        left = std::min(left, vertex.x);
+        top = std::min(top, vertex.y);
+        right = std::max(right, vertex.x);
+        bottom = std::max(bottom, vertex.y);
+    }
+    return CoversLogicalFrame({left, top, right - left, bottom - top});
+}
+
+/**
+ * Reports whether nothing can read the main target's alpha after an entry.
+ */
+bool MainAlphaOverwrittenAfter(const DisplayList &list, size_t from) {
+    TextureHandle target = kMainTarget;
+    for (size_t index = from + 1; index < list.entries.size(); ++index) {
+        const Entry &entry = list.entries[index];
+        if (const auto *change = std::get_if<TargetEntry>(&entry)) {
+            target = change->target;
+        } else if (const auto *copy = std::get_if<CopyEntry>(&entry)) {
+            if (ReadsMain(copy->src)) {
+                return false;
+            }
+        } else if (const auto *clear = std::get_if<ClearEntry>(&entry)) {
+            if (target == kMainTarget && clear->color && (!clear->has_rect || CoversLogicalFrame(clear->rect))) {
+                return true;
+            }
+        } else if (const auto *mesh = std::get_if<MeshEntry>(&entry)) {
+            if (ReadsMain(mesh->binding.texture) || (target == kMainTarget && mesh->state.blend && mesh->state.alpha.c == 1)) {
+                return false;
+            }
+        } else if (const auto *draw = std::get_if<Draw2DEntry>(&entry)) {
+            if (ReadsMain(draw->binding.texture) || (target == kMainTarget && draw->state.blend && draw->state.alpha.c == 1)) {
+                return false;
+            }
+            if (target == kMainTarget && ReplacesMainAlpha(*draw)) {
+                return true;
+            }
+        }
+    }
+    // Nothing in the list reads it; a later grab of the finished frame sees the alpha from before the layer.
+    return true;
+}
+
+/**
+ * Reports whether anything after a copy samples its destination's alpha or copies it onward.
+ */
+bool CopiedAlphaUsed(const DisplayList &list, size_t copy_index, TextureHandle destination) {
+    const auto samples = [destination](const TextureBinding &binding) { return binding.texture == destination && !binding.ignore_alpha; };
+    for (size_t index = copy_index + 1; index < list.entries.size(); ++index) {
+        const Entry &entry = list.entries[index];
+        if (const auto *copy = std::get_if<CopyEntry>(&entry)) {
+            if (copy->src == destination) {
+                return true;
+            }
+        } else if (const auto *mesh = std::get_if<MeshEntry>(&entry)) {
+            if (samples(mesh->binding)) {
+                return true;
+            }
+        } else if (const auto *draw = std::get_if<Draw2DEntry>(&entry)) {
+            if (samples(draw->binding)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Reports whether a display render may skip the alpha resets that nothing reads afterwards.
+ */
+bool DeadAlphaResetsEnabled() {
+    static const bool enabled = [] {
+        const char *setting = std::getenv("KZ_DEAD_ALPHA_RESETS");
+#ifdef __SWITCH__
+        return setting == nullptr || std::strcmp(setting, "0") != 0;
+#else
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+#endif
+    }();
+    return enabled;
+}
+
+/**
+ * Finds the first entry after which nothing reads the main target's alpha; a list that never stops reports its size.
+ *
+ * The main target becomes the next frame's previous frame, so a list that samples that frame's alpha keeps its own.
+ */
+size_t FirstDeadMainAlpha(const DisplayList &list) {
+    const auto samples_previous = [](const TextureBinding &binding) { return binding.texture == kPreviousFrame && !binding.ignore_alpha; };
+    for (size_t index = 0; index < list.entries.size(); ++index) {
+        const Entry &entry = list.entries[index];
+        const auto  *copy = std::get_if<CopyEntry>(&entry);
+        const auto  *mesh = std::get_if<MeshEntry>(&entry);
+        const auto  *draw = std::get_if<Draw2DEntry>(&entry);
+        if ((copy != nullptr && copy->src == kPreviousFrame && CopiedAlphaUsed(list, index, copy->dst)) ||
+            (mesh != nullptr && samples_previous(mesh->binding)) || (draw != nullptr && samples_previous(draw->binding))) {
+            return list.entries.size();
+        }
+    }
+    size_t        last = list.entries.size();
+    TextureHandle target = kMainTarget;
+    for (size_t index = 0; index < list.entries.size(); ++index) {
+        const Entry &entry = list.entries[index];
+        if (const auto *change = std::get_if<TargetEntry>(&entry)) {
+            target = change->target;
+        } else if (const auto *copy = std::get_if<CopyEntry>(&entry)) {
+            last = ReadsMain(copy->src) && CopiedAlphaUsed(list, index, copy->dst) ? index : last;
+        } else if (const auto *mesh = std::get_if<MeshEntry>(&entry)) {
+            last = ReadsMain(mesh->binding.texture) || (target == kMainTarget && mesh->state.blend && mesh->state.alpha.c == 1) ? index : last;
+        } else if (const auto *draw = std::get_if<Draw2DEntry>(&entry)) {
+            last = ReadsMain(draw->binding.texture) || (target == kMainTarget && draw->state.blend && draw->state.alpha.c == 1) ? index : last;
+        }
+    }
+    return last == list.entries.size() ? 0 : last + 1;
+}
+
+/**
+ * Finds the runs of large additive draws whose alpha nothing reads, and orders each ahead of its layer composite.
+ */
+AdditiveLayerPlan PlanAdditiveLayers(const DisplayList &list, const Overrides *overrides) {
+    AdditiveLayerPlan plan;
+    if (!AdditiveLayerEnabled() || !g.depth_blit) {
+        return plan;
+    }
+
+    struct Candidate {
+        std::vector<uint32_t> adds;
+        std::vector<uint32_t> subtracts;
+        std::vector<uint32_t> pulled;
+        std::vector<uint32_t> trailing;
+        float                 add_screens = 0.0f;
+        float                 subtract_screens = 0.0f;
+        uint32_t              first = 0;
+        uint32_t              last = 0;
+
+        [[nodiscard]] bool Empty() const { return adds.empty() && subtracts.empty(); }
+    };
+
+    std::vector<Candidate> accepted;
+    Candidate              current;
+    const auto             close = [&] {
+        if (!current.Empty() && current.add_screens + current.subtract_screens >= kAdditiveLayerMinScreens &&
+            MainAlphaOverwrittenAfter(list, current.last)) {
+            // A kind too small to repay a composite keeps full resolution, ahead of the layer.
+            if (current.subtract_screens < kAdditiveLayerSmallScreens) {
+                current.pulled.insert(current.pulled.end(), current.subtracts.begin(), current.subtracts.end());
+                current.subtracts.clear();
+            }
+            if (current.add_screens < kAdditiveLayerSmallScreens) {
+                current.pulled.insert(current.pulled.end(), current.adds.begin(), current.adds.end());
+                current.adds.clear();
+            }
+            std::ranges::sort(current.pulled);
+            accepted.push_back(std::move(current));
+        }
+        current = {};
+    };
+    TextureHandle target = CurrentRenderTarget();
+    for (size_t index = 0; index < list.entries.size(); ++index) {
+        const Entry &entry = list.entries[index];
+        const auto  *mesh = std::get_if<MeshEntry>(&entry);
+        if (mesh == nullptr || target != kMainTarget) {
+            if (const auto *change = std::get_if<TargetEntry>(&entry)) {
+                target = change->target;
+            }
+            close();
+            continue;
+        }
+        const bool adds = AdditiveLayerDraw(*mesh, false);
+        const bool subtracts = AdditiveLayerDraw(*mesh, true);
+        if (adds || subtracts) {
+            if (current.Empty()) {
+                current.first = static_cast<uint32_t>(index);
+            }
+            current.last = static_cast<uint32_t>(index);
+            current.pulled.insert(current.pulled.end(), current.trailing.begin(), current.trailing.end());
+            current.trailing.clear();
+            (adds ? current.adds : current.subtracts).push_back(static_cast<uint32_t>(index));
+            (adds ? current.add_screens : current.subtract_screens) += MeshScreenCoverage(*mesh, overrides);
+        } else if (!current.Empty() && mesh->presentation_region < 0 && !ReadsMain(mesh->binding.texture) &&
+                   current.pulled.size() + current.trailing.size() < kAdditiveLayerMaxPulled) {
+            current.trailing.push_back(static_cast<uint32_t>(index));
+        } else {
+            close();
+        }
+    }
+    close();
+    if (accepted.empty()) {
+        return plan;
+    }
+    plan.order.reserve(list.entries.size());
+    uint32_t next = 0;
+    for (const Candidate &candidate : accepted) {
+        for (; next < candidate.first; ++next) {
+            plan.order.push_back(next);
+        }
+        plan.order.insert(plan.order.end(), candidate.pulled.begin(), candidate.pulled.end());
+        const auto layer = [&](const std::vector<uint32_t> &draws, bool subtract, bool reuse_depth) {
+            if (!draws.empty()) {
+                const size_t begin = plan.order.size();
+                plan.order.insert(plan.order.end(), draws.begin(), draws.end());
+                plan.runs.push_back({begin, plan.order.size() - 1, subtract, reuse_depth});
+            }
+        };
+        layer(candidate.subtracts, true, false);
+        layer(candidate.adds, false, !candidate.subtracts.empty());
+        next = candidate.last + 1;
+    }
+    for (; next < list.entries.size(); ++next) {
+        plan.order.push_back(next);
+    }
+    return plan;
+}
+
+/**
+ * The low-resolution target, kept for reuse and remade when the main target's size changes.
+ */
+TextureHandle AdditiveLayerTarget(uint32_t &logical_width, uint32_t &logical_height) {
+    static TextureHandle layer = kNullTexture;
+    const LogicalMapping main = GetLogicalMapping(kMainTarget);
+    logical_width = static_cast<uint32_t>(std::ceil(static_cast<float>(main.pixel_width) / kAdditiveLayerDivisor / g.render_scale));
+    logical_height = static_cast<uint32_t>(std::ceil(static_cast<float>(main.pixel_height) / kAdditiveLayerDivisor / g.render_scale));
+    const std::optional<TextureInfo> info = GetTextureInfo(layer);
+    if (!info || info->width != logical_width || info->height != logical_height) {
+        if (info) {
+            DestroyTexture(layer);
+        }
+        layer = CreateRenderTarget(logical_width, logical_height, true, false, false);
+    }
+    return layer;
+}
+
+/**
+ * Redirects the draws that follow to the cleared layer, depth tested against the main target's depth so far.
+ */
+void BeginAdditiveLayer(bool reuse_depth) {
+    uint32_t            width = 0;
+    uint32_t            height = 0;
+    const TextureHandle layer = AdditiveLayerTarget(width, height);
+    if (layer == kNullTexture) {
+        return;
+    }
+    SetRenderTarget(layer);
+    constexpr uint8_t clear[4] = {0, 0, 0, 0};
+    Clear(true, clear, false, 0.0f);
+    if (reuse_depth) {
+        return;
+    }
+    const LogicalMapping main = GetLogicalMapping(kMainTarget);
+    CopyMainDepthToTarget({-main.offset_x / main.scale_x, -main.offset_y / main.scale_y,
+                           static_cast<float>(main.pixel_width) / main.scale_x,
+                           static_cast<float>(main.pixel_height) / main.scale_y});
+}
+
+/**
+ * Runs a new layer's setup and first depth copy, which would otherwise stall the frame showing the first additive effect.
+ */
+void PrewarmAdditiveLayer() {
+    if (!AdditiveLayerEnabled() || !g.depth_blit) {
+        return;
+    }
+    static TextureHandle prepared = kNullTexture;
+    uint32_t             width = 0;
+    uint32_t             height = 0;
+    if (const TextureHandle layer = AdditiveLayerTarget(width, height); layer != prepared) {
+        prepared = layer;
+        const TextureHandle target = CurrentRenderTarget();
+        BeginAdditiveLayer(false);
+        SetRenderTarget(target);
+    }
+}
+
+/**
+ * Adds the layer to the main target's colour, or takes it away.
+ */
+void EndAdditiveLayer(bool subtract) {
+    uint32_t            width = 0;
+    uint32_t            height = 0;
+    const TextureHandle layer = AdditiveLayerTarget(width, height);
+    if (layer == kNullTexture || CurrentRenderTarget() != layer) {
+        return;
+    }
+    SetRenderTarget(kMainTarget);
+    const LogicalMapping          main = GetLogicalMapping(kMainTarget);
+    const float                   left = -main.offset_x / main.scale_x;
+    const float                   top = -main.offset_y / main.scale_y;
+    const float                   right = left + static_cast<float>(main.pixel_width) / main.scale_x;
+    const float                   bottom = top + static_cast<float>(main.pixel_height) / main.scale_y;
+    const float                   u = static_cast<float>(width);
+    const float                   v = static_cast<float>(height);
+    const std::array<Vertex2D, 4> quad = {
+        Vertex2D{left,  top,    0.0f, 0.0f, 0.0f, {128, 128, 128, 128}},
+        Vertex2D{right, top,    0.0f, u,    0.0f, {128, 128, 128, 128}},
+        Vertex2D{right, bottom, 0.0f, u,    v,    {128, 128, 128, 128}},
+        Vertex2D{left,  bottom, 0.0f, 0.0f, v,    {128, 128, 128, 128}},
+    };
+    DrawState state;
+    state.blend = true;
+    state.alpha = {.a = static_cast<uint8_t>(subtract ? 2 : 0), .b = static_cast<uint8_t>(subtract ? 0 : 2), .c = 2, .d = 1, .fix = 0x80};
+    state.depth_test = DepthTest::Always;
+    state.color_write_mask = kWriteRgba & ~kWriteAlpha;
+    TextureBinding binding;
+    binding.texture = layer;
+    binding.filter = Filter::Linear;
+    Draw2DSided(Primitive::Quads, quad, binding, state, {});
+}
+
 void Replay(const DisplayList &list, bool canonical, const Overrides *overrides, bool host = false,
             bool tint = false, InterpKey suppressed_2d_key = 0) {
     AssertDeviceThread(__func__);
@@ -2545,13 +3208,21 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
         buckets.emplace();
     }
     const OcclusionPlan occlusion = PlanOcclusion(list, overrides);
-    const auto          presentation_coverage = !canonical ? ResolvePresentationCoverage(list, overrides) : std::vector<PresentationCoverage>{};
+    const auto          presentation_coverage = !canonical || OutlineTilesEnabled() ? ResolvePresentationCoverage(list, overrides, canonical) : std::vector<PresentationCoverage>{};
     AlphaFootprint      alpha_footprint;
     for (const auto &coverage : presentation_coverage) {
-        g.counters.bounded_presentation_regions += coverage.bounded ? 1u : 0u;
+        g.counters.bounded_presentation_regions += !canonical && coverage.bounded ? 1u : 0u;
     }
-    for (size_t index = 0; index < list.entries.size(); index++) {
+    const AdditiveLayerPlan additive_layers = PlanAdditiveLayers(list, overrides);
+    size_t                  additive_run = 0;
+    PrewarmAdditiveLayer();
+    const size_t dead_alpha_from = !canonical && DeadAlphaResetsEnabled() ? FirstDeadMainAlpha(list) : list.entries.size();
+    for (size_t step = 0; step < list.entries.size(); step++) {
+        const size_t index = additive_layers.order.empty() ? step : additive_layers.order[step];
         const Entry &entry = list.entries[index];
+        if (additive_run < additive_layers.runs.size() && additive_layers.runs[additive_run].begin == step) {
+            BeginAdditiveLayer(additive_layers.runs[additive_run].reuse_depth);
+        }
         AttachmentAlphaEntry(static_cast<uint32_t>(index));
         if (!occlusion.occluders.empty() && index == occlusion.start) {
             DrawOccluderDepth(occlusion, list, canonical, overrides);
@@ -2574,7 +3245,9 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                                                                    static_cast<size_t>(e.presentation_region) < presentation_coverage.size()
                                                                ? &presentation_coverage[static_cast<size_t>(e.presentation_region)]
                                                                : nullptr;
-                    if (e.region_alpha_reset && (coverage == nullptr || !coverage->bounded)) {
+                    // A reset only restores alpha for a later read, so past the last read it has nothing to protect.
+                    const bool alpha_dead = index >= dead_alpha_from;
+                    if (e.region_alpha_reset && (coverage == nullptr || !coverage->bounded || (alpha_dead && CurrentRenderTarget() == kMainTarget))) {
                         alpha_footprint.Invalidate(CurrentRenderTarget());
                         return;
                     }
@@ -2649,6 +3322,18 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                             ++alpha_footprint.unknown_resets;
                         }
                         alpha_footprint.Invalidate(CurrentRenderTarget());
+                    }
+                    // Only the copies: the body overwrites the region's alpha, which it must do everywhere.
+                    static thread_local std::vector<Vertex2D> tiled;
+                    if (OutlineTilesEnabled() && e.presentation_region >= 0 && !e.region_alpha_reset && !e.presentation_only &&
+                        static_cast<size_t>(e.presentation_region) < presentation_coverage.size() && vertices.size() == 4 &&
+                        (vertices[0].x != vertices[0].u || vertices[0].y != vertices[0].v) &&
+                        presentation_coverage[static_cast<size_t>(e.presentation_region)].parts_valid) {
+                        TileRegionCopy(vertices, presentation_coverage[static_cast<size_t>(e.presentation_region)].parts, tiled);
+                        if (tiled.empty()) {
+                            return;
+                        }
+                        vertices = tiled;
                     }
                     Draw2DSided(e.primitive, vertices, GrabbedBinding(e.binding, canonical), tested, side, nullptr,
                                 e.region_alpha_reset || (coverage != nullptr && coverage->bounded));
@@ -2735,6 +3420,10 @@ void Replay(const DisplayList &list, bool canonical, const Overrides *overrides,
                 }
             },
             entry);
+        if (additive_run < additive_layers.runs.size() && additive_layers.runs[additive_run].end == step) {
+            EndAdditiveLayer(additive_layers.runs[additive_run].subtract);
+            ++additive_run;
+        }
     }
     if (buckets) {
         buckets->Finish();
@@ -3401,6 +4090,10 @@ bool RenderCanonicalBeforeCommit(const DisplayList &next, const CanonicalImageTo
     return rendered;
 }
 
+void PrepareInterpolation(DisplayListRef list, DisplayListRef previous, float alpha) {
+    g_interpolation_worker.Prepare(std::move(list), std::move(previous), alpha);
+}
+
 bool RenderList(const DisplayList &list, float alpha, const RenderOptions &options) {
     KZ_PROFILE_ZONE("Kazarov RenderList");
     if (list.instance != g.renderer_instance || g.device == VK_NULL_HANDLE) {
@@ -3434,7 +4127,9 @@ bool RenderList(const DisplayList &list, float alpha, const RenderOptions &optio
         interpolate = interpolate && alpha < 1.0f && !list.cut;
         if (interpolate) {
             KZ_PROFILE_ZONE("Kazarov interpolate");
-            Interpolated(list, *options.previous, std::max(alpha, 0.0f), overrides);
+            if (!g_interpolation_worker.Take(list, *options.previous, alpha, overrides)) {
+                Interpolated(list, *options.previous, std::max(alpha, 0.0f), overrides);
+            }
         }
         const double preparation_ms = timing ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preparation_started).count() : 0.0;
         if (!OpenListFrame(false, options.present, list.needs_base, preparation_ms)) {

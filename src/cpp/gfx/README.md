@@ -577,7 +577,7 @@ renders one.
   towards or away from the eye must be left to `DrawState::cull`: the shadow volumes are recorded
   wound outwards and counted by a back-culled adding draw and a front-culled subtracting draw.
 
-- **Occlusion pre-pass** (`KZ_OCCLUSION_PREPASS=1`). From a list's full clear of the main depth to
+- **Occlusion pre-pass** (`KZ_OCCLUSION_PREPASS` set to `0` or `1` overrides the default, which is on for the Switch only). From a list's full clear of the main depth to
   its first entry other than a mesh, 2D draw or texture update, or its first stencil draw, the meshes
   whose colour and depth replace what lies behind them are drawn first into depth alone. They are
   depth-writing, GEqual or Always tested, unstenciled meshes that write all of colour, without an
@@ -585,6 +585,43 @@ renders one.
   Vu_prog0 lighting bound and an opaque texture keep at one or more. Draws in that span before the
   first occluder lie behind every occluder in drawing order, so those that test Always without
   writing depth test GEqual instead, and the hardware rejects what the occluders will cover.
+
+### Additive layer
+
+Replay can draw a large run of additive and subtractive meshes into a target a third of the main target's size per axis,
+depth tested against a copy of the main depth, and apply the result to the main target's colour. Those draws add or remove
+the same light whatever they follow, and a blast covering the screen several times costs far more than the copy and
+composite. A run qualifies with at least a screen of bounding-box coverage, no stencil, scissor or depth writes, and no later
+read of the main target's alpha in the list, since the layer leaves that alpha unwritten. Each run takes at most two layers
+sharing one depth copy, subtractive then additive. A kind with under a quarter of a screen stays at full resolution, and up
+to four other meshes between the draws replay ahead of the layers. The first replay after the target is made runs its
+setup and depth copy once, so the first effect does not stall. `KZ_ADDITIVE_LAYER` set to `0` or `1` overrides the default,
+which is on for the Switch only.
+
+### Alpha-tested depth prepass
+
+Fragments that can discard shade before depth rejects them, so a large alpha-tested mesh pays for every layer of its own
+overdraw. Replay draws such a mesh of at least `KZ_ALPHA_PREPASS_INDICES` indices (500 on the Switch, 0 and off elsewhere)
+to depth first, then colour with depth writes off, leaving only the nearest fragments to shade.
+
+### Interpolation worker
+
+`PrepareInterpolation` interpolates the next display frame on another core during the canonical render. It only reads both
+lists and fills its own overrides. A `RenderList` of exactly that pair takes the result; any other waits for the job and
+interpolates itself. The job runs on core 0, away from the game and render threads, at a lower priority than the audio
+sharing that core. `KZ_INTERPOLATION_WORKER` set to `0` or `1` overrides the default, which is on for the Switch only.
+
+### Outline composites
+
+A presentation region's offset copies draw only the 16-unit grid cells that overlap the padded screen rectangles of the
+meshes the region drew, since everywhere else samples empty texels. Their body keeps its full box, which overwrites the
+region's alpha. Canonical renders tile only regions whose copy box covers at least a tenth of the frame, where the savings
+repay bounding the meshes. `KZ_OUTLINE_TILES` set to `0` or `1` overrides the default, which is on for the Switch only.
+
+A display render skips a bounded region's alpha reset on the main target when no later entry of the list can read that
+alpha. Copies of the main target count as reads only if something samples the copy's alpha or copies it onward. The
+main target becomes the next frame's previous frame, so a list that samples the previous frame's alpha keeps every reset.
+`KZ_DEAD_ALPHA_RESETS` set to `0` or `1` overrides the default, which is on for the Switch only.
 
 ## Device
 

@@ -159,6 +159,9 @@ std::atomic<bool> g_game_frame_open{false};
 using TimingClock = std::chrono::steady_clock;
 
 std::atomic<bool>       g_timing_enabled{false};
+std::atomic<bool>       g_gpu_work_tracking{false};
+std::atomic<float>      g_recent_canonical_ms{0.0f};
+std::atomic<float>      g_recent_replay_ms{0.0f};
 std::mutex              g_timing_mutex;
 FrameTimings            g_timings;
 TimingClock::time_point g_last_present{};
@@ -2903,6 +2906,16 @@ void HarvestTimestamps(Frame &frame) {
         record.gpu_valid = true;
     });
     const double ms = static_cast<double>((ticks[1] - ticks[0]) & g.timestamp_mask) * TimestampPeriod() / 1.0e6;
+    // A display frame's envelope spans its acquire wait, so only a split render end measures its work; an endpoint
+    // only copies an image, which is all that remains below this.
+    constexpr double kCopyOnlyMs = 2.0;
+    const double     render_ms =
+        frame.split_timestamps ? static_cast<double>((ticks[2] - ticks[0]) & g.timestamp_mask) * TimestampPeriod() / 1.0e6 : ms;
+    if (kind == Frame::Timestamps::Canonical) {
+        g_recent_canonical_ms.store(static_cast<float>(ms), std::memory_order_relaxed);
+    } else if (frame.split_timestamps && render_ms > kCopyOnlyMs) {
+        g_recent_replay_ms.store(static_cast<float>(render_ms), std::memory_order_relaxed);
+    }
     RecordTiming([&](FrameTimings &timings) {
         (kind == Frame::Timestamps::Canonical ? timings.canonical_gpu : timings.display_gpu).Add(ms);
     });
@@ -3578,7 +3591,7 @@ void OpenTimestamps(VkCommandBuffer cmd) {
     if (FramePhasesEnabled()) {
         g_role_frame_opened_ns = FrameRoleClockNs();
     }
-    if (!Timing()) {
+    if (!Timing() && !g_gpu_work_tracking.load(std::memory_order_relaxed)) {
         return;
     }
     g_frame_opened = TimingClock::now();
@@ -4932,6 +4945,13 @@ bool GpuPresentsPendingAtMost(uint32_t presents) {
 void SetFrameTimingEnabled(bool enabled) { g_timing_enabled.store(enabled); }
 
 bool FrameTimingEnabled() { return Timing(); }
+
+void SetGpuWorkTracking(bool enabled) { g_gpu_work_tracking.store(enabled); }
+
+RecentGpuWork GetRecentGpuWork() {
+    return {.canonical_ms = g_recent_canonical_ms.load(std::memory_order_relaxed),
+            .replay_ms = g_recent_replay_ms.load(std::memory_order_relaxed)};
+}
 
 bool VsyncGateActive() {
 #ifdef __SWITCH__
