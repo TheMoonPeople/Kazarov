@@ -37,6 +37,8 @@ struct MeshConstantsData {
     vec4 world_uv[2];
     uint flags;
     uint light_count;
+    uint reflect_tint;
+    uint reflect_lift;
 };
 
 layout(set = 1, binding = 0, std430) readonly buffer MeshConstantsArray {
@@ -53,6 +55,8 @@ const uint kClip0       = 16u;
 const uint kClip1       = 32u;
 const uint kScreenUv    = 64u;
 const uint kWorldUv     = 128u;
+const uint kReflect     = 512u;
+const uint kReflectCube = 1024u;
 
 // A byte colour (0..255 as 0..1) read as a modulation with 0x80 as 1.0.
 const float kModulate = 255.0 / 128.0;
@@ -61,6 +65,15 @@ layout(location = 0) out vec4 v_color;
 layout(location = 1) out vec2 v_uv;
 layout(location = 2) out vec4 v_fog;
 layout(location = 3) flat out vec4 v_fog_mode;
+// xy: the surface's facing on screen (the view's x and y of its lighting-space normal); w: 1 when the pixel samples
+// the texture there (kReflect). For kReflectCube xyz is the reflected ray in lighting space and w 2 (right-handed
+// faces) or 3 (left-handed). Else 0.
+layout(location = 4) out vec4 v_reflect;
+// kReflectCube's block: its top left corner (xy) and one face's size (zw), in texture units.
+layout(location = 5) flat out vec4 v_cube;
+// kReflectCube's texel scale (rgb) and what is added to it (rgb).
+layout(location = 6) flat out vec4 v_tint;
+layout(location = 7) flat out vec4 v_lift;
 
 out float gl_ClipDistance[2];
 
@@ -104,6 +117,22 @@ void main() {
     v_color = clamp(vec4(color, alpha) / kModulate, 0.0, 1.0);
     v_uv    = (flags & kWorldUv) != 0u ? vec2(dot(mc.world_uv[0], position), dot(mc.world_uv[1], position)) :
               (flags & kScreenUv) != 0u ? clip.xy / clip.w * 0.5 + 0.5 + a_uv : a_uv;
+    v_cube = vec4(0.0);
+    v_tint = vec4(1.0);
+    v_lift = vec4(0.0);
+    if ((flags & kReflectCube) != 0u) {
+        // Reflected in object space (the eye brought there), then turned into lighting space.
+        vec3 ray  = reflect(normalize(a_position - mc.world_uv[0].xyz), normalize(a_normal));
+        v_reflect = vec4(mc.normal_matrix * ray, mc.world_uv[0].w > 0.0 ? 2.0 : 3.0);
+        v_cube    = mc.world_uv[1];
+        v_tint    = unpackUnorm4x8(mc.reflect_tint) * (255.0 / 64.0);
+        v_lift    = unpackUnorm4x8(mc.reflect_lift);
+    } else if ((flags & kReflect) != 0u) {
+        vec3 n    = normalize(mc.normal_matrix * a_normal);
+        v_reflect = vec4(dot(mc.world_uv[0].xyz, n), dot(mc.world_uv[1].xyz, n), 0.0, 1.0);
+    } else {
+        v_reflect = vec4(0.0);
+    }
     v_fog_mode = vec4(mc.fog.w, mc.fog.z, 0.0, 1.0);
     if ((flags & kFog) == 0u) {
         v_fog = vec4(1.0, 0.0, 0.0, 0.0);

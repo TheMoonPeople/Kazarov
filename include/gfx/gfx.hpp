@@ -638,7 +638,22 @@ enum MeshFlags : uint32_t {
     kMeshWorldUv = 1u << 7,
     // Implied by DrawMeshProg0 and DrawMeshImmediateProg0; a plain draw that sets it draws plain.
     kMeshProg0 = 1u << 8,
+    // A reflection map (matcap): each pixel samples the texture where its surface faces on screen, from the
+    // interpolated normal, not at Vertex3D::uv; world_uv[0] and [1] then hold the view's x and y axes in lighting
+    // space (xyz, unit length), and the centre of the texture is a surface facing the camera.
+    kMeshReflect = 1u << 9,
+    // A reflection cube: each pixel samples the texture where its reflected view ray leaves a cube of six square faces
+    // laid in a 3 x 2 block (+x, -x, +y in the top row, -y, +z, -z below; kReflectCubeAxis and kReflectCubeDown give each
+    // face's forward and down, its right is cross(down, forward) times the handedness). world_uv[0] holds the eye in
+    // object space (xyz) and the handedness (w, 1 or -1); world_uv[1] the block's top left corner (xy) and one face's
+    // size (zw) in texture units. The texel is scaled by reflect_tint (RGBA8, 0x40 as 1.0) and reflect_lift (RGBA8)
+    // added, before the lit colour modulates it.
+    kMeshReflectCube = 1u << 10,
 };
+
+// The faces of a kMeshReflectCube block: the axis each looks along and the direction that is down on it.
+inline constexpr float kReflectCubeAxis[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+inline constexpr float kReflectCubeDown[6][3] = {{0, -1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}, {0, -1, 0}, {0, -1, 0}};
 
 // Vu_prog0's flags word, as mgCVisualMDT::CreateRenderInfoPacket sets it.
 enum Prog0Flags : uint32_t {
@@ -721,7 +736,8 @@ struct MeshConstants {
     float    world_uv[2][4];   // world x/z rows for terrain sampled across map cells
     uint32_t flags = 0;
     uint32_t light_count = 0;
-    uint32_t pad[2] = {};
+    uint32_t reflect_tint = 0; // kMeshReflectCube's texel scale, 0x40 as 1.0
+    uint32_t reflect_lift = 0; // and what is added to it
 };
 
 static_assert(sizeof(MeshConstants) == 400);
